@@ -5,10 +5,9 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <stdbool.h>
-#include <string.h>
 
-#include "bpf_utils.h"
 #include "rgwtrace_events.h"
+#include "bpf_utils.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
 
@@ -22,6 +21,8 @@ struct rgw_request_ctx {
   __u32 tid;
   char trans_id[MAX_TRANS_ID];
 };
+
+static struct rados_op_state zero_rados_op = {};
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -65,7 +66,7 @@ static __always_inline void emit_request_event(__u32 type,
   if (e == 0)
     return;
 
-  memset(e, 0, sizeof(*e));
+  __builtin_memset(e, 0, sizeof(*e));
   e->type = type;
   e->data.request.start_ns = ctx->start_ns;
   e->data.request.end_ns = end_ns;
@@ -165,14 +166,13 @@ int uprobe_send_op(struct pt_regs *ctx) {
     bpf_probe_read_user(&key.cid, sizeof(key.cid), (void *)cid_addr);
   }
 
-  struct rados_op_state empty = {};
-  bpf_map_update_elem(&rados_ops, &key, &empty, 0);
+  bpf_map_update_elem(&rados_ops, &key, &zero_rados_op, 0);
   struct rados_op_state *state = bpf_map_lookup_elem(&rados_ops, &key);
   if (state == 0)
     return 0;
 
   struct rgwtrace_rados_event *event = &state->event;
-  memset(event, 0, sizeof(*event));
+  __builtin_memset(event, 0, sizeof(*event));
   event->sent_ns = bpf_ktime_get_boot_ns();
   event->tid = key.tid;
   event->cid = key.cid;
@@ -372,7 +372,7 @@ int uprobe_finish_op(struct pt_regs *ctx) {
   if (e == 0)
     return 0;
 
-  memset(e, 0, sizeof(*e));
+  __builtin_memset(e, 0, sizeof(*e));
   e->type = RGWTRACE_EVENT_RADOS_OP;
   e->data.rados = state->event;
   bpf_ringbuf_submit(e, 0);

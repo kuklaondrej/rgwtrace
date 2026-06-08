@@ -19,10 +19,16 @@ fn build_bpf() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     let skel = out_dir.join("rgwtrace.skel.rs");
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH must be set");
+    let (bpf_arch, multiarch_include) = match target_arch.as_str() {
+        "x86_64" => ("-D__TARGET_ARCH_x86", "/usr/include/x86_64-linux-gnu"),
+        "aarch64" => ("-D__TARGET_ARCH_arm64", "/usr/include/aarch64-linux-gnu"),
+        other => panic!("unsupported BPF target architecture {other}"),
+    };
 
     libbpf_cargo::SkeletonBuilder::new()
         .source("bpf/rgwtrace.bpf.c")
-        .clang_args(["-I", "bpf"])
+        .clang_args(["-I", "bpf", "-I", multiarch_include, bpf_arch])
         .build_and_generate(&skel)
         .expect("failed to build rgwtrace BPF skeleton");
 }

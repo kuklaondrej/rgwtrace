@@ -87,6 +87,35 @@ Live tracing builds and runs on Linux only. Building the BPF skeleton requires a
 
 The macOS build is intentionally kept working for parser/classifier/exporter development, but it cannot validate the Linux-gated BPF loader.
 
+### Linux Container Build From macOS
+
+Build a Linux `amd64` binary using Docker or Podman:
+
+```sh
+./scripts/build-linux-container.sh
+```
+
+The script:
+
+- Builds `docker/Dockerfile` with `--platform linux/amd64`.
+- Compiles `cargo build --release` inside Debian Bookworm.
+- Copies the binary to `dist/rgwtrace-linux-amd64`.
+
+Override the container runtime or output path if needed:
+
+```sh
+CONTAINER_RUNTIME=podman OUTPUT_DIR=/tmp ./scripts/build-linux-container.sh
+```
+
+Manual equivalent:
+
+```sh
+docker build --platform linux/amd64 -f docker/Dockerfile -t rgwtrace-linux-builder .
+container=$(docker create rgwtrace-linux-builder)
+docker cp "$container:/workspace/target/release/rgwtrace" ./rgwtrace-linux-amd64
+docker rm "$container"
+```
+
 ## Trace Model
 
 Default request output:

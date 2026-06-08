@@ -1,6 +1,8 @@
 use std::{
+    ffi::CString,
     mem::{align_of, size_of},
     path::Path,
+    ptr::NonNull,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -9,7 +11,10 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
+use libbpf_rs::{
+    skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, OpenObject,
+    RingBufferBuilder,
+};
 
 use crate::{
     cli::Cli,
@@ -34,11 +39,12 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = targets::discover(cli)?;
     let pid = cli.pid.unwrap_or(-1);
 
-    let mut open = RgwtraceSkelBuilder::default().open()?;
-    configure_rodata(open.rodata_mut(), dwarf.version.as_deref());
+    let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
+    let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
+    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref());
     let mut skel = open.load()?;
 
-    populate_hprobes(skel.maps_mut().hprobes(), dwarf)?;
+    populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
     let _links = attach_probes(&mut skel, dwarf, &targets, pid)?;
 
     let collector = Arc::new(Mutex::new(Collector::default()));
@@ -49,7 +55,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         .context("failed to install Ctrl-C handler")?;
 
     let mut ringbuf_builder = RingBufferBuilder::new();
-    ringbuf_builder.add(skel.maps().events(), move |data| {
+    ringbuf_builder.add(&skel.maps.events, move |data| {
         match decode_event(data) {
             Ok(event) => collector_cb
                 .lock()
@@ -81,7 +87,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     Ok(collector.into_trace_document(cli.service_name.clone()))
 }
 
-fn configure_rodata(rodata: &mut rgwtrace_bss_types::rodata, version: Option<&str>) {
+fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) {
     let squid_or_newer = version.map(is_squid_or_newer).unwrap_or(false);
 
     if squid_or_newer {
@@ -122,7 +128,7 @@ fn attach_probes(
     for path in targets.rados_libraries() {
         attach_if_present(
             &mut links,
-            skel.progs_mut().uprobe_send_op(),
+            &skel.progs.uprobe_send_op,
             false,
             pid,
             path,
@@ -131,7 +137,7 @@ fn attach_probes(
         )?;
         attach_if_present(
             &mut links,
-            skel.progs_mut().uprobe_finish_op(),
+            &skel.progs.uprobe_finish_op,
             false,
             pid,
             path,
@@ -142,7 +148,7 @@ fn attach_probes(
 
     attach_if_present(
         &mut links,
-        skel.progs_mut().uprobe_rgw_process_request(),
+        &skel.progs.uprobe_rgw_process_request,
         false,
         pid,
         &targets.radosgw,
@@ -151,7 +157,7 @@ fn attach_probes(
     )?;
     attach_if_present(
         &mut links,
-        skel.progs_mut().uretprobe_rgw_process_request(),
+        &skel.progs.uretprobe_rgw_process_request,
         true,
         pid,
         &targets.radosgw,
@@ -160,7 +166,7 @@ fn attach_probes(
     )?;
     attach_if_present(
         &mut links,
-        skel.progs_mut().uprobe_rgw_get_handler(),
+        &skel.progs.uprobe_rgw_get_handler,
         false,
         pid,
         &targets.radosgw,
@@ -177,7 +183,7 @@ fn attach_probes(
 
 fn attach_if_present(
     links: &mut Vec<Link>,
-    prog: &mut libbpf_rs::Program,
+    prog: &libbpf_rs::ProgramMut<'_>,
     retprobe: bool,
     pid: i32,
     path: &Path,
@@ -191,11 +197,41 @@ fn attach_if_present(
         return Ok(());
     };
 
-    let link = prog
-        .attach_uprobe(retprobe, pid, path, addr as usize)
+    let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
         .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
     links.push(link);
     Ok(())
+}
+
+fn attach_uprobe(
+    prog: &libbpf_rs::ProgramMut<'_>,
+    retprobe: bool,
+    pid: i32,
+    binary_path: &Path,
+    func_offset: usize,
+) -> Result<Link> {
+    let path = binary_path
+        .to_str()
+        .with_context(|| format!("{} is not valid unicode", binary_path.display()))?;
+    let path = CString::new(path).context("uprobe path contains an interior NUL byte")?;
+    let ptr = unsafe {
+        libbpf_rs::libbpf_sys::bpf_program__attach_uprobe(
+            prog.as_libbpf_object().as_ptr(),
+            retprobe,
+            pid,
+            path.as_ptr(),
+            func_offset as libbpf_rs::libbpf_sys::size_t,
+        )
+    };
+    match unsafe { libbpf_rs::libbpf_sys::libbpf_get_error(ptr.cast()) } {
+        0 => {
+            let ptr = NonNull::new(ptr).context("libbpf returned a null uprobe link")?;
+            Ok(unsafe { Link::from_ptr(ptr) })
+        }
+        err => {
+            Err(libbpf_rs::Error::from_raw_os_error(-err as i32)).context("failed to attach uprobe")
+        }
+    }
 }
 
 fn decode_event(data: &[u8]) -> Result<TraceEvent> {

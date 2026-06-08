@@ -1,4 +1,5 @@
 /target
+/dist
 *.o
 *.skel.rs
 *.tmp.bpf.o
