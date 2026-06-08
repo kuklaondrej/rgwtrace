@@ -34,6 +34,7 @@ mod skel {
 use skel::*;
 
 const EVENT_DATA_OFFSET: usize = 8;
+const EINTR: i32 = 4;
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = targets::discover(cli)?;
@@ -69,7 +70,17 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let started = Instant::now();
     loop {
-        ringbuf.poll(Duration::from_millis(250))?;
+        let ret = ringbuf.poll_raw(Duration::from_millis(250));
+        if ret < 0 {
+            let errno = -ret;
+            if errno == EINTR {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                continue;
+            }
+            return Err(libbpf_rs::Error::from_raw_os_error(errno).into());
+        }
         if stop.load(Ordering::SeqCst) {
             break;
         }
