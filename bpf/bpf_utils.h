@@ -11,53 +11,60 @@ static __always_inline __u32 get_tid(void) {
   return (__u32)pid_tgid;
 }
 
-static __noinline __u64 fetch_register(const struct pt_regs *const ctx, int reg) {
-  __u64 v = 0;
+#define READ_CTX_U64(ctx, offset)                                             \
+  ({                                                                          \
+    __u64 value;                                                              \
+    asm volatile("%0 = *(u64 *)(%1 + " #offset ")"                           \
+                 : "=r"(value)                                               \
+                 : "r"(ctx));                                                \
+    value;                                                                    \
+  })
 
+static __noinline __u64 fetch_register(const struct pt_regs *const ctx, int reg) {
 #if defined(__TARGET_ARCH_x86)
   if (reg == 0)
-    v = ctx->rax;
+    return READ_CTX_U64(ctx, 80);
   else if (reg == 1)
-    v = ctx->rdx;
+    return READ_CTX_U64(ctx, 96);
   else if (reg == 2)
-    v = ctx->rcx;
+    return READ_CTX_U64(ctx, 88);
   else if (reg == 3)
-    v = ctx->rbx;
+    return READ_CTX_U64(ctx, 40);
   else if (reg == 4)
-    v = ctx->rsi;
+    return READ_CTX_U64(ctx, 104);
   else if (reg == 5)
-    v = ctx->rdi;
+    return READ_CTX_U64(ctx, 112);
   else if (reg == 6)
-    v = ctx->rbp;
+    return READ_CTX_U64(ctx, 32);
   else if (reg == 7)
-    v = ctx->rsp;
+    return READ_CTX_U64(ctx, 152);
   else if (reg == 8)
-    v = ctx->r8;
+    return READ_CTX_U64(ctx, 72);
   else if (reg == 9)
-    v = ctx->r9;
+    return READ_CTX_U64(ctx, 64);
   else if (reg == 10)
-    v = ctx->r10;
+    return READ_CTX_U64(ctx, 56);
   else if (reg == 11)
-    v = ctx->r11;
+    return READ_CTX_U64(ctx, 48);
   else if (reg == 12)
-    v = ctx->r12;
+    return READ_CTX_U64(ctx, 24);
   else if (reg == 13)
-    v = ctx->r13;
+    return READ_CTX_U64(ctx, 16);
   else if (reg == 14)
-    v = ctx->r14;
+    return READ_CTX_U64(ctx, 8);
   else if (reg == 15)
-    v = ctx->r15;
+    return READ_CTX_U64(ctx, 0);
 #elif defined(__TARGET_ARCH_arm64)
   const struct user_pt_regs *regs = (const struct user_pt_regs *)ctx;
   if (reg >= 0 && reg <= 30)
-    v = regs->regs[reg];
+    return regs->regs[reg];
   else if (reg == 31)
-    v = regs->sp;
+    return regs->sp;
 #else
 #error "Unsupported architecture: only x86 and arm64 are supported"
 #endif
 
-  return v;
+  return 0;
 }
 
 static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
