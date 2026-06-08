@@ -1,0 +1,43 @@
+.dockerignore
+  s_9a285a225e3dbc::t_df9c568d8d00b3 1-6
+README.md
+  s_9a285a225e3dbc::t_7c97bd4654133c 90-118
+.gitignore
+  s_9a285a225e3dbc::t_097f574c9f1774 2
+src/live.rs
+  s_9a285a225e3dbc::t_49ecbdc86829d1 1,15
+docker/Dockerfile
+  s_9a285a225e3dbc::t_097f574c9f1774 1-14,17-20
+  s_9a285a225e3dbc::t_1f6bf2ee200f75 15-16
+build.rs
+  s_9a285a225e3dbc::t_097f574c9f1774 22,26-27
+  s_9a285a225e3dbc::t_df9c568d8d00b3 23-25,31
+scripts/build-linux-container.sh
+  s_9a285a225e3dbc::t_097f574c9f1774 1-40
+src/live/linux.rs
+  s_9a285a225e3dbc::t_4291f28532a11f 14,17
+  s_9a285a225e3dbc::t_0ca0dc0beac61b 2,5,15-16,43,200,206-230,234
+  s_9a285a225e3dbc::t_49ecbdc86829d1 42,47,58,90,131,140,151,160,169
+  s_9a285a225e3dbc::t_ca339d770f3cb9 231-233
+  s_9a285a225e3dbc::t_2f5c7d5c310bc9 44,186
+bpf/rgwtrace.bpf.c
+  s_9a285a225e3dbc::t_b374baefd17c5b 25-26,169
+  s_9a285a225e3dbc::t_57d605ad7f582a 69,175,375
+  s_9a285a225e3dbc::t_72dca982fc278e 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "4d1b2f38f433442afe8c5d0f31354609d14aab22",
+  "prompts": {},
+  "sessions": {
+    "s_9a285a225e3dbc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_172d48c8dffeBPFgWxXif3Vj67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
