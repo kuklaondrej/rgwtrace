@@ -91,6 +91,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         }
     }
 
+    drop(ringbuf);
     let collector = Arc::try_unwrap(collector)
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
         .into_inner()
