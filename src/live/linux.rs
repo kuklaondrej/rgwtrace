@@ -148,24 +148,6 @@ fn attach_probes(
 
     attach_if_present(
         &mut links,
-        &skel.progs.uprobe_rgw_process_request,
-        false,
-        pid,
-        &targets.radosgw,
-        dwarf,
-        "process_request",
-    )?;
-    attach_if_present(
-        &mut links,
-        &skel.progs.uretprobe_rgw_process_request,
-        true,
-        pid,
-        &targets.radosgw,
-        dwarf,
-        "process_request",
-    )?;
-    attach_if_present(
-        &mut links,
         &skel.progs.uprobe_rgw_get_handler,
         false,
         pid,
