@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde::Serialize;
 
 pub const MAX_ACTING: usize = 16;
@@ -67,6 +69,7 @@ pub struct RequestEvent {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RadosEvent {
+    pub pid: u32,
     pub cid: u64,
     pub tid: u64,
     pub sent_ns: u64,
@@ -155,6 +158,7 @@ impl From<RawRadosEvent> for RadosEvent {
             .collect();
 
         Self {
+            pid: raw.pid,
             cid: raw.cid,
             tid: raw.tid,
             sent_ns: raw.sent_ns,
