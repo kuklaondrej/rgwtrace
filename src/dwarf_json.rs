@@ -150,6 +150,14 @@ impl DwarfInfo {
         entries
     }
 
+    #[allow(dead_code)]
+    pub fn function_addr(&self, module_basename: &str, function: &str) -> Option<u64> {
+        self.modules
+            .get(module_basename)
+            .and_then(|module| module.func2pc.get(function).copied())
+            .filter(|addr| *addr != 0)
+    }
+
     pub fn summary(&self) -> DwarfSummary {
         let hprobe_entries = self.hprobe_entries().len();
         DwarfSummary {
@@ -159,6 +167,11 @@ impl DwarfInfo {
             hprobe_entries,
         }
     }
+}
+
+#[allow(dead_code)]
+pub fn basename(path: &Path) -> Option<&str> {
+    path.file_name().and_then(|name| name.to_str())
 }
 
 impl VarFieldJson {
