@@ -1,0 +1,26 @@
+src/cli.rs
+  s_9a285a225e3dbc::t_692c0925acc982 28-39
+src/targets.rs
+  s_9a285a225e3dbc::t_692c0925acc982 3-33,38-44,51-91,94-103,108-145,149,153-231
+  s_9a285a225e3dbc::t_0ccea2dd8fc1bd 34-37,92-93
+  s_9a285a225e3dbc::t_a9427fbeb8e934 1-2
+  s_9a285a225e3dbc::t_3d8f67d8ba6851 45-50,104-107,146-148,150-152
+src/main.rs
+  s_9a285a225e3dbc::t_692c0925acc982 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "6018afb821eeb04909fcda58693e6c7f2fd20c3a",
+  "prompts": {},
+  "sessions": {
+    "s_9a285a225e3dbc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_172d48c8dffeBPFgWxXif3Vj67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
