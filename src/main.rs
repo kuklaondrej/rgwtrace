@@ -6,6 +6,7 @@ mod collector;
 mod dwarf_json;
 mod live;
 mod otel;
+mod targets;
 
 use anyhow::Result;
 use clap::Parser;

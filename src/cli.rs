@@ -25,6 +25,18 @@ pub struct Cli {
 
     #[arg(long)]
     pub dry_run: bool,
+
+    #[arg(long)]
+    pub librados_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub librbd_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub libceph_common_path: Option<PathBuf>,
+
+    #[arg(long)]
+    pub radosgw_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
