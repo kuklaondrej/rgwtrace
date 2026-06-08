@@ -11,8 +11,7 @@ static __always_inline __u32 get_tid(void) {
   return (__u32)pid_tgid;
 }
 
-static __always_inline __u64 fetch_register(const struct pt_regs *const ctx,
-                                            int reg) {
+static __noinline __u64 fetch_register(const struct pt_regs *const ctx, int reg) {
   __u64 v = 0;
 
 #if defined(__TARGET_ARCH_x86)
