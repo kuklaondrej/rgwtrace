@@ -22,6 +22,9 @@ pub struct Cli {
 
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
+
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

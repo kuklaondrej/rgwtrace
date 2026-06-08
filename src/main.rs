@@ -4,6 +4,7 @@ mod classify;
 mod cli;
 mod collector;
 mod dwarf_json;
+mod live;
 mod otel;
 
 use anyhow::Result;
@@ -18,8 +19,11 @@ use crate::{
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let dwarf = DwarfInfo::from_path(&cli.import_json)?;
-    let collector = Collector::default();
-    let trace = collector.into_trace_document(cli.service_name.clone());
+    let trace = if cli.dry_run {
+        Collector::default().into_trace_document(cli.service_name.clone())
+    } else {
+        live::run(&cli, &dwarf)?
+    };
 
     match cli.output {
         OutputMode::Json => {
