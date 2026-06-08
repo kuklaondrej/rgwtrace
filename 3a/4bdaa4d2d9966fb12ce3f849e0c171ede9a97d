@@ -1,0 +1,19 @@
+README.md
+  s_9a285a225e3dbc::t_42870890fe366d 19-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.3",
+  "base_commit_sha": "3a4bdaa4d2d9966fb12ce3f849e0c171ede9a97d",
+  "prompts": {},
+  "sessions": {
+    "s_9a285a225e3dbc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_172d48c8dffeBPFgWxXif3Vj67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
