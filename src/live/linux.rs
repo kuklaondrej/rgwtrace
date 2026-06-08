@@ -1,7 +1,10 @@
 use std::{
     mem::{align_of, size_of},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -40,6 +43,10 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let collector = Arc::new(Mutex::new(Collector::default()));
     let collector_cb = Arc::clone(&collector);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_handler = Arc::clone(&stop);
+    ctrlc::set_handler(move || stop_handler.store(true, Ordering::SeqCst))
+        .context("failed to install Ctrl-C handler")?;
 
     let mut ringbuf_builder = RingBufferBuilder::new();
     ringbuf_builder.add(skel.maps().events(), move |data| {
@@ -57,6 +64,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let started = Instant::now();
     loop {
         ringbuf.poll(Duration::from_millis(250))?;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         if let Some(timeout) = cli.timeout {
             if started.elapsed() >= Duration::from_secs(timeout) {
                 break;
