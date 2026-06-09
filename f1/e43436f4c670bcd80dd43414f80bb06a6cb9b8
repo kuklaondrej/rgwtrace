@@ -1,0 +1,40 @@
+src/targets.rs
+  s_9748ec821b5a22::t_0f87cc9ded20c2 220
+  s_9748ec821b5a22::t_0d47057902dc2c 216-218
+src/main.rs
+  s_9748ec821b5a22::t_08acc5d40d4048 14,24-26,55-58,60-64
+  s_9748ec821b5a22::t_e073ede0b4335f 13
+  s_9748ec821b5a22::t_e94b2347862263 43-49
+  s_9748ec821b5a22::t_0f87cc9ded20c2 59
+Cargo.toml
+  s_9748ec821b5a22::t_08acc5d40d4048 12-13,17-18
+  s_9748ec821b5a22::t_0f87cc9ded20c2 14
+src/live/linux.rs
+  s_9748ec821b5a22::t_08acc5d40d4048 18,43,71,95,106-108
+README.md
+  s_9748ec821b5a22::t_6258ff17c13ede 20,71-73,77-90,158
+src/cli.rs
+  s_9748ec821b5a22::t_0d47057902dc2c 20
+  s_9748ec821b5a22::t_08acc5d40d4048 1,17-19,21-25,30-31,59-79
+  s_9748ec821b5a22::t_0f87cc9ded20c2 29
+ARCHITECTURE.md
+  s_9748ec821b5a22::t_6258ff17c13ede 16,121,123,125-127
+src/otel.rs
+  s_9748ec821b5a22::t_e94b2347862263 1,4-16,20,22-29,31-36,38-55,57,60-61,63-67,69,71-80,82,86,89-105,108-116,119-128,130-132,134,136-140,143-145,148,152-162,167-175,177-236,242,245-264,266-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "f1e43436f4c670bcd80dd43414f80bb06a6cb9b8",
+  "prompts": {},
+  "sessions": {
+    "s_9748ec821b5a22": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_153810b79ffeFBpK7wd0e2a5Ml",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
