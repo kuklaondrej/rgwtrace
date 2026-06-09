@@ -58,6 +58,27 @@ pub enum TraceEvent {
     RadosOp(RadosEvent),
 }
 
+impl TraceEvent {
+    pub fn add_timestamp_offset(&mut self, offset_ns: u64) {
+        fn add_offset(timestamp: &mut u64, offset_ns: u64) {
+            if *timestamp != 0 {
+                *timestamp = timestamp.saturating_add(offset_ns);
+            }
+        }
+
+        match self {
+            TraceEvent::RequestStart(request) | TraceEvent::RequestEnd(request) => {
+                add_offset(&mut request.start_ns, offset_ns);
+                add_offset(&mut request.end_ns, offset_ns);
+            }
+            TraceEvent::RadosOp(rados) => {
+                add_offset(&mut rados.sent_ns, offset_ns);
+                add_offset(&mut rados.finish_ns, offset_ns);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestEvent {
     pub start_ns: u64,
@@ -76,6 +97,7 @@ pub struct RadosEvent {
     pub finish_ns: u64,
     pub duration_ns: u64,
     pub pool: u64,
+    pub target_osd: u32,
     pub pg_seed: u32,
     pub acting: Vec<i32>,
     pub rw: RadosDirection,
@@ -111,12 +133,16 @@ pub fn rados_op_name(code: u16) -> String {
         0x1201 => "read",
         0x1202 => "stat",
         0x1203 => "mapext",
+        0x1206 => "notify",
+        0x1207 => "notify-ack",
+        0x1209 => "list-watchers",
         0x1205 => "sparse-read",
         0x120b => "sync_read",
         0x2201 => "write",
         0x2202 => "writefull",
         0x2204 => "zero",
         0x2206 => "append",
+        0x220f => "watch",
         0x1211 => "omap-get-keys",
         0x2215 => "omap-set-vals",
         0x1220 => "cmpext",
@@ -165,6 +191,7 @@ impl From<RawRadosEvent> for RadosEvent {
             finish_ns: raw.finish_ns,
             duration_ns: raw.finish_ns.saturating_sub(raw.sent_ns),
             pool: raw.pool,
+            target_osd: raw.target_osd,
             pg_seed: raw.pg_seed,
             acting: raw.acting.into_iter().take_while(|osd| *osd >= 0).collect(),
             rw: if raw.rw & 0x0020 != 0 {
@@ -178,5 +205,60 @@ impl From<RawRadosEvent> for RadosEvent {
             offset: raw.offset,
             length: raw.length,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_offset_keeps_zero_end_timestamp() {
+        let mut event = TraceEvent::RequestStart(RequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 1,
+            tid: 2,
+            trans_id: String::new(),
+        });
+
+        event.add_timestamp_offset(1000);
+
+        let TraceEvent::RequestStart(request) = event else {
+            panic!("expected request start event");
+        };
+        assert_eq!(request.start_ns, 1010);
+        assert_eq!(request.end_ns, 0);
+    }
+
+    #[test]
+    fn timestamp_offset_preserves_rados_duration() {
+        let mut event = TraceEvent::RadosOp(RadosEvent {
+            pid: 1,
+            cid: 2,
+            tid: 3,
+            sent_ns: 100,
+            finish_ns: 125,
+            duration_ns: 25,
+            pool: 4,
+            target_osd: 7,
+            pg_seed: 5,
+            acting: Vec::new(),
+            rw: RadosDirection::Read,
+            object_name: String::new(),
+            trans_id: String::new(),
+            ops: Vec::new(),
+            offset: 0,
+            length: 0,
+        });
+
+        event.add_timestamp_offset(1000);
+
+        let TraceEvent::RadosOp(rados) = event else {
+            panic!("expected rados event");
+        };
+        assert_eq!(rados.sent_ns, 1100);
+        assert_eq!(rados.finish_ns, 1125);
+        assert_eq!(rados.duration_ns, 25);
     }
 }

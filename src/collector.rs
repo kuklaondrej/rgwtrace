@@ -91,7 +91,7 @@ impl Collector {
         let mut spans = Vec::new();
 
         for (key, request) in self.requests {
-            spans.push(request_span(key, request));
+            spans.extend(request_spans(key, request));
         }
 
         for rados in self.background {
@@ -116,7 +116,7 @@ fn request_key(request: &RequestEvent) -> String {
     }
 }
 
-fn request_span(key: String, builder: RequestBuilder) -> SpanDocument {
+fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
     let start_ns = builder
         .request
         .as_ref()
@@ -142,10 +142,12 @@ fn request_span(key: String, builder: RequestBuilder) -> SpanDocument {
             .first()
             .map(|event| event.object_name.as_str()),
     );
+    let trace_id = trace_id(trans_id);
+    let request_span_id = span_id(&format!("request:{trans_id}"));
 
-    SpanDocument {
-        trace_id: trace_id(trans_id),
-        span_id: span_id(&format!("request:{trans_id}")),
+    let mut spans = vec![SpanDocument {
+        trace_id: trace_id.clone(),
+        span_id: request_span_id.clone(),
         parent_span_id: None,
         name: "rgw.request".to_string(),
         start_ns,
@@ -154,16 +156,24 @@ fn request_span(key: String, builder: RequestBuilder) -> SpanDocument {
             string_attr("rgw.trans_id", trans_id),
             string_attr("rgw.request_class", request_class_name(request_class)),
         ],
-        events: builder.rados.into_iter().map(rados_span_event).collect(),
-    }
+        events: Vec::new(),
+    }];
+
+    spans.extend(
+        builder
+            .rados
+            .into_iter()
+            .map(|rados| rados_child_span(rados, trace_id.clone(), request_span_id.clone())),
+    );
+
+    spans
 }
 
 fn background_span(rados: RadosEvent) -> SpanDocument {
-    let role = classify_rados(&rados);
-    let object_name = rados.object_name.clone();
     let start_ns = rados.sent_ns;
     let end_ns = rados.finish_ns;
     let trace_key = format!("background:{}:{}:{}", rados.pid, rados.tid, rados.sent_ns);
+    let attributes = rados_attributes(&rados);
 
     SpanDocument {
         trace_id: trace_id(&trace_key),
@@ -172,16 +182,40 @@ fn background_span(rados: RadosEvent) -> SpanDocument {
         name: "rgw.background.rados_op".to_string(),
         start_ns,
         end_ns,
-        attributes: vec![
-            string_attr("ceph.rados.object", &object_name),
-            string_attr("rgw.rados_role", rados_role_name(role)),
-        ],
+        attributes,
         events: vec![rados_span_event(rados)],
     }
 }
 
 fn rados_span_event(rados: RadosEvent) -> SpanEvent {
-    let role = classify_rados(&rados);
+    let time_ns = rados.finish_ns;
+
+    SpanEvent {
+        name: "rados.op".to_string(),
+        time_ns,
+        attributes: rados_attributes(&rados),
+    }
+}
+
+fn rados_child_span(rados: RadosEvent, trace_id: String, parent_span_id: String) -> SpanDocument {
+    let span_key = format!(
+        "rados:{}:{}:{}:{}",
+        rados.pid, rados.cid, rados.tid, rados.sent_ns
+    );
+    SpanDocument {
+        trace_id,
+        span_id: span_id(&span_key),
+        parent_span_id: Some(parent_span_id),
+        name: "rados.op".to_string(),
+        start_ns: rados.sent_ns,
+        end_ns: rados.finish_ns,
+        attributes: rados_attributes(&rados),
+        events: Vec::new(),
+    }
+}
+
+fn rados_attributes(rados: &RadosEvent) -> Vec<Attribute> {
+    let role = classify_rados(rados);
     let ops = rados
         .ops
         .iter()
@@ -192,21 +226,35 @@ fn rados_span_event(rados: RadosEvent) -> SpanEvent {
         .collect::<Vec<_>>()
         .join(" ");
 
-    SpanEvent {
-        name: "rados.op".to_string(),
-        time_ns: rados.finish_ns,
-        attributes: vec![
-            u64_attr("ceph.rados.duration_ns", rados.duration_ns),
-            u64_attr("ceph.rados.pool", rados.pool),
-            u64_attr("ceph.rados.pg_seed", rados.pg_seed as u64),
-            string_attr("ceph.rados.object", &rados.object_name),
-            string_attr("ceph.rados.ops", &ops),
-            string_attr("ceph.rados.rw", format!("{:?}", rados.rw).to_lowercase()),
-            u64_attr("ceph.rados.offset", rados.offset),
-            u64_attr("ceph.rados.length", rados.length),
-            string_attr("rgw.rados_role", rados_role_name(role)),
-        ],
-    }
+    vec![
+        u64_attr("ceph.rados.duration_ns", rados.duration_ns),
+        u64_attr("ceph.rados.pool", rados.pool),
+        string_attr("ceph.rados.pg", pg_name(rados.pool, rados.pg_seed)),
+        u64_attr("ceph.rados.pg_seed", rados.pg_seed as u64),
+        u64_attr("ceph.rados.target_osd", rados.target_osd as u64),
+        string_attr("ceph.rados.acting", acting_set(&rados.acting)),
+        string_attr("ceph.rados.object", &rados.object_name),
+        string_attr("ceph.rados.ops", &ops),
+        string_attr("ceph.rados.rw", format!("{:?}", rados.rw).to_lowercase()),
+        u64_attr("ceph.rados.offset", rados.offset),
+        u64_attr("ceph.rados.length", rados.length),
+        string_attr("rgw.rados_role", rados_role_name(role)),
+    ]
+}
+
+fn pg_name(pool: u64, pg_seed: u32) -> String {
+    format!("{pool}.{pg_seed:x}")
+}
+
+fn acting_set(acting: &[i32]) -> String {
+    format!(
+        "[{}]",
+        acting
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn string_attr(key: impl Into<String>, value: impl Into<String>) -> Attribute {
@@ -286,6 +334,7 @@ mod tests {
             finish_ns: 20,
             duration_ns: 10,
             pool: 16,
+            target_osd: 7,
             pg_seed: 1,
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
@@ -298,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn attaches_rados_ops_to_request_span() {
+    fn emits_rados_ops_as_request_child_spans() {
         let mut collector = Collector::default();
         collector.push(TraceEvent::RadosOp(rados("object", "tx1")));
         collector.push(TraceEvent::RequestEnd(RequestEvent {
@@ -311,9 +360,23 @@ mod tests {
 
         let document = collector.into_trace_document("rgwtrace");
 
-        assert_eq!(document.spans.len(), 1);
-        assert_eq!(document.spans[0].name, "rgw.request");
-        assert_eq!(document.spans[0].events.len(), 1);
+        assert_eq!(document.spans.len(), 2);
+        let request = &document.spans[0];
+        let rados = &document.spans[1];
+        assert_eq!(request.name, "rgw.request");
+        assert!(request.events.is_empty());
+        assert_eq!(rados.name, "rados.op");
+        assert_eq!(rados.trace_id, request.trace_id);
+        assert_eq!(
+            rados.parent_span_id.as_deref(),
+            Some(request.span_id.as_str())
+        );
+        assert_eq!(string_attribute(rados, "ceph.rados.pg"), Some("16.1"));
+        assert_eq!(
+            string_attribute(rados, "ceph.rados.acting"),
+            Some("[1,2,3]")
+        );
+        assert_eq!(u64_attribute(rados, "ceph.rados.target_osd"), Some(7));
     }
 
     #[test]
@@ -325,5 +388,27 @@ mod tests {
 
         assert_eq!(document.spans.len(), 1);
         assert_eq!(document.spans[0].name, "rgw.background.rados_op");
+    }
+
+    fn string_attribute<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {
+        span.attributes.iter().find_map(|attribute| {
+            if attribute.key == key {
+                if let AttributeValue::String(value) = &attribute.value {
+                    return Some(value.as_str());
+                }
+            }
+            None
+        })
+    }
+
+    fn u64_attribute(span: &SpanDocument, key: &str) -> Option<u64> {
+        span.attributes.iter().find_map(|attribute| {
+            if attribute.key == key {
+                if let AttributeValue::U64(value) = attribute.value {
+                    return Some(value);
+                }
+            }
+            None
+        })
     }
 }

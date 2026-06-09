@@ -500,6 +500,7 @@ dependencies = [
  "ctrlc",
  "libbpf-cargo",
  "libbpf-rs",
+ "libc",
  "serde",
  "serde_json",
 ]

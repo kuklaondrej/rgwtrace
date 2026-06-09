@@ -47,6 +47,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
     let _links = attach_probes(&mut skel, dwarf, &targets, pid)?;
+    let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
     let collector = Arc::new(Mutex::new(Collector::default()));
     let collector_cb = Arc::clone(&collector);
@@ -58,10 +59,13 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let mut ringbuf_builder = RingBufferBuilder::new();
     ringbuf_builder.add(&skel.maps.events, move |data| {
         match decode_event(data) {
-            Ok(event) => collector_cb
-                .lock()
-                .expect("collector lock poisoned")
-                .push(event),
+            Ok(mut event) => {
+                event.add_timestamp_offset(timestamp_offset_ns);
+                collector_cb
+                    .lock()
+                    .expect("collector lock poisoned")
+                    .push(event);
+            }
             Err(err) => eprintln!("failed to decode rgwtrace event: {err:#}"),
         }
         0
@@ -261,6 +265,29 @@ fn read_payload<T: Copy>(payload: &[u8]) -> Result<T> {
 
     let ptr = payload.as_ptr() as *const T;
     Ok(unsafe { ptr.read_unaligned() })
+}
+
+fn unix_boottime_offset_ns() -> Result<u64> {
+    let realtime_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
+    let boottime_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
+    realtime_ns
+        .checked_sub(boottime_ns)
+        .context("CLOCK_REALTIME is earlier than CLOCK_BOOTTIME")
+}
+
+fn clock_time_ns(clock_id: libc::clockid_t) -> Result<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let ret = unsafe { libc::clock_gettime(clock_id, &mut ts) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("clock_gettime failed");
+    }
+
+    let seconds = u64::try_from(ts.tv_sec).context("clock_gettime returned negative seconds")?;
+    let nanos = u64::try_from(ts.tv_nsec).context("clock_gettime returned negative nanoseconds")?;
+    Ok(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
 }
 
 fn bytes_of(value: &VarFieldKernel) -> &[u8] {

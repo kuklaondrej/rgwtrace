@@ -95,6 +95,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   int varid = 30;
   __u32 thread_id = get_tid();
   struct rgw_request_ctx fallback = {};
+  bpf_map_delete_elem(&rgw_requests, &thread_id);
   struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
 
   if (request == 0) {
@@ -129,6 +130,8 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   if (trans_id_len > 0 && trans_id_base > 0) {
     bpf_probe_read_user_str(request->trans_id, sizeof(request->trans_id),
                             (void *)trans_id_base);
+    emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
+                       bpf_ktime_get_boot_ns());
   }
 
   return 0;

@@ -124,6 +124,7 @@ mod tests {
             finish_ns: 20,
             duration_ns: 10,
             pool: 16,
+            target_osd: 7,
             pg_seed: 1,
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
