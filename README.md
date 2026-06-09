@@ -17,7 +17,7 @@ Implemented today:
 - RGW request spans keyed by `trans_id`.
 - Correlated RADOS operations as `rados.op` child spans.
 - Background RADOS operations as standalone root spans.
-- JSON output and minimal OTLP/HTTP JSON export.
+- JSON output and OTLP/HTTP protobuf export.
 - Unix epoch nanosecond timestamps for Tempo and OTLP.
 
 ---
@@ -68,9 +68,25 @@ sudo rgwtrace \
   --otlp-endpoint http://localhost:4318/v1/traces
 ```
 
-The exporter currently supports plain `http://` OTLP JSON endpoints.
+The exporter sends OTLP protobuf with `Content-Type: application/x-protobuf`.
+
+The exporter currently supports plain `http://` OTLP endpoints.
 
 Use `--service-name` to set the OTLP `service.name` resource attribute.
+
+Tune exporter behavior when needed:
+
+```sh
+sudo rgwtrace \
+  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --output otlp \
+  --otlp-endpoint http://localhost:4318/v1/traces \
+  --otlp-timeout 10 \
+  --otlp-retries 3 \
+  --otlp-header 'Authorization:Bearer local-token'
+```
+
+Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
 ---
 
@@ -139,7 +155,7 @@ Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter:
 
 Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans.
 
-OTLP export has no HTTPS, authentication, compression, retries, or protobuf support yet.
+OTLP export has no HTTPS, compression, batching, or incremental flush yet.
 
 ---
 

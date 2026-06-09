@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, ValueEnum};
 
@@ -14,8 +14,20 @@ pub struct Cli {
     #[arg(long, default_value = "http://localhost:4318/v1/traces")]
     pub otlp_endpoint: String,
 
+    #[arg(long, value_parser = parse_http_header)]
+    pub otlp_header: Vec<(String, String)>,
+
+    #[arg(long, default_value = "5", value_parser = parse_duration_secs)]
+    pub otlp_timeout: Duration,
+
+    #[arg(long, default_value_t = 2)]
+    pub otlp_retries: u32,
+
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
+
+    #[arg(long, default_value = "warn")]
+    pub log_level: String,
 
     #[arg(short = 'p', long)]
     pub pid: Option<i32>,
@@ -43,4 +55,26 @@ pub struct Cli {
 pub enum OutputMode {
     Json,
     Otlp,
+}
+
+fn parse_duration_secs(value: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid duration {value:?}: {err}"))?;
+    if seconds == 0 {
+        return Err("duration must be at least 1 second".to_string());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+fn parse_http_header(value: &str) -> Result<(String, String), String> {
+    let Some((name, header_value)) = value.split_once(':') else {
+        return Err("header must use NAME:VALUE syntax".to_string());
+    };
+    let name = name.trim();
+    let header_value = header_value.trim();
+    if name.is_empty() || header_value.is_empty() {
+        return Err("header name and value must be non-empty".to_string());
+    }
+    Ok((name.to_string(), header_value.to_string()))
 }

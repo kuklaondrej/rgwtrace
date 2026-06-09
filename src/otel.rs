@@ -1,174 +1,281 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::{thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use opentelemetry_proto::tonic::{
+    collector::trace::v1::ExportTraceServiceRequest,
+    common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
+    resource::v1::Resource,
+    trace::v1::{span, ResourceSpans, ScopeSpans, Span},
+};
+use prost::Message;
+use reqwest::{
+    blocking::Client,
+    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE},
+    StatusCode,
+};
+use tracing::{debug, info, warn};
 
 use crate::collector::{Attribute, AttributeValue, SpanDocument, SpanEvent, TraceDocument};
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OtlpRequest {
-    resource_spans: Vec<ResourceSpans>,
+const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
+
+pub fn export_otlp_http(
+    endpoint: &str,
+    headers: &[(String, String)],
+    timeout: Duration,
+    retries: u32,
+    document: &TraceDocument,
+) -> Result<()> {
+    ensure_http_endpoint(endpoint)?;
+
+    let body = to_otlp_protobuf(document)?;
+    let headers = header_map(headers)?;
+    let client = Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("failed to build OTLP HTTP client")?;
+
+    let max_attempts = retries.saturating_add(1);
+    for attempt in 1..=max_attempts {
+        debug!(attempt, max_attempts, endpoint, "exporting OTLP traces");
+        match send_once(&client, endpoint, headers.clone(), body.clone()) {
+            Ok(()) => {
+                info!(
+                    spans = document.spans.len(),
+                    attempt, "exported OTLP traces"
+                );
+                return Ok(());
+            }
+            Err(err) if attempt < max_attempts && err.retryable => {
+                warn!(attempt, error = %err.message, "OTLP export failed; retrying");
+                thread::sleep(retry_delay(attempt));
+            }
+            Err(err) => bail!(err.message),
+        }
+    }
+
+    unreachable!("OTLP export loop always returns")
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResourceSpans {
-    resource: Resource,
-    scope_spans: Vec<ScopeSpans>,
-}
-
-#[derive(Debug, Serialize)]
-struct Resource {
-    attributes: Vec<OtlpAttribute>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ScopeSpans {
-    scope: Scope,
-    spans: Vec<OtlpSpan>,
-}
-
-#[derive(Debug, Serialize)]
-struct Scope {
-    name: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OtlpSpan {
-    trace_id: String,
-    span_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent_span_id: Option<String>,
-    name: String,
-    kind: i32,
-    start_time_unix_nano: String,
-    end_time_unix_nano: String,
-    attributes: Vec<OtlpAttribute>,
-    events: Vec<OtlpEvent>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OtlpEvent {
-    time_unix_nano: String,
-    name: String,
-    attributes: Vec<OtlpAttribute>,
-}
-
-#[derive(Debug, Serialize)]
-struct OtlpAttribute {
-    key: String,
-    value: OtlpValue,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum OtlpValue {
-    StringValue(String),
-    IntValue(String),
-}
-
-pub fn to_otlp_json(document: &TraceDocument) -> Result<String> {
-    let request = OtlpRequest {
+pub fn to_otlp_protobuf(document: &TraceDocument) -> Result<Vec<u8>> {
+    let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: Resource {
-                attributes: vec![OtlpAttribute {
-                    key: "service.name".to_string(),
-                    value: OtlpValue::StringValue(document.service_name.clone()),
-                }],
-            },
+            resource: Some(Resource {
+                attributes: vec![string_key_value("service.name", &document.service_name)],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
             scope_spans: vec![ScopeSpans {
-                scope: Scope {
+                scope: Some(InstrumentationScope {
                     name: "rgwtrace".to_string(),
-                },
-                spans: document.spans.iter().map(span_to_otlp).collect(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    attributes: Vec::new(),
+                    dropped_attributes_count: 0,
+                }),
+                spans: document
+                    .spans
+                    .iter()
+                    .map(span_to_otlp)
+                    .collect::<Result<_>>()?,
+                schema_url: String::new(),
             }],
+            schema_url: String::new(),
         }],
     };
 
-    Ok(serde_json::to_string_pretty(&request)?)
+    Ok(request.encode_to_vec())
 }
 
-pub fn export_otlp_http(endpoint: &str, document: &TraceDocument) -> Result<()> {
-    let (host, port, path) = parse_http_endpoint(endpoint)?;
-    let body = to_otlp_json(document)?;
-    let mut stream = TcpStream::connect((host.as_str(), port))
-        .with_context(|| format!("failed to connect to {host}:{port}"))?;
+fn send_once(
+    client: &Client,
+    endpoint: &str,
+    headers: HeaderMap,
+    body: Vec<u8>,
+) -> Result<(), ExportError> {
+    let response = client
+        .post(endpoint)
+        .headers(headers)
+        .header(CONTENT_TYPE, OTLP_PROTOBUF_CONTENT_TYPE)
+        .body(body)
+        .send()
+        .map_err(|err| ExportError::retryable(format!("failed to send OTLP request: {err}")))?;
+    let status = response.status();
 
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(request.as_bytes())?;
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    if !(response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2")) {
-        bail!("OTLP endpoint returned non-success response: {response}");
+    if status.is_success() {
+        return Ok(());
     }
 
-    Ok(())
+    let body = response
+        .text()
+        .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+    let message = format!("OTLP endpoint returned {status}: {body}");
+    if is_retryable_status(status) {
+        Err(ExportError::retryable(message))
+    } else {
+        Err(ExportError::fatal(message))
+    }
 }
 
-fn span_to_otlp(span: &SpanDocument) -> OtlpSpan {
-    OtlpSpan {
-        trace_id: span.trace_id.clone(),
-        span_id: span.span_id.clone(),
-        parent_span_id: span.parent_span_id.clone(),
+fn span_to_otlp(span: &SpanDocument) -> Result<Span> {
+    Ok(Span {
+        trace_id: decode_hex_id(&span.trace_id, 16, "trace_id")?,
+        span_id: decode_hex_id(&span.span_id, 8, "span_id")?,
+        trace_state: String::new(),
+        parent_span_id: match &span.parent_span_id {
+            Some(parent_span_id) => decode_hex_id(parent_span_id, 8, "parent_span_id")?,
+            None => Vec::new(),
+        },
+        flags: 0,
         name: span.name.clone(),
-        kind: 1,
-        start_time_unix_nano: span.start_ns.to_string(),
-        end_time_unix_nano: span.end_ns.to_string(),
+        kind: span::SpanKind::Internal as i32,
+        start_time_unix_nano: span.start_ns,
+        end_time_unix_nano: span.end_ns,
         attributes: span.attributes.iter().map(attribute_to_otlp).collect(),
+        dropped_attributes_count: 0,
         events: span.events.iter().map(event_to_otlp).collect(),
-    }
+        dropped_events_count: 0,
+        links: Vec::new(),
+        dropped_links_count: 0,
+        status: None,
+    })
 }
 
-fn event_to_otlp(event: &SpanEvent) -> OtlpEvent {
-    OtlpEvent {
-        time_unix_nano: event.time_ns.to_string(),
+fn event_to_otlp(event: &SpanEvent) -> span::Event {
+    span::Event {
+        time_unix_nano: event.time_ns,
         name: event.name.clone(),
         attributes: event.attributes.iter().map(attribute_to_otlp).collect(),
+        dropped_attributes_count: 0,
     }
 }
 
-fn attribute_to_otlp(attribute: &Attribute) -> OtlpAttribute {
-    OtlpAttribute {
-        key: attribute.key.clone(),
-        value: match &attribute.value {
-            AttributeValue::String(value) => OtlpValue::StringValue(value.clone()),
-            AttributeValue::U64(value) => OtlpValue::IntValue(value.to_string()),
+fn attribute_to_otlp(attribute: &Attribute) -> KeyValue {
+    match &attribute.value {
+        AttributeValue::String(value) => string_key_value(&attribute.key, value),
+        AttributeValue::U64(value) => KeyValue {
+            key: attribute.key.clone(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::IntValue(
+                    i64::try_from(*value).unwrap_or(i64::MAX),
+                )),
+            }),
+            key_strindex: 0,
         },
     }
 }
 
-fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16, String)> {
-    let Some(rest) = endpoint.strip_prefix("http://") else {
-        bail!("only http:// OTLP endpoints are supported by the minimal exporter")
-    };
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, "v1/traces"));
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((host, port)) => (host.to_string(), port.parse()?),
-        None => (host_port.to_string(), 80),
-    };
+fn string_key_value(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_string())),
+        }),
+        key_strindex: 0,
+    }
+}
 
-    Ok((host, port, format!("/{path}")))
+fn header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .with_context(|| format!("invalid OTLP header name {name:?}"))?;
+        let value = HeaderValue::from_str(value)
+            .with_context(|| format!("invalid OTLP header value for {name}"))?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
+fn ensure_http_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint.starts_with("http://") {
+        bail!("only http:// OTLP endpoints are supported")
+    }
+    Ok(())
+}
+
+fn decode_hex_id(value: &str, expected_len: usize, field: &str) -> Result<Vec<u8>> {
+    if value.len() != expected_len * 2 {
+        bail!("{field} must be {} hex characters", expected_len * 2);
+    }
+
+    (0..value.len())
+        .step_by(2)
+        .map(|idx| {
+            u8::from_str_radix(&value[idx..idx + 2], 16)
+                .with_context(|| format!("{field} contains non-hex data"))
+        })
+        .collect()
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250 * u64::from(attempt.min(8)))
+}
+
+struct ExportError {
+    message: String,
+    retryable: bool,
+}
+
+impl ExportError {
+    fn retryable(message: String) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    fn fatal(message: String) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::{AttributeValue, SpanDocument, TraceDocument};
 
     #[test]
-    fn parses_default_otlp_http_endpoint() {
-        let (host, port, path) = parse_http_endpoint("http://localhost:4318/v1/traces").unwrap();
+    fn encodes_otlp_protobuf() {
+        let document = TraceDocument {
+            service_name: "rgwtrace".to_string(),
+            spans: vec![SpanDocument {
+                trace_id: "11111111111111112222222222222222".to_string(),
+                span_id: "3333333333333333".to_string(),
+                parent_span_id: None,
+                name: "rgw.request".to_string(),
+                start_ns: 10,
+                end_ns: 20,
+                attributes: vec![Attribute {
+                    key: "rgw.trans_id".to_string(),
+                    value: AttributeValue::String("tx1".to_string()),
+                }],
+                events: Vec::new(),
+            }],
+        };
 
-        assert_eq!(host, "localhost");
-        assert_eq!(port, 4318);
-        assert_eq!(path, "/v1/traces");
+        let bytes = to_otlp_protobuf(&document).unwrap();
+        let request = ExportTraceServiceRequest::decode(bytes.as_slice()).unwrap();
+
+        assert_eq!(request.resource_spans.len(), 1);
+        assert_eq!(request.resource_spans[0].scope_spans[0].spans.len(), 1);
+        assert_eq!(
+            request.resource_spans[0].scope_spans[0].spans[0]
+                .trace_id
+                .len(),
+            16
+        );
+    }
+
+    #[test]
+    fn rejects_https_endpoint_for_now() {
+        assert!(ensure_http_endpoint("https://localhost:4318/v1/traces").is_err());
+        assert!(ensure_http_endpoint("http://localhost:4318/v1/traces").is_ok());
     }
 }
