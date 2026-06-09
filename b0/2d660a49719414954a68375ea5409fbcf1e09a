@@ -1,0 +1,35 @@
+bpf/rgwtrace.bpf.c
+  s_9a285a225e3dbc::t_1bb60df5c9fba9 98,133-134
+src/live/linux.rs
+  s_9a285a225e3dbc::t_39a17d4008e355 50,62-68,270-290
+Cargo.toml
+  s_9a285a225e3dbc::t_39a17d4008e355 17
+src/classify.rs
+  s_9a285a225e3dbc::t_bb83166709c4e1 127
+src/collector.rs
+  s_9a285a225e3dbc::t_bb83166709c4e1 176,185,232,234-235,245-257,337,374,379,392-412
+  s_9a285a225e3dbc::t_c16be1cc75e2c9 218
+  s_9a285a225e3dbc::t_21aad6437da264 375-378
+  s_9a285a225e3dbc::t_aae29f3681d10e 94,119,145-146,148-150,159-169,191-217,229-231,233,236-242,350,363-369
+  s_9a285a225e3dbc::t_fce3a5d4b3f5a2 370-373
+src/events.rs
+  s_9a285a225e3dbc::t_bb83166709c4e1 100,194,244
+  s_9a285a225e3dbc::t_39a17d4008e355 61-81,210-243,245-262
+  s_9a285a225e3dbc::t_1bb60df5c9fba9 136-138,145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "b02d660a49719414954a68375ea5409fbcf1e09a",
+  "prompts": {},
+  "sessions": {
+    "s_9a285a225e3dbc": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_172d48c8dffeBPFgWxXif3Vj67",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
