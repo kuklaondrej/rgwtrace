@@ -1,0 +1,21 @@
+scripts/verify.sh
+  s_9748ec821b5a22::t_f3fbecb2bc92e5 1-15
+.github/workflows/ci.yml
+  s_9748ec821b5a22::t_f3fbecb2bc92e5 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "56f7a6ddc3d2bffb1c4c9524b5c9c2296b257fe3",
+  "prompts": {},
+  "sessions": {
+    "s_9748ec821b5a22": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_153810b79ffeFBpK7wd0e2a5Ml",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
