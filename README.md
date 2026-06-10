@@ -38,7 +38,9 @@ sudo rgwtrace \
   --preflight
 ```
 
-`--preflight` checks the requested `--pid`, explicit target paths, discovered Ceph/RGW target files, required DWARF functions, and minimum variable-field counts.
+`--preflight` checks the requested `--pid`, explicit target paths, discovered Ceph/RGW target files, required DWARF functions, minimum variable-field counts, and ELF build IDs.
+
+Build ID mismatches are reported as warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched build IDs.
 
 Run live tracing and flush JSON on `Ctrl-C`:
 
@@ -171,7 +173,7 @@ sudo rgwtrace \
 
 The DWARF JSON must match the Ceph binaries being traced closely enough for function offsets and field paths to stay valid.
 
-`rgwtrace` currently validates the required probe functions and field counts but does not validate ELF build IDs against the DWARF JSON yet.
+`rgwtrace` validates required probe functions, field counts, and ELF build IDs. Build ID mismatches warn by default and fail with `--strict-build-id`.
 
 ---
 

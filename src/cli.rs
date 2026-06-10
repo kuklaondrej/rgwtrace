@@ -48,6 +48,9 @@ pub struct Cli {
     pub preflight: bool,
 
     #[arg(long)]
+    pub strict_build_id: bool,
+
+    #[arg(long)]
     pub librados_path: Option<PathBuf>,
 
     #[arg(long)]

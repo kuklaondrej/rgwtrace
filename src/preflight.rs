@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::{fs, path::Path};
 
 use anyhow::{bail, Context, Result};
+use object::Object;
 use serde::Serialize;
 
 use crate::{
@@ -23,6 +24,7 @@ pub struct PreflightReport {
     pub dwarf: DwarfSummary,
     pub targets: ProbeTargets,
     pub checks: Vec<PreflightCheck>,
+    pub build_ids: Vec<BuildIdCheck>,
 }
 
 #[derive(Debug, Serialize)]
@@ -32,12 +34,24 @@ pub struct PreflightCheck {
     pub detail: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct BuildIdCheck {
+    pub module: String,
+    pub path: String,
+    pub status: &'static str,
+    pub dwarf_build_id: Option<String>,
+    pub target_build_id: Option<String>,
+    pub detail: String,
+}
+
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<PreflightReport> {
     let targets = validated_targets(cli, dwarf)?;
+    let build_ids = build_id_checks(dwarf, &targets)?;
     Ok(PreflightReport {
         ok: true,
         dwarf: dwarf.summary(),
         checks: checks(dwarf, &targets),
+        build_ids,
         targets,
     })
 }
@@ -47,6 +61,7 @@ pub fn validated_targets(cli: &Cli, dwarf: &DwarfInfo) -> Result<ProbeTargets> {
     let targets = targets::discover(cli)?;
     validate_target_paths(&targets)?;
     validate_dwarf_targets(dwarf, &targets)?;
+    validate_build_ids(dwarf, &targets, cli.strict_build_id)?;
     Ok(targets)
 }
 
@@ -158,6 +173,78 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
             detail: format!("{GET_HANDLER} available in {radosgw}"),
         },
     ]
+}
+
+fn validate_build_ids(dwarf: &DwarfInfo, targets: &ProbeTargets, strict: bool) -> Result<()> {
+    let checks = build_id_checks(dwarf, targets)?;
+    if strict {
+        if let Some(check) = checks.iter().find(|check| check.status != "ok") {
+            bail!(
+                "build ID check failed for {} at {}: {}",
+                check.module,
+                check.path,
+                check.detail
+            );
+        }
+    }
+    Ok(())
+}
+
+fn build_id_checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<Vec<BuildIdCheck>> {
+    [
+        targets.librados.as_path(),
+        targets.librbd.as_path(),
+        targets.libceph_common.as_path(),
+        targets.radosgw.as_path(),
+    ]
+    .into_iter()
+    .map(|path| build_id_check(dwarf, path))
+    .collect()
+}
+
+fn build_id_check(dwarf: &DwarfInfo, path: &Path) -> Result<BuildIdCheck> {
+    let module = target_basename(path, "target")?.to_string();
+    let dwarf_build_id = dwarf.module_build_id(&module).map(ToOwned::to_owned);
+    let target_build_id = elf_build_id(path)
+        .with_context(|| format!("failed to read build ID from {}", path.display()))?;
+    let (status, detail) = match (dwarf_build_id.as_deref(), target_build_id.as_deref()) {
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => {
+            ("ok", "build IDs match".to_string())
+        }
+        (Some(expected), Some(actual)) => (
+            "warn",
+            format!("build ID mismatch: DWARF has {expected}, target has {actual}"),
+        ),
+        (None, Some(_)) => (
+            "warn",
+            "DWARF JSON has no build ID for this module".to_string(),
+        ),
+        (Some(_), None) => ("warn", "target has no readable build ID".to_string()),
+        (None, None) => (
+            "warn",
+            "neither DWARF JSON nor target has a build ID".to_string(),
+        ),
+    };
+
+    Ok(BuildIdCheck {
+        module,
+        path: path.display().to_string(),
+        status,
+        dwarf_build_id,
+        target_build_id,
+        detail,
+    })
+}
+
+fn elf_build_id(path: &Path) -> Result<Option<String>> {
+    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let file = object::File::parse(data.as_slice())
+        .with_context(|| format!("{} is not a supported object file", path.display()))?;
+    Ok(file.build_id()?.map(hex_string))
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn target_basename<'a>(path: &'a Path, label: &str) -> Result<&'a str> {

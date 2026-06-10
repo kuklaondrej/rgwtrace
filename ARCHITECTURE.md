@@ -10,7 +10,7 @@ Live tracing pipeline for RGW and RADOS.
 
 The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
 
-Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, and minimum variable-field counts for the probes used by the BPF program.
+Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, minimum variable-field counts for the probes used by the BPF program, and ELF build IDs.
 
 Pipeline:
 
@@ -146,7 +146,7 @@ Native DWARF parsing is not implemented.
 
 Use matching `cephtrace`-generated DWARF JSON for the Ceph binaries being traced.
 
-Build IDs are parsed but not validated against discovered binaries yet.
+Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
 
 Field offsets can be wrong if the DWARF JSON and runtime binaries do not match.
 

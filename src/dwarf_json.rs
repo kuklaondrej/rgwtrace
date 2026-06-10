@@ -164,6 +164,13 @@ impl DwarfInfo {
             .map(|vars| vars.var_fields.len())
     }
 
+    pub fn module_build_id(&self, module_basename: &str) -> Option<&str> {
+        self.modules
+            .get(module_basename)
+            .and_then(|module| module.build_id.as_deref())
+            .filter(|build_id| !build_id.is_empty())
+    }
+
     pub fn summary(&self) -> DwarfSummary {
         let hprobe_entries = self.hprobe_entries().len();
         DwarfSummary {
