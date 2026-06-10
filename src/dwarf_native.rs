@@ -268,6 +268,9 @@ fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dwarf_json::{
+        DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
+    };
 
     #[test]
     fn parses_probe_function_pcs_from_cpp_fixture_when_compiler_is_available() {
@@ -281,6 +284,191 @@ mod tests {
         assert!(module.function_addr("Objecter::_send_op").is_some());
         assert!(module.function_addr("Objecter::_finish_op").is_some());
         assert!(module.function_addr("RGWREST::get_handler").is_some());
+    }
+
+    #[test]
+    fn oracle_comparison_reports_function_pc_mismatch() {
+        let mut expected = DwarfInfo {
+            version: None,
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::new(),
+        };
+        expected.modules.insert(
+            "libceph-common.so.2".to_string(),
+            module_with_func("Objecter::_send_op", 123),
+        );
+        let mut actual = expected.clone();
+        actual
+            .modules
+            .get_mut("libceph-common.so.2")
+            .unwrap()
+            .func2pc
+            .insert("Objecter::_send_op".to_string(), 456);
+
+        let error = compare_dwarf_oracle(&expected, &actual, false).unwrap_err();
+
+        assert!(error.contains("func2pc mismatch"));
+        assert!(error.contains("Objecter::_send_op"));
+    }
+
+    #[test]
+    fn oracle_comparison_can_include_var_fields() {
+        let mut expected = DwarfInfo {
+            version: None,
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::new(),
+        };
+        let mut module = module_with_func("RGWREST::get_handler", 100);
+        module.func2vf.insert(
+            "RGWREST::get_handler".to_string(),
+            FunctionVarFields {
+                var_fields: vec![VarFieldJson {
+                    location: VarLocationJson {
+                        reg: 4,
+                        offset: 0,
+                        stack: false,
+                    },
+                    fields: vec![FieldJson {
+                        offset: 16,
+                        pointer: true,
+                    }],
+                }],
+            },
+        );
+        expected
+            .modules
+            .insert("radosgw".to_string(), module.clone());
+        let mut actual = expected.clone();
+        actual.modules.get_mut("radosgw").unwrap().func2vf.clear();
+
+        assert!(compare_dwarf_oracle(&expected, &actual, false).is_ok());
+        let error = compare_dwarf_oracle(&expected, &actual, true).unwrap_err();
+
+        assert!(error.contains("func2vf"));
+        assert!(error.contains("RGWREST::get_handler"));
+    }
+
+    #[test]
+    fn compares_native_output_to_cephtrace_json_oracle_when_configured() {
+        let Some((oracle_json, target_paths, compare_var_fields)) = oracle_config() else {
+            return;
+        };
+
+        let expected = DwarfInfo::from_path(&oracle_json).unwrap();
+        let actual = from_paths(&target_paths).unwrap();
+
+        compare_dwarf_oracle(&expected, &actual, compare_var_fields).unwrap();
+    }
+
+    fn compare_dwarf_oracle(
+        expected: &DwarfInfo,
+        actual: &DwarfInfo,
+        compare_var_fields: bool,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+
+        if expected.arch != actual.arch {
+            errors.push(format!(
+                "arch mismatch: expected {:?}, actual {:?}",
+                expected.arch, actual.arch
+            ));
+        }
+
+        for (module_name, expected_module) in &expected.modules {
+            let Some(actual_module) = actual.modules.get(module_name) else {
+                errors.push(format!("missing module {module_name}"));
+                continue;
+            };
+            compare_module(
+                module_name,
+                expected_module,
+                actual_module,
+                compare_var_fields,
+                &mut errors,
+            );
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
+    fn compare_module(
+        module_name: &str,
+        expected: &DwarfModule,
+        actual: &DwarfModule,
+        compare_var_fields: bool,
+        errors: &mut Vec<String>,
+    ) {
+        if expected.build_id != actual.build_id {
+            errors.push(format!(
+                "{module_name} build_id mismatch: expected {:?}, actual {:?}",
+                expected.build_id, actual.build_id
+            ));
+        }
+
+        for (function, expected_pc) in &expected.func2pc {
+            match actual.func2pc.get(function) {
+                Some(actual_pc) if actual_pc == expected_pc => {}
+                Some(actual_pc) => errors.push(format!(
+                    "{module_name} func2pc mismatch for {function}: expected {expected_pc}, actual {actual_pc}"
+                )),
+                None => errors.push(format!("{module_name} missing func2pc for {function}")),
+            }
+        }
+
+        if compare_var_fields {
+            for (function, expected_fields) in &expected.func2vf {
+                match actual.func2vf.get(function) {
+                    Some(actual_fields) if same_var_fields(expected_fields, actual_fields) => {}
+                    Some(_) => {
+                        errors.push(format!("{module_name} func2vf mismatch for {function}"))
+                    }
+                    None => errors.push(format!("{module_name} missing func2vf for {function}")),
+                }
+            }
+        }
+    }
+
+    fn same_var_fields(left: &FunctionVarFields, right: &FunctionVarFields) -> bool {
+        if left.var_fields.len() != right.var_fields.len() {
+            return false;
+        }
+        left.var_fields
+            .iter()
+            .zip(&right.var_fields)
+            .all(|(left, right)| {
+                left.location.reg == right.location.reg
+                    && left.location.offset == right.location.offset
+                    && left.location.stack == right.location.stack
+                    && left.fields.len() == right.fields.len()
+                    && left.fields.iter().zip(&right.fields).all(|(left, right)| {
+                        left.offset == right.offset && left.pointer == right.pointer
+                    })
+            })
+    }
+
+    fn oracle_config() -> Option<(std::path::PathBuf, Vec<std::path::PathBuf>, bool)> {
+        let oracle_json = std::env::var_os("RGWTRACE_ORACLE_JSON")?.into();
+        let target_paths = std::env::var_os("RGWTRACE_ORACLE_TARGETS")?;
+        let target_paths = std::env::split_paths(&target_paths).collect::<Vec<_>>();
+        if target_paths.is_empty() {
+            return None;
+        }
+        let compare_var_fields = std::env::var_os("RGWTRACE_ORACLE_COMPARE_FUNC2VF").is_some();
+        Some((oracle_json, target_paths, compare_var_fields))
+    }
+
+    fn module_with_func(function: &str, pc: u64) -> DwarfModule {
+        let mut module = DwarfModule {
+            build_id: Some("abc".to_string()),
+            func2pc: BTreeMap::new(),
+            func2vf: BTreeMap::new(),
+        };
+        module.func2pc.insert(function.to_string(), pc);
+        module
     }
 
     fn compile_cpp_fixture() -> Option<std::path::PathBuf> {
