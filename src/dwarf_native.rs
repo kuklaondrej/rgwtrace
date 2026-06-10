@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::BTreeMap, fs, path::Path};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 use gimli::{
@@ -45,15 +50,25 @@ fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
     }
 
     let build_id = file.build_id()?.map(hex_string);
-    let endian = if file.is_little_endian() {
+    let debug_data = debug_data(path, &file, data.as_slice(), build_id.as_deref())?;
+    let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
+        format!(
+            "debug info for {} is not a supported object file",
+            path.display()
+        )
+    })?;
+    let endian = if debug_file.is_little_endian() {
         RunTimeEndian::Little
     } else {
         RunTimeEndian::Big
     };
-    let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+    let dwarf_cow = Dwarf::load(|section| load_section(&debug_file, section))?;
     #[allow(deprecated)]
     let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
     let mut func2pc = function_pcs(&dwarf)?;
+    for (function, pc) in symbol_function_pcs(&debug_file) {
+        func2pc.entry(function).or_insert(pc);
+    }
     for (function, pc) in symbol_function_pcs(&file) {
         func2pc.entry(function).or_insert(pc);
     }
@@ -248,6 +263,113 @@ fn load_section<'data>(
         .with_context(|| format!("failed to read {}", section.name().unwrap_or("<unknown>")))
 }
 
+fn debug_data<'data>(
+    path: &Path,
+    file: &object::File<'data>,
+    data: &'data [u8],
+    build_id: Option<&str>,
+) -> Result<Cow<'data, [u8]>> {
+    if file.has_debug_symbols() {
+        return Ok(Cow::Borrowed(data));
+    }
+
+    if let Some(debug_path) = debuglink_file(path, file)? {
+        return fs::read(&debug_path)
+            .map(Cow::Owned)
+            .with_context(|| format!("failed to read debuglink file {}", debug_path.display()));
+    }
+
+    if let Some(build_id) = build_id {
+        if let Some(debug_path) = build_id_debug_file(path, build_id) {
+            return fs::read(&debug_path).map(Cow::Owned).with_context(|| {
+                format!(
+                    "failed to read build-id debug file {}",
+                    debug_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(Cow::Borrowed(data))
+}
+
+fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf>> {
+    let Some((filename, _crc)) = file.gnu_debuglink()? else {
+        return Ok(None);
+    };
+    let filename = std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
+    Ok(first_existing(debuglink_candidates(path, filename)))
+}
+
+fn build_id_debug_file(path: &Path, build_id: &str) -> Option<PathBuf> {
+    first_existing(build_id_debug_candidates(path, build_id))
+}
+
+fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn debuglink_candidates(path: &Path, filename: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let filename = Path::new(filename);
+    let Some(parent) = path.parent() else {
+        return candidates;
+    };
+
+    push_unique(&mut candidates, parent.join(filename));
+    push_unique(&mut candidates, parent.join(".debug").join(filename));
+
+    for ancestor in parent.ancestors() {
+        if let Ok(relative_parent) = parent.strip_prefix(ancestor) {
+            push_unique(
+                &mut candidates,
+                ancestor
+                    .join("usr/lib/debug")
+                    .join(relative_parent)
+                    .join(filename),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn build_id_debug_candidates(path: &Path, build_id: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if build_id.len() < 3 {
+        return candidates;
+    }
+
+    let prefix = &build_id[..2];
+    let filename = format!("{}.debug", &build_id[2..]);
+    push_unique(
+        &mut candidates,
+        Path::new("/usr/lib/debug/.build-id")
+            .join(prefix)
+            .join(&filename),
+    );
+
+    if let Some(parent) = path.parent() {
+        for ancestor in parent.ancestors() {
+            push_unique(
+                &mut candidates,
+                ancestor
+                    .join("usr/lib/debug/.build-id")
+                    .join(prefix)
+                    .join(&filename),
+            );
+        }
+    }
+
+    candidates
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
 fn macho_section_name(dwarf_section_name: &str) -> String {
     dwarf_section_name.replacen('.', "__", 1)
 }
@@ -284,6 +406,71 @@ mod tests {
         assert!(module.function_addr("Objecter::_send_op").is_some());
         assert!(module.function_addr("Objecter::_finish_op").is_some());
         assert!(module.function_addr("RGWREST::get_handler").is_some());
+    }
+
+    #[test]
+    fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
+        let Some(binary) = compile_cpp_fixture() else {
+            return;
+        };
+        let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
+        let debug_file = binary.with_extension("debug");
+        let stripped = binary.with_file_name("fixture-stripped");
+
+        if !std::process::Command::new(&objcopy)
+            .args(["--only-keep-debug"])
+            .arg(&binary)
+            .arg(&debug_file)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        if std::fs::copy(&binary, &stripped).is_err() {
+            return;
+        }
+        if !std::process::Command::new(&objcopy)
+            .args(["--strip-all"])
+            .arg(format!(
+                "--add-gnu-debuglink={}",
+                debug_file.to_string_lossy()
+            ))
+            .arg(&stripped)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+
+        let info = from_paths(&[stripped.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+
+        assert!(module.function_addr("Objecter::_send_op").is_some());
+        assert!(module.function_addr("Objecter::_finish_op").is_some());
+        assert!(module.function_addr("RGWREST::get_handler").is_some());
+    }
+
+    #[test]
+    fn debuglink_candidates_include_local_and_debug_trees() {
+        let candidates =
+            debuglink_candidates(Path::new("/tmp/root/usr/bin/radosgw"), "radosgw.debug");
+
+        assert!(candidates.contains(&PathBuf::from("/tmp/root/usr/bin/radosgw.debug")));
+        assert!(candidates.contains(&PathBuf::from("/tmp/root/usr/bin/.debug/radosgw.debug")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/root/usr/lib/debug/usr/bin/radosgw.debug"
+        )));
+    }
+
+    #[test]
+    fn build_id_candidates_include_host_and_rooted_debug_trees() {
+        let candidates =
+            build_id_debug_candidates(Path::new("/tmp/root/usr/bin/radosgw"), "abcdef");
+
+        assert!(candidates.contains(&PathBuf::from("/usr/lib/debug/.build-id/ab/cdef.debug")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/root/usr/lib/debug/.build-id/ab/cdef.debug"
+        )));
     }
 
     #[test]
@@ -473,8 +660,14 @@ mod tests {
 
     fn compile_cpp_fixture() -> Option<std::path::PathBuf> {
         let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
-        let dir =
-            std::env::temp_dir().join(format!("rgwtrace-dwarf-native-{}", std::process::id()));
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rgwtrace-dwarf-native-{}-{suffix}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).ok()?;
         let source = dir.join("fixture.cc");
         let binary = dir.join("fixture");
