@@ -11,7 +11,7 @@ use prost::Message;
 use reqwest::{
     blocking::Client,
     header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE},
-    StatusCode,
+    StatusCode, Url,
 };
 use tracing::{debug, info, warn};
 
@@ -32,7 +32,7 @@ pub fn export_otlp_http(
     retries: u32,
     document: &TraceDocument,
 ) -> Result<ExportDiagnostics> {
-    ensure_http_endpoint(endpoint)?;
+    validate_otlp_endpoint(endpoint)?;
 
     let body = to_otlp_protobuf(document)?;
     let headers = header_map(headers)?;
@@ -216,11 +216,13 @@ fn header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
     Ok(map)
 }
 
-fn ensure_http_endpoint(endpoint: &str) -> Result<()> {
-    if !endpoint.starts_with("http://") {
-        bail!("only http:// OTLP endpoints are supported")
+fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+    let url =
+        Url::parse(endpoint).with_context(|| format!("invalid OTLP endpoint {endpoint:?}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => bail!("unsupported OTLP endpoint scheme {scheme:?}; use http:// or https://"),
     }
-    Ok(())
 }
 
 fn decode_hex_id(value: &str, expected_len: usize, field: &str) -> Result<Vec<u8>> {
@@ -315,8 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_https_endpoint_for_now() {
-        assert!(ensure_http_endpoint("https://localhost:4318/v1/traces").is_err());
-        assert!(ensure_http_endpoint("http://localhost:4318/v1/traces").is_ok());
+    fn accepts_http_and_https_endpoints() {
+        assert!(validate_otlp_endpoint("http://localhost:4318/v1/traces").is_ok());
+        assert!(validate_otlp_endpoint("https://localhost:4318/v1/traces").is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_otlp_endpoints() {
+        assert!(validate_otlp_endpoint("grpc://localhost:4317").is_err());
+        assert!(validate_otlp_endpoint("localhost:4318/v1/traces").is_err());
     }
 }
