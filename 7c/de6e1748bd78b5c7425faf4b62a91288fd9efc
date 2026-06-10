@@ -1,0 +1,32 @@
+src/main.rs
+  s_698c79eedd62ed::t_31f4918fa56a47 55-63
+src/otel.rs
+  s_698c79eedd62ed::t_909aae4fddf5e0 413,475-528
+  s_698c79eedd62ed::t_26aec6b3bbfdea 28,50-51,64-69,72-78,81-83,85-86,93-117,122,293-330
+  s_698c79eedd62ed::t_31f4918fa56a47 33-43,45,48-49,53-57,59,63,70-71,79-80,84
+  s_698c79eedd62ed::t_4be3a4ba9ddd51 87-92
+src/collector.rs
+  s_698c79eedd62ed::t_26aec6b3bbfdea 27,49
+src/live/linux.rs
+  s_698c79eedd62ed::t_31f4918fa56a47 136-144
+src/targets.rs
+  s_698c79eedd62ed::t_26aec6b3bbfdea 220-221
+src/cli.rs
+  s_698c79eedd62ed::t_26aec6b3bbfdea 29-34,97-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7cde6e1748bd78b5c7425faf4b62a91288fd9efc",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
