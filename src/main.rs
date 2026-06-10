@@ -6,6 +6,7 @@ mod collector;
 mod dwarf_json;
 mod live;
 mod otel;
+mod preflight;
 mod targets;
 
 use anyhow::Result;
@@ -25,6 +26,13 @@ fn main() -> Result<()> {
 
     info!(path = %cli.import_json.display(), "loading DWARF JSON");
     let dwarf = DwarfInfo::from_path(&cli.import_json)?;
+    if cli.preflight {
+        let report = preflight::run(&cli, &dwarf)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    preflight::validate_cli(&cli)?;
     let trace = if cli.dry_run {
         Collector::default().into_trace_document(cli.service_name.clone())
     } else {

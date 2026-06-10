@@ -30,6 +30,16 @@ Validate DWARF JSON parsing without attaching probes:
 rgwtrace --import-json 18.2.8-1jammy_dwarf_traceid.json --dry-run --output json
 ```
 
+Validate DWARF data and target discovery before attaching probes:
+
+```sh
+sudo rgwtrace \
+  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --preflight
+```
+
+`--preflight` checks the requested `--pid`, explicit target paths, discovered Ceph/RGW target files, required DWARF functions, and minimum variable-field counts.
+
 Run live tracing and flush JSON on `Ctrl-C`:
 
 ```sh
@@ -88,6 +98,12 @@ sudo rgwtrace \
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
+If export fails with `connection refused`, `timed out`, or DNS errors, verify the endpoint from the tracing host first:
+
+```sh
+curl -v --max-time 5 http://localhost:4318/v1/traces
+```
+
 ---
 
 ## Build
@@ -144,6 +160,8 @@ sudo rgwtrace \
 ```
 
 The DWARF JSON must match the Ceph binaries being traced closely enough for function offsets and field paths to stay valid.
+
+`rgwtrace` currently validates the required probe functions and field counts but does not validate ELF build IDs against the DWARF JSON yet.
 
 ---
 

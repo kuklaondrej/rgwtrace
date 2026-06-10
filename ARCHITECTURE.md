@@ -10,6 +10,8 @@ Live tracing pipeline for RGW and RADOS.
 
 The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
 
+Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, and minimum variable-field counts for the probes used by the BPF program.
+
 Pipeline:
 
 ```text
@@ -23,6 +25,8 @@ DWARF JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> 
 The BPF program attaches RADOS probes to `Objecter::_send_op` and `Objecter::_finish_op`.
 
 It also attaches `RGWREST::get_handler` to read the RGW `trans_id` and seed request context.
+
+The older `process_request` probe path is intentionally not present because live testing showed it could crash RGW on return-probe attach.
 
 Captured request data:
 

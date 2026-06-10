@@ -39,6 +39,9 @@ pub struct Cli {
     pub dry_run: bool,
 
     #[arg(long)]
+    pub preflight: bool,
+
+    #[arg(long)]
     pub librados_path: Option<PathBuf>,
 
     #[arg(long)]

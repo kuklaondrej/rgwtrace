@@ -25,7 +25,7 @@ use crate::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
         RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
     },
-    targets,
+    preflight, targets,
 };
 
 mod skel {
@@ -38,7 +38,7 @@ const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
-    let targets = targets::discover(cli)?;
+    let targets = preflight::validated_targets(cli, dwarf)?;
     let pid = cli.pid.unwrap_or(-1);
     info!(pid, "starting live tracing");
 

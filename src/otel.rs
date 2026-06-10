@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::{error::Error as StdError, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use opentelemetry_proto::tonic::{
@@ -37,7 +37,15 @@ pub fn export_otlp_http(
 
     let max_attempts = retries.saturating_add(1);
     for attempt in 1..=max_attempts {
-        debug!(attempt, max_attempts, endpoint, "exporting OTLP traces");
+        debug!(
+            attempt,
+            max_attempts,
+            endpoint,
+            timeout_ms = timeout.as_millis(),
+            spans = document.spans.len(),
+            body_bytes = body.len(),
+            "exporting OTLP traces"
+        );
         match send_once(&client, endpoint, headers.clone(), body.clone()) {
             Ok(()) => {
                 info!(
@@ -98,7 +106,12 @@ fn send_once(
         .header(CONTENT_TYPE, OTLP_PROTOBUF_CONTENT_TYPE)
         .body(body)
         .send()
-        .map_err(|err| ExportError::retryable(format!("failed to send OTLP request: {err}")))?;
+        .map_err(|err| {
+            ExportError::retryable(format!(
+                "failed to send OTLP request to {endpoint}: {}",
+                error_chain(&err)
+            ))
+        })?;
     let status = response.status();
 
     if status.is_success() {
@@ -213,6 +226,16 @@ fn is_retryable_status(status: StatusCode) -> bool {
 
 fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(250 * u64::from(attempt.min(8)))
+}
+
+fn error_chain(error: &dyn StdError) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        messages.push(error.to_string());
+        source = error.source();
+    }
+    messages.join(": ")
 }
 
 struct ExportError {

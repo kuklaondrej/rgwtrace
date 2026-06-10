@@ -221,6 +221,7 @@ mod tests {
             pid: None,
             timeout: None,
             dry_run: false,
+            preflight: false,
             librados_path: Some("/tmp/librados.so.2".into()),
             librbd_path: Some("/tmp/librbd.so.1".into()),
             libceph_common_path: Some("/tmp/libceph-common.so.2".into()),
