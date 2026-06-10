@@ -1,0 +1,23 @@
+ARCHITECTURE.md
+  s_9748ec821b5a22::t_b7f4b40cd9d35b 156-157
+README.md
+  s_9748ec821b5a22::t_b7f4b40cd9d35b 195-196
+RUNBOOK.md
+  s_9748ec821b5a22::t_b7f4b40cd9d35b 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "cdb3113faa03f967ec056331a61546e5c33bc17d",
+  "prompts": {},
+  "sessions": {
+    "s_9748ec821b5a22": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_153810b79ffeFBpK7wd0e2a5Ml",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
