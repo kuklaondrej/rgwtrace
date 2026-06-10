@@ -216,6 +216,7 @@ mod tests {
             otlp_header: Vec::new(),
             otlp_timeout: std::time::Duration::from_secs(5),
             otlp_retries: 2,
+            otlp_compression: crate::cli::OtlpCompression::None,
             otlp_flush_interval: std::time::Duration::from_secs(30),
             correlation_ttl: std::time::Duration::from_secs(120),
             service_name: "rgwtrace".to_string(),

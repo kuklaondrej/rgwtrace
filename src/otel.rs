@@ -1,6 +1,7 @@
-use std::{error::Error as StdError, thread, time::Duration};
+use std::{error::Error as StdError, io::Write, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
+use flate2::{write::GzEncoder, Compression as GzipCompression};
 use opentelemetry_proto::tonic::{
     collector::trace::v1::ExportTraceServiceRequest,
     common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue},
@@ -10,12 +11,15 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use reqwest::{
     blocking::Client,
-    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE},
+    header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE},
     StatusCode, Url,
 };
 use tracing::{debug, info, warn};
 
-use crate::collector::{Attribute, AttributeValue, SpanDocument, SpanEvent, TraceDocument};
+use crate::{
+    cli::OtlpCompression,
+    collector::{Attribute, AttributeValue, SpanDocument, SpanEvent, TraceDocument},
+};
 
 const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
@@ -28,14 +32,16 @@ pub struct ExportDiagnostics {
 pub fn export_otlp_http(
     endpoint: &str,
     headers: &[(String, String)],
+    compression: OtlpCompression,
     timeout: Duration,
     retries: u32,
     document: &TraceDocument,
 ) -> Result<ExportDiagnostics> {
     validate_otlp_endpoint(endpoint)?;
 
-    let body = to_otlp_protobuf(document)?;
-    let headers = header_map(headers)?;
+    let protobuf_body = to_otlp_protobuf(document)?;
+    let body = encode_body(protobuf_body, compression)?;
+    let headers = otlp_headers(headers, body.content_encoding)?;
     let client = Client::builder()
         .timeout(timeout)
         .build()
@@ -51,10 +57,12 @@ pub fn export_otlp_http(
             endpoint,
             timeout_ms = timeout.as_millis(),
             spans = document.spans.len(),
-            body_bytes = body.len(),
+            body_bytes = body.bytes.len(),
+            uncompressed_body_bytes = body.uncompressed_len,
+            compression = ?compression,
             "exporting OTLP traces"
         );
-        match send_once(&client, endpoint, headers.clone(), body.clone()) {
+        match send_once(&client, endpoint, headers.clone(), body.bytes.clone()) {
             Ok(()) => {
                 info!(
                     spans = document.spans.len(),
@@ -120,7 +128,6 @@ fn send_once(
     let response = client
         .post(endpoint)
         .headers(headers)
-        .header(CONTENT_TYPE, OTLP_PROTOBUF_CONTENT_TYPE)
         .body(body)
         .send()
         .map_err(|err| {
@@ -204,7 +211,10 @@ fn string_key_value(key: &str, value: &str) -> KeyValue {
     }
 }
 
-fn header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
+fn otlp_headers(
+    headers: &[(String, String)],
+    content_encoding: Option<&'static str>,
+) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -213,7 +223,45 @@ fn header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
             .with_context(|| format!("invalid OTLP header value for {name}"))?;
         map.insert(name, value);
     }
+    map.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(OTLP_PROTOBUF_CONTENT_TYPE),
+    );
+    if let Some(content_encoding) = content_encoding {
+        map.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
+    }
     Ok(map)
+}
+
+fn encode_body(bytes: Vec<u8>, compression: OtlpCompression) -> Result<EncodedBody> {
+    let uncompressed_len = bytes.len();
+    match compression {
+        OtlpCompression::None => Ok(EncodedBody {
+            bytes,
+            content_encoding: None,
+            uncompressed_len,
+        }),
+        OtlpCompression::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), GzipCompression::default());
+            encoder
+                .write_all(&bytes)
+                .context("failed to gzip OTLP protobuf body")?;
+            let bytes = encoder
+                .finish()
+                .context("failed to finish gzip OTLP protobuf body")?;
+            Ok(EncodedBody {
+                bytes,
+                content_encoding: Some("gzip"),
+                uncompressed_len,
+            })
+        }
+    }
+}
+
+struct EncodedBody {
+    bytes: Vec<u8>,
+    content_encoding: Option<&'static str>,
+    uncompressed_len: usize,
 }
 
 fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
@@ -281,6 +329,10 @@ impl ExportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+
+    use flate2::read::GzDecoder;
+
     use crate::collector::{AttributeValue, SpanDocument, TraceDiagnostics, TraceDocument};
 
     #[test]
@@ -326,5 +378,41 @@ mod tests {
     fn rejects_unsupported_otlp_endpoints() {
         assert!(validate_otlp_endpoint("grpc://localhost:4317").is_err());
         assert!(validate_otlp_endpoint("localhost:4318/v1/traces").is_err());
+    }
+
+    #[test]
+    fn leaves_otlp_body_uncompressed_by_default() {
+        let bytes = b"protobuf".to_vec();
+
+        let encoded = encode_body(bytes.clone(), OtlpCompression::None).unwrap();
+
+        assert_eq!(encoded.bytes, bytes);
+        assert_eq!(encoded.content_encoding, None);
+        assert_eq!(encoded.uncompressed_len, 8);
+    }
+
+    #[test]
+    fn gzips_otlp_body_when_requested() {
+        let bytes = b"protobuf protobuf protobuf".to_vec();
+
+        let encoded = encode_body(bytes.clone(), OtlpCompression::Gzip).unwrap();
+        let mut decoder = GzDecoder::new(encoded.bytes.as_slice());
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+
+        assert_eq!(decoded, bytes);
+        assert_eq!(encoded.content_encoding, Some("gzip"));
+        assert_eq!(encoded.uncompressed_len, 26);
+    }
+
+    #[test]
+    fn sets_otlp_content_headers() {
+        let headers = otlp_headers(&[], Some("gzip")).unwrap();
+
+        assert_eq!(
+            headers.get(CONTENT_TYPE).unwrap(),
+            OTLP_PROTOBUF_CONTENT_TYPE
+        );
+        assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "gzip");
     }
 }

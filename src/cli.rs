@@ -23,6 +23,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     pub otlp_retries: u32,
 
+    #[arg(long, default_value = "none")]
+    pub otlp_compression: OtlpCompression,
+
     #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
     pub otlp_flush_interval: Duration,
 
@@ -67,6 +70,12 @@ pub struct Cli {
 pub enum OutputMode {
     Json,
     Otlp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OtlpCompression {
+    None,
+    Gzip,
 }
 
 fn parse_duration_secs(value: &str) -> Result<Duration, String> {

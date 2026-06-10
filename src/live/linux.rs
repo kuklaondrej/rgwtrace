@@ -135,6 +135,7 @@ fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()
     let export = otel::export_otlp_http(
         &cli.otlp_endpoint,
         &cli.otlp_header,
+        cli.otlp_compression,
         cli.otlp_timeout,
         cli.otlp_retries,
         &trace,

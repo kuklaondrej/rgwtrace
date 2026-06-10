@@ -54,6 +54,7 @@ fn main() -> Result<()> {
                 otel::export_otlp_http(
                     &cli.otlp_endpoint,
                     &cli.otlp_header,
+                    cli.otlp_compression,
                     cli.otlp_timeout,
                     cli.otlp_retries,
                     &trace,
