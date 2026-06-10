@@ -12,12 +12,18 @@ use gimli::{
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol};
 
-use crate::dwarf_json::{basename, DwarfInfo, DwarfModule, FieldJson, VarLocationJson};
+use crate::dwarf_json::{
+    basename, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
+};
 
 const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
     "Objecter::_finish_op",
     "RGWREST::get_handler",
+];
+const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
+    &["s", "trans_id", "_M_string_length"],
+    &["s", "trans_id", "_M_dataplus", "_M_p"],
 ];
 
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
@@ -67,6 +73,7 @@ fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
     #[allow(deprecated)]
     let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
     let mut func2pc = function_pcs(&dwarf)?;
+    let func2vf = function_var_fields(&dwarf)?;
     for (function, pc) in symbol_function_pcs(&debug_file) {
         func2pc.entry(function).or_insert(pc);
     }
@@ -77,7 +84,7 @@ fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
     Ok(DwarfModule {
         build_id,
         func2pc,
-        func2vf: BTreeMap::new(),
+        func2vf,
     })
 }
 
@@ -91,6 +98,89 @@ fn function_pcs<R: Reader>(dwarf: &Dwarf<R>) -> Result<BTreeMap<String, u64>> {
         collect_function_pcs(dwarf, &unit, root, &mut Vec::new(), &mut result)?;
     }
     Ok(result)
+}
+
+fn function_var_fields<R: Reader>(dwarf: &Dwarf<R>) -> Result<BTreeMap<String, FunctionVarFields>> {
+    let mut result = BTreeMap::new();
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut tree = unit.entries_tree(None)?;
+        let root = tree.root()?;
+        collect_function_var_fields(dwarf, &unit, root, &mut Vec::new(), &mut result)?;
+    }
+    Ok(result)
+}
+
+fn collect_function_var_fields<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    node: EntriesTreeNode<R>,
+    scopes: &mut Vec<String>,
+    result: &mut BTreeMap<String, FunctionVarFields>,
+) -> Result<()> {
+    let entry = node.entry();
+    let scope = scope_name(dwarf, unit, entry)?;
+    if let Some(scope) = &scope {
+        scopes.push(scope.clone());
+    }
+
+    if entry.tag() == gimli::DW_TAG_subprogram {
+        for fullname in function_names(dwarf, unit, entry, scopes)? {
+            if let Some(paths) = probe_field_paths(&fullname) {
+                if let Some(fields) = probe_function_var_fields(dwarf, unit, entry, paths)? {
+                    result.entry(fullname).or_insert(fields);
+                }
+            }
+        }
+    }
+
+    let mut children = node.children();
+    while let Some(child) = children.next()? {
+        collect_function_var_fields(dwarf, unit, child, scopes, result)?;
+    }
+
+    if scope.is_some() {
+        scopes.pop();
+    }
+    Ok(())
+}
+
+fn probe_function_var_fields<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    function: &DebuggingInformationEntry<R>,
+    paths: &[&[&str]],
+) -> Result<Option<FunctionVarFields>> {
+    let Some(pc) = entry_pc(dwarf, unit, function)? else {
+        return Ok(None);
+    };
+    let mut var_fields = Vec::new();
+
+    for path in paths {
+        let Some(variable_name) = path.first() else {
+            return Ok(None);
+        };
+        let Some(variable) = find_function_variable(dwarf, unit, function, variable_name)? else {
+            return Ok(None);
+        };
+        let Some(location) = variable_location(dwarf, unit, function, &variable, pc)? else {
+            return Ok(None);
+        };
+        let Some(fields) = translate_field_path(dwarf, unit, &variable, path)? else {
+            return Ok(None);
+        };
+        var_fields.push(VarFieldJson { location, fields });
+    }
+
+    Ok(Some(FunctionVarFields { var_fields }))
+}
+
+fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]]> {
+    match function {
+        "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
+        _ => None,
+    }
 }
 
 fn symbol_function_pcs(file: &object::File<'_>) -> BTreeMap<String, u64> {
@@ -463,6 +553,45 @@ fn find_child_entry_by_name<'unit, R: Reader>(
             return Ok(Some(unit.entry(entry.offset())?));
         }
     }
+    Ok(None)
+}
+
+fn find_function_variable<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    function: &DebuggingInformationEntry<R>,
+    name: &str,
+) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+    let variable_tags = &[gimli::DW_TAG_formal_parameter, gimli::DW_TAG_variable];
+    if let Some(variable) =
+        find_child_entry_by_name(dwarf, unit, function.offset(), variable_tags, name)?
+    {
+        return Ok(Some(variable));
+    }
+
+    if let Some(origin) = referenced_entry(unit, function, gimli::DW_AT_abstract_origin)? {
+        if let Some(variable) =
+            find_child_entry_by_name(dwarf, unit, origin.offset(), variable_tags, name)?
+        {
+            return Ok(Some(variable));
+        }
+        if let Some(specification) = referenced_entry(unit, &origin, gimli::DW_AT_specification)? {
+            if let Some(variable) =
+                find_child_entry_by_name(dwarf, unit, specification.offset(), variable_tags, name)?
+            {
+                return Ok(Some(variable));
+            }
+        }
+    }
+
+    if let Some(specification) = referenced_entry(unit, function, gimli::DW_AT_specification)? {
+        if let Some(variable) =
+            find_child_entry_by_name(dwarf, unit, specification.offset(), variable_tags, name)?
+        {
+            return Ok(Some(variable));
+        }
+    }
+
     Ok(None)
 }
 
@@ -856,6 +985,26 @@ mod tests {
     }
 
     #[test]
+    fn extracts_rgw_get_handler_var_fields_from_cpp_fixture() {
+        let Some(binary) = compile_rgw_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get("RGWREST::get_handler") else {
+            return;
+        };
+
+        assert_eq!(fields.var_fields.len(), 2);
+        assert_eq!(fields.var_fields[0].fields.len(), 3);
+        assert!(fields.var_fields[0].fields[1].pointer);
+        assert_eq!(fields.var_fields[0].fields[2].offset, 8);
+        assert_eq!(fields.var_fields[1].fields.len(), 4);
+        assert!(fields.var_fields[1].fields[1].pointer);
+    }
+
+    #[test]
     fn oracle_comparison_reports_function_pc_mismatch() {
         let mut expected = DwarfInfo {
             version: None,
@@ -1088,6 +1237,40 @@ mod tests {
             int main() {
               Outer outer = {1, {2, 3}};
               return inspect(outer);
+            }
+            "#,
+        )
+    }
+
+    fn compile_rgw_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_source(
+            "rgw-fixture",
+            r#"
+            struct DataPtr {
+              char* _M_p;
+            };
+            struct StringLike {
+              DataPtr _M_dataplus;
+              unsigned long _M_string_length;
+            };
+            struct ReqState {
+              StringLike trans_id;
+            };
+            class RGWREST {
+            public:
+              __attribute__((noinline)) void get_handler(ReqState* s);
+              volatile unsigned long sink = 0;
+            };
+            void RGWREST::get_handler(ReqState* s) {
+              sink += s->trans_id._M_string_length;
+              sink += (unsigned long)s->trans_id._M_dataplus._M_p;
+            }
+            int main() {
+              char value = 0;
+              ReqState state = {{{&value}, 12}};
+              RGWREST rest;
+              rest.get_handler(&state);
+              return 0;
             }
             "#,
         )
