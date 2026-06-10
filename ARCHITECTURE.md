@@ -147,11 +147,13 @@ It supports optional gzip compression, span-count batching, and encoded-size bat
 
 ## Limit
 
-Native DWARF parsing is not implemented.
+Native DWARF parsing is partially implemented.
 
 Use matching `cephtrace`-generated DWARF JSON for the Ceph binaries being traced.
 
-The code has a DWARF input abstraction, but a native parser still needs safe implementation of ELF/DWARF debug-info discovery, build-id and `.gnu_debuglink` lookup, C++ symbol resolution, function PC extraction, variable-location expression decoding, and member-offset path extraction into `VarFieldKernel`.
+The native parser can extract module build IDs and probe function PCs from local debug data. It does not yet extract variable-location expressions or member-offset paths into `VarFieldKernel`, so it is not sufficient for live tracing.
+
+The remaining parser work is safe implementation of ELF/DWARF debug-info discovery, build-id and `.gnu_debuglink` lookup, variable-location expression decoding, and member-offset path extraction into `VarFieldKernel`.
 
 Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
 

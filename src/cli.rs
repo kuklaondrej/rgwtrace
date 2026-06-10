@@ -6,7 +6,10 @@ use clap::{Parser, ValueEnum};
 #[command(version, about = "Trace Ceph RGW requests and export telemetry")]
 pub struct Cli {
     #[arg(short = 'i', long = "import-json")]
-    pub import_json: PathBuf,
+    pub import_json: Option<PathBuf>,
+
+    #[arg(long, default_value = "json")]
+    pub dwarf_source: DwarfSource,
 
     #[arg(long, default_value = "json")]
     pub output: OutputMode,
@@ -79,6 +82,12 @@ pub struct Cli {
 pub enum OutputMode {
     Json,
     Otlp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DwarfSource {
+    Json,
+    Native,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

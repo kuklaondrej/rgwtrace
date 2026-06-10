@@ -113,7 +113,7 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
         .collect::<Vec<_>>();
     if rados_modules.is_empty() {
         bail!(
-            "DWARF JSON has no RADOS module matching discovered libraries with required {SEND_OP}/{FINISH_OP} data"
+            "DWARF data has no RADOS module matching discovered libraries with required {SEND_OP}/{FINISH_OP} data"
         );
     }
 
@@ -134,14 +134,14 @@ fn require_function(
     min_fields: usize,
 ) -> Result<()> {
     if dwarf.function_addr(module, function).is_none() {
-        bail!("DWARF JSON module {module} is missing function address for {function}");
+        bail!("DWARF data module {module} is missing function address for {function}");
     }
     let Some(fields) = dwarf.function_var_field_count(module, function) else {
-        bail!("DWARF JSON module {module} is missing variable fields for {function}");
+        bail!("DWARF data module {module} is missing variable fields for {function}");
     };
     if fields < min_fields {
         bail!(
-            "DWARF JSON module {module} has {fields} variable fields for {function}; need at least {min_fields}"
+            "DWARF data module {module} has {fields} variable fields for {function}; need at least {min_fields}"
         );
     }
     Ok(())

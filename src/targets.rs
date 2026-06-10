@@ -210,7 +210,8 @@ mod tests {
     #[test]
     fn explicit_paths_win() {
         let cli = Cli {
-            import_json: "x.json".into(),
+            import_json: Some("x.json".into()),
+            dwarf_source: crate::cli::DwarfSource::Json,
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),

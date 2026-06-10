@@ -5,12 +5,13 @@ mod cli;
 mod collector;
 mod dwarf_input;
 mod dwarf_json;
+mod dwarf_native;
 mod live;
 mod otel;
 mod preflight;
 mod targets;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -25,8 +26,23 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
 
-    let dwarf_input = DwarfInput::json(cli.import_json.clone());
-    info!(path = %dwarf_input.path().display(), "loading DWARF JSON");
+    let dwarf_input = match cli.dwarf_source {
+        cli::DwarfSource::Json => DwarfInput::json(
+            cli.import_json
+                .clone()
+                .context("--import-json is required when --dwarf-source json is used")?,
+        ),
+        cli::DwarfSource::Native => {
+            let targets = targets::discover(&cli)?;
+            DwarfInput::native(vec![
+                targets.librados,
+                targets.librbd,
+                targets.libceph_common,
+                targets.radosgw,
+            ])
+        }
+    };
+    info!(source = %dwarf_input.description(), "loading DWARF probe data");
     let dwarf = dwarf_input.load()?;
     if cli.preflight {
         let report = preflight::run(&cli, &dwarf)?;
