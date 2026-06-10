@@ -1,0 +1,22 @@
+src/dwarf_input.rs
+  s_698c79eedd62ed::t_8e2123f32feb97 1-40
+src/main.rs
+  s_698c79eedd62ed::t_046fd03c080333 28
+  s_698c79eedd62ed::t_8e2123f32feb97 6,21,29-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "572588d29a79259535d20a8cb125c8b86fd7d1a4",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
