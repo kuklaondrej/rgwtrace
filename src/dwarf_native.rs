@@ -21,6 +21,11 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_finish_op",
     "RGWREST::get_handler",
 ];
+const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
+    &["op", "tid"],
+    &["this", "monc", "global_id"],
+    &["op", "target", "osd"],
+];
 const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
     &["s", "trans_id", "_M_string_length"],
     &["s", "trans_id", "_M_dataplus", "_M_p"],
@@ -178,6 +183,7 @@ fn probe_function_var_fields<R: Reader>(
 
 fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]]> {
     match function {
+        "Objecter::_finish_op" => Some(OBJECTER_FINISH_OP_FIELDS),
         "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
         _ => None,
     }
@@ -1005,6 +1011,27 @@ mod tests {
     }
 
     #[test]
+    fn extracts_objecter_finish_op_var_fields_from_cpp_fixture() {
+        let Some(binary) = compile_objecter_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get("Objecter::_finish_op") else {
+            return;
+        };
+
+        assert_eq!(fields.var_fields.len(), 3);
+        assert_eq!(fields.var_fields[0].fields.len(), 2);
+        assert!(fields.var_fields[0].fields[1].pointer);
+        assert_eq!(fields.var_fields[1].fields.len(), 3);
+        assert!(fields.var_fields[1].fields[1].pointer);
+        assert_eq!(fields.var_fields[2].fields.len(), 3);
+        assert!(fields.var_fields[2].fields[1].pointer);
+    }
+
+    #[test]
     fn oracle_comparison_reports_function_pc_mismatch() {
         let mut expected = DwarfInfo {
             version: None,
@@ -1270,6 +1297,42 @@ mod tests {
               ReqState state = {{{&value}, 12}};
               RGWREST rest;
               rest.get_handler(&state);
+              return 0;
+            }
+            "#,
+        )
+    }
+
+    fn compile_objecter_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_source(
+            "objecter-fixture",
+            r#"
+            struct Target {
+              int osd;
+            };
+            struct Op {
+              unsigned long tid;
+              Target target;
+            };
+            struct MonClient {
+              unsigned long global_id;
+            };
+            class Objecter {
+            public:
+              __attribute__((noinline)) void _finish_op(Op* op);
+              MonClient monc;
+              volatile unsigned long sink = 0;
+            };
+            void Objecter::_finish_op(Op* op) {
+              sink += op->tid;
+              sink += monc.global_id;
+              sink += op->target.osd;
+            }
+            int main() {
+              Op op = {12, {3}};
+              Objecter objecter;
+              objecter.monc.global_id = 9;
+              objecter._finish_op(&op);
               return 0;
             }
             "#,
