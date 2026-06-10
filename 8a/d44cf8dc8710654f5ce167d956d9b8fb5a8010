@@ -1,0 +1,31 @@
+ARCHITECTURE.md
+  s_9748ec821b5a22::t_2a8255a72d28db 123,129
+README.md
+  s_9748ec821b5a22::t_2a8255a72d28db 101-104
+src/otel.rs
+  s_9748ec821b5a22::t_7dc86bc9c19c95 22-27,34,45,47,63,66,70-71
+  s_9748ec821b5a22::t_ca8b61430b4872 72-77
+  s_9748ec821b5a22::t_3eca49fc6e86f2 282,301
+src/collector.rs
+  s_9748ec821b5a22::t_dbd6f2fa1ae568 17,30-41,78,81,85,93,95,98,109-113,123,128,405-410,422-424
+src/live/linux.rs
+  s_9748ec821b5a22::t_46b5c2c776c995 71-77
+src/main.rs
+  s_9748ec821b5a22::t_732560e17e2dc0 51,58-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "8ad44cf8dc8710654f5ce167d956d9b8fb5a8010",
+  "prompts": {},
+  "sessions": {
+    "s_9748ec821b5a22": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_153810b79ffeFBpK7wd0e2a5Ml",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
