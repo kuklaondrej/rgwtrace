@@ -1,0 +1,34 @@
+src/live/linux.rs
+  s_9748ec821b5a22::t_55597972a6f9db 21,28,84,108-110,123-150,338-339
+  s_9748ec821b5a22::t_8b43fcc3048597 106-107
+ARCHITECTURE.md
+  s_9748ec821b5a22::t_e741251cbe5a56 74-75,129,131,135
+src/targets.rs
+  s_9748ec821b5a22::t_26a5d0f00d8491 219-220
+src/collector.rs
+  s_9748ec821b5a22::t_8b43fcc3048597 106
+  s_9748ec821b5a22::t_fc218794cc3f3b 24,43-44,93-96,105,107-108,118-161,182-183
+  s_9748ec821b5a22::t_ad56a296bb9790 480-511
+README.md
+  s_9748ec821b5a22::t_e741251cbe5a56 96-97,101-102,105,184
+src/main.rs
+  s_9748ec821b5a22::t_55597972a6f9db 51-61
+src/cli.rs
+  s_9748ec821b5a22::t_26a5d0f00d8491 26-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "3ea7ad5bc1453cfc8753cb90a892c0a07e31f6b5",
+  "prompts": {},
+  "sessions": {
+    "s_9748ec821b5a22": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_153810b79ffeFBpK7wd0e2a5Ml",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
