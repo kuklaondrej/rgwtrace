@@ -68,7 +68,13 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                     .expect("collector lock poisoned")
                     .push(event);
             }
-            Err(err) => warn!(error = %format_args!("{err:#}"), "failed to decode rgwtrace event"),
+            Err(err) => {
+                collector_cb
+                    .lock()
+                    .expect("collector lock poisoned")
+                    .record_decode_error();
+                warn!(error = %format_args!("{err:#}"), "failed to decode rgwtrace event");
+            }
         }
         0
     })?;

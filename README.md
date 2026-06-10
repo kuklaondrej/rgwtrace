@@ -98,6 +98,10 @@ sudo rgwtrace \
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, and produced spans.
+
+OTLP mode logs the same trace counters plus export attempts and export failures when internal logging is enabled.
+
 If export fails with `connection refused`, `timed out`, or DNS errors, verify the endpoint from the tracing host first:
 
 ```sh

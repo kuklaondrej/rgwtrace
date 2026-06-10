@@ -19,13 +19,19 @@ use crate::collector::{Attribute, AttributeValue, SpanDocument, SpanEvent, Trace
 
 const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExportDiagnostics {
+    pub attempts: u64,
+    pub failures: u64,
+}
+
 pub fn export_otlp_http(
     endpoint: &str,
     headers: &[(String, String)],
     timeout: Duration,
     retries: u32,
     document: &TraceDocument,
-) -> Result<()> {
+) -> Result<ExportDiagnostics> {
     ensure_http_endpoint(endpoint)?;
 
     let body = to_otlp_protobuf(document)?;
@@ -36,7 +42,9 @@ pub fn export_otlp_http(
         .context("failed to build OTLP HTTP client")?;
 
     let max_attempts = retries.saturating_add(1);
+    let mut diagnostics = ExportDiagnostics::default();
     for attempt in 1..=max_attempts {
+        diagnostics.attempts += 1;
         debug!(
             attempt,
             max_attempts,
@@ -52,13 +60,22 @@ pub fn export_otlp_http(
                     spans = document.spans.len(),
                     attempt, "exported OTLP traces"
                 );
-                return Ok(());
+                return Ok(diagnostics);
             }
             Err(err) if attempt < max_attempts && err.retryable => {
+                diagnostics.failures += 1;
                 warn!(attempt, error = %err.message, "OTLP export failed; retrying");
                 thread::sleep(retry_delay(attempt));
             }
-            Err(err) => bail!(err.message),
+            Err(err) => {
+                diagnostics.failures += 1;
+                bail!(
+                    "{}; export attempts: {}, export failures: {}",
+                    err.message,
+                    diagnostics.attempts,
+                    diagnostics.failures
+                )
+            }
         }
     }
 
@@ -262,7 +279,7 @@ impl ExportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::{AttributeValue, SpanDocument, TraceDocument};
+    use crate::collector::{AttributeValue, SpanDocument, TraceDiagnostics, TraceDocument};
 
     #[test]
     fn encodes_otlp_protobuf() {
@@ -281,6 +298,7 @@ mod tests {
                 }],
                 events: Vec::new(),
             }],
+            diagnostics: TraceDiagnostics::default(),
         };
 
         let bytes = to_otlp_protobuf(&document).unwrap();

@@ -48,13 +48,24 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         OutputMode::Otlp => {
-            otel::export_otlp_http(
+            let export = otel::export_otlp_http(
                 &cli.otlp_endpoint,
                 &cli.otlp_header,
                 cli.otlp_timeout,
                 cli.otlp_retries,
                 &trace,
             )?;
+            info!(
+                spans = trace.spans.len(),
+                events_decoded = trace.diagnostics.events_decoded,
+                decode_errors = trace.diagnostics.decode_errors,
+                rados_ops = trace.diagnostics.rados_ops,
+                correlated_rados_ops = trace.diagnostics.correlated_rados_ops,
+                background_rados_ops = trace.diagnostics.background_rados_ops,
+                export_attempts = export.attempts,
+                export_failures = export.failures,
+                "rgwtrace shutdown summary"
+            );
         }
     }
 

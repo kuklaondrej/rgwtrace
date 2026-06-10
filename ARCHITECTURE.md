@@ -120,11 +120,13 @@ Roles include data, bucket index, bucket metadata, user metadata, auth metadata,
 
 ## Export
 
-JSON output prints a debug document with DWARF summary and trace spans.
+JSON output prints a debug document with DWARF summary, trace spans, and trace diagnostics counters.
 
 OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name` from `--service-name`.
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, and extra headers.
+
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, and produced spans. OTLP export logs add export attempts and failures.
 
 It supports plain HTTP only.
 

@@ -14,6 +14,7 @@ pub struct Collector {
     starts_by_tid: BTreeMap<u32, RequestEvent>,
     requests: BTreeMap<String, RequestBuilder>,
     background: Vec<RadosEvent>,
+    diagnostics: TraceDiagnostics,
 }
 
 #[derive(Debug, Default)]
@@ -26,6 +27,18 @@ struct RequestBuilder {
 pub struct TraceDocument {
     pub service_name: String,
     pub spans: Vec<SpanDocument>,
+    pub diagnostics: TraceDiagnostics,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TraceDiagnostics {
+    pub events_decoded: u64,
+    pub decode_errors: u64,
+    pub request_markers: u64,
+    pub rados_ops: u64,
+    pub correlated_rados_ops: u64,
+    pub background_rados_ops: u64,
+    pub spans_produced: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,11 +75,14 @@ pub enum AttributeValue {
 
 impl Collector {
     pub fn push(&mut self, event: TraceEvent) {
+        self.diagnostics.events_decoded += 1;
         match event {
             TraceEvent::RequestStart(request) => {
+                self.diagnostics.request_markers += 1;
                 self.starts_by_tid.insert(request.tid, request);
             }
             TraceEvent::RequestEnd(mut request) => {
+                self.diagnostics.request_markers += 1;
                 if let Some(start) = self.starts_by_tid.remove(&request.tid) {
                     request.start_ns = start.start_ns;
                 }
@@ -74,9 +90,12 @@ impl Collector {
                 self.requests.entry(key).or_default().request = Some(request);
             }
             TraceEvent::RadosOp(rados) => {
+                self.diagnostics.rados_ops += 1;
                 if rados.trans_id.is_empty() {
+                    self.diagnostics.background_rados_ops += 1;
                     self.background.push(rados);
                 } else {
+                    self.diagnostics.correlated_rados_ops += 1;
                     self.requests
                         .entry(rados.trans_id.clone())
                         .or_default()
@@ -87,7 +106,11 @@ impl Collector {
         }
     }
 
-    pub fn into_trace_document(self, service_name: impl Into<String>) -> TraceDocument {
+    pub fn record_decode_error(&mut self) {
+        self.diagnostics.decode_errors += 1;
+    }
+
+    pub fn into_trace_document(mut self, service_name: impl Into<String>) -> TraceDocument {
         let mut spans = Vec::new();
 
         for (key, request) in self.requests {
@@ -97,10 +120,12 @@ impl Collector {
         for rados in self.background {
             spans.push(background_span(rados));
         }
+        self.diagnostics.spans_produced = spans.len() as u64;
 
         TraceDocument {
             service_name: service_name.into(),
             spans,
+            diagnostics: self.diagnostics,
         }
     }
 }
@@ -377,6 +402,12 @@ mod tests {
             Some("[1,2,3]")
         );
         assert_eq!(u64_attribute(rados, "ceph.rados.target_osd"), Some(7));
+        assert_eq!(document.diagnostics.events_decoded, 2);
+        assert_eq!(document.diagnostics.request_markers, 1);
+        assert_eq!(document.diagnostics.rados_ops, 1);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 0);
+        assert_eq!(document.diagnostics.spans_produced, 2);
     }
 
     #[test]
@@ -388,6 +419,9 @@ mod tests {
 
         assert_eq!(document.spans.len(), 1);
         assert_eq!(document.spans[0].name, "rgw.background.rados_op");
+        assert_eq!(document.diagnostics.rados_ops, 1);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 0);
+        assert_eq!(document.diagnostics.background_rados_ops, 1);
     }
 
     fn string_attribute<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {
