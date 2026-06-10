@@ -7,7 +7,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use gimli::{
-    DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Reader, RunTimeEndian,
+    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Reader,
+    RunTimeEndian,
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol};
 
@@ -152,6 +153,41 @@ fn function_names<R: Reader>(
     scopes: &[String],
 ) -> Result<Vec<String>> {
     let mut names = Vec::new();
+    add_entry_function_names(dwarf, unit, entry, scopes, &mut names)?;
+    add_referenced_function_names(dwarf, unit, entry, gimli::DW_AT_abstract_origin, &mut names)?;
+    add_referenced_function_names(dwarf, unit, entry, gimli::DW_AT_specification, &mut names)?;
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
+
+fn add_referenced_function_names<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+    attr: gimli::DwAt,
+    names: &mut Vec<String>,
+) -> Result<()> {
+    let Some(referenced) = referenced_entry(unit, entry, attr)? else {
+        return Ok(());
+    };
+    let referenced_scopes = entry_scopes(dwarf, unit, referenced.offset())?.unwrap_or_default();
+    add_entry_function_names(dwarf, unit, &referenced, &referenced_scopes, names)?;
+
+    if attr == gimli::DW_AT_abstract_origin {
+        add_referenced_function_names(dwarf, unit, &referenced, gimli::DW_AT_specification, names)?;
+    }
+
+    Ok(())
+}
+
+fn add_entry_function_names<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+    scopes: &[String],
+    names: &mut Vec<String>,
+) -> Result<()> {
     if let Some(name) = die_name(dwarf, unit, entry)? {
         names.push(match scopes.last() {
             Some(scope) => format!("{scope}::{name}"),
@@ -163,9 +199,62 @@ fn function_names<R: Reader>(
             names.push(demangled);
         }
     }
-    names.sort();
-    names.dedup();
-    Ok(names)
+    Ok(())
+}
+
+fn referenced_entry<'unit, R: Reader>(
+    unit: &'unit gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+    attr: gimli::DwAt,
+) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+    let Some(attr) = entry.attr(attr)? else {
+        return Ok(None);
+    };
+    match attr.value() {
+        AttributeValue::UnitRef(offset) => Ok(Some(unit.entry(offset)?)),
+        _ => Ok(None),
+    }
+}
+
+fn entry_scopes<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    offset: gimli::UnitOffset<R::Offset>,
+) -> Result<Option<Vec<String>>> {
+    let mut tree = unit.entries_tree(None)?;
+    let root = tree.root()?;
+    find_entry_scopes(dwarf, unit, root, offset, &mut Vec::new())
+}
+
+fn find_entry_scopes<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    node: EntriesTreeNode<R>,
+    offset: gimli::UnitOffset<R::Offset>,
+    scopes: &mut Vec<String>,
+) -> Result<Option<Vec<String>>> {
+    let entry = node.entry();
+    if entry.offset() == offset {
+        return Ok(Some(scopes.clone()));
+    }
+
+    let scope = scope_name(dwarf, unit, entry)?;
+    if let Some(scope) = &scope {
+        scopes.push(scope.clone());
+    }
+
+    let mut children = node.children();
+    while let Some(child) = children.next()? {
+        if let Some(found) = find_entry_scopes(dwarf, unit, child, offset, scopes)? {
+            return Ok(Some(found));
+        }
+    }
+
+    if scope.is_some() {
+        scopes.pop();
+    }
+
+    Ok(None)
 }
 
 fn scope_name<R: Reader>(
@@ -676,15 +765,18 @@ mod tests {
             r#"
             class Objecter {
             public:
-              __attribute__((noinline)) void _send_op(int op) { sink += op; }
-              __attribute__((noinline)) void _finish_op(int op) { sink += op; }
+              __attribute__((noinline)) void _send_op(int op);
+              __attribute__((noinline)) void _finish_op(int op);
               volatile int sink = 0;
             };
             class RGWREST {
             public:
-              __attribute__((noinline)) void get_handler(int s) { sink += s; }
+              __attribute__((noinline)) void get_handler(int s);
               volatile int sink = 0;
             };
+            void Objecter::_send_op(int op) { sink += op; }
+            void Objecter::_finish_op(int op) { sink += op; }
+            void RGWREST::get_handler(int s) { sink += s; }
             int main() {
               Objecter objecter;
               RGWREST rest;
