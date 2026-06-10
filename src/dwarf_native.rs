@@ -12,7 +12,7 @@ use gimli::{
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol};
 
-use crate::dwarf_json::{basename, DwarfInfo, DwarfModule, FieldJson};
+use crate::dwarf_json::{basename, DwarfInfo, DwarfModule, FieldJson, VarLocationJson};
 
 const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
@@ -298,6 +298,102 @@ fn translate_field_path<R: Reader>(
     }
 
     Ok(Some(fields))
+}
+
+#[allow(dead_code)]
+fn variable_location<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    function: &DebuggingInformationEntry<R>,
+    variable: &DebuggingInformationEntry<R>,
+    pc: u64,
+) -> Result<Option<VarLocationJson>> {
+    let Some(attr) = variable.attr(gimli::DW_AT_location)? else {
+        return Ok(None);
+    };
+    let frame_base = function
+        .attr(gimli::DW_AT_frame_base)?
+        .and_then(|attr| match attr.value() {
+            AttributeValue::Exprloc(expression) => Some(expression),
+            _ => None,
+        });
+
+    if let AttributeValue::Exprloc(expression) = attr.value() {
+        return decode_location_expression(unit, frame_base, expression);
+    }
+
+    let Some(mut locations) = dwarf.attr_locations(unit, attr.value())? else {
+        return Ok(None);
+    };
+    while let Some(location) = locations.next()? {
+        if pc >= location.range.begin && pc < location.range.end {
+            return decode_location_expression(unit, frame_base, location.data);
+        }
+    }
+
+    Ok(None)
+}
+
+fn decode_location_expression<R: Reader>(
+    unit: &gimli::Unit<R>,
+    frame_base: Option<gimli::Expression<R>>,
+    expression: gimli::Expression<R>,
+) -> Result<Option<VarLocationJson>> {
+    let mut location = VarLocationJson {
+        reg: -1,
+        offset: 0,
+        stack: false,
+    };
+    let mut seen_location = false;
+    let mut operations = expression.operations(unit.encoding());
+
+    while let Some(operation) = operations.next()? {
+        match operation {
+            Operation::Register { register } => {
+                location.reg = register.0 as i32;
+                seen_location = true;
+            }
+            Operation::RegisterOffset {
+                register, offset, ..
+            } => {
+                location.reg = register.0 as i32;
+                add_location_offset(&mut location, offset)?;
+                seen_location = true;
+            }
+            Operation::FrameOffset { offset } => {
+                let Some(frame_base) = frame_base else {
+                    return Ok(None);
+                };
+                let Some(mut frame_location) = decode_location_expression(unit, None, frame_base)?
+                else {
+                    return Ok(None);
+                };
+                add_location_offset(&mut frame_location, offset)?;
+                frame_location.stack = true;
+                return Ok(Some(frame_location));
+            }
+            Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
+                add_location_offset(&mut location, value as i64)?;
+            }
+            Operation::SignedConstant { value } => {
+                add_location_offset(&mut location, value)?;
+            }
+            Operation::Nop => {}
+            Operation::CallFrameCFA => return Ok(None),
+            _ => {}
+        }
+    }
+
+    Ok(seen_location.then_some(location))
+}
+
+fn add_location_offset(location: &mut VarLocationJson, offset: i64) -> Result<()> {
+    let offset = i32::try_from(offset).context("DWARF location offset does not fit i32")?;
+    location.offset = location
+        .offset
+        .checked_add(offset)
+        .context("DWARF location offset overflow")?;
+    Ok(())
 }
 
 fn peel_type_qualifiers<'unit, R: Reader>(
@@ -747,6 +843,19 @@ mod tests {
     }
 
     #[test]
+    fn decodes_parameter_location_from_cpp_fixture() {
+        let Some(binary) = compile_field_fixture() else {
+            return;
+        };
+
+        let Some(location) = parameter_location_from_fixture(&binary).unwrap() else {
+            return;
+        };
+
+        assert!(location.reg >= 0);
+    }
+
+    #[test]
     fn oracle_comparison_reports_function_pc_mismatch() {
         let mut expected = DwarfInfo {
             version: None,
@@ -1037,6 +1146,43 @@ mod tests {
                 continue;
             };
             return translate_field_path(&dwarf, &unit, &param, &["outer", "leaf", "value"]);
+        }
+
+        Ok(None)
+    }
+
+    fn parameter_location_from_fixture(binary: &Path) -> Result<Option<VarLocationJson>> {
+        let data = std::fs::read(binary)?;
+        let file = object::File::parse(data.as_slice())?;
+        let endian = if file.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        #[allow(deprecated)]
+        let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+
+        let mut units = dwarf.units();
+        while let Some(header) = units.next()? {
+            let unit = dwarf.unit(header)?;
+            let Some(function) = find_subprogram_by_name(&dwarf, &unit, "inspect")? else {
+                continue;
+            };
+            let Some(param) = find_child_entry_by_name(
+                &dwarf,
+                &unit,
+                function.offset(),
+                &[gimli::DW_TAG_formal_parameter],
+                "outer",
+            )?
+            else {
+                continue;
+            };
+            let Some(pc) = entry_pc(&dwarf, &unit, &function)? else {
+                continue;
+            };
+            return variable_location(&dwarf, &unit, &function, &param, pc);
         }
 
         Ok(None)
