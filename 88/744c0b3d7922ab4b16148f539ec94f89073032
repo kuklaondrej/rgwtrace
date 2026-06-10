@@ -1,0 +1,41 @@
+README.md
+  s_698c79eedd62ed::t_2b185ff536aefc 193-195
+src/dwarf_native.rs
+  s_698c79eedd62ed::t_2ce31bde01c2d8 54,223-225
+  s_698c79eedd62ed::t_f06e12fc59055b 113,133-155,175-189,194-196,206
+  s_698c79eedd62ed::t_04a7469bc6141d 240-243,249-252
+  s_698c79eedd62ed::t_f94b1714baab09 203-205
+  s_698c79eedd62ed::t_72615b39a20422 1-6,8-53,55,60-77,97-112,114-132,156-174,190-193,207-222,226-239,244-248,253-340
+  s_698c79eedd62ed::t_dee277c3f5a811 7,56-59,78-96,197-202
+src/dwarf_input.rs
+  s_698c79eedd62ed::t_94de346461939a 1,5,10,18-22,24-29,36,49-56
+src/targets.rs
+  s_698c79eedd62ed::t_94de346461939a 213-214
+src/cli.rs
+  s_698c79eedd62ed::t_94de346461939a 9-12,87-90
+src/main.rs
+  s_698c79eedd62ed::t_94de346461939a 8,14,29-45
+ARCHITECTURE.md
+  s_698c79eedd62ed::t_2b185ff536aefc 150,154-156
+src/preflight.rs
+  s_698c79eedd62ed::t_2b185ff536aefc 116,137,140,144
+Cargo.toml
+  s_698c79eedd62ed::t_f06e12fc59055b 12
+  s_698c79eedd62ed::t_94de346461939a 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "88744c0b3d7922ab4b16148f539ec94f89073032",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
