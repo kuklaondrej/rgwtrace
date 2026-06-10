@@ -1,0 +1,31 @@
+Cargo.toml
+  s_698c79eedd62ed::t_f776070a007eec 12
+src/cli.rs
+  s_698c79eedd62ed::t_f776070a007eec 26-28,75-78
+src/main.rs
+  s_698c79eedd62ed::t_f776070a007eec 57
+src/live/linux.rs
+  s_698c79eedd62ed::t_f776070a007eec 138
+src/otel.rs
+  s_698c79eedd62ed::t_f776070a007eec 1,4,14,19-22,35,42-44,60-62,65,230-232,236-264
+  s_698c79eedd62ed::t_32306492b48eb4 214-217,226-229,412-415
+  s_698c79eedd62ed::t_62c1b29c1b9c4d 332-335,382-411,416
+src/targets.rs
+  s_698c79eedd62ed::t_62c1b29c1b9c4d 219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "922a71733b79a7b4b5517260767587ed410f0d5e",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
