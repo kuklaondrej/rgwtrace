@@ -7,12 +7,12 @@ use std::{
 
 use anyhow::{Context, Result};
 use gimli::{
-    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Reader,
-    RunTimeEndian,
+    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Operation,
+    Reader, RunTimeEndian,
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol};
 
-use crate::dwarf_json::{basename, DwarfInfo, DwarfModule};
+use crate::dwarf_json::{basename, DwarfInfo, DwarfModule, FieldJson};
 
 const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
@@ -255,6 +255,171 @@ fn find_entry_scopes<R: Reader>(
     }
 
     Ok(None)
+}
+
+#[allow(dead_code)]
+fn translate_field_path<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    variable: &DebuggingInformationEntry<R>,
+    path: &[&str],
+) -> Result<Option<Vec<FieldJson>>> {
+    let Some(mut typedie) = die_type(unit, variable)? else {
+        return Ok(None);
+    };
+    let mut fields = vec![FieldJson::default(); path.len()];
+    let mut index = 1;
+
+    while index < path.len() {
+        typedie = peel_type_qualifiers(unit, typedie)?;
+        match typedie.tag() {
+            gimli::DW_TAG_reference_type
+            | gimli::DW_TAG_rvalue_reference_type
+            | gimli::DW_TAG_pointer_type => {
+                fields[index].pointer = true;
+                let Some(next_type) = die_type(unit, &typedie)? else {
+                    return Ok(None);
+                };
+                typedie = next_type;
+            }
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
+                let Some(member) = find_member_entry(dwarf, unit, &typedie, path[index])? else {
+                    return Ok(None);
+                };
+                fields[index].offset = member_offset(unit, &member)?.unwrap_or_default();
+                let Some(next_type) = die_type(unit, &member)? else {
+                    return Ok(None);
+                };
+                typedie = next_type;
+                index += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(Some(fields))
+}
+
+fn peel_type_qualifiers<'unit, R: Reader>(
+    unit: &'unit gimli::Unit<R>,
+    mut typedie: DebuggingInformationEntry<'unit, 'unit, R>,
+) -> Result<DebuggingInformationEntry<'unit, 'unit, R>> {
+    while matches!(
+        typedie.tag(),
+        gimli::DW_TAG_typedef
+            | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type
+            | gimli::DW_TAG_restrict_type
+    ) {
+        let Some(next_type) = die_type(unit, &typedie)? else {
+            break;
+        };
+        typedie = next_type;
+    }
+    Ok(typedie)
+}
+
+fn find_member_entry<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    typedie: &DebuggingInformationEntry<R>,
+    member_name: &str,
+) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+    let mut queue = vec![typedie.offset()];
+    while let Some(offset) = queue.pop() {
+        let mut tree = unit.entries_tree(Some(offset))?;
+        let root = tree.root()?;
+        let mut children = root.children();
+        while let Some(child) = children.next()? {
+            let entry = child.entry();
+            match entry.tag() {
+                gimli::DW_TAG_member => {
+                    if die_name(dwarf, unit, entry)?.as_deref() == Some(member_name) {
+                        return Ok(Some(unit.entry(entry.offset())?));
+                    }
+                }
+                gimli::DW_TAG_inheritance => {
+                    if let Some(parent_type) = die_type(unit, entry)? {
+                        queue.push(parent_type.offset());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+#[allow(dead_code)]
+fn find_child_entry_by_name<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    parent_offset: gimli::UnitOffset<R::Offset>,
+    tags: &[gimli::DwTag],
+    name: &str,
+) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+    let mut tree = unit.entries_tree(Some(parent_offset))?;
+    let root = tree.root()?;
+    let mut children = root.children();
+    while let Some(child) = children.next()? {
+        let entry = child.entry();
+        if tags.contains(&entry.tag()) && die_name(dwarf, unit, entry)?.as_deref() == Some(name) {
+            return Ok(Some(unit.entry(entry.offset())?));
+        }
+    }
+    Ok(None)
+}
+
+fn die_type<'unit, R: Reader>(
+    unit: &'unit gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+    referenced_entry(unit, entry, gimli::DW_AT_type)
+}
+
+fn member_offset<R: Reader>(
+    unit: &gimli::Unit<R>,
+    member: &DebuggingInformationEntry<R>,
+) -> Result<Option<i32>> {
+    let Some(attr) = member.attr(gimli::DW_AT_data_member_location)? else {
+        return Ok(None);
+    };
+    attr_offset(unit, attr.value())
+}
+
+fn attr_offset<R: Reader>(unit: &gimli::Unit<R>, value: AttributeValue<R>) -> Result<Option<i32>> {
+    let offset = match value {
+        AttributeValue::Data1(value) => value as i64,
+        AttributeValue::Data2(value) => value as i64,
+        AttributeValue::Data4(value) => value as i64,
+        AttributeValue::Data8(value) => value as i64,
+        AttributeValue::Sdata(value) => value,
+        AttributeValue::Udata(value) => value as i64,
+        AttributeValue::Exprloc(expression) => expression_offset(unit, expression)?,
+        _ => return Ok(None),
+    };
+    Ok(i32::try_from(offset).ok())
+}
+
+fn expression_offset<R: Reader>(
+    unit: &gimli::Unit<R>,
+    expression: gimli::Expression<R>,
+) -> Result<i64> {
+    let mut offset = 0;
+    let mut operations = expression.operations(unit.encoding());
+    while let Some(operation) = operations.next()? {
+        match operation {
+            Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
+                offset += value as i64;
+            }
+            Operation::SignedConstant { value } | Operation::FrameOffset { offset: value } => {
+                offset += value;
+            }
+            Operation::Nop => {}
+            _ => return Ok(0),
+        }
+    }
+    Ok(offset)
 }
 
 fn scope_name<R: Reader>(
@@ -563,6 +728,25 @@ mod tests {
     }
 
     #[test]
+    fn translates_nested_member_offsets_from_cpp_fixture() {
+        let Some(binary) = compile_field_fixture() else {
+            return;
+        };
+
+        let Some(fields) = field_offsets_from_fixture(&binary).unwrap() else {
+            return;
+        };
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].offset, 0);
+        assert!(!fields[0].pointer);
+        assert_eq!(fields[1].offset, 4);
+        assert!(!fields[1].pointer);
+        assert_eq!(fields[2].offset, 4);
+        assert!(!fields[2].pointer);
+    }
+
+    #[test]
     fn oracle_comparison_reports_function_pc_mismatch() {
         let mut expected = DwarfInfo {
             version: None,
@@ -748,20 +932,8 @@ mod tests {
     }
 
     fn compile_cpp_fixture() -> Option<std::path::PathBuf> {
-        let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
-        let suffix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "rgwtrace-dwarf-native-{}-{suffix}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).ok()?;
-        let source = dir.join("fixture.cc");
-        let binary = dir.join("fixture");
-        std::fs::write(
-            &source,
+        compile_cpp_source(
+            "fixture",
             r#"
             class Objecter {
             public:
@@ -787,7 +959,45 @@ mod tests {
             }
             "#,
         )
-        .ok()?;
+    }
+
+    fn compile_field_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_source(
+            "field-fixture",
+            r#"
+            struct Leaf {
+              int prefix;
+              int value;
+            };
+            struct Outer {
+              int pad;
+              Leaf leaf;
+            };
+            __attribute__((noinline)) int inspect(Outer outer) {
+              return outer.leaf.value;
+            }
+            int main() {
+              Outer outer = {1, {2, 3}};
+              return inspect(outer);
+            }
+            "#,
+        )
+    }
+
+    fn compile_cpp_source(name: &str, contents: &str) -> Option<std::path::PathBuf> {
+        let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rgwtrace-dwarf-native-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let source = dir.join(format!("{name}.cc"));
+        let binary = dir.join(name);
+        std::fs::write(&source, contents).ok()?;
         let status = std::process::Command::new(compiler)
             .args(["-g", "-O0", "-fno-inline"])
             .arg(&source)
@@ -796,6 +1006,85 @@ mod tests {
             .status()
             .ok()?;
         status.success().then_some(binary)
+    }
+
+    fn field_offsets_from_fixture(binary: &Path) -> Result<Option<Vec<FieldJson>>> {
+        let data = std::fs::read(binary)?;
+        let file = object::File::parse(data.as_slice())?;
+        let endian = if file.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        #[allow(deprecated)]
+        let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+
+        let mut units = dwarf.units();
+        while let Some(header) = units.next()? {
+            let unit = dwarf.unit(header)?;
+            let Some(function) = find_subprogram_by_name(&dwarf, &unit, "inspect")? else {
+                continue;
+            };
+            let Some(param) = find_child_entry_by_name(
+                &dwarf,
+                &unit,
+                function.offset(),
+                &[gimli::DW_TAG_formal_parameter],
+                "outer",
+            )?
+            else {
+                continue;
+            };
+            return translate_field_path(&dwarf, &unit, &param, &["outer", "leaf", "value"]);
+        }
+
+        Ok(None)
+    }
+
+    fn find_subprogram_by_name<'unit, R: Reader>(
+        dwarf: &Dwarf<R>,
+        unit: &'unit gimli::Unit<R>,
+        name: &str,
+    ) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+        let mut tree = unit.entries_tree(None)?;
+        let root = tree.root()?;
+        find_subprogram_node(dwarf, unit, root, &mut Vec::new(), name)
+    }
+
+    fn find_subprogram_node<'unit, R: Reader>(
+        dwarf: &Dwarf<R>,
+        unit: &'unit gimli::Unit<R>,
+        node: EntriesTreeNode<R>,
+        scopes: &mut Vec<String>,
+        name: &str,
+    ) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+        let entry = node.entry();
+        let scope = scope_name(dwarf, unit, entry)?;
+        if let Some(scope) = &scope {
+            scopes.push(scope.clone());
+        }
+
+        if entry.tag() == gimli::DW_TAG_subprogram
+            && function_names(dwarf, unit, entry, scopes)?
+                .iter()
+                .any(|candidate| candidate == name)
+        {
+            return Ok(Some(unit.entry(entry.offset())?));
+        }
+
+        let mut children = node.children();
+        while let Some(child) = children.next()? {
+            if let Some(found) = find_subprogram_node(dwarf, unit, child, scopes, name)? {
+                return Ok(Some(found));
+            }
+        }
+
+        if scope.is_some() {
+            scopes.pop();
+        }
+
+        Ok(None)
     }
 
     trait TestModuleExt {
