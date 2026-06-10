@@ -24,7 +24,7 @@ struct RequestBuilder {
     last_seen_ns: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TraceDocument {
     pub service_name: String,
     pub spans: Vec<SpanDocument>,
@@ -46,7 +46,7 @@ pub struct TraceDiagnostics {
     pub expired_background_rados_ops: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct SpanDocument {
     pub trace_id: String,
     pub span_id: String,

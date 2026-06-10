@@ -133,11 +133,15 @@ fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()
 
     let spans = trace.spans.len();
     let export = otel::export_otlp_http(
-        &cli.otlp_endpoint,
-        &cli.otlp_header,
-        cli.otlp_compression,
-        cli.otlp_timeout,
-        cli.otlp_retries,
+        otel::ExportConfig {
+            endpoint: &cli.otlp_endpoint,
+            headers: &cli.otlp_header,
+            compression: cli.otlp_compression,
+            max_spans_per_batch: cli.otlp_max_spans_per_batch,
+            max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
+            timeout: cli.otlp_timeout,
+            retries: cli.otlp_retries,
+        },
         &trace,
     )?;
     info!(

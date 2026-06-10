@@ -26,6 +26,12 @@ pub struct Cli {
     #[arg(long, default_value = "none")]
     pub otlp_compression: OtlpCompression,
 
+    #[arg(long, default_value_t = 512, value_parser = parse_positive_usize)]
+    pub otlp_max_spans_per_batch: usize,
+
+    #[arg(long, default_value_t = 0)]
+    pub otlp_max_bytes_per_batch: usize,
+
     #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
     pub otlp_flush_interval: Duration,
 
@@ -86,6 +92,16 @@ fn parse_duration_secs(value: &str) -> Result<Duration, String> {
         return Err("duration must be at least 1 second".to_string());
     }
     Ok(Duration::from_secs(seconds))
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let number = value
+        .parse::<usize>()
+        .map_err(|err| format!("invalid positive integer {value:?}: {err}"))?;
+    if number == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(number)
 }
 
 fn parse_http_header(value: &str) -> Result<(String, String), String> {

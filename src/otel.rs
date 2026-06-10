@@ -25,69 +25,101 @@ const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExportDiagnostics {
+    pub batches: u64,
     pub attempts: u64,
     pub failures: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ExportConfig<'a> {
+    pub endpoint: &'a str,
+    pub headers: &'a [(String, String)],
+    pub compression: OtlpCompression,
+    pub max_spans_per_batch: usize,
+    pub max_bytes_per_batch: usize,
+    pub timeout: Duration,
+    pub retries: u32,
+}
+
 pub fn export_otlp_http(
-    endpoint: &str,
-    headers: &[(String, String)],
-    compression: OtlpCompression,
-    timeout: Duration,
-    retries: u32,
+    config: ExportConfig<'_>,
     document: &TraceDocument,
 ) -> Result<ExportDiagnostics> {
-    validate_otlp_endpoint(endpoint)?;
+    validate_otlp_endpoint(config.endpoint)?;
+    if config.max_spans_per_batch == 0 {
+        bail!("OTLP max spans per batch must be at least 1");
+    }
 
-    let protobuf_body = to_otlp_protobuf(document)?;
-    let body = encode_body(protobuf_body, compression)?;
-    let headers = otlp_headers(headers, body.content_encoding)?;
+    let batches = otlp_batches(
+        document,
+        config.max_spans_per_batch,
+        config.max_bytes_per_batch,
+    )?;
     let client = Client::builder()
-        .timeout(timeout)
+        .timeout(config.timeout)
         .build()
         .context("failed to build OTLP HTTP client")?;
 
-    let max_attempts = retries.saturating_add(1);
-    let mut diagnostics = ExportDiagnostics::default();
-    for attempt in 1..=max_attempts {
-        diagnostics.attempts += 1;
-        debug!(
-            attempt,
-            max_attempts,
-            endpoint,
-            timeout_ms = timeout.as_millis(),
-            spans = document.spans.len(),
-            body_bytes = body.bytes.len(),
-            uncompressed_body_bytes = body.uncompressed_len,
-            compression = ?compression,
-            "exporting OTLP traces"
-        );
-        match send_once(&client, endpoint, headers.clone(), body.bytes.clone()) {
-            Ok(()) => {
-                info!(
-                    spans = document.spans.len(),
-                    attempt, "exported OTLP traces"
-                );
-                return Ok(diagnostics);
-            }
-            Err(err) if attempt < max_attempts && err.retryable => {
-                diagnostics.failures += 1;
-                warn!(attempt, error = %err.message, "OTLP export failed; retrying");
-                thread::sleep(retry_delay(attempt));
-            }
-            Err(err) => {
-                diagnostics.failures += 1;
-                bail!(
-                    "{}; export attempts: {}, export failures: {}",
-                    err.message,
-                    diagnostics.attempts,
-                    diagnostics.failures
-                )
+    let max_attempts = config.retries.saturating_add(1);
+    let mut diagnostics = ExportDiagnostics {
+        batches: batches.len() as u64,
+        ..ExportDiagnostics::default()
+    };
+    for (batch_idx, batch) in batches.iter().enumerate() {
+        let protobuf_body = to_otlp_protobuf(batch)?;
+        let body = encode_body(protobuf_body, config.compression)?;
+        let headers = otlp_headers(config.headers, body.content_encoding)?;
+        for attempt in 1..=max_attempts {
+            diagnostics.attempts += 1;
+            debug!(
+                attempt,
+                max_attempts,
+                batch = batch_idx + 1,
+                batches = batches.len(),
+                endpoint = config.endpoint,
+                timeout_ms = config.timeout.as_millis(),
+                spans = batch.spans.len(),
+                body_bytes = body.bytes.len(),
+                uncompressed_body_bytes = body.uncompressed_len,
+                compression = ?config.compression,
+                "exporting OTLP traces"
+            );
+            match send_once(
+                &client,
+                config.endpoint,
+                headers.clone(),
+                body.bytes.clone(),
+            ) {
+                Ok(()) => {
+                    info!(
+                        spans = batch.spans.len(),
+                        batch = batch_idx + 1,
+                        batches = batches.len(),
+                        attempt,
+                        "exported OTLP traces"
+                    );
+                    break;
+                }
+                Err(err) if attempt < max_attempts && err.retryable => {
+                    diagnostics.failures += 1;
+                    warn!(attempt, error = %err.message, "OTLP export failed; retrying");
+                    thread::sleep(retry_delay(attempt));
+                }
+                Err(err) => {
+                    diagnostics.failures += 1;
+                    bail!(
+                        "{}; export batches: {}, export attempts: {}, export failures: {}",
+                        err.message,
+                        diagnostics.batches,
+                        diagnostics.attempts,
+                        diagnostics.failures
+                    )
+                }
             }
         }
     }
 
-    unreachable!("OTLP export loop always returns")
+    Ok(diagnostics)
 }
 
 pub fn to_otlp_protobuf(document: &TraceDocument) -> Result<Vec<u8>> {
@@ -258,6 +290,47 @@ fn encode_body(bytes: Vec<u8>, compression: OtlpCompression) -> Result<EncodedBo
     }
 }
 
+fn otlp_batches(
+    document: &TraceDocument,
+    max_spans_per_batch: usize,
+    max_bytes_per_batch: usize,
+) -> Result<Vec<TraceDocument>> {
+    if document.spans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut batches = Vec::new();
+    let mut spans = Vec::new();
+    for span in &document.spans {
+        if !spans.is_empty() && spans.len() >= max_spans_per_batch {
+            batches.push(trace_batch(document, std::mem::take(&mut spans)));
+        }
+
+        if max_bytes_per_batch > 0 && !spans.is_empty() {
+            let mut candidate = spans.clone();
+            candidate.push(span.clone());
+            let candidate = trace_batch(document, candidate);
+            if to_otlp_protobuf(&candidate)?.len() > max_bytes_per_batch {
+                batches.push(trace_batch(document, std::mem::take(&mut spans)));
+            }
+        }
+
+        spans.push(span.clone());
+    }
+    if !spans.is_empty() {
+        batches.push(trace_batch(document, spans));
+    }
+    Ok(batches)
+}
+
+fn trace_batch(document: &TraceDocument, spans: Vec<SpanDocument>) -> TraceDocument {
+    TraceDocument {
+        service_name: document.service_name.clone(),
+        spans,
+        diagnostics: document.diagnostics.clone(),
+    }
+}
+
 struct EncodedBody {
     bytes: Vec<u8>,
     content_encoding: Option<&'static str>,
@@ -337,23 +410,7 @@ mod tests {
 
     #[test]
     fn encodes_otlp_protobuf() {
-        let document = TraceDocument {
-            service_name: "rgwtrace".to_string(),
-            spans: vec![SpanDocument {
-                trace_id: "11111111111111112222222222222222".to_string(),
-                span_id: "3333333333333333".to_string(),
-                parent_span_id: None,
-                name: "rgw.request".to_string(),
-                start_ns: 10,
-                end_ns: 20,
-                attributes: vec![Attribute {
-                    key: "rgw.trans_id".to_string(),
-                    value: AttributeValue::String("tx1".to_string()),
-                }],
-                events: Vec::new(),
-            }],
-            diagnostics: TraceDiagnostics::default(),
-        };
+        let document = trace_document(1);
 
         let bytes = to_otlp_protobuf(&document).unwrap();
         let request = ExportTraceServiceRequest::decode(bytes.as_slice()).unwrap();
@@ -414,5 +471,60 @@ mod tests {
             OTLP_PROTOBUF_CONTENT_TYPE
         );
         assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+    }
+
+    #[test]
+    fn batches_otlp_spans_by_count() {
+        let document = trace_document(5);
+
+        let batches = otlp_batches(&document, 2, 0).unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].spans.len(), 2);
+        assert_eq!(batches[1].spans.len(), 2);
+        assert_eq!(batches[2].spans.len(), 1);
+        assert_eq!(all_span_ids(&batches), all_span_ids(&[document]));
+    }
+
+    #[test]
+    fn batches_otlp_spans_by_encoded_size() {
+        let document = trace_document(3);
+        let one_span_size = to_otlp_protobuf(&trace_document(1)).unwrap().len();
+        let max_bytes = one_span_size + 8;
+
+        let batches = otlp_batches(&document, 512, max_bytes).unwrap();
+
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| batch.spans.len() == 1));
+        assert_eq!(all_span_ids(&batches), all_span_ids(&[document]));
+    }
+
+    fn trace_document(span_count: usize) -> TraceDocument {
+        TraceDocument {
+            service_name: "rgwtrace".to_string(),
+            spans: (0..span_count)
+                .map(|idx| SpanDocument {
+                    trace_id: format!("1111111111111111222222222222{idx:04x}"),
+                    span_id: format!("333333333333{idx:04x}"),
+                    parent_span_id: None,
+                    name: "rgw.request".to_string(),
+                    start_ns: 10,
+                    end_ns: 20,
+                    attributes: vec![Attribute {
+                        key: "rgw.trans_id".to_string(),
+                        value: AttributeValue::String(format!("tx{idx}")),
+                    }],
+                    events: Vec::new(),
+                })
+                .collect(),
+            diagnostics: TraceDiagnostics::default(),
+        }
+    }
+
+    fn all_span_ids(documents: &[TraceDocument]) -> Vec<String> {
+        documents
+            .iter()
+            .flat_map(|document| document.spans.iter().map(|span| span.span_id.clone()))
+            .collect()
     }
 }
