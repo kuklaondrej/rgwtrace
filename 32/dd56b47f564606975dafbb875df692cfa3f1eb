@@ -1,0 +1,22 @@
+src/dwarf_native.rs
+  s_698c79eedd62ed::t_d34fa2a5726c7c 303-366,368-398
+  s_698c79eedd62ed::t_fda23363008c25 367
+  s_698c79eedd62ed::t_840768b1b3f530 15
+  s_698c79eedd62ed::t_e4caaba51f50ad 846-857,1154-1185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "32dd56b47f564606975dafbb875df692cfa3f1eb",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
