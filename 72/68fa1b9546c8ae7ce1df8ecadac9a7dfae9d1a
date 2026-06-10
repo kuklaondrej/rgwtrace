@@ -1,0 +1,30 @@
+src/events.rs
+  s_698c79eedd62ed::t_52b4cefc53f463 14-20,35,54,98,116,137-182,220,262,282,310
+bpf/rgwtrace_events.h
+  s_698c79eedd62ed::t_52b4cefc53f463 12-20,26,43
+src/classify.rs
+  s_698c79eedd62ed::t_72edab3de70afc 116,133
+bpf/rgwtrace.bpf.c
+  s_698c79eedd62ed::t_a5211132e8de7b 256,258-261
+  s_698c79eedd62ed::t_52b4cefc53f463 22,76,120-121,165,199-200,202,292-293,295,325-326,328-330,332
+src/collector.rs
+  s_698c79eedd62ed::t_65322c9e79d0d3 349-352
+  s_698c79eedd62ed::t_72edab3de70afc 488
+  s_698c79eedd62ed::t_ee58f23ffe8b85 47-52,93,98,110,342-345,353-372,454,471,580-598
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7268fa1b9546c8ae7ce1df8ecadac9a7dfae9d1a",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
