@@ -15,13 +15,27 @@ pub struct Collector {
     requests: BTreeMap<String, RequestBuilder>,
     background: Vec<RadosEvent>,
     diagnostics: TraceDiagnostics,
+    infer_correlation: bool,
+    inference_window_ns: u64,
 }
 
 #[derive(Debug, Default)]
 struct RequestBuilder {
     request: Option<RequestEvent>,
-    rados: Vec<RadosEvent>,
+    rados: Vec<CorrelatedRados>,
     last_seen_ns: u64,
+}
+
+#[derive(Debug)]
+struct CorrelatedRados {
+    event: RadosEvent,
+    correlation: RadosCorrelation,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RadosCorrelation {
+    SameThread,
+    Inferred,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -40,6 +54,7 @@ pub struct TraceDiagnostics {
     pub correlated_rados_ops: u64,
     pub background_rados_ops: u64,
     pub same_thread_correlations: u64,
+    pub inferred_correlations: u64,
     pub missing_trans_id_background_ops: u64,
     pub background_rados_by_role: BTreeMap<String, u64>,
     pub background_rados_by_reason: BTreeMap<String, u64>,
@@ -87,6 +102,14 @@ pub enum AttributeValue {
 }
 
 impl Collector {
+    pub fn with_inferred_correlation(inference_window_ns: u64) -> Self {
+        Self {
+            infer_correlation: true,
+            inference_window_ns,
+            ..Self::default()
+        }
+    }
+
     pub fn push(&mut self, event: TraceEvent) {
         self.diagnostics.events_decoded += 1;
         match event {
@@ -111,6 +134,18 @@ impl Collector {
                 self.diagnostics.rados_ops += 1;
                 record_truncation(&mut self.diagnostics, rados.truncation);
                 if rados.trans_id.is_empty() {
+                    if let Some(key) = self.inferred_request_key(&rados) {
+                        self.diagnostics.correlated_rados_ops += 1;
+                        self.diagnostics.inferred_correlations += 1;
+                        let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
+                        let builder = self.requests.entry(key).or_default();
+                        builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
+                        builder.rados.push(CorrelatedRados {
+                            event: rados,
+                            correlation: RadosCorrelation::Inferred,
+                        });
+                        return;
+                    }
                     self.diagnostics.background_rados_ops += 1;
                     self.diagnostics.missing_trans_id_background_ops += 1;
                     record_background_breakdown(&mut self.diagnostics, &rados);
@@ -121,10 +156,26 @@ impl Collector {
                     let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
                     let builder = self.requests.entry(rados.trans_id.clone()).or_default();
                     builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
-                    builder.rados.push(rados);
+                    builder.rados.push(CorrelatedRados {
+                        event: rados,
+                        correlation: RadosCorrelation::SameThread,
+                    });
                 }
             }
         }
+    }
+
+    fn inferred_request_key(&self, rados: &RadosEvent) -> Option<String> {
+        if !self.infer_correlation || !inferable_rados_role(classify_rados(rados)) {
+            return None;
+        }
+
+        let mut candidates = self.requests.iter().filter_map(|(key, builder)| {
+            let request = builder.request.as_ref()?;
+            inferred_candidate(request, rados, self.inference_window_ns).then(|| key.clone())
+        });
+        let candidate = candidates.next()?;
+        candidates.next().is_none().then_some(candidate)
     }
 
     pub fn record_decode_error(&mut self) {
@@ -215,13 +266,19 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         .request
         .as_ref()
         .map(|request| request.start_ns)
-        .or_else(|| builder.rados.iter().map(|event| event.sent_ns).min())
+        .or_else(|| builder.rados.iter().map(|rados| rados.event.sent_ns).min())
         .unwrap_or_default();
     let end_ns = builder
         .request
         .as_ref()
         .map(|request| request.end_ns)
-        .or_else(|| builder.rados.iter().map(|event| event.finish_ns).max())
+        .or_else(|| {
+            builder
+                .rados
+                .iter()
+                .map(|rados| rados.event.finish_ns)
+                .max()
+        })
         .unwrap_or(start_ns);
     let trans_id = builder
         .request
@@ -234,7 +291,7 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         builder
             .rados
             .first()
-            .map(|event| event.object_name.as_str()),
+            .map(|rados| rados.event.object_name.as_str()),
     );
     let trace_id = trace_id(trans_id);
     let request_span_id = span_id(&format!("request:{trans_id}"));
@@ -291,19 +348,24 @@ fn rados_span_event(rados: RadosEvent, attributes: Vec<Attribute>) -> SpanEvent 
     }
 }
 
-fn rados_child_span(rados: RadosEvent, trace_id: String, parent_span_id: String) -> SpanDocument {
+fn rados_child_span(
+    rados: CorrelatedRados,
+    trace_id: String,
+    parent_span_id: String,
+) -> SpanDocument {
+    let event = rados.event;
     let span_key = format!(
         "rados:{}:{}:{}:{}",
-        rados.pid, rados.cid, rados.tid, rados.sent_ns
+        event.pid, event.cid, event.tid, event.sent_ns
     );
     SpanDocument {
         trace_id,
         span_id: span_id(&span_key),
         parent_span_id: Some(parent_span_id),
         name: "rados.op".to_string(),
-        start_ns: rados.sent_ns,
-        end_ns: rados.finish_ns,
-        attributes: rados_attributes(&rados, "same_thread", None),
+        start_ns: event.sent_ns,
+        end_ns: event.finish_ns,
+        attributes: rados_attributes(&event, rados.correlation.name(), rados.correlation.reason()),
         events: Vec::new(),
     }
 }
@@ -391,6 +453,42 @@ fn background_reason(rados: &RadosEvent) -> &'static str {
             "classified_background_role"
         }
         _ => "missing_trans_id",
+    }
+}
+
+fn inferred_candidate(request: &RequestEvent, rados: &RadosEvent, window_ns: u64) -> bool {
+    if request.pid != rados.pid {
+        return false;
+    }
+    let request_end = request.end_ns.max(request.start_ns);
+    rados.sent_ns >= request.start_ns && rados.sent_ns <= request_end.saturating_add(window_ns)
+}
+
+fn inferable_rados_role(role: RadosRole) -> bool {
+    matches!(
+        role,
+        RadosRole::Data
+            | RadosRole::BucketIndex
+            | RadosRole::BucketMeta
+            | RadosRole::UserMeta
+            | RadosRole::AuthMeta
+            | RadosRole::Unknown
+    )
+}
+
+impl RadosCorrelation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::SameThread => "same_thread",
+            Self::Inferred => "inferred",
+        }
+    }
+
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::SameThread => None,
+            Self::Inferred => Some("pid_time_window"),
+        }
     }
 }
 
@@ -581,6 +679,66 @@ mod tests {
     }
 
     #[test]
+    fn inferred_correlation_is_disabled_by_default() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx1", 1, 30)));
+        let mut event = rados("object", "");
+        event.sent_ns = 40;
+        event.finish_ns = 45;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+        assert_eq!(document.diagnostics.background_rados_ops, 1);
+        assert!(document
+            .spans
+            .iter()
+            .any(|span| span.name == "rgw.background.rados_op"));
+    }
+
+    #[test]
+    fn infers_correlation_for_single_pid_time_window_candidate() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        collector.push(TraceEvent::RequestEnd(request("tx1", 1, 30)));
+        let mut event = rados("object", "");
+        event.sent_ns = 40;
+        event.finish_ns = 45;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 0);
+        assert_eq!(
+            string_attribute(&document.spans[1], "rgw.correlation"),
+            Some("inferred")
+        );
+        assert_eq!(
+            string_attribute(&document.spans[1], "rgw.correlation_reason"),
+            Some("pid_time_window")
+        );
+    }
+
+    #[test]
+    fn does_not_infer_ambiguous_candidates() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        collector.push(TraceEvent::RequestEnd(request("tx1", 1, 30)));
+        collector.push(TraceEvent::RequestEnd(request("tx2", 1, 30)));
+        let mut event = rados("object", "");
+        event.sent_ns = 40;
+        event.finish_ns = 45;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+        assert_eq!(document.diagnostics.background_rados_ops, 1);
+    }
+
+    #[test]
     fn drains_only_expired_trace_groups() {
         let mut collector = Collector::default();
         collector.push(TraceEvent::RadosOp(rados("old", "tx-old")));
@@ -631,6 +789,17 @@ mod tests {
             string_attribute(&document.spans[1], "rgwtrace.truncated"),
             Some("object_name,rados_ops")
         );
+    }
+
+    fn request(trans_id: &str, start_ns: u64, end_ns: u64) -> RequestEvent {
+        RequestEvent {
+            start_ns,
+            end_ns,
+            pid: 42,
+            tid: 7,
+            trans_id: trans_id.to_string(),
+            truncation: CaptureTruncation::default(),
+        }
     }
 
     fn string_attribute<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {

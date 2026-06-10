@@ -51,7 +51,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let _links = attach_probes(&mut skel, dwarf, &targets, pid)?;
     let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
-    let collector = Arc::new(Mutex::new(Collector::default()));
+    let collector = Arc::new(Mutex::new(if cli.correlate_inferred {
+        Collector::with_inferred_correlation(duration_ns(cli.correlation_ttl))
+    } else {
+        Collector::default()
+    }));
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);

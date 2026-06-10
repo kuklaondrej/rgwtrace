@@ -221,6 +221,7 @@ mod tests {
             otlp_max_bytes_per_batch: 0,
             otlp_flush_interval: std::time::Duration::from_secs(30),
             correlation_ttl: std::time::Duration::from_secs(120),
+            correlate_inferred: false,
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),
             pid: None,
