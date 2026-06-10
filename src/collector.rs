@@ -24,6 +24,7 @@ struct RequestBuilder {
     request: Option<RequestEvent>,
     rados: Vec<CorrelatedRados>,
     last_seen_ns: u64,
+    saw_request_start: bool,
 }
 
 #[derive(Debug)]
@@ -121,13 +122,18 @@ impl Collector {
             TraceEvent::RequestEnd(mut request) => {
                 self.diagnostics.request_markers += 1;
                 record_truncation(&mut self.diagnostics, request.truncation);
-                if let Some(start) = self.starts_by_tid.remove(&request.tid) {
+                let saw_request_start = if let Some(start) = self.starts_by_tid.remove(&request.tid)
+                {
                     request.start_ns = start.start_ns;
-                }
+                    true
+                } else {
+                    false
+                };
                 let key = request_key(&request);
                 let last_seen_ns = request.end_ns.max(request.start_ns);
                 let builder = self.requests.entry(key).or_default();
                 builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
+                builder.saw_request_start |= saw_request_start;
                 builder.request = Some(request);
             }
             TraceEvent::RadosOp(rados) => {
@@ -295,6 +301,7 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
     );
     let trace_id = trace_id(trans_id);
     let request_span_id = span_id(&format!("request:{trans_id}"));
+    let duration_quality = request_duration_quality(&builder);
 
     let mut spans = vec![SpanDocument {
         trace_id: trace_id.clone(),
@@ -306,6 +313,7 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         attributes: vec![
             string_attr("rgw.trans_id", trans_id),
             string_attr("rgw.request_class", request_class_name(request_class)),
+            string_attr("rgw.duration_quality", duration_quality),
         ],
         events: Vec::new(),
     }];
@@ -530,6 +538,16 @@ fn request_class_name(class: RequestClass) -> &'static str {
     }
 }
 
+fn request_duration_quality(builder: &RequestBuilder) -> &'static str {
+    if builder.request.is_none() {
+        "rados_bounds"
+    } else if builder.saw_request_start {
+        "request_lifecycle"
+    } else {
+        "marker"
+    }
+}
+
 fn rados_role_name(role: RadosRole) -> &'static str {
     match role {
         RadosRole::Data => "data",
@@ -617,6 +635,10 @@ mod tests {
         let rados = &document.spans[1];
         assert_eq!(request.name, "rgw.request");
         assert!(request.events.is_empty());
+        assert_eq!(
+            string_attribute(request, "rgw.duration_quality"),
+            Some("marker")
+        );
         assert_eq!(rados.name, "rados.op");
         assert_eq!(rados.trace_id, request.trace_id);
         assert_eq!(
@@ -719,6 +741,21 @@ mod tests {
         assert_eq!(
             string_attribute(&document.spans[1], "rgw.correlation_reason"),
             Some("pid_time_window")
+        );
+    }
+
+    #[test]
+    fn marks_request_lifecycle_duration_when_start_was_seen() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestStart(request("", 1, 0)));
+        collector.push(TraceEvent::RequestEnd(request("tx1", 10, 30)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans[0].start_ns, 1);
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.duration_quality"),
+            Some("request_lifecycle")
         );
     }
 
