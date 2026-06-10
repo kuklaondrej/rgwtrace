@@ -153,3 +153,5 @@ Field offsets can be wrong if the DWARF JSON and runtime binaries do not match.
 Request correlation is intentionally conservative.
 
 Cross-thread, late async, startup, and background RADOS operations may remain standalone spans.
+
+See [Production Runbook](RUNBOOK.md) for operating guidance and troubleshooting.

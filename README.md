@@ -192,3 +192,5 @@ OTLP export has no HTTPS, compression, or size-based batching yet.
 ## Read
 
 See [Architecture](ARCHITECTURE.md) for the event pipeline, trace model, captured fields, and current limitations.
+
+See [Production Runbook](RUNBOOK.md) for operating commands, preflight checks, OTLP troubleshooting, and background span interpretation.
