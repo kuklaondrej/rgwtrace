@@ -18,14 +18,14 @@ use libbpf_rs::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    cli::Cli,
+    cli::{Cli, OutputMode},
     collector::{Collector, TraceDocument},
     dwarf_json::{basename, DwarfInfo, VarFieldKernel},
     events::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
         RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
     },
-    targets,
+    otel, preflight, targets,
 };
 
 mod skel {
@@ -38,7 +38,7 @@ const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
-    let targets = targets::discover(cli)?;
+    let targets = preflight::validated_targets(cli, dwarf)?;
     let pid = cli.pid.unwrap_or(-1);
     info!(pid, "starting live tracing");
 
@@ -68,13 +68,20 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                     .expect("collector lock poisoned")
                     .push(event);
             }
-            Err(err) => warn!(error = %format_args!("{err:#}"), "failed to decode rgwtrace event"),
+            Err(err) => {
+                collector_cb
+                    .lock()
+                    .expect("collector lock poisoned")
+                    .record_decode_error();
+                warn!(error = %format_args!("{err:#}"), "failed to decode rgwtrace event");
+            }
         }
         0
     })?;
     let ringbuf = ringbuf_builder.build()?;
 
     let started = Instant::now();
+    let mut last_flush = Instant::now();
     loop {
         let ret = ringbuf.poll_raw(Duration::from_millis(250));
         if ret < 0 {
@@ -96,6 +103,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                 break;
             }
         }
+        if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
+        {
+            flush_expired_otlp(cli, &collector)?;
+            last_flush = Instant::now();
+        }
     }
 
     drop(ringbuf);
@@ -106,6 +118,34 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let trace = collector.into_trace_document(cli.service_name.clone());
     info!(spans = trace.spans.len(), "finished live tracing");
     Ok(trace)
+}
+
+fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()> {
+    let ttl_ns = duration_ns(cli.correlation_ttl);
+    let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
+    let trace = collector
+        .lock()
+        .expect("collector lock poisoned")
+        .drain_expired(cli.service_name.clone(), now_ns, ttl_ns);
+    let Some(trace) = trace else {
+        return Ok(());
+    };
+
+    let spans = trace.spans.len();
+    let export = otel::export_otlp_http(
+        &cli.otlp_endpoint,
+        &cli.otlp_header,
+        cli.otlp_timeout,
+        cli.otlp_retries,
+        &trace,
+    )?;
+    info!(
+        spans,
+        export_attempts = export.attempts,
+        export_failures = export.failures,
+        "flushed expired OTLP spans"
+    );
+    Ok(())
 }
 
 fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) {
@@ -293,6 +333,10 @@ fn clock_time_ns(clock_id: libc::clockid_t) -> Result<u64> {
     let seconds = u64::try_from(ts.tv_sec).context("clock_gettime returned negative seconds")?;
     let nanos = u64::try_from(ts.tv_nsec).context("clock_gettime returned negative nanoseconds")?;
     Ok(seconds.saturating_mul(1_000_000_000).saturating_add(nanos))
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn bytes_of(value: &VarFieldKernel) -> &[u8] {

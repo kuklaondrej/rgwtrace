@@ -30,6 +30,18 @@ Validate DWARF JSON parsing without attaching probes:
 rgwtrace --import-json 18.2.8-1jammy_dwarf_traceid.json --dry-run --output json
 ```
 
+Validate DWARF data and target discovery before attaching probes:
+
+```sh
+sudo rgwtrace \
+  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --preflight
+```
+
+`--preflight` checks the requested `--pid`, explicit target paths, discovered Ceph/RGW target files, required DWARF functions, minimum variable-field counts, and ELF build IDs.
+
+Build ID mismatches are reported as warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched build IDs.
+
 Run live tracing and flush JSON on `Ctrl-C`:
 
 ```sh
@@ -83,10 +95,24 @@ sudo rgwtrace \
   --otlp-endpoint http://localhost:4318/v1/traces \
   --otlp-timeout 10 \
   --otlp-retries 3 \
+  --otlp-flush-interval 30 \
+  --correlation-ttl 120 \
   --otlp-header 'Authorization:Bearer local-token'
 ```
 
+In OTLP mode, live tracing periodically exports spans whose correlation window has expired. `--otlp-flush-interval` controls how often expired spans are checked, and `--correlation-ttl` controls how long request/RADOS correlation state is retained before it is flushed.
+
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
+
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread correlations, missing-`trans_id` background ops, produced spans, expired request groups, and expired background RADOS ops.
+
+OTLP mode logs the same trace counters plus export attempts and export failures when internal logging is enabled.
+
+If export fails with `connection refused`, `timed out`, or DNS errors, verify the endpoint from the tracing host first:
+
+```sh
+curl -v --max-time 5 http://localhost:4318/v1/traces
+```
 
 ---
 
@@ -128,6 +154,8 @@ rgw.background.rados_op
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
 
+RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; standalone background spans use `none` with `rgw.correlation_reason = "missing_trans_id"`.
+
 ---
 
 ## Configure
@@ -145,6 +173,8 @@ sudo rgwtrace \
 
 The DWARF JSON must match the Ceph binaries being traced closely enough for function offsets and field paths to stay valid.
 
+`rgwtrace` validates required probe functions, field counts, and ELF build IDs. Build ID mismatches warn by default and fail with `--strict-build-id`.
+
 ---
 
 ## Limit
@@ -155,10 +185,12 @@ Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter:
 
 Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans.
 
-OTLP export has no HTTPS, compression, batching, or incremental flush yet.
+OTLP export has no HTTPS, compression, or size-based batching yet.
 
 ---
 
 ## Read
 
 See [Architecture](ARCHITECTURE.md) for the event pipeline, trace model, captured fields, and current limitations.
+
+See [Production Runbook](RUNBOOK.md) for operating commands, preflight checks, OTLP troubleshooting, and background span interpretation.

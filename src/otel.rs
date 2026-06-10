@@ -1,4 +1,4 @@
-use std::{thread, time::Duration};
+use std::{error::Error as StdError, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use opentelemetry_proto::tonic::{
@@ -19,13 +19,19 @@ use crate::collector::{Attribute, AttributeValue, SpanDocument, SpanEvent, Trace
 
 const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExportDiagnostics {
+    pub attempts: u64,
+    pub failures: u64,
+}
+
 pub fn export_otlp_http(
     endpoint: &str,
     headers: &[(String, String)],
     timeout: Duration,
     retries: u32,
     document: &TraceDocument,
-) -> Result<()> {
+) -> Result<ExportDiagnostics> {
     ensure_http_endpoint(endpoint)?;
 
     let body = to_otlp_protobuf(document)?;
@@ -36,21 +42,40 @@ pub fn export_otlp_http(
         .context("failed to build OTLP HTTP client")?;
 
     let max_attempts = retries.saturating_add(1);
+    let mut diagnostics = ExportDiagnostics::default();
     for attempt in 1..=max_attempts {
-        debug!(attempt, max_attempts, endpoint, "exporting OTLP traces");
+        diagnostics.attempts += 1;
+        debug!(
+            attempt,
+            max_attempts,
+            endpoint,
+            timeout_ms = timeout.as_millis(),
+            spans = document.spans.len(),
+            body_bytes = body.len(),
+            "exporting OTLP traces"
+        );
         match send_once(&client, endpoint, headers.clone(), body.clone()) {
             Ok(()) => {
                 info!(
                     spans = document.spans.len(),
                     attempt, "exported OTLP traces"
                 );
-                return Ok(());
+                return Ok(diagnostics);
             }
             Err(err) if attempt < max_attempts && err.retryable => {
+                diagnostics.failures += 1;
                 warn!(attempt, error = %err.message, "OTLP export failed; retrying");
                 thread::sleep(retry_delay(attempt));
             }
-            Err(err) => bail!(err.message),
+            Err(err) => {
+                diagnostics.failures += 1;
+                bail!(
+                    "{}; export attempts: {}, export failures: {}",
+                    err.message,
+                    diagnostics.attempts,
+                    diagnostics.failures
+                )
+            }
         }
     }
 
@@ -98,7 +123,12 @@ fn send_once(
         .header(CONTENT_TYPE, OTLP_PROTOBUF_CONTENT_TYPE)
         .body(body)
         .send()
-        .map_err(|err| ExportError::retryable(format!("failed to send OTLP request: {err}")))?;
+        .map_err(|err| {
+            ExportError::retryable(format!(
+                "failed to send OTLP request to {endpoint}: {}",
+                error_chain(&err)
+            ))
+        })?;
     let status = response.status();
 
     if status.is_success() {
@@ -215,6 +245,16 @@ fn retry_delay(attempt: u32) -> Duration {
     Duration::from_millis(250 * u64::from(attempt.min(8)))
 }
 
+fn error_chain(error: &dyn StdError) -> String {
+    let mut messages = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(error) = source {
+        messages.push(error.to_string());
+        source = error.source();
+    }
+    messages.join(": ")
+}
+
 struct ExportError {
     message: String,
     retryable: bool,
@@ -239,7 +279,7 @@ impl ExportError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::collector::{AttributeValue, SpanDocument, TraceDocument};
+    use crate::collector::{AttributeValue, SpanDocument, TraceDiagnostics, TraceDocument};
 
     #[test]
     fn encodes_otlp_protobuf() {
@@ -258,6 +298,7 @@ mod tests {
                 }],
                 events: Vec::new(),
             }],
+            diagnostics: TraceDiagnostics::default(),
         };
 
         let bytes = to_otlp_protobuf(&document).unwrap();

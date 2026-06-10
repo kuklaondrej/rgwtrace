@@ -10,6 +10,8 @@ Live tracing pipeline for RGW and RADOS.
 
 The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
 
+Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, minimum variable-field counts for the probes used by the BPF program, and ELF build IDs.
+
 Pipeline:
 
 ```text
@@ -23,6 +25,8 @@ DWARF JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> 
 The BPF program attaches RADOS probes to `Objecter::_send_op` and `Objecter::_finish_op`.
 
 It also attaches `RGWREST::get_handler` to read the RGW `trans_id` and seed request context.
+
+The older `process_request` probe path is intentionally not present because live testing showed it could crash RGW on return-probe attach.
 
 Captured request data:
 
@@ -67,6 +71,10 @@ The Rust collector groups request and RADOS events by `trans_id`.
 
 RADOS events without `trans_id` become background spans instead of being attached to a request.
 
+Correlated RADOS spans are marked with `rgw.correlation = "same_thread"`. Background RADOS spans are marked with `rgw.correlation = "none"` and `rgw.correlation_reason = "missing_trans_id"`.
+
+For OTLP live mode, old request groups and background RADOS ops are flushed when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request.
+
 ---
 
 ## Shape
@@ -107,6 +115,8 @@ RADOS span attributes:
 - `ceph.rados.offset`.
 - `ceph.rados.length`.
 - `rgw.rados_role`.
+- `rgw.correlation`.
+- `rgw.correlation_reason` when correlation is absent.
 
 `rgw.rados_role` is classified from object names and request context.
 
@@ -116,15 +126,17 @@ Roles include data, bucket index, bucket metadata, user metadata, auth metadata,
 
 ## Export
 
-JSON output prints a debug document with DWARF summary and trace spans.
+JSON output prints a debug document with DWARF summary, trace spans, and trace diagnostics counters.
 
 OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name` from `--service-name`.
 
-The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, and extra headers.
+The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
+
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread correlations, missing-`trans_id` background ops, produced spans, expired request groups, and expired background RADOS ops. OTLP export logs add export attempts and failures.
 
 It supports plain HTTP only.
 
-It does not support HTTPS, compression, batching, or incremental flush yet.
+It does not support HTTPS, compression, or size-based batching yet.
 
 ---
 
@@ -134,10 +146,12 @@ Native DWARF parsing is not implemented.
 
 Use matching `cephtrace`-generated DWARF JSON for the Ceph binaries being traced.
 
-Build IDs are parsed but not validated against discovered binaries yet.
+Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
 
 Field offsets can be wrong if the DWARF JSON and runtime binaries do not match.
 
 Request correlation is intentionally conservative.
 
 Cross-thread, late async, startup, and background RADOS operations may remain standalone spans.
+
+See [Production Runbook](RUNBOOK.md) for operating guidance and troubleshooting.

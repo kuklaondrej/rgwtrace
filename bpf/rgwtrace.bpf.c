@@ -78,19 +78,6 @@ static __always_inline void emit_request_event(__u32 type,
 }
 
 SEC("uprobe")
-int uprobe_rgw_process_request(struct pt_regs *ctx) {
-  __u32 thread_id = get_tid();
-  struct rgw_request_ctx request = {};
-
-  request.start_ns = bpf_ktime_get_boot_ns();
-  request.pid = get_pid();
-  request.tid = thread_id;
-  bpf_map_update_elem(&rgw_requests, &thread_id, &request, 0);
-  emit_request_event(RGWTRACE_EVENT_REQUEST_START, &request, 0);
-  return 0;
-}
-
-SEC("uprobe")
 int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   int varid = 30;
   __u32 thread_id = get_tid();
@@ -134,18 +121,6 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
                        bpf_ktime_get_boot_ns());
   }
 
-  return 0;
-}
-
-SEC("uretprobe")
-int uretprobe_rgw_process_request(struct pt_regs *ctx) {
-  __u32 thread_id = get_tid();
-  struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
-  if (request != 0)
-    emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
-                       bpf_ktime_get_boot_ns());
-
-  bpf_map_delete_elem(&rgw_requests, &thread_id);
   return 0;
 }
 
@@ -214,7 +189,10 @@ int uprobe_send_op(struct pt_regs *ctx) {
     bpf_probe_read_user(&name_base, sizeof(name_base), (void *)name_base_addr);
   }
 
-  name_len &= 127;
+  if (name_len < 0)
+    name_len = 0;
+  if (name_len >= MAX_OBJECT_NAME)
+    name_len = MAX_OBJECT_NAME - 1;
   if (name_len > 0 && name_base > 0)
     bpf_probe_read_user(event->object_name, name_len, (void *)name_base);
 
@@ -301,7 +279,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
   bpf_probe_read_user(&event->ops_size, sizeof(event->ops_size),
                       (void *)ops_size_addr);
 
-  event->ops_size &= 3;
+  if (event->ops_size > MAX_RADOS_OPS)
+    event->ops_size = MAX_RADOS_OPS;
   for (__u32 i = 0; i < MAX_RADOS_OPS; ++i) {
     if (i >= event->ops_size)
       break;
@@ -331,8 +310,10 @@ int uprobe_send_op(struct pt_regs *ctx) {
       bpf_probe_read_user(&data, sizeof(data),
                           (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
 
-      cls_len &= 7;
-      method_len &= 31;
+      if (cls_len >= sizeof(event->cls_ops[i].cls_name))
+        cls_len = sizeof(event->cls_ops[i].cls_name) - 1;
+      if (method_len >= sizeof(event->cls_ops[i].method_name))
+        method_len = sizeof(event->cls_ops[i].method_name) - 1;
       bpf_probe_read_user(event->cls_ops[i].cls_name, cls_len, (void *)data);
       bpf_probe_read_user(event->cls_ops[i].method_name, method_len,
                           (void *)data + cls_len);

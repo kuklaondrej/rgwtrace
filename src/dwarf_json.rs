@@ -81,7 +81,6 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("Objecter::_send_op", 0),
     ("Objecter::_finish_op", 20),
     ("RGWREST::get_handler", 30),
-    ("process_request", 40),
 ];
 
 impl DwarfInfo {
@@ -156,6 +155,20 @@ impl DwarfInfo {
             .get(module_basename)
             .and_then(|module| module.func2pc.get(function).copied())
             .filter(|addr| *addr != 0)
+    }
+
+    pub fn function_var_field_count(&self, module_basename: &str, function: &str) -> Option<usize> {
+        self.modules
+            .get(module_basename)
+            .and_then(|module| module.func2vf.get(function))
+            .map(|vars| vars.var_fields.len())
+    }
+
+    pub fn module_build_id(&self, module_basename: &str) -> Option<&str> {
+        self.modules
+            .get(module_basename)
+            .and_then(|module| module.build_id.as_deref())
+            .filter(|build_id| !build_id.is_empty())
     }
 
     pub fn summary(&self) -> DwarfSummary {
