@@ -9,7 +9,7 @@ Operational notes for running `rgwtrace` against live RGW hosts.
 - Linux host with eBPF and uprobes enabled.
 - `root` or equivalent BPF/perf privileges. Running with `sudo` is the expected path today.
 - Ceph/RGW binaries matching the imported `cephtrace` DWARF JSON.
-- Reachable OTLP/HTTP endpoint when using `--output otlp`.
+- Reachable OTLP/HTTP or OTLP/HTTPS endpoint when using `--output otlp`.
 - Linux `amd64` binary built with `./scripts/build-linux-container.sh` when building from macOS.
 
 ---
@@ -53,7 +53,7 @@ sudo rgwtrace \
   --output json
 ```
 
-Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, decode errors, and expired spans.
+Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, and expired spans.
 
 ---
 
@@ -72,13 +72,17 @@ sudo rgwtrace \
   --import-json 18.2.8-1jammy_dwarf_traceid.json \
   --pid "$(pidof radosgw | awk '{print $1}')" \
   --output otlp \
-  --otlp-endpoint http://tempo.example.net:4318/v1/traces \
+  --otlp-endpoint https://tempo.example.net:4318/v1/traces \
   --service-name rgwtrace \
+  --otlp-compression gzip \
+  --otlp-max-spans-per-batch 512 \
   --otlp-flush-interval 30 \
   --correlation-ttl 120
 ```
 
 Use `--log-level info` or `RUST_LOG=rgwtrace=debug` to see export summaries and retry details.
+
+Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobuf payloads. The byte limit is checked before gzip compression; `0` disables byte-based splitting.
 
 ---
 
@@ -98,6 +102,7 @@ Use `--log-level info` or `RUST_LOG=rgwtrace=debug` to see export summaries and 
 - `timed out`: firewall, routing, load balancer, or collector availability issue.
 - HTTP `404`: wrong path; OTLP/HTTP traces usually use `/v1/traces`.
 - HTTP `415`: receiver does not accept OTLP protobuf on that endpoint.
+- TLS/certificate errors: verify the endpoint certificate chain from the RGW host and use `http://` only for trusted local networks.
 - HTTP `4xx`: endpoint/auth/config issue; not retried.
 - HTTP `429` or `5xx`: retried according to `--otlp-retries`.
 
@@ -113,10 +118,25 @@ Inspect:
 
 - `rgw.rados_role` for object classification.
 - `rgw.correlation = "none"`.
-- `rgw.correlation_reason = "missing_trans_id"`.
+- `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`.
 - `trace.diagnostics.missing_trans_id_background_ops` for volume.
+- `trace.diagnostics.background_rados_by_role` and `trace.diagnostics.background_rados_by_reason` for breakdowns.
 
-Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether a future conservative fallback correlation is warranted.
+Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether `--correlate-inferred` is warranted.
+
+`--correlate-inferred` can attach untagged RADOS ops to a request only when there is one same-PID candidate in the correlation window and the role does not look like RGW background work. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`.
+
+---
+
+## Capture Quality
+
+Request spans include `rgw.duration_quality`.
+
+- `marker`: current live probe path observed a request marker, not full lifecycle latency.
+- `request_lifecycle`: both request start and end markers were observed.
+- `rados_bounds`: the request group was built from RADOS timestamps only.
+
+RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names.
 
 ---
 

@@ -59,6 +59,8 @@ Fixed capture limits:
 - Class names are 8 bytes.
 - Method names are 32 bytes.
 
+BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans.
+
 ---
 
 ## Correlate
@@ -71,7 +73,9 @@ The Rust collector groups request and RADOS events by `trans_id`.
 
 RADOS events without `trans_id` become background spans instead of being attached to a request.
 
-Correlated RADOS spans are marked with `rgw.correlation = "same_thread"`. Background RADOS spans are marked with `rgw.correlation = "none"` and `rgw.correlation_reason = "missing_trans_id"`.
+Correlated RADOS spans are marked with `rgw.correlation = "same_thread"`. Background RADOS spans are marked with `rgw.correlation = "none"` and a reason such as `missing_trans_id` or `classified_background_role`.
+
+When `--correlate-inferred` is enabled, untagged RADOS events can be attached to a request only if there is exactly one same-PID candidate in the configured correlation window and the RADOS role is not classified as RGW background work. These spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`.
 
 For OTLP live mode, old request groups and background RADOS ops are flushed when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request.
 
@@ -87,7 +91,7 @@ rgw.request
   rados.op
 ```
 
-The request span has `rgw.trans_id` and `rgw.request_class` attributes.
+The request span has `rgw.trans_id`, `rgw.request_class`, and `rgw.duration_quality` attributes.
 
 Each `rados.op` child span uses the request trace ID and request span ID as its parent.
 
@@ -117,6 +121,7 @@ RADOS span attributes:
 - `rgw.rados_role`.
 - `rgw.correlation`.
 - `rgw.correlation_reason` when correlation is absent.
+- `rgwtrace.truncated` when fixed capture limits truncated one or more fields.
 
 `rgw.rados_role` is classified from object names and request context.
 
@@ -132,11 +137,11 @@ OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
-Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread correlations, missing-`trans_id` background ops, produced spans, expired request groups, and expired background RADOS ops. OTLP export logs add export attempts and failures.
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, and expired background RADOS ops. OTLP export logs add export batches, attempts, and failures.
 
-It supports plain HTTP only.
+It supports HTTP and HTTPS.
 
-It does not support HTTPS, compression, or size-based batching yet.
+It supports optional gzip compression, span-count batching, and encoded-size batching.
 
 ---
 
@@ -146,12 +151,14 @@ Native DWARF parsing is not implemented.
 
 Use matching `cephtrace`-generated DWARF JSON for the Ceph binaries being traced.
 
+The code has a DWARF input abstraction, but a native parser still needs safe implementation of ELF/DWARF debug-info discovery, build-id and `.gnu_debuglink` lookup, C++ symbol resolution, function PC extraction, variable-location expression decoding, and member-offset path extraction into `VarFieldKernel`.
+
 Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
 
 Field offsets can be wrong if the DWARF JSON and runtime binaries do not match.
 
 Request correlation is intentionally conservative.
 
-Cross-thread, late async, startup, and background RADOS operations may remain standalone spans.
+Cross-thread, late async, startup, and background RADOS operations may remain standalone spans. Optional inferred correlation never joins ambiguous candidates.
 
 See [Production Runbook](RUNBOOK.md) for operating guidance and troubleshooting.
