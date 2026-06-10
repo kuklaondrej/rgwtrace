@@ -41,6 +41,8 @@ pub struct TraceDiagnostics {
     pub background_rados_ops: u64,
     pub same_thread_correlations: u64,
     pub missing_trans_id_background_ops: u64,
+    pub background_rados_by_role: BTreeMap<String, u64>,
+    pub background_rados_by_reason: BTreeMap<String, u64>,
     pub spans_produced: u64,
     pub expired_request_groups: u64,
     pub expired_background_rados_ops: u64,
@@ -111,6 +113,7 @@ impl Collector {
                 if rados.trans_id.is_empty() {
                     self.diagnostics.background_rados_ops += 1;
                     self.diagnostics.missing_trans_id_background_ops += 1;
+                    record_background_breakdown(&mut self.diagnostics, &rados);
                     self.background.push(rados);
                 } else {
                     self.diagnostics.correlated_rados_ops += 1;
@@ -264,7 +267,7 @@ fn background_span(rados: RadosEvent) -> SpanDocument {
     let start_ns = rados.sent_ns;
     let end_ns = rados.finish_ns;
     let trace_key = format!("background:{}:{}:{}", rados.pid, rados.tid, rados.sent_ns);
-    let attributes = rados_attributes(&rados, "none", Some("missing_trans_id"));
+    let attributes = rados_attributes(&rados, "none", Some(background_reason(&rados)));
 
     SpanDocument {
         trace_id: trace_id(&trace_key),
@@ -367,6 +370,27 @@ fn record_truncation(
     }
     if truncation.method_name {
         diagnostics.truncated_method_names += 1;
+    }
+}
+
+fn record_background_breakdown(diagnostics: &mut TraceDiagnostics, rados: &RadosEvent) {
+    let role = rados_role_name(classify_rados(rados));
+    *diagnostics
+        .background_rados_by_role
+        .entry(role.to_string())
+        .or_default() += 1;
+    *diagnostics
+        .background_rados_by_reason
+        .entry(background_reason(rados).to_string())
+        .or_default() += 1;
+}
+
+fn background_reason(rados: &RadosEvent) -> &'static str {
+    match classify_rados(rados) {
+        RadosRole::Gc | RadosRole::Notify | RadosRole::Sync | RadosRole::Config => {
+            "classified_background_role"
+        }
+        _ => "missing_trans_id",
     }
 }
 
@@ -536,12 +560,23 @@ mod tests {
         assert_eq!(document.diagnostics.same_thread_correlations, 0);
         assert_eq!(document.diagnostics.missing_trans_id_background_ops, 1);
         assert_eq!(
+            document.diagnostics.background_rados_by_role.get("notify"),
+            Some(&1)
+        );
+        assert_eq!(
+            document
+                .diagnostics
+                .background_rados_by_reason
+                .get("classified_background_role"),
+            Some(&1)
+        );
+        assert_eq!(
             string_attribute(&document.spans[0], "rgw.correlation"),
             Some("none")
         );
         assert_eq!(
             string_attribute(&document.spans[0], "rgw.correlation_reason"),
-            Some("missing_trans_id")
+            Some("classified_background_role")
         );
     }
 
