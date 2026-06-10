@@ -21,6 +21,7 @@ pub struct Collector {
 struct RequestBuilder {
     request: Option<RequestEvent>,
     rados: Vec<RadosEvent>,
+    last_seen_ns: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -39,6 +40,8 @@ pub struct TraceDiagnostics {
     pub correlated_rados_ops: u64,
     pub background_rados_ops: u64,
     pub spans_produced: u64,
+    pub expired_request_groups: u64,
+    pub expired_background_rados_ops: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -87,7 +90,10 @@ impl Collector {
                     request.start_ns = start.start_ns;
                 }
                 let key = request_key(&request);
-                self.requests.entry(key).or_default().request = Some(request);
+                let last_seen_ns = request.end_ns.max(request.start_ns);
+                let builder = self.requests.entry(key).or_default();
+                builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
+                builder.request = Some(request);
             }
             TraceEvent::RadosOp(rados) => {
                 self.diagnostics.rados_ops += 1;
@@ -96,11 +102,10 @@ impl Collector {
                     self.background.push(rados);
                 } else {
                     self.diagnostics.correlated_rados_ops += 1;
-                    self.requests
-                        .entry(rados.trans_id.clone())
-                        .or_default()
-                        .rados
-                        .push(rados);
+                    let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
+                    let builder = self.requests.entry(rados.trans_id.clone()).or_default();
+                    builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
+                    builder.rados.push(rados);
                 }
             }
         }
@@ -108,6 +113,50 @@ impl Collector {
 
     pub fn record_decode_error(&mut self) {
         self.diagnostics.decode_errors += 1;
+    }
+
+    pub fn drain_expired(
+        &mut self,
+        service_name: impl Into<String>,
+        now_ns: u64,
+        ttl_ns: u64,
+    ) -> Option<TraceDocument> {
+        let cutoff_ns = now_ns.saturating_sub(ttl_ns);
+        let mut spans = Vec::new();
+        let mut remaining_requests = BTreeMap::new();
+
+        for (key, request) in std::mem::take(&mut self.requests) {
+            if request.last_seen_ns != 0 && request.last_seen_ns <= cutoff_ns {
+                self.diagnostics.expired_request_groups += 1;
+                spans.extend(request_spans(key, request));
+            } else {
+                remaining_requests.insert(key, request);
+            }
+        }
+        self.requests = remaining_requests;
+
+        let mut remaining_background = Vec::new();
+        for rados in std::mem::take(&mut self.background) {
+            if rados_event_time_ns(&rados) <= cutoff_ns {
+                self.diagnostics.expired_background_rados_ops += 1;
+                spans.push(background_span(rados));
+            } else {
+                remaining_background.push(rados);
+            }
+        }
+        self.background = remaining_background;
+
+        if spans.is_empty() {
+            return None;
+        }
+
+        let mut diagnostics = self.diagnostics.clone();
+        diagnostics.spans_produced = spans.len() as u64;
+        Some(TraceDocument {
+            service_name: service_name.into(),
+            spans,
+            diagnostics,
+        })
     }
 
     pub fn into_trace_document(mut self, service_name: impl Into<String>) -> TraceDocument {
@@ -128,6 +177,10 @@ impl Collector {
             diagnostics: self.diagnostics,
         }
     }
+}
+
+fn rados_event_time_ns(rados: &RadosEvent) -> u64 {
+    rados.finish_ns.max(rados.sent_ns)
 }
 
 fn request_key(request: &RequestEvent) -> String {
@@ -422,6 +475,38 @@ mod tests {
         assert_eq!(document.diagnostics.rados_ops, 1);
         assert_eq!(document.diagnostics.correlated_rados_ops, 0);
         assert_eq!(document.diagnostics.background_rados_ops, 1);
+    }
+
+    #[test]
+    fn drains_only_expired_trace_groups() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(rados("old", "tx-old")));
+
+        let mut fresh = rados("fresh", "tx-fresh");
+        fresh.sent_ns = 1_000;
+        fresh.finish_ns = 1_010;
+        collector.push(TraceEvent::RadosOp(fresh));
+
+        let document = collector.drain_expired("rgwtrace", 200, 100).unwrap();
+
+        assert_eq!(document.spans.len(), 2);
+        assert_eq!(document.diagnostics.expired_request_groups, 1);
+        assert_eq!(document.diagnostics.spans_produced, 2);
+
+        let remaining = collector.into_trace_document("rgwtrace");
+        assert_eq!(remaining.spans.len(), 2);
+    }
+
+    #[test]
+    fn drains_expired_background_ops() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(rados("notify.0", "")));
+
+        let document = collector.drain_expired("rgwtrace", 200, 100).unwrap();
+
+        assert_eq!(document.spans.len(), 1);
+        assert_eq!(document.diagnostics.expired_background_rados_ops, 1);
+        assert!(collector.drain_expired("rgwtrace", 200, 100).is_none());
     }
 
     fn string_attribute<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {

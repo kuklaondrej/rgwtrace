@@ -48,13 +48,17 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         OutputMode::Otlp => {
-            let export = otel::export_otlp_http(
-                &cli.otlp_endpoint,
-                &cli.otlp_header,
-                cli.otlp_timeout,
-                cli.otlp_retries,
-                &trace,
-            )?;
+            let export = if trace.spans.is_empty() {
+                otel::ExportDiagnostics::default()
+            } else {
+                otel::export_otlp_http(
+                    &cli.otlp_endpoint,
+                    &cli.otlp_header,
+                    cli.otlp_timeout,
+                    cli.otlp_retries,
+                    &trace,
+                )?
+            };
             info!(
                 spans = trace.spans.len(),
                 events_decoded = trace.diagnostics.events_decoded,

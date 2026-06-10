@@ -23,6 +23,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 2)]
     pub otlp_retries: u32,
 
+    #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
+    pub otlp_flush_interval: Duration,
+
+    #[arg(long, default_value = "120", value_parser = parse_duration_secs)]
+    pub correlation_ttl: Duration,
+
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
 

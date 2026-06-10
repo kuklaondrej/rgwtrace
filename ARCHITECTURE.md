@@ -71,6 +71,8 @@ The Rust collector groups request and RADOS events by `trans_id`.
 
 RADOS events without `trans_id` become background spans instead of being attached to a request.
 
+For OTLP live mode, old request groups and background RADOS ops are flushed when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request.
+
 ---
 
 ## Shape
@@ -124,13 +126,13 @@ JSON output prints a debug document with DWARF summary, trace spans, and trace d
 
 OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name` from `--service-name`.
 
-The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, and extra headers.
+The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
-Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, and produced spans. OTLP export logs add export attempts and failures.
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, produced spans, expired request groups, and expired background RADOS ops. OTLP export logs add export attempts and failures.
 
 It supports plain HTTP only.
 
-It does not support HTTPS, compression, batching, or incremental flush yet.
+It does not support HTTPS, compression, or size-based batching yet.
 
 ---
 

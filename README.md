@@ -93,12 +93,16 @@ sudo rgwtrace \
   --otlp-endpoint http://localhost:4318/v1/traces \
   --otlp-timeout 10 \
   --otlp-retries 3 \
+  --otlp-flush-interval 30 \
+  --correlation-ttl 120 \
   --otlp-header 'Authorization:Bearer local-token'
 ```
 
+In OTLP mode, live tracing periodically exports spans whose correlation window has expired. `--otlp-flush-interval` controls how often expired spans are checked, and `--correlation-ttl` controls how long request/RADOS correlation state is retained before it is flushed.
+
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, and produced spans.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, produced spans, expired request groups, and expired background RADOS ops.
 
 OTLP mode logs the same trace counters plus export attempts and export failures when internal logging is enabled.
 
@@ -177,7 +181,7 @@ Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter:
 
 Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans.
 
-OTLP export has no HTTPS, compression, batching, or incremental flush yet.
+OTLP export has no HTTPS, compression, or size-based batching yet.
 
 ---
 
