@@ -13,7 +13,7 @@ The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates 
 Pipeline:
 
 ```text
-DWARF JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP
+DWARF JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
 
 ---
@@ -118,11 +118,13 @@ Roles include data, bucket index, bucket metadata, user metadata, auth metadata,
 
 JSON output prints a debug document with DWARF summary and trace spans.
 
-OTLP output sends minimal OTLP/HTTP JSON to `--otlp-endpoint` and sets `service.name` from `--service-name`.
+OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name` from `--service-name`.
 
-The exporter supports plain HTTP only.
+The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, and extra headers.
 
-It does not support HTTPS, authentication, compression, retries, or protobuf yet.
+It supports plain HTTP only.
+
+It does not support HTTPS, compression, batching, or incremental flush yet.
 
 ---
 

@@ -15,6 +15,7 @@ use libbpf_rs::{
     skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, OpenObject,
     RingBufferBuilder,
 };
+use tracing::{debug, info, warn};
 
 use crate::{
     cli::Cli,
@@ -39,6 +40,7 @@ const EINTR: i32 = 4;
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = targets::discover(cli)?;
     let pid = cli.pid.unwrap_or(-1);
+    info!(pid, "starting live tracing");
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
     let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
@@ -66,7 +68,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                     .expect("collector lock poisoned")
                     .push(event);
             }
-            Err(err) => eprintln!("failed to decode rgwtrace event: {err:#}"),
+            Err(err) => warn!(error = %format_args!("{err:#}"), "failed to decode rgwtrace event"),
         }
         0
     })?;
@@ -90,6 +92,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         }
         if let Some(timeout) = cli.timeout {
             if started.elapsed() >= Duration::from_secs(timeout) {
+                debug!(timeout_seconds = timeout, "trace timeout reached");
                 break;
             }
         }
@@ -100,7 +103,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
         .into_inner()
         .expect("collector lock poisoned");
-    Ok(collector.into_trace_document(cli.service_name.clone()))
+    let trace = collector.into_trace_document(cli.service_name.clone());
+    info!(spans = trace.spans.len(), "finished live tracing");
+    Ok(trace)
 }
 
 fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) {
