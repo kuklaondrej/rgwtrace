@@ -102,7 +102,7 @@ In OTLP mode, live tracing periodically exports spans whose correlation window h
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, produced spans, expired request groups, and expired background RADOS ops.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread correlations, missing-`trans_id` background ops, produced spans, expired request groups, and expired background RADOS ops.
 
 OTLP mode logs the same trace counters plus export attempts and export failures when internal logging is enabled.
 
@@ -151,6 +151,8 @@ rgw.background.rados_op
 ```
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
+
+RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; standalone background spans use `none` with `rgw.correlation_reason = "missing_trans_id"`.
 
 ---
 

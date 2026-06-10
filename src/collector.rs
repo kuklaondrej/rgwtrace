@@ -39,6 +39,8 @@ pub struct TraceDiagnostics {
     pub rados_ops: u64,
     pub correlated_rados_ops: u64,
     pub background_rados_ops: u64,
+    pub same_thread_correlations: u64,
+    pub missing_trans_id_background_ops: u64,
     pub spans_produced: u64,
     pub expired_request_groups: u64,
     pub expired_background_rados_ops: u64,
@@ -99,9 +101,11 @@ impl Collector {
                 self.diagnostics.rados_ops += 1;
                 if rados.trans_id.is_empty() {
                     self.diagnostics.background_rados_ops += 1;
+                    self.diagnostics.missing_trans_id_background_ops += 1;
                     self.background.push(rados);
                 } else {
                     self.diagnostics.correlated_rados_ops += 1;
+                    self.diagnostics.same_thread_correlations += 1;
                     let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
                     let builder = self.requests.entry(rados.trans_id.clone()).or_default();
                     builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
@@ -251,7 +255,7 @@ fn background_span(rados: RadosEvent) -> SpanDocument {
     let start_ns = rados.sent_ns;
     let end_ns = rados.finish_ns;
     let trace_key = format!("background:{}:{}:{}", rados.pid, rados.tid, rados.sent_ns);
-    let attributes = rados_attributes(&rados);
+    let attributes = rados_attributes(&rados, "none", Some("missing_trans_id"));
 
     SpanDocument {
         trace_id: trace_id(&trace_key),
@@ -260,18 +264,18 @@ fn background_span(rados: RadosEvent) -> SpanDocument {
         name: "rgw.background.rados_op".to_string(),
         start_ns,
         end_ns,
-        attributes,
-        events: vec![rados_span_event(rados)],
+        attributes: attributes.clone(),
+        events: vec![rados_span_event(rados, attributes)],
     }
 }
 
-fn rados_span_event(rados: RadosEvent) -> SpanEvent {
+fn rados_span_event(rados: RadosEvent, attributes: Vec<Attribute>) -> SpanEvent {
     let time_ns = rados.finish_ns;
 
     SpanEvent {
         name: "rados.op".to_string(),
         time_ns,
-        attributes: rados_attributes(&rados),
+        attributes,
     }
 }
 
@@ -287,12 +291,16 @@ fn rados_child_span(rados: RadosEvent, trace_id: String, parent_span_id: String)
         name: "rados.op".to_string(),
         start_ns: rados.sent_ns,
         end_ns: rados.finish_ns,
-        attributes: rados_attributes(&rados),
+        attributes: rados_attributes(&rados, "same_thread", None),
         events: Vec::new(),
     }
 }
 
-fn rados_attributes(rados: &RadosEvent) -> Vec<Attribute> {
+fn rados_attributes(
+    rados: &RadosEvent,
+    correlation: &'static str,
+    correlation_reason: Option<&'static str>,
+) -> Vec<Attribute> {
     let role = classify_rados(rados);
     let ops = rados
         .ops
@@ -304,7 +312,7 @@ fn rados_attributes(rados: &RadosEvent) -> Vec<Attribute> {
         .collect::<Vec<_>>()
         .join(" ");
 
-    vec![
+    let mut attributes = vec![
         u64_attr("ceph.rados.duration_ns", rados.duration_ns),
         u64_attr("ceph.rados.pool", rados.pool),
         string_attr("ceph.rados.pg", pg_name(rados.pool, rados.pg_seed)),
@@ -317,7 +325,12 @@ fn rados_attributes(rados: &RadosEvent) -> Vec<Attribute> {
         u64_attr("ceph.rados.offset", rados.offset),
         u64_attr("ceph.rados.length", rados.length),
         string_attr("rgw.rados_role", rados_role_name(role)),
-    ]
+        string_attr("rgw.correlation", correlation),
+    ];
+    if let Some(reason) = correlation_reason {
+        attributes.push(string_attr("rgw.correlation_reason", reason));
+    }
+    attributes
 }
 
 fn pg_name(pool: u64, pg_seed: u32) -> String {
@@ -460,7 +473,13 @@ mod tests {
         assert_eq!(document.diagnostics.rados_ops, 1);
         assert_eq!(document.diagnostics.correlated_rados_ops, 1);
         assert_eq!(document.diagnostics.background_rados_ops, 0);
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.missing_trans_id_background_ops, 0);
         assert_eq!(document.diagnostics.spans_produced, 2);
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("same_thread")
+        );
     }
 
     #[test]
@@ -475,6 +494,16 @@ mod tests {
         assert_eq!(document.diagnostics.rados_ops, 1);
         assert_eq!(document.diagnostics.correlated_rados_ops, 0);
         assert_eq!(document.diagnostics.background_rados_ops, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 0);
+        assert_eq!(document.diagnostics.missing_trans_id_background_ops, 1);
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.correlation"),
+            Some("none")
+        );
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.correlation_reason"),
+            Some("missing_trans_id")
+        );
     }
 
     #[test]
