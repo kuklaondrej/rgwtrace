@@ -3,6 +3,7 @@ mod events;
 mod classify;
 mod cli;
 mod collector;
+mod dwarf_input;
 mod dwarf_json;
 mod live;
 mod otel;
@@ -17,15 +18,16 @@ use tracing_subscriber::EnvFilter;
 use crate::{
     cli::{Cli, OutputMode},
     collector::Collector,
-    dwarf_json::DwarfInfo,
+    dwarf_input::DwarfInput,
 };
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
 
-    info!(path = %cli.import_json.display(), "loading DWARF JSON");
-    let dwarf = DwarfInfo::from_path(&cli.import_json)?;
+    let dwarf_input = DwarfInput::json(cli.import_json.clone());
+    info!(path = %dwarf_input.path().display(), "loading DWARF JSON");
+    let dwarf = dwarf_input.load()?;
     if cli.preflight {
         let report = preflight::run(&cli, &dwarf)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
