@@ -44,6 +44,12 @@ pub struct TraceDiagnostics {
     pub spans_produced: u64,
     pub expired_request_groups: u64,
     pub expired_background_rados_ops: u64,
+    pub truncated_trans_ids: u64,
+    pub truncated_object_names: u64,
+    pub truncated_acting_sets: u64,
+    pub truncated_rados_ops: u64,
+    pub truncated_cls_names: u64,
+    pub truncated_method_names: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -84,10 +90,12 @@ impl Collector {
         match event {
             TraceEvent::RequestStart(request) => {
                 self.diagnostics.request_markers += 1;
+                record_truncation(&mut self.diagnostics, request.truncation);
                 self.starts_by_tid.insert(request.tid, request);
             }
             TraceEvent::RequestEnd(mut request) => {
                 self.diagnostics.request_markers += 1;
+                record_truncation(&mut self.diagnostics, request.truncation);
                 if let Some(start) = self.starts_by_tid.remove(&request.tid) {
                     request.start_ns = start.start_ns;
                 }
@@ -99,6 +107,7 @@ impl Collector {
             }
             TraceEvent::RadosOp(rados) => {
                 self.diagnostics.rados_ops += 1;
+                record_truncation(&mut self.diagnostics, rados.truncation);
                 if rados.trans_id.is_empty() {
                     self.diagnostics.background_rados_ops += 1;
                     self.diagnostics.missing_trans_id_background_ops += 1;
@@ -330,7 +339,35 @@ fn rados_attributes(
     if let Some(reason) = correlation_reason {
         attributes.push(string_attr("rgw.correlation_reason", reason));
     }
+    let truncation = rados.truncation.names();
+    if !truncation.is_empty() {
+        attributes.push(string_attr("rgwtrace.truncated", truncation.join(",")));
+    }
     attributes
+}
+
+fn record_truncation(
+    diagnostics: &mut TraceDiagnostics,
+    truncation: crate::events::CaptureTruncation,
+) {
+    if truncation.trans_id {
+        diagnostics.truncated_trans_ids += 1;
+    }
+    if truncation.object_name {
+        diagnostics.truncated_object_names += 1;
+    }
+    if truncation.acting {
+        diagnostics.truncated_acting_sets += 1;
+    }
+    if truncation.rados_ops {
+        diagnostics.truncated_rados_ops += 1;
+    }
+    if truncation.cls_name {
+        diagnostics.truncated_cls_names += 1;
+    }
+    if truncation.method_name {
+        diagnostics.truncated_method_names += 1;
+    }
 }
 
 fn pg_name(pool: u64, pg_seed: u32) -> String {
@@ -414,7 +451,7 @@ fn fnv1a64_with_seed(bytes: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{RadosDirection, RadosEvent, RequestEvent};
+    use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RequestEvent};
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
@@ -431,6 +468,7 @@ mod tests {
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
             trans_id: trans_id.to_string(),
+            truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
             length: 0,
@@ -447,6 +485,7 @@ mod tests {
             pid: 42,
             tid: 7,
             trans_id: "tx1".to_string(),
+            truncation: CaptureTruncation::default(),
         }));
 
         let document = collector.into_trace_document("rgwtrace");
@@ -536,6 +575,27 @@ mod tests {
         assert_eq!(document.spans.len(), 1);
         assert_eq!(document.diagnostics.expired_background_rados_ops, 1);
         assert!(collector.drain_expired("rgwtrace", 200, 100).is_none());
+    }
+
+    #[test]
+    fn reports_capture_truncation() {
+        let mut collector = Collector::default();
+        let mut event = rados("object", "tx1");
+        event.truncation = CaptureTruncation {
+            object_name: true,
+            rados_ops: true,
+            ..CaptureTruncation::default()
+        };
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.truncated_object_names, 1);
+        assert_eq!(document.diagnostics.truncated_rados_ops, 1);
+        assert_eq!(
+            string_attribute(&document.spans[1], "rgwtrace.truncated"),
+            Some("object_name,rados_ops")
+        );
     }
 
     fn string_attribute<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {

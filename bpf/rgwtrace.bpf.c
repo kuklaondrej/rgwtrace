@@ -19,6 +19,7 @@ struct rgw_request_ctx {
   __u64 start_ns;
   __u32 pid;
   __u32 tid;
+  __u32 flags;
   char trans_id[MAX_TRANS_ID];
 };
 
@@ -72,6 +73,7 @@ static __always_inline void emit_request_event(__u32 type,
   e->data.request.end_ns = end_ns;
   e->data.request.pid = ctx->pid;
   e->data.request.tid = ctx->tid;
+  e->data.request.flags = ctx->flags;
   __builtin_memcpy(e->data.request.trans_id, ctx->trans_id,
                    sizeof(e->data.request.trans_id));
   bpf_ringbuf_submit(e, 0);
@@ -115,6 +117,8 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   bpf_probe_read_user(&trans_id_base, sizeof(trans_id_base), (void *)base_addr);
 
   if (trans_id_len > 0 && trans_id_base > 0) {
+    if (trans_id_len >= MAX_TRANS_ID)
+      request->flags |= RGWTRACE_TRUNC_TRANS_ID;
     bpf_probe_read_user_str(request->trans_id, sizeof(request->trans_id),
                             (void *)trans_id_base);
     emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
@@ -158,6 +162,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   __u32 thread_id = get_tid();
   struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
   if (request != 0) {
+    event->flags |= request->flags & RGWTRACE_TRUNC_TRANS_ID;
     __builtin_memcpy(event->trans_id, request->trans_id,
                      sizeof(event->trans_id));
   }
@@ -191,8 +196,10 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   if (name_len < 0)
     name_len = 0;
-  if (name_len >= MAX_OBJECT_NAME)
+  if (name_len >= MAX_OBJECT_NAME) {
+    event->flags |= RGWTRACE_TRUNC_OBJECT_NAME;
     name_len = MAX_OBJECT_NAME - 1;
+  }
   if (name_len > 0 && name_base > 0)
     bpf_probe_read_user(event->object_name, name_len, (void *)name_base);
 
@@ -246,9 +253,12 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   if (acting_start > 0 && acting_finish >= acting_start) {
     __u64 acting_bytes = acting_finish - acting_start;
-    if ((acting_bytes % sizeof(int)) == 0 &&
-        acting_bytes <= MAX_ACTING * sizeof(int)) {
+    if ((acting_bytes % sizeof(int)) == 0) {
       int acting_size = acting_bytes / sizeof(int);
+      if (acting_size > MAX_ACTING) {
+        event->flags |= RGWTRACE_TRUNC_ACTING;
+        acting_size = MAX_ACTING;
+      }
       for (int i = 0; i < MAX_ACTING; ++i) {
         if (i >= acting_size)
           break;
@@ -279,8 +289,10 @@ int uprobe_send_op(struct pt_regs *ctx) {
   bpf_probe_read_user(&event->ops_size, sizeof(event->ops_size),
                       (void *)ops_size_addr);
 
-  if (event->ops_size > MAX_RADOS_OPS)
+  if (event->ops_size > MAX_RADOS_OPS) {
+    event->flags |= RGWTRACE_TRUNC_RADOS_OPS;
     event->ops_size = MAX_RADOS_OPS;
+  }
   for (__u32 i = 0; i < MAX_RADOS_OPS; ++i) {
     if (i >= event->ops_size)
       break;
@@ -310,10 +322,14 @@ int uprobe_send_op(struct pt_regs *ctx) {
       bpf_probe_read_user(&data, sizeof(data),
                           (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
 
-      if (cls_len >= sizeof(event->cls_ops[i].cls_name))
+      if (cls_len >= sizeof(event->cls_ops[i].cls_name)) {
+        event->flags |= RGWTRACE_TRUNC_CLS_NAME;
         cls_len = sizeof(event->cls_ops[i].cls_name) - 1;
-      if (method_len >= sizeof(event->cls_ops[i].method_name))
+      }
+      if (method_len >= sizeof(event->cls_ops[i].method_name)) {
+        event->flags |= RGWTRACE_TRUNC_METHOD_NAME;
         method_len = sizeof(event->cls_ops[i].method_name) - 1;
+      }
       bpf_probe_read_user(event->cls_ops[i].cls_name, cls_len, (void *)data);
       bpf_probe_read_user(event->cls_ops[i].method_name, method_len,
                           (void *)data + cls_len);

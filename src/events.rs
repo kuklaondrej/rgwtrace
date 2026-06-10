@@ -11,6 +11,13 @@ pub const RGWTRACE_EVENT_REQUEST_START: u32 = 1;
 pub const RGWTRACE_EVENT_REQUEST_END: u32 = 2;
 pub const RGWTRACE_EVENT_RADOS_OP: u32 = 3;
 
+pub const RGWTRACE_TRUNC_TRANS_ID: u32 = 1 << 0;
+pub const RGWTRACE_TRUNC_OBJECT_NAME: u32 = 1 << 1;
+pub const RGWTRACE_TRUNC_ACTING: u32 = 1 << 2;
+pub const RGWTRACE_TRUNC_RADOS_OPS: u32 = 1 << 3;
+pub const RGWTRACE_TRUNC_CLS_NAME: u32 = 1 << 4;
+pub const RGWTRACE_TRUNC_METHOD_NAME: u32 = 1 << 5;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawClsOp {
@@ -25,6 +32,7 @@ pub struct RawRequestEvent {
     pub end_ns: u64,
     pub pid: u32,
     pub tid: u32,
+    pub flags: u32,
     pub trans_id: [u8; MAX_TRANS_ID],
 }
 
@@ -43,6 +51,7 @@ pub struct RawRadosEvent {
     pub pg_seed: u32,
     pub rw: u16,
     pub ops_size: u32,
+    pub flags: u32,
     pub acting: [i32; MAX_ACTING],
     pub ops: [u16; MAX_RADOS_OPS],
     pub cls_ops: [RawClsOp; MAX_RADOS_OPS],
@@ -86,6 +95,7 @@ pub struct RequestEvent {
     pub pid: u32,
     pub tid: u32,
     pub trans_id: String,
+    pub truncation: CaptureTruncation,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,6 +113,7 @@ pub struct RadosEvent {
     pub rw: RadosDirection,
     pub object_name: String,
     pub trans_id: String,
+    pub truncation: CaptureTruncation,
     pub ops: Vec<RadosOp>,
     pub offset: u64,
     pub length: u64,
@@ -121,6 +132,52 @@ pub struct RadosOp {
     pub name: String,
     pub class: Option<String>,
     pub method: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct CaptureTruncation {
+    pub trans_id: bool,
+    pub object_name: bool,
+    pub acting: bool,
+    pub rados_ops: bool,
+    pub cls_name: bool,
+    pub method_name: bool,
+}
+
+impl CaptureTruncation {
+    pub fn from_flags(flags: u32) -> Self {
+        Self {
+            trans_id: flags & RGWTRACE_TRUNC_TRANS_ID != 0,
+            object_name: flags & RGWTRACE_TRUNC_OBJECT_NAME != 0,
+            acting: flags & RGWTRACE_TRUNC_ACTING != 0,
+            rados_ops: flags & RGWTRACE_TRUNC_RADOS_OPS != 0,
+            cls_name: flags & RGWTRACE_TRUNC_CLS_NAME != 0,
+            method_name: flags & RGWTRACE_TRUNC_METHOD_NAME != 0,
+        }
+    }
+
+    pub fn names(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.trans_id {
+            names.push("trans_id");
+        }
+        if self.object_name {
+            names.push("object_name");
+        }
+        if self.acting {
+            names.push("acting");
+        }
+        if self.rados_ops {
+            names.push("rados_ops");
+        }
+        if self.cls_name {
+            names.push("cls_name");
+        }
+        if self.method_name {
+            names.push("method_name");
+        }
+        names
+    }
 }
 
 pub fn nul_terminated_string(bytes: &[u8]) -> String {
@@ -160,6 +217,7 @@ impl From<RawRequestEvent> for RequestEvent {
             pid: raw.pid,
             tid: raw.tid,
             trans_id: nul_terminated_string(&raw.trans_id),
+            truncation: CaptureTruncation::from_flags(raw.flags),
         }
     }
 }
@@ -201,6 +259,7 @@ impl From<RawRadosEvent> for RadosEvent {
             },
             object_name: nul_terminated_string(&raw.object_name),
             trans_id: nul_terminated_string(&raw.trans_id),
+            truncation: CaptureTruncation::from_flags(raw.flags),
             ops,
             offset: raw.offset,
             length: raw.length,
@@ -220,6 +279,7 @@ mod tests {
             pid: 1,
             tid: 2,
             trans_id: String::new(),
+            truncation: CaptureTruncation::default(),
         });
 
         event.add_timestamp_offset(1000);
@@ -247,6 +307,7 @@ mod tests {
             rw: RadosDirection::Read,
             object_name: String::new(),
             trans_id: String::new(),
+            truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
             length: 0,

@@ -113,7 +113,7 @@ fn looks_like_uuid(object: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{RadosDirection, RadosEvent};
+    use crate::events::{CaptureTruncation, RadosDirection, RadosEvent};
 
     fn event(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
@@ -130,6 +130,7 @@ mod tests {
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
             trans_id: trans_id.to_string(),
+            truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
             length: 0,
