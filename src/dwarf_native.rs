@@ -26,6 +26,20 @@ const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
     &["this", "monc", "global_id"],
     &["op", "target", "osd"],
 ];
+const OBJECTER_SEND_OP_FIELDS: &[&[&str]] = &[
+    &["op", "tid"],
+    &["this", "monc", "global_id"],
+    &["op", "target", "osd"],
+    &["op", "target", "base_oid", "name", "_M_string_length"],
+    &["op", "target", "base_oid", "name", "_M_dataplus", "_M_p"],
+    &["op", "target", "flags"],
+    &["op", "target", "actual_pgid", "pgid", "m_pool"],
+    &["op", "target", "actual_pgid", "pgid", "m_seed"],
+    &["op", "target", "acting", "_M_impl", "_M_start"],
+    &["op", "target", "acting", "_M_impl", "_M_finish"],
+    &["op", "ops", "m_holder", "m_start"],
+    &["op", "ops", "m_holder", "m_size"],
+];
 const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
     &["s", "trans_id", "_M_string_length"],
     &["s", "trans_id", "_M_dataplus", "_M_p"],
@@ -183,6 +197,7 @@ fn probe_function_var_fields<R: Reader>(
 
 fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]]> {
     match function {
+        "Objecter::_send_op" => Some(OBJECTER_SEND_OP_FIELDS),
         "Objecter::_finish_op" => Some(OBJECTER_FINISH_OP_FIELDS),
         "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
         _ => None,
@@ -1032,6 +1047,30 @@ mod tests {
     }
 
     #[test]
+    fn extracts_objecter_send_op_var_fields_from_cpp_fixture() {
+        let Some(binary) = compile_objecter_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get("Objecter::_send_op") else {
+            return;
+        };
+
+        assert_eq!(fields.var_fields.len(), 12);
+        assert_eq!(fields.var_fields[0].fields.len(), 2);
+        assert_eq!(fields.var_fields[3].fields.len(), 5);
+        assert_eq!(fields.var_fields[4].fields.len(), 6);
+        assert_eq!(fields.var_fields[10].fields.len(), 4);
+        assert_eq!(fields.var_fields[11].fields.len(), 4);
+        assert!(fields
+            .var_fields
+            .iter()
+            .all(|field| field.location.reg >= 0));
+    }
+
+    #[test]
     fn oracle_comparison_reports_function_pc_mismatch() {
         let mut expected = DwarfInfo {
             version: None,
@@ -1307,31 +1346,90 @@ mod tests {
         compile_cpp_source(
             "objecter-fixture",
             r#"
+            struct DataPtr {
+              char* _M_p;
+            };
+            struct StringLike {
+              DataPtr _M_dataplus;
+              unsigned long _M_string_length;
+            };
+            struct ObjectId {
+              StringLike name;
+            };
+            struct PgidInner {
+              long m_pool;
+              unsigned int m_seed;
+            };
+            struct Pgid {
+              PgidInner pgid;
+            };
+            struct ActingImpl {
+              int* _M_start;
+              int* _M_finish;
+            };
+            struct Acting {
+              ActingImpl _M_impl;
+            };
+            struct OpsHolder {
+              char* m_start;
+              unsigned long m_size;
+            };
+            struct Ops {
+              OpsHolder m_holder;
+            };
             struct Target {
               int osd;
+              ObjectId base_oid;
+              unsigned int flags;
+              Pgid actual_pgid;
+              Acting acting;
             };
             struct Op {
               unsigned long tid;
               Target target;
+              Ops ops;
             };
             struct MonClient {
               unsigned long global_id;
             };
             class Objecter {
             public:
+              __attribute__((noinline)) void _send_op(Op* op);
               __attribute__((noinline)) void _finish_op(Op* op);
               MonClient monc;
               volatile unsigned long sink = 0;
             };
+            void Objecter::_send_op(Op* op) {
+              sink += op->tid;
+              sink += monc.global_id;
+              sink += op->target.osd;
+              sink += op->target.base_oid.name._M_string_length;
+              sink += (unsigned long)op->target.base_oid.name._M_dataplus._M_p;
+              sink += op->target.flags;
+              sink += op->target.actual_pgid.pgid.m_pool;
+              sink += op->target.actual_pgid.pgid.m_seed;
+              sink += (unsigned long)op->target.acting._M_impl._M_start;
+              sink += (unsigned long)op->target.acting._M_impl._M_finish;
+              sink += (unsigned long)op->ops.m_holder.m_start;
+              sink += op->ops.m_holder.m_size;
+            }
             void Objecter::_finish_op(Op* op) {
               sink += op->tid;
               sink += monc.global_id;
               sink += op->target.osd;
             }
             int main() {
-              Op op = {12, {3}};
+              char name = 0;
+              char ops = 0;
+              int acting[2] = {1, 2};
+              Op op = {
+                12,
+                {3, {{{&name}, 4}}, 5, {{6, 7}}, {{&acting[0], &acting[1]}}},
+                {{&ops, 8}}
+              };
               Objecter objecter;
               objecter.monc.global_id = 9;
+              objecter._send_op(&op);
               objecter._finish_op(&op);
               return 0;
             }
