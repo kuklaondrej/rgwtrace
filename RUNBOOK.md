@@ -8,7 +8,7 @@ Operational notes for running `rgwtrace` against live RGW hosts.
 
 - Linux host with eBPF and uprobes enabled.
 - `root` or equivalent BPF/perf privileges. Running with `sudo` is the expected path today.
-- Ceph/RGW binaries matching the imported `cephtrace` DWARF JSON.
+- Ceph/RGW binaries with accessible native debug info, or matching `cephtrace` JSON fallback data.
 - Reachable OTLP/HTTP or OTLP/HTTPS endpoint when using `--output otlp`.
 - Linux `amd64` binary built with `./scripts/build-linux-container.sh` when building from macOS.
 
@@ -20,7 +20,7 @@ Run preflight before live attach:
 
 ```sh
 sudo rgwtrace \
-  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --dwarf-source native \
   --pid "$(pidof radosgw | awk '{print $1}')" \
   --preflight
 ```
@@ -29,13 +29,15 @@ Use explicit paths when discovery is ambiguous:
 
 ```sh
 sudo rgwtrace \
-  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --dwarf-source native \
   --preflight \
   --librados-path /lib/librados.so.2 \
   --librbd-path /lib/librbd.so.1 \
   --libceph-common-path /usr/lib/ceph/libceph-common.so.2 \
   --radosgw-path /usr/bin/radosgw
 ```
+
+Use `--import-json` when native debug info is unavailable or when comparing against the `cephtrace` oracle.
 
 Build ID mismatches are warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched IDs.
 
@@ -47,11 +49,13 @@ Start with JSON output for a short run:
 
 ```sh
 sudo rgwtrace \
-  --import-json 18.2.8-1jammy_dwarf_traceid.json \
+  --dwarf-source native \
   --pid "$(pidof radosgw | awk '{print $1}')" \
   --timeout 30 \
   --output json
 ```
+
+For fallback validation, rerun with `--import-json 18.2.8-1jammy_dwarf_traceid.json`.
 
 Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, and expired spans.
 
@@ -90,9 +94,9 @@ Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobu
 
 - `--pid must be a positive process id`: pass a single live RGW PID.
 - `failed to discover ...`: pass the corresponding explicit path flag.
-- `missing function address`: DWARF JSON does not match the binary/module name.
-- `missing variable fields`: DWARF JSON is incomplete for the probe set.
-- `build ID mismatch`: regenerate DWARF JSON for the exact binaries or rerun without `--strict-build-id` only if the mismatch is understood.
+- `missing function address`: native debug data or imported JSON lacks a required probe PC.
+- `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
+- `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun without `--strict-build-id` only if the mismatch is understood.
 
 ---
 

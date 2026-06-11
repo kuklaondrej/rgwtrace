@@ -6,7 +6,7 @@ Live tracing pipeline for RGW and RADOS.
 
 ## Follow
 
-`rgwtrace` starts by loading Ceph DWARF JSON with function addresses and variable field paths.
+`rgwtrace` starts by loading probe metadata from native DWARF or `cephtrace` JSON.
 
 The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
 
@@ -15,7 +15,7 @@ Before live attach, preflight validation checks CLI input, discovered target fil
 Pipeline:
 
 ```text
-DWARF JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
+native DWARF or cephtrace JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
 
 ---
@@ -147,17 +147,15 @@ It supports optional gzip compression, span-count batching, and encoded-size bat
 
 ## Limit
 
-Native DWARF parsing is partially implemented.
+Native DWARF parsing supports the current RGW/RADOS probe set: `Objecter::_send_op`, `Objecter::_finish_op`, and `RGWREST::get_handler`.
 
-Use matching `cephtrace`-generated DWARF JSON for the Ceph binaries being traced.
+It discovers debug data from embedded DWARF, `.gnu_debuglink`, and build-id paths, then extracts module build IDs, probe PCs, variable locations, and member field paths into the existing probe field model.
 
-The native parser can extract module build IDs and probe function PCs from local debug data. It does not yet extract variable-location expressions or member-offset paths into `VarFieldKernel`, so it is not sufficient for live tracing.
-
-The remaining parser work is safe implementation of ELF/DWARF debug-info discovery, build-id and `.gnu_debuglink` lookup, variable-location expression decoding, and member-offset path extraction into `VarFieldKernel`.
+`cephtrace` JSON import remains supported as a stable fallback and oracle for native extraction.
 
 Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
 
-Field offsets can be wrong if the DWARF JSON and runtime binaries do not match.
+Field offsets can be wrong if native debug data or imported JSON does not match the runtime binaries.
 
 Request correlation is intentionally conservative.
 
