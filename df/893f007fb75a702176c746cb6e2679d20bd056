@@ -1,0 +1,19 @@
+src/live/linux.rs
+  s_698c79eedd62ed::t_df127550fa0e9a 368-369
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "df893f007fb75a702176c746cb6e2679d20bd056",
+  "prompts": {},
+  "sessions": {
+    "s_698c79eedd62ed": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_14f87ae60ffem4tnELTRW4nUFA",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
