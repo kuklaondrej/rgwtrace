@@ -365,6 +365,6 @@ fn is_squid_or_newer(version: &str) -> bool {
 }
 
 const _: () = {
-    assert!(EVENT_DATA_OFFSET % align_of::<RawRequestEvent>() == 0);
-    assert!(EVENT_DATA_OFFSET % align_of::<RawRadosEvent>() == 0);
+    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
+    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
 };
