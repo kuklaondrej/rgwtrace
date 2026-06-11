@@ -15,7 +15,7 @@ const FINISH_OP: &str = "Objecter::_finish_op";
 const GET_HANDLER: &str = "RGWREST::get_handler";
 
 const SEND_OP_FIELDS: usize = 12;
-const FINISH_OP_FIELDS: usize = 2;
+const FINISH_OP_FIELDS: usize = 3;
 const GET_HANDLER_FIELDS: usize = 2;
 
 #[derive(Debug, Serialize)]
@@ -281,7 +281,43 @@ mod tests {
         assert!(validate_dwarf_targets(&dwarf, &targets).is_err());
     }
 
+    #[test]
+    fn rejects_incomplete_finish_op_fields() {
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_field_counts(
+            "libceph-common.so.2",
+            "radosgw",
+            SEND_OP_FIELDS,
+            FINISH_OP_FIELDS - 1,
+            GET_HANDLER_FIELDS,
+        ))
+        .unwrap();
+        let targets = ProbeTargets {
+            librados: "/tmp/librados.so.2".into(),
+            librbd: "/tmp/librbd.so.1".into(),
+            libceph_common: "/tmp/libceph-common.so.2".into(),
+            radosgw: "/tmp/radosgw".into(),
+        };
+
+        assert!(validate_dwarf_targets(&dwarf, &targets).is_err());
+    }
+
     fn dwarf_json(rados_module: &str, rgw_module: &str) -> String {
+        dwarf_json_with_field_counts(
+            rados_module,
+            rgw_module,
+            SEND_OP_FIELDS,
+            FINISH_OP_FIELDS,
+            GET_HANDLER_FIELDS,
+        )
+    }
+
+    fn dwarf_json_with_field_counts(
+        rados_module: &str,
+        rgw_module: &str,
+        send_field_count: usize,
+        finish_field_count: usize,
+        handler_field_count: usize,
+    ) -> String {
         format!(
             r#"{{
               "version": "18.2.8-1jammy",
@@ -298,9 +334,9 @@ mod tests {
                 "func2vf": {{"{GET_HANDLER}": {{"var_fields": {handler_fields}}}}}
               }}
             }}"#,
-            send_fields = var_fields(SEND_OP_FIELDS),
-            finish_fields = var_fields(FINISH_OP_FIELDS),
-            handler_fields = var_fields(GET_HANDLER_FIELDS),
+            send_fields = var_fields(send_field_count),
+            finish_fields = var_fields(finish_field_count),
+            handler_fields = var_fields(handler_field_count),
         )
     }
 
