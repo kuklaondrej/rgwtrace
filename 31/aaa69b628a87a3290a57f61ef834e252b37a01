@@ -1,0 +1,20 @@
+src/live/linux.rs
+  s_d55bcf179af080::t_c5511b19f9ff5d 371-418,423-470,473-482
+  s_d55bcf179af080::t_fff48446266307 419-422,471-472
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "31aaa69b628a87a3290a57f61ef834e252b37a01",
+  "prompts": {},
+  "sessions": {
+    "s_d55bcf179af080": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1441df2ddffexdUtEOPhEYRmHN",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
