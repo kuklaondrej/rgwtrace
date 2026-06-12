@@ -1,0 +1,45 @@
+{
+  "version": "19.2.3-test",
+  "arch": "amd64",
+  "libceph-common.so.2": {
+    "build_id": "111111",
+    "func2pc": {
+      "Objecter::_send_op": 4096,
+      "Objecter::_finish_op": 8192
+    },
+    "func2vf": {
+      "Objecter::_send_op": {
+        "var_fields": [
+          {
+            "location": {"reg": 4, "offset": 0, "stack": false},
+            "fields": [{"offset": 16, "pointer": true}]
+          }
+        ]
+      },
+      "Objecter::_finish_op": {
+        "var_fields": [
+          {
+            "location": {"reg": 5, "offset": 8, "stack": true},
+            "fields": [{"offset": 24, "pointer": false}]
+          }
+        ]
+      }
+    }
+  },
+  "radosgw": {
+    "build_id": "222222",
+    "func2pc": {
+      "RGWREST::get_handler": 12288
+    },
+    "func2vf": {
+      "RGWREST::get_handler": {
+        "var_fields": [
+          {
+            "location": {"reg": 6, "offset": 0, "stack": false},
+            "fields": [{"offset": 32, "pointer": true}]
+          }
+        ]
+      }
+    }
+  }
+}
