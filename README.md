@@ -148,6 +148,20 @@ Live tracing requires Linux with eBPF support, clang, libelf development headers
 
 ---
 
+## Test
+
+Run the fast no-cluster verification loop before live testing:
+
+```sh
+./scripts/verify.sh
+```
+
+The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, and BPF source regressions. Linux CI also covers ring-buffer event decoding without attaching probes.
+
+Use live RGW/Ceph testing only after the fast suite passes or when validating probe attachment against a real runtime.
+
+---
+
 ## Trace
 
 Correlated request output:
