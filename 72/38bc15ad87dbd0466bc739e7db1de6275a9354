@@ -1,0 +1,21 @@
+tests/fixtures/minimal_dwarf.json
+  s_d55bcf179af080::t_7e2072aecbfb83 1-45
+tests/cli_dry_run.rs
+  s_d55bcf179af080::t_7e2072aecbfb83 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "7238bc15ad87dbd0466bc739e7db1de6275a9354",
+  "prompts": {},
+  "sessions": {
+    "s_d55bcf179af080": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1441df2ddffexdUtEOPhEYRmHN",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
