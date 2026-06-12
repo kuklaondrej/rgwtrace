@@ -1,0 +1,247 @@
+{
+  "service_name": "rgwtrace",
+  "spans": [
+    {
+      "trace_id": "3a6b98975565b5a9360f6ee0ddd28822",
+      "span_id": "012f40144208e21e",
+      "parent_span_id": null,
+      "name": "rgw.request",
+      "start_ns": 100,
+      "end_ns": 250,
+      "attributes": [
+        {
+          "key": "rgw.trans_id",
+          "value": "tx-golden"
+        },
+        {
+          "key": "rgw.request_class",
+          "value": "s3_request"
+        },
+        {
+          "key": "rgw.duration_quality",
+          "value": "request_lifecycle"
+        }
+      ],
+      "events": []
+    },
+    {
+      "trace_id": "3a6b98975565b5a9360f6ee0ddd28822",
+      "span_id": "31739bab25da023c",
+      "parent_span_id": "012f40144208e21e",
+      "name": "rados.op",
+      "start_ns": 120,
+      "end_ns": 190,
+      "attributes": [
+        {
+          "key": "ceph.rados.duration_ns",
+          "value": 70
+        },
+        {
+          "key": "ceph.rados.pool",
+          "value": 16
+        },
+        {
+          "key": "ceph.rados.pg",
+          "value": "16.2a"
+        },
+        {
+          "key": "ceph.rados.pg_seed",
+          "value": 42
+        },
+        {
+          "key": "ceph.rados.target_osd",
+          "value": 7
+        },
+        {
+          "key": "ceph.rados.acting",
+          "value": "[1,2,3]"
+        },
+        {
+          "key": "ceph.rados.object",
+          "value": "bucket-object"
+        },
+        {
+          "key": "ceph.rados.ops",
+          "value": "writefull call(cls.method)"
+        },
+        {
+          "key": "ceph.rados.rw",
+          "value": "write"
+        },
+        {
+          "key": "ceph.rados.offset",
+          "value": 128
+        },
+        {
+          "key": "ceph.rados.length",
+          "value": 4096
+        },
+        {
+          "key": "rgw.rados_role",
+          "value": "data"
+        },
+        {
+          "key": "rgw.correlation",
+          "value": "same_thread"
+        }
+      ],
+      "events": []
+    },
+    {
+      "trace_id": "11a9a406c78d2410d694c3d4914f2037",
+      "span_id": "11a9a406c78d2410",
+      "parent_span_id": null,
+      "name": "rgw.background.rados_op",
+      "start_ns": 300,
+      "end_ns": 320,
+      "attributes": [
+        {
+          "key": "ceph.rados.duration_ns",
+          "value": 20
+        },
+        {
+          "key": "ceph.rados.pool",
+          "value": 16
+        },
+        {
+          "key": "ceph.rados.pg",
+          "value": "16.1"
+        },
+        {
+          "key": "ceph.rados.pg_seed",
+          "value": 1
+        },
+        {
+          "key": "ceph.rados.target_osd",
+          "value": 7
+        },
+        {
+          "key": "ceph.rados.acting",
+          "value": "[1,2,3]"
+        },
+        {
+          "key": "ceph.rados.object",
+          "value": "notify.0"
+        },
+        {
+          "key": "ceph.rados.ops",
+          "value": "read"
+        },
+        {
+          "key": "ceph.rados.rw",
+          "value": "read"
+        },
+        {
+          "key": "ceph.rados.offset",
+          "value": 0
+        },
+        {
+          "key": "ceph.rados.length",
+          "value": 0
+        },
+        {
+          "key": "rgw.rados_role",
+          "value": "notify"
+        },
+        {
+          "key": "rgw.correlation",
+          "value": "none"
+        },
+        {
+          "key": "rgw.correlation_reason",
+          "value": "classified_background_role"
+        }
+      ],
+      "events": [
+        {
+          "name": "rados.op",
+          "time_ns": 320,
+          "attributes": [
+            {
+              "key": "ceph.rados.duration_ns",
+              "value": 20
+            },
+            {
+              "key": "ceph.rados.pool",
+              "value": 16
+            },
+            {
+              "key": "ceph.rados.pg",
+              "value": "16.1"
+            },
+            {
+              "key": "ceph.rados.pg_seed",
+              "value": 1
+            },
+            {
+              "key": "ceph.rados.target_osd",
+              "value": 7
+            },
+            {
+              "key": "ceph.rados.acting",
+              "value": "[1,2,3]"
+            },
+            {
+              "key": "ceph.rados.object",
+              "value": "notify.0"
+            },
+            {
+              "key": "ceph.rados.ops",
+              "value": "read"
+            },
+            {
+              "key": "ceph.rados.rw",
+              "value": "read"
+            },
+            {
+              "key": "ceph.rados.offset",
+              "value": 0
+            },
+            {
+              "key": "ceph.rados.length",
+              "value": 0
+            },
+            {
+              "key": "rgw.rados_role",
+              "value": "notify"
+            },
+            {
+              "key": "rgw.correlation",
+              "value": "none"
+            },
+            {
+              "key": "rgw.correlation_reason",
+              "value": "classified_background_role"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "diagnostics": {
+    "events_decoded": 4,
+    "decode_errors": 0,
+    "request_markers": 2,
+    "rados_ops": 2,
+    "correlated_rados_ops": 1,
+    "background_rados_ops": 1,
+    "same_thread_correlations": 1,
+    "inferred_correlations": 0,
+    "missing_trans_id_background_ops": 1,
+    "background_rados_by_role": {
+      "notify": 1
+    },
+    "background_rados_by_reason": {
+      "classified_background_role": 1
+    },
+    "spans_produced": 3,
+    "expired_request_groups": 0,
+    "expired_background_rados_ops": 0,
+    "truncated_trans_ids": 0,
+    "truncated_object_names": 0,
+    "truncated_acting_sets": 0,
+    "truncated_rados_ops": 0,
+    "truncated_cls_names": 0,
+    "truncated_method_names": 0
+  }
+}

@@ -591,7 +591,7 @@ fn fnv1a64_with_seed(bytes: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RequestEvent};
+    use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RadosOp, RequestEvent};
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
@@ -825,6 +825,58 @@ mod tests {
         assert_eq!(
             string_attribute(&document.spans[1], "rgwtrace.truncated"),
             Some("object_name,rados_ops")
+        );
+    }
+
+    #[test]
+    fn collector_trace_matches_golden_fixture() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestStart(request("", 100, 0)));
+
+        let mut child = rados("bucket-object", "tx-golden");
+        child.sent_ns = 120;
+        child.finish_ns = 190;
+        child.duration_ns = 70;
+        child.pg_seed = 0x2a;
+        child.rw = RadosDirection::Write;
+        child.offset = 128;
+        child.length = 4096;
+        child.ops = vec![
+            RadosOp {
+                code: 0x2202,
+                name: "writefull".to_string(),
+                class: None,
+                method: None,
+            },
+            RadosOp {
+                code: 0x1401,
+                name: "call".to_string(),
+                class: Some("cls".to_string()),
+                method: Some("method".to_string()),
+            },
+        ];
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(TraceEvent::RequestEnd(request("tx-golden", 150, 250)));
+
+        let mut background = rados("notify.0", "");
+        background.sent_ns = 300;
+        background.finish_ns = 320;
+        background.duration_ns = 20;
+        background.ops = vec![RadosOp {
+            code: 0x1201,
+            name: "read".to_string(),
+            class: None,
+            method: None,
+        }];
+        collector.push(TraceEvent::RadosOp(background));
+
+        let actual = serde_json::to_string_pretty(&collector.into_trace_document("rgwtrace"))
+            .expect("trace document should serialize");
+        let expected = include_str!("../tests/fixtures/collector_trace_golden.json").trim();
+
+        assert_eq!(
+            actual, expected,
+            "collector trace golden changed:\n{actual}"
         );
     }
 
