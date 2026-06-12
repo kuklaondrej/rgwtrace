@@ -1,0 +1,21 @@
+src/collector.rs
+  s_d55bcf179af080::t_c74f42c5674d0d 594,831-879
+tests/fixtures/collector_trace_golden.json
+  s_d55bcf179af080::t_65ba1a9652e8b0 1-247
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "876bcb8fe6b1320395ecbd43679aeff074e99411",
+  "prompts": {},
+  "sessions": {
+    "s_d55bcf179af080": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1441df2ddffexdUtEOPhEYRmHN",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
