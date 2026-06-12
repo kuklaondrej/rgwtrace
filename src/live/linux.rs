@@ -368,3 +368,115 @@ const _: () = {
     assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
     assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{RawClsOp, MAX_ACTING, MAX_RADOS_OPS};
+
+    #[test]
+    fn decodes_request_start_event() {
+        let raw = RawRequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 42,
+            tid: 7,
+            flags: 0,
+            trans_id: bytes("tx0001"),
+        };
+
+        let event = decode_event(&event_data(RGWTRACE_EVENT_REQUEST_START, &raw)).unwrap();
+
+        let TraceEvent::RequestStart(request) = event else {
+            panic!("expected request start event");
+        };
+        assert_eq!(request.start_ns, 10);
+        assert_eq!(request.pid, 42);
+        assert_eq!(request.trans_id, "tx0001");
+    }
+
+    #[test]
+    fn decodes_rados_event() {
+        let mut acting = [-1; MAX_ACTING];
+        acting[0] = 1;
+        acting[1] = 2;
+        let raw = RawRadosEvent {
+            cid: 9,
+            tid: 10,
+            sent_ns: 100,
+            finish_ns: 150,
+            pool: 16,
+            offset: 64,
+            length: 4096,
+            pid: 42,
+            target_osd: 7,
+            pg_seed: 0x2a,
+            rw: 0,
+            ops_size: 1,
+            flags: 0,
+            acting,
+            ops: [0x1201, 0, 0],
+            cls_ops: [RawClsOp {
+                cls_name: [0; 8],
+                method_name: [0; 32],
+            }; MAX_RADOS_OPS],
+            trans_id: bytes("tx0002"),
+            object_name: bytes("bucket-object"),
+        };
+
+        let event = decode_event(&event_data(RGWTRACE_EVENT_RADOS_OP, &raw)).unwrap();
+
+        let TraceEvent::RadosOp(rados) = event else {
+            panic!("expected rados event");
+        };
+        assert_eq!(rados.sent_ns, 100);
+        assert_eq!(rados.duration_ns, 50);
+        assert_eq!(rados.acting, vec![1, 2]);
+        assert_eq!(rados.ops[0].name, "read");
+        assert_eq!(rados.object_name, "bucket-object");
+        assert_eq!(rados.trans_id, "tx0002");
+    }
+
+    #[test]
+    fn rejects_short_event_header() {
+        let err = decode_event(&[0, 1, 2, 3]).unwrap_err();
+
+        assert!(err.to_string().contains("event too short"));
+    }
+
+    #[test]
+    fn rejects_unknown_event_type() {
+        let mut data = 99_u32.to_ne_bytes().to_vec();
+        data.extend_from_slice(&0_u32.to_ne_bytes());
+
+        let err = decode_event(&data).unwrap_err();
+
+        assert!(err.to_string().contains("unknown event type 99"));
+    }
+
+    #[test]
+    fn rejects_short_payload() {
+        let mut data = RGWTRACE_EVENT_REQUEST_END.to_ne_bytes().to_vec();
+        data.extend_from_slice(&0_u32.to_ne_bytes());
+        data.extend_from_slice(&[1, 2, 3]);
+
+        let err = decode_event(&data).unwrap_err();
+
+        assert!(err.to_string().contains("payload too short"));
+    }
+
+    fn event_data<T: Copy>(event_type: u32, payload: &T) -> Vec<u8> {
+        let mut data = event_type.to_ne_bytes().to_vec();
+        data.extend_from_slice(&0_u32.to_ne_bytes());
+        let payload =
+            unsafe { std::slice::from_raw_parts(payload as *const T as *const u8, size_of::<T>()) };
+        data.extend_from_slice(payload);
+        data
+    }
+
+    fn bytes<const N: usize>(value: &str) -> [u8; N] {
+        let mut bytes = [0; N];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        bytes
+    }
+}
