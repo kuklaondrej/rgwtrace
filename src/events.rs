@@ -322,4 +322,98 @@ mod tests {
         assert_eq!(rados.finish_ns, 1125);
         assert_eq!(rados.duration_ns, 25);
     }
+
+    #[test]
+    fn converts_raw_request_event() {
+        let request = RequestEvent::from(RawRequestEvent {
+            start_ns: 10,
+            end_ns: 20,
+            pid: 42,
+            tid: 7,
+            flags: RGWTRACE_TRUNC_TRANS_ID,
+            trans_id: bytes("tx0001"),
+        });
+
+        assert_eq!(request.start_ns, 10);
+        assert_eq!(request.end_ns, 20);
+        assert_eq!(request.pid, 42);
+        assert_eq!(request.tid, 7);
+        assert_eq!(request.trans_id, "tx0001");
+        assert!(request.truncation.trans_id);
+        assert!(!request.truncation.object_name);
+    }
+
+    #[test]
+    fn converts_raw_rados_event() {
+        let mut acting = [-1; MAX_ACTING];
+        acting[0] = 1;
+        acting[1] = 2;
+
+        let empty_cls_op = RawClsOp {
+            cls_name: [0; 8],
+            method_name: [0; 32],
+        };
+        let raw = RawRadosEvent {
+            cid: 9,
+            tid: 10,
+            sent_ns: 200,
+            finish_ns: 150,
+            pool: 16,
+            offset: 64,
+            length: 4096,
+            pid: 42,
+            target_osd: 7,
+            pg_seed: 0x2a,
+            rw: 0x0020,
+            ops_size: 99,
+            flags: RGWTRACE_TRUNC_OBJECT_NAME
+                | RGWTRACE_TRUNC_RADOS_OPS
+                | RGWTRACE_TRUNC_CLS_NAME
+                | RGWTRACE_TRUNC_METHOD_NAME,
+            acting,
+            ops: [0x2202, 0x1401, 0xffff],
+            cls_ops: [
+                empty_cls_op,
+                RawClsOp {
+                    cls_name: bytes("cls"),
+                    method_name: bytes("method"),
+                },
+                empty_cls_op,
+            ],
+            trans_id: bytes("tx0002"),
+            object_name: bytes("bucket-object"),
+        };
+
+        let event = RadosEvent::from(raw);
+
+        assert_eq!(event.pid, 42);
+        assert_eq!(event.cid, 9);
+        assert_eq!(event.tid, 10);
+        assert_eq!(event.duration_ns, 0);
+        assert_eq!(event.pool, 16);
+        assert_eq!(event.target_osd, 7);
+        assert_eq!(event.pg_seed, 0x2a);
+        assert_eq!(event.acting, vec![1, 2]);
+        assert_eq!(event.rw, RadosDirection::Write);
+        assert_eq!(event.object_name, "bucket-object");
+        assert_eq!(event.trans_id, "tx0002");
+        assert_eq!(event.offset, 64);
+        assert_eq!(event.length, 4096);
+        assert_eq!(event.ops.len(), MAX_RADOS_OPS);
+        assert_eq!(event.ops[0].name, "writefull");
+        assert_eq!(event.ops[1].name, "call");
+        assert_eq!(event.ops[1].class.as_deref(), Some("cls"));
+        assert_eq!(event.ops[1].method.as_deref(), Some("method"));
+        assert_eq!(event.ops[2].name, "unknown(0xffff)");
+        assert!(event.truncation.object_name);
+        assert!(event.truncation.rados_ops);
+        assert!(event.truncation.cls_name);
+        assert!(event.truncation.method_name);
+    }
+
+    fn bytes<const N: usize>(value: &str) -> [u8; N] {
+        let mut bytes = [0; N];
+        bytes[..value.len()].copy_from_slice(value.as_bytes());
+        bytes
+    }
 }
