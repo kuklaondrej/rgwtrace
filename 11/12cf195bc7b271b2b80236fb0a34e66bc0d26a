@@ -1,0 +1,30 @@
+tests/e2e/verify-rgwtrace-json.py
+  s_80a90a86d668f6::t_fbbf6a48c39478 1-164
+tests/e2e/s3-workload.py
+  s_80a90a86d668f6::t_7efebf2d513aa6 1-153
+src/classify.rs
+  s_80a90a86d668f6::t_fe00d4f50d088f 157-161,166-167,172-176,185,190-206
+  s_80a90a86d668f6::t_eef4648327a83a 162-165,168-171,177-184,186-189
+tests/e2e/functional-test-microceph-rgw.sh
+  s_80a90a86d668f6::t_b17a21e9615490 31,190-192,197,203,210
+  s_80a90a86d668f6::t_372c9a47f061e0 193
+  s_80a90a86d668f6::t_75ed147a075b11 1-30,32-189,194-196,198-202,204-209,211-355
+.github/workflows/e2e.yml
+  s_80a90a86d668f6::t_fa2790864cbfbe 1-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1112cf195bc7b271b2b80236fb0a34e66bc0d26a",
+  "prompts": {},
+  "sessions": {
+    "s_80a90a86d668f6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_13f5d9f51ffeSEnxvxAQrKvyPj",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
