@@ -10,7 +10,9 @@ TRACE_ATTACH_DELAY="${TRACE_ATTACH_DELAY:-6}"
 MICROCEPH_OSDS="${MICROCEPH_OSDS:-3}"
 MICROCEPH_OSD_SIZE="${MICROCEPH_OSD_SIZE:-3G}"
 MICROCEPH_HEALTH_TIMEOUT="${MICROCEPH_HEALTH_TIMEOUT:-180}"
-MICROCEPH_CHANNEL="${MICROCEPH_CHANNEL:-}"
+MICROCEPH_CHANNEL="${MICROCEPH_CHANNEL:-reef/stable}"
+MICROCEPH_EXPECTED_CEPH_VERSION="${MICROCEPH_EXPECTED_CEPH_VERSION:-18.2.8-1jammy}"
+MICROCEPH_ALLOW_CHANNEL_SWITCH="${MICROCEPH_ALLOW_CHANNEL_SWITCH:-0}"
 RGW_PORT="${RGW_PORT:-8080}"
 RGW_ENDPOINT="${RGW_ENDPOINT:-}"
 RGW_USER="${RGW_USER:-rgwtrace-e2e}"
@@ -29,6 +31,11 @@ WORKLOAD_LOG="${ARTIFACT_DIR}/workload.log"
 VERIFY_LOG="${ARTIFACT_DIR}/verify.log"
 RGW_USER_JSON="${ARTIFACT_DIR}/rgw-user.json"
 RGW_ENABLE_LOG="${ARTIFACT_DIR}/microceph-rgw-enable.log"
+MICROCEPH_VERSION_FILE="${ARTIFACT_DIR}/microceph-version.txt"
+MICROCEPH_METADATA_FILE="${ARTIFACT_DIR}/microceph-metadata.yaml"
+MICROCEPH_MANIFEST_FILE="${ARTIFACT_DIR}/microceph-manifest.yaml"
+MICROCEPH_MANIFEST_CEPH_FILE="${ARTIFACT_DIR}/microceph-manifest-ceph.txt"
+MICROCEPH_SNAP_LIST_FILE="${ARTIFACT_DIR}/microceph-snap-list.txt"
 
 TRACE_PID=""
 RGW_ADMIN=""
@@ -86,22 +93,122 @@ PY
     fi
 }
 
+capture_microceph_version_artifacts() {
+    local metadata=/snap/microceph/current/share/metadata.yaml
+    local manifest=/snap/microceph/current/snap/manifest.yaml
+    local resolved_version=""
+
+    snap list microceph >"${MICROCEPH_SNAP_LIST_FILE}" 2>&1 || true
+    if [[ -r "${metadata}" ]]; then
+        cp "${metadata}" "${MICROCEPH_METADATA_FILE}"
+    fi
+    if [[ -r "${manifest}" ]]; then
+        cp "${manifest}" "${MICROCEPH_MANIFEST_FILE}"
+        python3 - <<'PY' >"${MICROCEPH_MANIFEST_CEPH_FILE}" || true
+from pathlib import Path
+
+manifest = Path("/snap/microceph/current/snap/manifest.yaml")
+needles = ("ceph", "rados", "rgw", "librbd", "librados")
+if manifest.exists():
+    for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+        lowered = line.lower()
+        if any(needle in lowered for needle in needles):
+            print(line)
+PY
+    fi
+
+    resolved_version=$(resolve_microceph_ceph_version || true)
+    {
+        printf 'microceph_channel=%s\n' "${MICROCEPH_CHANNEL}"
+        printf 'microceph_expected_ceph_version=%s\n' "${MICROCEPH_EXPECTED_CEPH_VERSION}"
+        printf 'microceph_resolved_ceph_version=%s\n' "${resolved_version}"
+    } >"${MICROCEPH_VERSION_FILE}"
+}
+
+resolve_microceph_ceph_version() {
+    python3 - <<'PY'
+from pathlib import Path
+import re
+import sys
+
+manifest = Path("/snap/microceph/current/snap/manifest.yaml")
+metadata = Path("/snap/microceph/current/share/metadata.yaml")
+packages = ("radosgw", "librados2", "ceph-common", "ceph-osd")
+
+if manifest.exists():
+    text = manifest.read_text(encoding="utf-8", errors="replace")
+    for package in packages:
+        patterns = (
+            rf"(?m)^\s*{re.escape(package)}\s*[:=]\s*([^\s,]+)",
+            rf"(?m)\b{re.escape(package)}=([^\s,]+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                print(match.group(1).strip().strip('"\''))
+                sys.exit(0)
+
+if metadata.exists():
+    for line in metadata.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = re.match(r"^\s*ceph-version\s*:\s*(\S+)", line)
+        if match:
+            print(match.group(1).strip().strip('"\''))
+            sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+assert_microceph_ceph_version() {
+    capture_microceph_version_artifacts
+
+    local resolved_version
+    resolved_version=$(resolve_microceph_ceph_version || true)
+    if [[ -z "${resolved_version}" ]]; then
+        err "failed to resolve MicroCeph Ceph package version; see ${MICROCEPH_METADATA_FILE} and ${MICROCEPH_MANIFEST_FILE}"
+        return 1
+    fi
+
+    info "MicroCeph Ceph package version: ${resolved_version}"
+    if [[ -n "${MICROCEPH_EXPECTED_CEPH_VERSION}" && "${resolved_version}" != "${MICROCEPH_EXPECTED_CEPH_VERSION}" ]]; then
+        err "MicroCeph Ceph package version ${resolved_version} does not match expected ${MICROCEPH_EXPECTED_CEPH_VERSION}"
+        err "set MICROCEPH_EXPECTED_CEPH_VERSION=${resolved_version} to accept this version, or provide a matching MicroCeph channel/revision"
+        return 1
+    fi
+}
+
+ensure_microceph_version() {
+    if assert_microceph_ceph_version; then
+        return 0
+    fi
+
+    if [[ "${MICROCEPH_ALLOW_CHANNEL_SWITCH}" != "1" ]]; then
+        err "refusing to switch an installed MicroCeph snap automatically; set MICROCEPH_ALLOW_CHANNEL_SWITCH=1 to run 'snap refresh microceph --channel ${MICROCEPH_CHANNEL}'"
+        return 1
+    fi
+
+    info "switching MicroCeph snap to channel ${MICROCEPH_CHANNEL}"
+    snap refresh --unhold microceph >/dev/null 2>&1 || true
+    snap refresh microceph --channel "${MICROCEPH_CHANNEL}"
+    snap refresh --hold microceph || true
+    assert_microceph_ceph_version
+}
+
 microceph_setup_single_node() {
     local osd_count="$1"
     local osd_size="$2"
     local health_timeout="$3"
 
     if ! snap list microceph >/dev/null 2>&1; then
-        local install_args=(install microceph)
-        if [[ -n "${MICROCEPH_CHANNEL}" ]]; then
-            install_args+=(--channel "${MICROCEPH_CHANNEL}")
-        fi
-        info "installing MicroCeph snap"
+        local install_args=(install microceph --channel "${MICROCEPH_CHANNEL}")
+        info "installing MicroCeph snap from ${MICROCEPH_CHANNEL}"
         snap "${install_args[@]}"
         snap refresh --hold microceph || true
     else
         info "MicroCeph snap already installed"
     fi
+
+    ensure_microceph_version
 
     if ! microceph cluster list 2>/dev/null | grep -q "$(hostname)"; then
         info "bootstrapping MicroCeph cluster"

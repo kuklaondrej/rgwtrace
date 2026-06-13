@@ -19,7 +19,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release
       - name: Run MicroCeph RGW e2e
-        run: sudo tests/e2e/functional-test-microceph-rgw.sh
+        run: sudo MICROCEPH_CHANNEL=reef/stable MICROCEPH_EXPECTED_CEPH_VERSION=18.2.8-1jammy tests/e2e/functional-test-microceph-rgw.sh
       - name: Stage e2e artifacts
         if: always()
         run: |

@@ -169,6 +169,18 @@ sudo tests/e2e/functional-test-microceph-rgw.sh
 
 The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
 
+By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.8-1jammy`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `/tmp/rgwtrace-e2e` so the traced version is explicit.
+
+Override the pin when needed:
+
+```sh
+sudo MICROCEPH_CHANNEL=reef/stable \
+  MICROCEPH_EXPECTED_CEPH_VERSION=18.2.8-1jammy \
+  tests/e2e/functional-test-microceph-rgw.sh
+```
+
+If MicroCeph is already installed at a different version, the test fails rather than switching it automatically. Set `MICROCEPH_ALLOW_CHANNEL_SWITCH=1` only on disposable test hosts.
+
 If native DWARF is unavailable for the MicroCeph snap, pass matching probe metadata explicitly:
 
 ```sh
