@@ -160,6 +160,21 @@ The default tests cover imported DWARF dry-run CLI output, synthetic collector t
 
 Use live RGW/Ceph testing only after the fast suite passes or when validating probe attachment against a real runtime.
 
+Run the privileged MicroCeph RGW e2e test on Linux when validating live request capture:
+
+```sh
+cargo build --release
+sudo tests/e2e/functional-test-microceph-rgw.sh
+```
+
+The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
+
+If native DWARF is unavailable for the MicroCeph snap, pass matching probe metadata explicitly:
+
+```sh
+sudo RGWTRACE_DWARF_JSON=/path/to/rgwtrace_dwarf.json tests/e2e/functional-test-microceph-rgw.sh
+```
+
 ---
 
 ## Trace

@@ -154,4 +154,54 @@ mod tests {
             RadosRole::Sync
         );
     }
+
+    #[test]
+    fn classifies_all_rados_roles() {
+        assert_eq!(classify_rados(&event("object", "tx1")), RadosRole::Data);
+        assert_eq!(
+            classify_rados(&event(".dir.bucket.1", "tx1")),
+            RadosRole::BucketIndex
+        );
+        assert_eq!(
+            classify_rados(&event(".bucket.meta.bucket:marker", "tx1")),
+            RadosRole::BucketMeta
+        );
+        assert_eq!(
+            classify_rados(&event("user.buckets", "tx1")),
+            RadosRole::UserMeta
+        );
+        assert_eq!(
+            classify_rados(&event("123e4567-e89b-12d3-a456-426614174000", "tx1")),
+            RadosRole::UserMeta
+        );
+        assert_eq!(
+            classify_rados(&event("ABCDEFGHIJKLMNOPQRST", "tx1")),
+            RadosRole::AuthMeta
+        );
+        assert_eq!(
+            classify_rados(&event("obj_delete_at_hint.1", "")),
+            RadosRole::Gc
+        );
+        assert_eq!(classify_rados(&event("data_log.1", "")), RadosRole::Sync);
+        assert_eq!(
+            classify_rados(&event("default.realm", "")),
+            RadosRole::Config
+        );
+        assert_eq!(classify_rados(&event("unknown", "")), RadosRole::Unknown);
+    }
+
+    #[test]
+    fn classifies_request_contexts() {
+        assert_eq!(classify_request("tx1", None), RequestClass::S3Request);
+        assert_eq!(
+            classify_request("", Some("default.realm")),
+            RequestClass::RgwStartup
+        );
+        assert_eq!(
+            classify_request("", Some("notify.0")),
+            RequestClass::RgwBackground
+        );
+        assert_eq!(classify_request("", Some("unknown")), RequestClass::Unknown);
+        assert_eq!(classify_request("", None), RequestClass::Unknown);
+    }
 }

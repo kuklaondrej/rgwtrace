@@ -1,0 +1,36 @@
+name: E2E
+
+on:
+  workflow_dispatch:
+
+jobs:
+  microceph-rgw:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang curl libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
+      - name: Build release binary
+        run: cargo build --release
+      - name: Run MicroCeph RGW e2e
+        run: sudo tests/e2e/functional-test-microceph-rgw.sh
+      - name: Stage e2e artifacts
+        if: always()
+        run: |
+          mkdir -p e2e-artifacts
+          sudo cp -a /tmp/rgwtrace-e2e/. e2e-artifacts/ 2>/dev/null || true
+          sudo chown -R "$USER" e2e-artifacts
+      - name: Upload e2e artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microceph-rgw-e2e-artifacts
+          path: e2e-artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
