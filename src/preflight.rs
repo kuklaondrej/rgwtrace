@@ -88,7 +88,9 @@ fn validate_explicit_path(flag: &str, path: Option<&Path>) -> Result<()> {
 
 fn validate_target_paths(targets: &ProbeTargets) -> Result<()> {
     validate_file_path("librados target", &targets.librados)?;
-    validate_file_path("librbd target", &targets.librbd)?;
+    if let Some(librbd) = &targets.librbd {
+        validate_file_path("librbd target", librbd)?;
+    }
     validate_file_path("libceph-common target", &targets.libceph_common)?;
     validate_file_path("radosgw target", &targets.radosgw)?;
     Ok(())
@@ -191,15 +193,11 @@ fn validate_build_ids(dwarf: &DwarfInfo, targets: &ProbeTargets, strict: bool) -
 }
 
 fn build_id_checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<Vec<BuildIdCheck>> {
-    [
-        targets.librados.as_path(),
-        targets.librbd.as_path(),
-        targets.libceph_common.as_path(),
-        targets.radosgw.as_path(),
-    ]
-    .into_iter()
-    .map(|path| build_id_check(dwarf, path))
-    .collect()
+    targets
+        .all_paths()
+        .into_iter()
+        .map(|path| build_id_check(dwarf, path))
+        .collect()
 }
 
 fn build_id_check(dwarf: &DwarfInfo, path: &Path) -> Result<BuildIdCheck> {
@@ -260,7 +258,7 @@ mod tests {
         let dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "radosgw")).unwrap();
         let targets = ProbeTargets {
             librados: "/tmp/librados.so.2".into(),
-            librbd: "/tmp/librbd.so.1".into(),
+            librbd: None,
             libceph_common: "/tmp/libceph-common.so.2".into(),
             radosgw: "/tmp/radosgw".into(),
         };
@@ -273,7 +271,7 @@ mod tests {
         let dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "other-rgw")).unwrap();
         let targets = ProbeTargets {
             librados: "/tmp/librados.so.2".into(),
-            librbd: "/tmp/librbd.so.1".into(),
+            librbd: None,
             libceph_common: "/tmp/libceph-common.so.2".into(),
             radosgw: "/tmp/radosgw".into(),
         };
@@ -293,7 +291,7 @@ mod tests {
         .unwrap();
         let targets = ProbeTargets {
             librados: "/tmp/librados.so.2".into(),
-            librbd: "/tmp/librbd.so.1".into(),
+            librbd: None,
             libceph_common: "/tmp/libceph-common.so.2".into(),
             radosgw: "/tmp/radosgw".into(),
         };

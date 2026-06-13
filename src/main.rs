@@ -34,12 +34,13 @@ fn main() -> Result<()> {
         ),
         cli::DwarfSource::Native => {
             let targets = targets::discover(&cli)?;
-            DwarfInput::native(vec![
-                targets.librados,
-                targets.librbd,
-                targets.libceph_common,
-                targets.radosgw,
-            ])
+            let mut paths = vec![targets.librados];
+            if let Some(librbd) = targets.librbd {
+                paths.push(librbd);
+            }
+            paths.push(targets.libceph_common);
+            paths.push(targets.radosgw);
+            DwarfInput::native(paths)
         }
     };
     info!(source = %dwarf_input.description(), "loading DWARF probe data");

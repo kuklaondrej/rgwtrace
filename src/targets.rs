@@ -15,18 +15,25 @@ use crate::cli::Cli;
 #[derive(Clone, Debug, Serialize)]
 pub struct ProbeTargets {
     pub librados: PathBuf,
-    pub librbd: PathBuf,
+    pub librbd: Option<PathBuf>,
     pub libceph_common: PathBuf,
     pub radosgw: PathBuf,
 }
 
 impl ProbeTargets {
-    pub fn rados_libraries(&self) -> [&Path; 3] {
-        [
-            self.librados.as_path(),
-            self.librbd.as_path(),
-            self.libceph_common.as_path(),
-        ]
+    pub fn rados_libraries(&self) -> Vec<&Path> {
+        let mut paths = vec![self.librados.as_path()];
+        if let Some(librbd) = &self.librbd {
+            paths.push(librbd.as_path());
+        }
+        paths.push(self.libceph_common.as_path());
+        paths
+    }
+
+    pub fn all_paths(&self) -> Vec<&Path> {
+        let mut paths = self.rados_libraries();
+        paths.push(self.radosgw.as_path());
+        paths
     }
 }
 
@@ -42,7 +49,7 @@ pub fn discover(cli: &Cli) -> Result<ProbeTargets> {
         cli.pid,
         maps.as_ref(),
     )?;
-    let librbd = discover_library(
+    let librbd = discover_optional_library(
         "librbd.so.1",
         cli.librbd_path.clone(),
         cli.pid,
@@ -91,6 +98,33 @@ fn discover_library(
     let pid_hint = pid.map(|pid| format!(" for pid {pid}")).unwrap_or_default();
     let flag = soname_flag(soname);
     bail!("failed to discover {soname}{pid_hint}; pass --{flag}")
+}
+
+fn discover_optional_library(
+    soname: &str,
+    explicit: Option<PathBuf>,
+    pid: Option<i32>,
+    maps: Option<&BTreeMap<String, PathBuf>>,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        return Ok(Some(path));
+    }
+
+    if let Some(path) = maps.and_then(|maps| maps.get(soname)).cloned() {
+        return Ok(Some(path));
+    }
+
+    if pid.is_some() {
+        return Ok(None);
+    }
+
+    for path in common_library_paths(soname) {
+        if path.exists() {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(ldconfig_path(soname))
 }
 
 fn discover_radosgw(explicit: Option<PathBuf>, pid: Option<i32>) -> Result<PathBuf> {
@@ -239,6 +273,32 @@ mod tests {
         let targets = discover(&cli).unwrap();
 
         assert_eq!(targets.librados, PathBuf::from("/tmp/librados.so.2"));
+        assert_eq!(targets.librbd, Some(PathBuf::from("/tmp/librbd.so.1")));
         assert_eq!(targets.radosgw, PathBuf::from("/tmp/radosgw"));
+    }
+
+    #[test]
+    fn rados_libraries_omit_missing_librbd() {
+        let targets = ProbeTargets {
+            librados: "/tmp/librados.so.2".into(),
+            librbd: None,
+            libceph_common: "/tmp/libceph-common.so.2".into(),
+            radosgw: "/tmp/radosgw".into(),
+        };
+
+        let libraries = targets.rados_libraries();
+
+        assert_eq!(libraries.len(), 2);
+        assert_eq!(libraries[0], Path::new("/tmp/librados.so.2"));
+        assert_eq!(libraries[1], Path::new("/tmp/libceph-common.so.2"));
+    }
+
+    #[test]
+    fn optional_library_can_be_absent_for_pid_scoped_discovery() {
+        let maps = BTreeMap::new();
+
+        let path = discover_optional_library("librbd.so.1", None, Some(42), Some(&maps)).unwrap();
+
+        assert_eq!(path, None);
     }
 }
