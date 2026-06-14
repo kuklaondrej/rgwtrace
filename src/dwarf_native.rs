@@ -565,46 +565,57 @@ fn translate_named_type_field_path<R: Reader>(
         let unit = dwarf.unit(header)?;
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        if let Some(fields) = find_named_type_field_path(
-            dwarf, &unit, root, type_name, fields, index, path, resolving,
-        )? {
+        let search = NamedTypeFieldSearch { type_name, path };
+        if let Some(fields) =
+            find_named_type_field_path(dwarf, &unit, root, fields, index, &search, resolving)?
+        {
             return Ok(Some(fields));
         }
     }
     Ok(None)
 }
 
+struct NamedTypeFieldSearch<'a> {
+    type_name: &'a str,
+    path: &'a [&'a str],
+}
+
 fn find_named_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &gimli::Unit<R>,
     node: EntriesTreeNode<R>,
-    type_name: &str,
     fields: &[FieldJson],
     index: usize,
-    path: &[&str],
+    search: &NamedTypeFieldSearch<'_>,
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
     let entry = node.entry();
     if matches!(
         entry.tag(),
         gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
-    ) && die_name(dwarf, unit, entry)?.as_deref() == Some(type_name)
+    ) && die_name(dwarf, unit, entry)?.as_deref() == Some(search.type_name)
         && !entry_flag(entry, gimli::DW_AT_declaration)?
     {
         let typedie = unit.entry(entry.offset())?;
         let mut fields = fields.to_vec();
-        if let Some(fields) =
-            translate_field_path_from(dwarf, unit, typedie, &mut fields, index, path, resolving)?
-        {
+        if let Some(fields) = translate_field_path_from(
+            dwarf,
+            unit,
+            typedie,
+            &mut fields,
+            index,
+            search.path,
+            resolving,
+        )? {
             return Ok(Some(fields));
         }
     }
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        if let Some(fields) = find_named_type_field_path(
-            dwarf, unit, child, type_name, fields, index, path, resolving,
-        )? {
+        if let Some(fields) =
+            find_named_type_field_path(dwarf, unit, child, fields, index, search, resolving)?
+        {
             return Ok(Some(fields));
         }
     }
