@@ -1,0 +1,19 @@
+.github/workflows/e2e.yml
+  s_80a90a86d668f6::t_ad02f7e0047de8 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "06ae87957164f10154fb20ba3231335d9b0cb4db",
+  "prompts": {},
+  "sessions": {
+    "s_80a90a86d668f6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_13f5d9f51ffeSEnxvxAQrKvyPj",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
