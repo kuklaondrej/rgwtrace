@@ -194,14 +194,19 @@ int uprobe_send_op(struct pt_regs *ctx) {
     bpf_probe_read_user(&name_base, sizeof(name_base), (void *)name_base_addr);
   }
 
-  if (name_len < 0)
-    name_len = 0;
-  if (name_len >= MAX_OBJECT_NAME) {
-    event->flags |= RGWTRACE_TRUNC_OBJECT_NAME;
-    name_len = MAX_OBJECT_NAME - 1;
+  __u32 read_len = 0;
+  if (name_len > 0) {
+    if (name_len >= MAX_OBJECT_NAME) {
+      event->flags |= RGWTRACE_TRUNC_OBJECT_NAME;
+      read_len = MAX_OBJECT_NAME - 1;
+    } else {
+      read_len = name_len;
+    }
   }
-  if (name_len > 0 && name_base > 0)
-    bpf_probe_read_user(event->object_name, name_len, (void *)name_base);
+  read_len &= MAX_OBJECT_NAME - 1;
+  asm volatile("%0 &= 127" : "+r"(read_len));
+  if (read_len > 0 && name_base > 0)
+    bpf_probe_read_user(event->object_name, read_len, (void *)name_base);
 
   ++varid;
   vf = bpf_map_lookup_elem(&hprobes, &varid);

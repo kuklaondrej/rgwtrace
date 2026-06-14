@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+PATH="/snap/bin:${PATH}"
+
 ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-e2e}"
 TRACE_SECONDS="${TRACE_SECONDS:-60}"
 TRACE_ATTACH_DELAY="${TRACE_ATTACH_DELAY:-6}"

@@ -63,6 +63,9 @@ pub struct Cli {
     pub preflight: bool,
 
     #[arg(long)]
+    pub export_dwarf_json: bool,
+
+    #[arg(long)]
     pub strict_build_id: bool,
 
     #[arg(long)]

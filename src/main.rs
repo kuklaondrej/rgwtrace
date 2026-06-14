@@ -45,6 +45,13 @@ fn main() -> Result<()> {
     };
     info!(source = %dwarf_input.description(), "loading DWARF probe data");
     let dwarf = dwarf_input.load()?;
+    if cli.export_dwarf_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&export_dwarf_json(&dwarf))?
+        );
+        return Ok(());
+    }
     if cli.preflight {
         let report = preflight::run(&cli, &dwarf)?;
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -98,6 +105,26 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn export_dwarf_json(dwarf: &crate::dwarf_json::DwarfInfo) -> serde_json::Value {
+    let mut root = serde_json::Map::new();
+    if let Some(version) = &dwarf.version {
+        root.insert(
+            "version".to_string(),
+            serde_json::Value::String(version.clone()),
+        );
+    }
+    if let Some(arch) = &dwarf.arch {
+        root.insert("arch".to_string(), serde_json::Value::String(arch.clone()));
+    }
+    for (name, module) in &dwarf.modules {
+        root.insert(
+            name.clone(),
+            serde_json::to_value(module).expect("module serialization cannot fail"),
+        );
+    }
+    serde_json::Value::Object(root)
 }
 
 fn init_logging(default_filter: &str) {

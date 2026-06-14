@@ -10,7 +10,8 @@ use gimli::{
     AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Operation,
     Reader, RunTimeEndian,
 };
-use object::{Architecture, Object, ObjectSection, ObjectSymbol};
+use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
+use tracing::debug;
 
 use crate::dwarf_json::{
     basename, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
@@ -21,6 +22,9 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_finish_op",
     "RGWREST::get_handler",
 ];
+const OBJECTER_PROBE_FUNCTIONS: &[&str] = &["Objecter::_send_op", "Objecter::_finish_op"];
+const RGW_PROBE_FUNCTIONS: &[&str] = &["RGWREST::get_handler"];
+const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &["_send_op", "_finish_op", "get_handler"];
 const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
     &["op", "tid"],
     &["this", "monc", "global_id"],
@@ -54,7 +58,7 @@ pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
         let module_name = basename(path)
             .with_context(|| format!("native DWARF target {} has no file name", path.display()))?
             .to_string();
-        let module = parse_module(path, &mut arch)
+        let module = parse_module(path, &module_name, &mut arch)
             .with_context(|| format!("failed to parse native DWARF from {}", path.display()))?;
         modules.insert(module_name, module);
     }
@@ -66,7 +70,7 @@ pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
     })
 }
 
-fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
+fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Result<DwarfModule> {
     let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let file = object::File::parse(data.as_slice())
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
@@ -91,14 +95,17 @@ fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
     let dwarf_cow = Dwarf::load(|section| load_section(&debug_file, section))?;
     #[allow(deprecated)]
     let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
-    let mut func2pc = function_pcs(&dwarf)?;
-    let func2vf = function_var_fields(&dwarf)?;
-    for (function, pc) in symbol_function_pcs(&debug_file) {
+    let wanted = probe_functions_for_module(module_name);
+    let mut func2pc = symbol_function_pcs(&debug_file, wanted);
+    for (function, pc) in symbol_function_pcs(&file, wanted) {
         func2pc.entry(function).or_insert(pc);
     }
-    for (function, pc) in symbol_function_pcs(&file) {
-        func2pc.entry(function).or_insert(pc);
+    if !has_all_functions(&func2pc, wanted) {
+        for (function, pc) in function_pcs(&dwarf, wanted)? {
+            func2pc.entry(function).or_insert(pc);
+        }
     }
+    let func2vf = function_var_fields(&dwarf, wanted)?;
 
     Ok(DwarfModule {
         build_id,
@@ -107,26 +114,49 @@ fn parse_module(path: &Path, arch: &mut Option<String>) -> Result<DwarfModule> {
     })
 }
 
-fn function_pcs<R: Reader>(dwarf: &Dwarf<R>) -> Result<BTreeMap<String, u64>> {
+fn probe_functions_for_module(module_name: &str) -> &'static [&'static str] {
+    if module_name == "radosgw" || module_name.contains("radosgw") {
+        RGW_PROBE_FUNCTIONS
+    } else if module_name.starts_with("libceph-common") {
+        OBJECTER_PROBE_FUNCTIONS
+    } else {
+        PROBE_FUNCTIONS
+    }
+}
+
+fn has_all_functions<T>(result: &BTreeMap<String, T>, wanted: &[&str]) -> bool {
+    wanted.iter().all(|function| result.contains_key(*function))
+}
+
+fn function_pcs<R: Reader>(dwarf: &Dwarf<R>, wanted: &[&str]) -> Result<BTreeMap<String, u64>> {
     let mut result = BTreeMap::new();
     let mut units = dwarf.units();
     while let Some(header) = units.next()? {
         let unit = dwarf.unit(header)?;
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        collect_function_pcs(dwarf, &unit, root, &mut Vec::new(), &mut result)?;
+        collect_function_pcs(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
+        if has_all_functions(&result, wanted) {
+            break;
+        }
     }
     Ok(result)
 }
 
-fn function_var_fields<R: Reader>(dwarf: &Dwarf<R>) -> Result<BTreeMap<String, FunctionVarFields>> {
+fn function_var_fields<R: Reader>(
+    dwarf: &Dwarf<R>,
+    wanted: &[&str],
+) -> Result<BTreeMap<String, FunctionVarFields>> {
     let mut result = BTreeMap::new();
     let mut units = dwarf.units();
     while let Some(header) = units.next()? {
         let unit = dwarf.unit(header)?;
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        collect_function_var_fields(dwarf, &unit, root, &mut Vec::new(), &mut result)?;
+        collect_function_var_fields(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
+        if has_all_functions(&result, wanted) {
+            break;
+        }
     }
     Ok(result)
 }
@@ -137,7 +167,12 @@ fn collect_function_var_fields<R: Reader>(
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
+    wanted: &[&str],
 ) -> Result<()> {
+    if has_all_functions(result, wanted) {
+        return Ok(());
+    }
+
     let entry = node.entry();
     let scope = scope_name(dwarf, unit, entry)?;
     if let Some(scope) = &scope {
@@ -146,17 +181,29 @@ fn collect_function_var_fields<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, unit, entry, scopes)? {
+            if !wanted.contains(&fullname.as_str()) {
+                continue;
+            }
             if let Some(paths) = probe_field_paths(&fullname) {
-                if let Some(fields) = probe_function_var_fields(dwarf, unit, entry, paths)? {
+                if let Some(fields) =
+                    probe_function_var_fields(dwarf, unit, entry, &fullname, paths)?
+                {
                     result.entry(fullname).or_insert(fields);
                 }
             }
         }
+        if scope.is_some() {
+            scopes.pop();
+        }
+        return Ok(());
     }
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_var_fields(dwarf, unit, child, scopes, result)?;
+        collect_function_var_fields(dwarf, unit, child, scopes, result, wanted)?;
+        if has_all_functions(result, wanted) {
+            break;
+        }
     }
 
     if scope.is_some() {
@@ -169,24 +216,48 @@ fn probe_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &gimli::Unit<R>,
     function: &DebuggingInformationEntry<R>,
+    function_name: &str,
     paths: &[&[&str]],
 ) -> Result<Option<FunctionVarFields>> {
     let Some(pc) = entry_pc(dwarf, unit, function)? else {
+        debug!(
+            function = function_name,
+            "native DWARF probe rejected: missing function PC"
+        );
         return Ok(None);
     };
     let mut var_fields = Vec::new();
 
     for path in paths {
         let Some(variable_name) = path.first() else {
+            debug!(
+                function = function_name,
+                "native DWARF probe rejected: empty field path"
+            );
             return Ok(None);
         };
         let Some(variable) = find_function_variable(dwarf, unit, function, variable_name)? else {
+            debug!(
+                function = function_name,
+                variable = *variable_name,
+                "native DWARF probe rejected: missing variable"
+            );
             return Ok(None);
         };
         let Some(location) = variable_location(dwarf, unit, function, &variable, pc)? else {
+            debug!(
+                function = function_name,
+                variable = *variable_name,
+                "native DWARF probe rejected: missing variable location"
+            );
             return Ok(None);
         };
         let Some(fields) = translate_field_path(dwarf, unit, &variable, path)? else {
+            debug!(
+                function = function_name,
+                path = path.join("."),
+                "native DWARF probe rejected: field path translation failed"
+            );
             return Ok(None);
         };
         var_fields.push(VarFieldJson { location, fields });
@@ -204,10 +275,14 @@ fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]
     }
 }
 
-fn symbol_function_pcs(file: &object::File<'_>) -> BTreeMap<String, u64> {
+fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<String, u64> {
     let mut result = BTreeMap::new();
     for symbol in file.symbols().chain(file.dynamic_symbols()) {
-        if !symbol.is_definition() || symbol.address() == 0 {
+        if !symbol.is_definition()
+            || !symbol.is_global()
+            || symbol.kind() != SymbolKind::Text
+            || symbol.address() == 0
+        {
             continue;
         }
         let Ok(name) = symbol.name() else {
@@ -216,7 +291,7 @@ fn symbol_function_pcs(file: &object::File<'_>) -> BTreeMap<String, u64> {
         let Some(function) = demangle_function_name(name) else {
             continue;
         };
-        if PROBE_FUNCTIONS.contains(&function.as_str()) {
+        if wanted.contains(&function.as_str()) {
             result.entry(function).or_insert(symbol.address());
         }
     }
@@ -229,7 +304,12 @@ fn collect_function_pcs<R: Reader>(
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, u64>,
+    wanted: &[&str],
 ) -> Result<()> {
+    if has_all_functions(result, wanted) {
+        return Ok(());
+    }
+
     let entry = node.entry();
     let scope = scope_name(dwarf, unit, entry)?;
     if let Some(scope) = &scope {
@@ -238,17 +318,24 @@ fn collect_function_pcs<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, unit, entry, scopes)? {
-            if PROBE_FUNCTIONS.contains(&fullname.as_str()) {
+            if wanted.contains(&fullname.as_str()) {
                 if let Some(pc) = entry_pc(dwarf, unit, entry)? {
                     result.entry(fullname).or_insert(pc);
                 }
             }
         }
+        if scope.is_some() {
+            scopes.pop();
+        }
+        return Ok(());
     }
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_pcs(dwarf, unit, child, scopes, result)?;
+        collect_function_pcs(dwarf, unit, child, scopes, result, wanted)?;
+        if has_all_functions(result, wanted) {
+            break;
+        }
     }
 
     if scope.is_some() {
@@ -282,8 +369,21 @@ fn add_referenced_function_names<R: Reader>(
     let Some(referenced) = referenced_entry(unit, entry, attr)? else {
         return Ok(());
     };
-    let referenced_scopes = entry_scopes(dwarf, unit, referenced.offset())?.unwrap_or_default();
-    add_entry_function_names(dwarf, unit, &referenced, &referenced_scopes, names)?;
+    let before = names.len();
+    add_entry_function_names(dwarf, unit, &referenced, &[], names)?;
+
+    let already_qualified = names[before..]
+        .iter()
+        .any(|name| PROBE_FUNCTIONS.contains(&name.as_str()));
+    if !already_qualified {
+        if let Some(name) = die_name(dwarf, unit, &referenced)? {
+            if PROBE_FUNCTION_LEAF_NAMES.contains(&name.as_str()) {
+                let referenced_scopes =
+                    entry_scopes(dwarf, unit, referenced.offset())?.unwrap_or_default();
+                add_entry_function_names(dwarf, unit, &referenced, &referenced_scopes, names)?;
+            }
+        }
+    }
 
     if attr == gimli::DW_AT_abstract_origin {
         add_referenced_function_names(dwarf, unit, &referenced, gimli::DW_AT_specification, names)?;
@@ -375,12 +475,23 @@ fn translate_field_path<R: Reader>(
     variable: &DebuggingInformationEntry<R>,
     path: &[&str],
 ) -> Result<Option<Vec<FieldJson>>> {
-    let Some(mut typedie) = die_type(unit, variable)? else {
+    let Some(typedie) = die_type(unit, variable)? else {
         return Ok(None);
     };
     let mut fields = vec![FieldJson::default(); path.len()];
-    let mut index = 1;
+    let mut resolving = Vec::new();
+    translate_field_path_from(dwarf, unit, typedie, &mut fields, 1, path, &mut resolving)
+}
 
+fn translate_field_path_from<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    mut typedie: DebuggingInformationEntry<'unit, 'unit, R>,
+    fields: &mut [FieldJson],
+    mut index: usize,
+    path: &[&str],
+    resolving: &mut Vec<String>,
+) -> Result<Option<Vec<FieldJson>>> {
     while index < path.len() {
         typedie = peel_type_qualifiers(unit, typedie)?;
         match typedie.tag() {
@@ -395,6 +506,11 @@ fn translate_field_path<R: Reader>(
             }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
                 let Some(member) = find_member_entry(dwarf, unit, &typedie, path[index])? else {
+                    if let Some(fields) = translate_declared_type_field_path(
+                        dwarf, unit, &typedie, fields, index, path, resolving,
+                    )? {
+                        return Ok(Some(fields));
+                    }
                     return Ok(None);
                 };
                 fields[index].offset = member_offset(unit, &member)?.unwrap_or_default();
@@ -408,7 +524,92 @@ fn translate_field_path<R: Reader>(
         }
     }
 
-    Ok(Some(fields))
+    Ok(Some(fields.to_vec()))
+}
+
+fn translate_declared_type_field_path<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    typedie: &DebuggingInformationEntry<'unit, 'unit, R>,
+    fields: &[FieldJson],
+    index: usize,
+    path: &[&str],
+    resolving: &mut Vec<String>,
+) -> Result<Option<Vec<FieldJson>>> {
+    if !entry_flag(typedie, gimli::DW_AT_declaration)? {
+        return Ok(None);
+    }
+    let Some(type_name) = die_name(dwarf, unit, typedie)? else {
+        return Ok(None);
+    };
+    if resolving.contains(&type_name) {
+        return Ok(None);
+    }
+
+    resolving.push(type_name.clone());
+    let result = translate_named_type_field_path(dwarf, &type_name, fields, index, path, resolving);
+    resolving.pop();
+    result
+}
+
+fn translate_named_type_field_path<R: Reader>(
+    dwarf: &Dwarf<R>,
+    type_name: &str,
+    fields: &[FieldJson],
+    index: usize,
+    path: &[&str],
+    resolving: &mut Vec<String>,
+) -> Result<Option<Vec<FieldJson>>> {
+    let mut units = dwarf.units();
+    while let Some(header) = units.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut tree = unit.entries_tree(None)?;
+        let root = tree.root()?;
+        if let Some(fields) = find_named_type_field_path(
+            dwarf, &unit, root, type_name, fields, index, path, resolving,
+        )? {
+            return Ok(Some(fields));
+        }
+    }
+    Ok(None)
+}
+
+fn find_named_type_field_path<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    node: EntriesTreeNode<R>,
+    type_name: &str,
+    fields: &[FieldJson],
+    index: usize,
+    path: &[&str],
+    resolving: &mut Vec<String>,
+) -> Result<Option<Vec<FieldJson>>> {
+    let entry = node.entry();
+    if matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
+    ) && die_name(dwarf, unit, entry)?.as_deref() == Some(type_name)
+        && !entry_flag(entry, gimli::DW_AT_declaration)?
+    {
+        let typedie = unit.entry(entry.offset())?;
+        let mut fields = fields.to_vec();
+        if let Some(fields) =
+            translate_field_path_from(dwarf, unit, typedie, &mut fields, index, path, resolving)?
+        {
+            return Ok(Some(fields));
+        }
+    }
+
+    let mut children = node.children();
+    while let Some(child) = children.next()? {
+        if let Some(fields) = find_named_type_field_path(
+            dwarf, unit, child, type_name, fields, index, path, resolving,
+        )? {
+            return Ok(Some(fields));
+        }
+    }
+
+    Ok(None)
 }
 
 #[allow(dead_code)]
@@ -647,6 +848,21 @@ fn attr_offset<R: Reader>(unit: &gimli::Unit<R>, value: AttributeValue<R>) -> Re
     Ok(i32::try_from(offset).ok())
 }
 
+fn entry_flag<R: Reader>(entry: &DebuggingInformationEntry<R>, attr: gimli::DwAt) -> Result<bool> {
+    let Some(attr) = entry.attr(attr)? else {
+        return Ok(false);
+    };
+    Ok(match attr.value() {
+        AttributeValue::Flag(value) => value,
+        AttributeValue::Data1(value) => value != 0,
+        AttributeValue::Data2(value) => value != 0,
+        AttributeValue::Data4(value) => value != 0,
+        AttributeValue::Data8(value) => value != 0,
+        AttributeValue::Udata(value) => value != 0,
+        _ => false,
+    })
+}
+
 fn expression_offset<R: Reader>(
     unit: &gimli::Unit<R>,
     expression: gimli::Expression<R>,
@@ -714,7 +930,9 @@ fn demangle_function_name(linkage_name: &str) -> Option<String> {
             cpp_demangle::Symbol::new(linkage_name.strip_prefix('_').unwrap_or(linkage_name))
         })
         .ok()?;
-    let demangled = symbol.to_string();
+    let demangled = symbol
+        .demangle(&cpp_demangle::DemangleOptions::default())
+        .ok()?;
     let without_args = demangled
         .split_once('(')
         .map_or(demangled.as_str(), |(name, _)| name);
@@ -990,6 +1208,23 @@ mod tests {
         assert!(!fields[1].pointer);
         assert_eq!(fields[2].offset, 4);
         assert!(!fields[2].pointer);
+    }
+
+    #[test]
+    fn resolves_declared_member_type_from_another_compilation_unit() {
+        let Some(binary) = compile_declared_type_fixture() else {
+            return;
+        };
+
+        let Some(fields) = field_offsets_from_fixture(&binary).unwrap() else {
+            return;
+        };
+
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[1].offset, 8);
+        assert!(!fields[1].pointer);
+        assert_eq!(fields[2].offset, 4);
+        assert!(fields[2].pointer);
     }
 
     #[test]
@@ -1437,7 +1672,47 @@ mod tests {
         )
     }
 
+    fn compile_declared_type_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources(
+            "declared-type-fixture",
+            &[
+                (
+                    "inspect",
+                    r#"
+                    struct Leaf;
+                    struct Outer {
+                      int pad;
+                      Leaf* leaf;
+                    };
+                    __attribute__((noinline)) int inspect(Outer outer) {
+                      return outer.leaf != 0;
+                    }
+                    int main() {
+                      Outer outer = {1, 0};
+                      return inspect(outer);
+                    }
+                    "#,
+                ),
+                (
+                    "leaf",
+                    r#"
+                    struct Leaf {
+                      int prefix;
+                      int value;
+                    };
+                    Leaf leaf = {1, 2};
+                    int use_leaf() { return leaf.value; }
+                    "#,
+                ),
+            ],
+        )
+    }
+
     fn compile_cpp_source(name: &str, contents: &str) -> Option<std::path::PathBuf> {
+        compile_cpp_sources(name, &[(name, contents)])
+    }
+
+    fn compile_cpp_sources(name: &str, sources: &[(&str, &str)]) -> Option<std::path::PathBuf> {
         let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1448,16 +1723,21 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).ok()?;
-        let source = dir.join(format!("{name}.cc"));
         let binary = dir.join(name);
-        std::fs::write(&source, contents).ok()?;
-        let status = std::process::Command::new(compiler)
-            .args(["-g", "-O0", "-fno-inline"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .status()
-            .ok()?;
+        let sources = sources
+            .iter()
+            .map(|(source_name, contents)| {
+                let source = dir.join(format!("{source_name}.cc"));
+                std::fs::write(&source, contents).ok()?;
+                Some(source)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut command = std::process::Command::new(compiler);
+        command.args(["-g", "-O0", "-fno-inline"]);
+        for source in &sources {
+            command.arg(source);
+        }
+        let status = command.arg("-o").arg(&binary).status().ok()?;
         status.success().then_some(binary)
     }
 
