@@ -58,6 +58,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<PreflightReport> {
 
 pub fn validated_targets(cli: &Cli, dwarf: &DwarfInfo) -> Result<ProbeTargets> {
     validate_cli(cli)?;
+    validate_ceph_version(dwarf)?;
     let targets = targets::discover(cli)?;
     validate_target_paths(&targets)?;
     validate_dwarf_targets(dwarf, &targets)?;
@@ -160,6 +161,15 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
 
     vec![
         PreflightCheck {
+            name: "ceph_abi".to_string(),
+            status: "ok",
+            detail: format!(
+                "Ceph {} uses {} ceph_osd_op layout",
+                dwarf.version.as_deref().unwrap_or("<unknown>"),
+                ceph_abi_layout(dwarf.version.as_deref().unwrap_or_default()).unwrap_or("unknown")
+            ),
+        },
+        PreflightCheck {
             name: "target_paths".to_string(),
             status: "ok",
             detail: "all discovered target paths are accessible files".to_string(),
@@ -175,6 +185,27 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
             detail: format!("{GET_HANDLER} available in {radosgw}"),
         },
     ]
+}
+
+fn validate_ceph_version(dwarf: &DwarfInfo) -> Result<()> {
+    let version = dwarf.version.as_deref().context(
+        "Ceph version is required to select ceph_osd_op ABI offsets; pass --ceph-version or use DWARF JSON with a version",
+    )?;
+    ceph_abi_layout(version)
+        .with_context(|| format!("failed to parse Ceph version {version:?}"))?;
+    Ok(())
+}
+
+fn ceph_abi_layout(version: &str) -> Option<&'static str> {
+    let major = version
+        .split(['.', '-'])
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())?;
+    if major >= 19 {
+        Some("squid+")
+    } else {
+        Some("pre-squid")
+    }
 }
 
 fn validate_build_ids(dwarf: &DwarfInfo, targets: &ProbeTargets, strict: bool) -> Result<()> {
@@ -297,6 +328,23 @@ mod tests {
         };
 
         assert!(validate_dwarf_targets(&dwarf, &targets).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_ceph_version() {
+        let mut dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "radosgw")).unwrap();
+        dwarf.version = None;
+
+        let err = validate_ceph_version(&dwarf).unwrap_err();
+
+        assert!(err.to_string().contains("Ceph version is required"));
+    }
+
+    #[test]
+    fn reports_ceph_abi_layout_from_version() {
+        assert_eq!(ceph_abi_layout("18.2.8-1jammy"), Some("pre-squid"));
+        assert_eq!(ceph_abi_layout("19.2.0"), Some("squid+"));
+        assert_eq!(ceph_abi_layout("not-a-version"), None);
     }
 
     fn dwarf_json(rados_module: &str, rgw_module: &str) -> String {

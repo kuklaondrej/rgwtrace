@@ -246,6 +246,7 @@ mod tests {
         let cli = Cli {
             import_json: Some("x.json".into()),
             dwarf_source: crate::cli::DwarfSource::Json,
+            ceph_version: None,
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),

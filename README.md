@@ -47,6 +47,8 @@ sudo rgwtrace \
 
 `--preflight` checks the requested `--pid`, explicit target paths, discovered Ceph/RGW target files, required DWARF functions, minimum variable-field counts, and ELF build IDs.
 
+Native mode also needs a Ceph version to select the `ceph_osd_op` ABI layout. `rgwtrace` resolves this from native metadata when possible; pass `--ceph-version 18.2.8-1jammy` or `--ceph-version 19.2.0` when the version cannot be discovered.
+
 Build ID mismatches are reported as warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched build IDs.
 
 Run live tracing and flush JSON on `Ctrl-C`:
@@ -229,6 +231,8 @@ sudo rgwtrace \
 ```
 
 Native mode reads selected Ceph/RGW modules and their debug info directly. It discovers embedded DWARF, `.gnu_debuglink`, and build-id debug files. JSON mode requires `cephtrace` output that matches the traced binaries closely enough for probe PCs and field paths to stay valid.
+
+Live attach refuses to guess the Ceph ABI layout when no version is available. Use DWARF JSON with a `version` field or pass `--ceph-version` for native mode.
 
 `rgwtrace` validates required probe functions, field counts, and ELF build IDs. Build ID mismatches warn by default and fail with `--strict-build-id`.
 

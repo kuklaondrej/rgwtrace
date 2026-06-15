@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, Result};
@@ -49,7 +50,15 @@ const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
     &["s", "trans_id", "_M_dataplus", "_M_p"],
 ];
 
+#[allow(dead_code)]
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
+    from_paths_with_version(paths, None)
+}
+
+pub fn from_paths_with_version(
+    paths: &[impl AsRef<Path>],
+    version_override: Option<&str>,
+) -> Result<DwarfInfo> {
     let mut modules = BTreeMap::new();
     let mut arch = None;
 
@@ -63,11 +72,129 @@ pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
         modules.insert(module_name, module);
     }
 
+    let version = version_override
+        .and_then(clean_version)
+        .or_else(|| resolve_ceph_version(paths));
+
     Ok(DwarfInfo {
-        version: None,
+        version,
         arch,
         modules,
     })
+}
+
+fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
+    embedded_ceph_version(paths)
+        .or_else(|| microceph_ceph_version(paths))
+        .or_else(package_manager_ceph_version)
+}
+
+fn embedded_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
+    paths
+        .iter()
+        .filter_map(|path| fs::read(path).ok())
+        .find_map(|data| ceph_version_from_bytes(&data))
+}
+
+fn ceph_version_from_bytes(bytes: &[u8]) -> Option<String> {
+    let needle = b"ceph version ";
+    let start = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)?
+        + needle.len();
+    let len = bytes[start..]
+        .iter()
+        .position(|byte| byte.is_ascii_whitespace() || *byte == 0)
+        .unwrap_or(bytes.len() - start);
+    let version = std::str::from_utf8(&bytes[start..start + len]).ok()?;
+    clean_version(version)
+}
+
+fn microceph_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
+    paths
+        .iter()
+        .flat_map(|path| microceph_metadata_candidates(path.as_ref()))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .find_map(|contents| ceph_version_from_text(&contents))
+}
+
+fn microceph_metadata_candidates(path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    for ancestor in path.ancestors() {
+        push_unique(&mut candidates, ancestor.join("share/metadata.yaml"));
+        push_unique(&mut candidates, ancestor.join("snap/manifest.yaml"));
+    }
+    candidates
+}
+
+fn ceph_version_from_text(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with("ceph-version") {
+            if let Some(version) = version_from_line_value(line) {
+                return Some(version);
+            }
+        }
+        for package in ["radosgw", "librados2", "ceph-common", "ceph-osd"] {
+            if line.starts_with(package) {
+                if let Some(version) = version_from_line_value(line) {
+                    return Some(version);
+                }
+            }
+        }
+    }
+    text.find("ceph version ")
+        .and_then(|idx| first_version_token(&text[idx + "ceph version ".len()..]))
+}
+
+fn version_from_line_value(line: &str) -> Option<String> {
+    let value = line
+        .split_once(':')
+        .or_else(|| line.split_once('='))
+        .map(|(_, value)| value)?;
+    first_version_token(value)
+}
+
+fn first_version_token(value: &str) -> Option<String> {
+    value
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '"' || ch == '\'')
+        .find_map(clean_version)
+}
+
+fn clean_version(version: &str) -> Option<String> {
+    let version = version.trim().trim_matches(['"', '\'', '[', ']']);
+    let starts_with_digit = version
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_digit());
+    (starts_with_digit && version.contains('.')).then(|| version.to_string())
+}
+
+fn package_manager_ceph_version() -> Option<String> {
+    for package in ["radosgw", "librados2", "ceph-common"] {
+        if let Some(version) =
+            command_output_version("dpkg-query", &["-W", "-f=${Version}", package])
+        {
+            return Some(version);
+        }
+    }
+    for package in ["ceph-radosgw", "librados2", "ceph-common"] {
+        if let Some(version) =
+            command_output_version("rpm", &["-q", "--qf", "%{VERSION}-%{RELEASE}", package])
+        {
+            return Some(version);
+        }
+    }
+    None
+}
+
+fn command_output_version(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+        .and_then(|stdout| first_version_token(&stdout))
 }
 
 fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Result<DwarfModule> {
@@ -1200,6 +1327,33 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             "/tmp/root/usr/lib/debug/.build-id/ab/cdef.debug"
         )));
+    }
+
+    #[test]
+    fn extracts_ceph_version_from_embedded_version_string() {
+        let data = b"prefix\0ceph version 19.2.0 (hash) squid\0suffix";
+
+        assert_eq!(ceph_version_from_bytes(data).as_deref(), Some("19.2.0"));
+    }
+
+    #[test]
+    fn extracts_ceph_version_from_microceph_metadata_text() {
+        let text = "name: microceph\nceph-version: 18.2.8-1jammy\n";
+
+        assert_eq!(
+            ceph_version_from_text(text).as_deref(),
+            Some("18.2.8-1jammy")
+        );
+    }
+
+    #[test]
+    fn extracts_ceph_version_from_microceph_manifest_text() {
+        let text = "packages:\n  radosgw=18.2.8-1jammy\n";
+
+        assert_eq!(
+            ceph_version_from_text(text).as_deref(),
+            Some("18.2.8-1jammy")
+        );
     }
 
     #[test]

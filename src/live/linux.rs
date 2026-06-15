@@ -44,7 +44,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
     let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
-    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref());
+    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref())?;
     let mut skel = open.load()?;
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
@@ -157,8 +157,13 @@ fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()
     Ok(())
 }
 
-fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) {
-    let squid_or_newer = version.map(is_squid_or_newer).unwrap_or(false);
+fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result<()> {
+    let version = version.context(
+        "Ceph version is required to select ceph_osd_op ABI offsets; pass --ceph-version or use DWARF JSON with a version",
+    )?;
+    let squid_or_newer = is_squid_or_newer(version).with_context(|| {
+        format!("failed to parse Ceph version {version:?} for ceph_osd_op ABI offsets")
+    })?;
 
     if squid_or_newer {
         rodata.CEPH_OSD_OP_SIZE = 112;
@@ -174,6 +179,7 @@ fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) {
     rodata.CEPH_OSD_OP_CLS_METHOD_OFFSET = 7;
     rodata.CEPH_OSD_OP_BUFFER_RAW_OFFSET = 8;
     rodata.CEPH_OSD_OP_BUFFER_DATA_OFFSET = 32;
+    Ok(())
 }
 
 fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
@@ -353,15 +359,12 @@ fn bytes_of(value: &VarFieldKernel) -> &[u8] {
     unsafe { std::slice::from_raw_parts(ptr, size_of::<VarFieldKernel>()) }
 }
 
-fn is_squid_or_newer(version: &str) -> bool {
-    let Some(major) = version
+fn is_squid_or_newer(version: &str) -> Option<bool> {
+    let major = version
         .split(['.', '-'])
         .next()
-        .and_then(|major| major.parse::<u64>().ok())
-    else {
-        return false;
-    };
-    major >= 19
+        .and_then(|major| major.parse::<u64>().ok())?;
+    Some(major >= 19)
 }
 
 const _: () = {
@@ -463,6 +466,35 @@ mod tests {
         let err = decode_event(&data).unwrap_err();
 
         assert!(err.to_string().contains("payload too short"));
+    }
+
+    #[test]
+    fn rejects_missing_ceph_version_for_abi_layout() {
+        let mut rodata = types::rodata::default();
+
+        let err = configure_rodata(&mut rodata, None).unwrap_err();
+
+        assert!(err.to_string().contains("Ceph version is required"));
+    }
+
+    #[test]
+    fn configures_pre_squid_abi_layout() {
+        let mut rodata = types::rodata::default();
+
+        configure_rodata(&mut rodata, Some("18.2.8-1jammy")).unwrap();
+
+        assert_eq!(rodata.CEPH_OSD_OP_SIZE, 152);
+        assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 96);
+    }
+
+    #[test]
+    fn configures_squid_abi_layout() {
+        let mut rodata = types::rodata::default();
+
+        configure_rodata(&mut rodata, Some("19.2.0")).unwrap();
+
+        assert_eq!(rodata.CEPH_OSD_OP_SIZE, 112);
+        assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 56);
     }
 
     fn event_data<T: Copy>(event_type: u32, payload: &T) -> Vec<u8> {

@@ -11,6 +11,9 @@ pub struct Cli {
     #[arg(long, default_value = "json")]
     pub dwarf_source: DwarfSource,
 
+    #[arg(long)]
+    pub ceph_version: Option<String>,
+
     #[arg(long, default_value = "json")]
     pub output: OutputMode,
 

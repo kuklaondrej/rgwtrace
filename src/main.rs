@@ -40,7 +40,7 @@ fn main() -> Result<()> {
             }
             paths.push(targets.libceph_common);
             paths.push(targets.radosgw);
-            DwarfInput::native(paths)
+            DwarfInput::native(paths, cli.ceph_version.clone())
         }
     };
     info!(source = %dwarf_input.description(), "loading DWARF probe data");

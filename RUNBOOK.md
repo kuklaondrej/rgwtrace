@@ -39,6 +39,8 @@ sudo rgwtrace \
 
 Use `--import-json` when native debug info is unavailable or when comparing against the `cephtrace` oracle.
 
+If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout.
+
 Build ID mismatches are warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched IDs.
 
 ---
