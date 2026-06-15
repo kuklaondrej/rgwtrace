@@ -381,8 +381,15 @@ int uprobe_send_op(struct pt_regs *ctx) {
         event->flags |= RGWTRACE_TRUNC_METHOD_NAME;
         method_len = sizeof(event->cls_ops[i].method_name) - 1;
       }
-      rgwtrace_probe_read_user(event->cls_ops[i].cls_name, cls_len, (void *)data);
-      rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_len,
+      __u32 cls_read_len = cls_len;
+      cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;
+      asm volatile("%0 &= 7" : "+r"(cls_read_len));
+      __u32 method_read_len = method_len;
+      method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;
+      asm volatile("%0 &= 31" : "+r"(method_read_len));
+      rgwtrace_probe_read_user(event->cls_ops[i].cls_name, cls_read_len,
+                               (void *)data);
+      rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_read_len,
                                (void *)data + cls_len);
     }
 

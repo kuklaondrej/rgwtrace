@@ -26,6 +26,18 @@ fn bpf_records_drop_and_probe_read_diagnostics() {
 }
 
 #[test]
+fn cls_and_method_reads_use_verifier_bounded_lengths() {
+    assert!(RGWTRACE_BPF.contains("__u32 cls_read_len = cls_len;"));
+    assert!(RGWTRACE_BPF.contains("cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 7\" : \"+r\"(cls_read_len));"));
+    assert!(RGWTRACE_BPF.contains("__u32 method_read_len = method_len;"));
+    assert!(RGWTRACE_BPF.contains("method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 31\" : \"+r\"(method_read_len));"));
+    assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].cls_name, cls_len"));
+    assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].method_name, method_len"));
+}
+
+#[test]
 fn dwarf_native_demangling_uses_fallible_api() {
     let normalized = DWARF_NATIVE.split_whitespace().collect::<String>();
     assert!(normalized.contains("symbol.demangle(&cpp_demangle::DemangleOptions::default()).ok()?"));

@@ -10,6 +10,10 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 git diff --check
 
+if [[ "${VERIFY_BPF_LOAD:-0}" == "1" ]]; then
+  sudo "${repo_root}/scripts/verify-bpf-load.sh"
+fi
+
 if [[ "${VERIFY_CONTAINER_BUILD:-0}" == "1" ]]; then
   "${repo_root}/scripts/build-linux-container.sh"
 fi

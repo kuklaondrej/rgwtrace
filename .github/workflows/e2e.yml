@@ -15,9 +15,11 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang curl libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
+          sudo apt-get install -y --no-install-recommends bpftool clang curl libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
       - name: Build release binary
         run: cargo build --release
+      - name: Verify BPF load
+        run: sudo scripts/verify-bpf-load.sh
       - name: Run MicroCeph RGW e2e
         run: sudo MICROCEPH_CHANNEL=reef/stable MICROCEPH_EXPECTED_CEPH_VERSION=18.2.4-0ubuntu1~cloud0 tests/e2e/functional-test-microceph-rgw.sh
       - name: Stage e2e artifacts

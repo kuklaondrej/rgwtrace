@@ -161,3 +161,9 @@ Include the Linux container build when needed:
 ```sh
 VERIFY_CONTAINER_BUILD=1 ./scripts/verify.sh
 ```
+
+Run a real BPF verifier load check on Linux when BPF code changes:
+
+```sh
+VERIFY_BPF_LOAD=1 ./scripts/verify.sh
+```

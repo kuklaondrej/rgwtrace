@@ -162,6 +162,14 @@ Run the fast no-cluster verification loop before live testing:
 
 The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, and BPF source regressions. Linux CI also covers ring-buffer event decoding without attaching probes.
 
+On Linux, run a real verifier load check when changing BPF code:
+
+```sh
+sudo scripts/verify-bpf-load.sh
+```
+
+The repository also has a manual `BPF Verify Linux 5.8` workflow for a self-hosted runner labeled `kernel-5.8`.
+
 Use live RGW/Ceph testing only after the fast suite passes or when validating probe attachment against a real runtime.
 
 Run the privileged MicroCeph RGW e2e test on Linux when validating live request capture:
