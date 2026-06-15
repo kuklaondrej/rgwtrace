@@ -85,6 +85,15 @@ fn discover_library(
         return Ok(path);
     }
 
+    if let Some(pid) = pid {
+        for path in common_library_paths(soname) {
+            let path = pid_root_path(pid, &path);
+            if path.exists() {
+                return Ok(path);
+            }
+        }
+    }
+
     for path in common_library_paths(soname) {
         if path.exists() {
             return Ok(path);
@@ -114,7 +123,13 @@ fn discover_optional_library(
         return Ok(Some(path));
     }
 
-    if pid.is_some() {
+    if let Some(pid) = pid {
+        for path in common_library_paths(soname) {
+            let path = pid_root_path(pid, &path);
+            if path.exists() {
+                return Ok(Some(path));
+            }
+        }
         return Ok(None);
     }
 
@@ -140,7 +155,7 @@ fn discover_radosgw(explicit: Option<PathBuf>, pid: Option<i32>) -> Result<PathB
             .and_then(|name| name.to_str())
             .unwrap_or_default();
         if name == "radosgw" || name == "ceph-radosgw" {
-            return Ok(exe);
+            return Ok(pid_root_path(pid, &exe));
         }
     }
 
@@ -163,6 +178,10 @@ fn discover_radosgw(explicit: Option<PathBuf>, pid: Option<i32>) -> Result<PathB
 fn read_process_maps(pid: i32) -> Result<BTreeMap<String, PathBuf>> {
     let contents = fs::read_to_string(format!("/proc/{pid}/maps"))
         .with_context(|| format!("failed to read /proc/{pid}/maps"))?;
+    Ok(parse_process_maps(pid, &contents))
+}
+
+fn parse_process_maps(pid: i32, contents: &str) -> BTreeMap<String, PathBuf> {
     let mut result = BTreeMap::new();
 
     for line in contents.lines() {
@@ -179,19 +198,28 @@ fn read_process_maps(pid: i32) -> Result<BTreeMap<String, PathBuf>> {
         if basename.starts_with("librados.so.2") {
             result
                 .entry("librados.so.2".to_string())
-                .or_insert_with(|| path.into());
+                .or_insert_with(|| pid_root_path(pid, Path::new(path)));
         } else if basename.starts_with("librbd.so.1") {
             result
                 .entry("librbd.so.1".to_string())
-                .or_insert_with(|| path.into());
+                .or_insert_with(|| pid_root_path(pid, Path::new(path)));
         } else if basename.starts_with("libceph-common.so.2") {
             result
                 .entry("libceph-common.so.2".to_string())
-                .or_insert_with(|| path.into());
+                .or_insert_with(|| pid_root_path(pid, Path::new(path)));
         }
     }
 
-    Ok(result)
+    result
+}
+
+fn pid_root_path(pid: i32, path: &Path) -> PathBuf {
+    let root = PathBuf::from(format!("/proc/{pid}/root"));
+    if let Ok(relative) = path.strip_prefix("/") {
+        root.join(relative)
+    } else {
+        root.join(path)
+    }
 }
 
 fn common_library_paths(soname: &str) -> Vec<PathBuf> {
@@ -302,5 +330,31 @@ mod tests {
         let path = discover_optional_library("librbd.so.1", None, Some(42), Some(&maps)).unwrap();
 
         assert_eq!(path, None);
+    }
+
+    #[test]
+    fn process_maps_paths_are_rooted_for_pid_namespace() {
+        let maps = parse_process_maps(
+            42,
+            "7f-8 r-xp 00000000 08:01 1 /usr/lib/librados.so.2.0.0\n\
+             8f-9 r-xp 00000000 08:01 2 /usr/lib/libceph-common.so.2\n",
+        );
+
+        assert_eq!(
+            maps.get("librados.so.2"),
+            Some(&PathBuf::from("/proc/42/root/usr/lib/librados.so.2.0.0"))
+        );
+        assert_eq!(
+            maps.get("libceph-common.so.2"),
+            Some(&PathBuf::from("/proc/42/root/usr/lib/libceph-common.so.2"))
+        );
+    }
+
+    #[test]
+    fn pid_root_path_prefixes_absolute_namespace_path() {
+        assert_eq!(
+            pid_root_path(42, Path::new("/usr/bin/radosgw")),
+            PathBuf::from("/proc/42/root/usr/bin/radosgw")
+        );
     }
 }

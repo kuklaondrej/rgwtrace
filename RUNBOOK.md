@@ -25,6 +25,8 @@ sudo rgwtrace \
   --preflight
 ```
 
+With `--pid`, discovered library and executable paths are opened through `/proc/<pid>/root` so the host attaches to the same inode the target process sees inside its mount namespace.
+
 Use explicit paths when discovery is ambiguous:
 
 ```sh

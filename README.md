@@ -76,6 +76,8 @@ sudo rgwtrace \
   --output json
 ```
 
+When `--pid` is used, discovered target paths are resolved through `/proc/<pid>/root` so attaches work for RGW processes running in a different mount namespace, including container runtimes.
+
 ---
 
 ## Export
