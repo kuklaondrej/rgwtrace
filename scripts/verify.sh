@@ -10,6 +10,13 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 git diff --check
 
+if [[ "${VERIFY_AUDIT:-0}" == "1" ]]; then
+  if ! command -v cargo-audit >/dev/null 2>&1; then
+    cargo install cargo-audit --locked
+  fi
+  cargo audit
+fi
+
 if [[ "${VERIFY_BPF_LOAD:-0}" == "1" ]]; then
   sudo "${repo_root}/scripts/verify-bpf-load.sh"
 fi

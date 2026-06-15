@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Derived from Ceph cephtrace/radostrace BPF tracing code; see NOTICE. */
+
 #define BPF_KERNEL_SPACE
 
 #include <linux/bpf.h>
@@ -8,7 +11,7 @@
 
 #include "rgwtrace_events.h"
 
-char LICENSE[] SEC("license") = "Dual BSD/GPL";
+char LICENSE[] SEC("license") = "GPL";
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);

@@ -1,0 +1,5 @@
+rgwtrace includes BPF tracing code derived from the Ceph cephtrace/radostrace tracing implementation.
+
+Ceph is developed by the Ceph authors and contributors. The derived BPF files in `bpf/` are distributed under GPL-2.0-only with SPDX headers.
+
+Project license text is available in `LICENSE.GPL-2.0`.

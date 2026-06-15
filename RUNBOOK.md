@@ -167,3 +167,9 @@ Run a real BPF verifier load check on Linux when BPF code changes:
 ```sh
 VERIFY_BPF_LOAD=1 ./scripts/verify.sh
 ```
+
+Run dependency audit checks when dependency or toolchain inputs change:
+
+```sh
+VERIFY_AUDIT=1 ./scripts/verify.sh
+```

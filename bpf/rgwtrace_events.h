@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Derived from Ceph cephtrace/radostrace BPF tracing code; see NOTICE. */
+
 #ifndef RGWTRACE_EVENTS_H
 #define RGWTRACE_EVENTS_H
 

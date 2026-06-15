@@ -2,6 +2,15 @@ name: E2E
 
 on:
   workflow_dispatch:
+    inputs:
+      microceph_channel:
+        description: MicroCeph snap channel
+        default: reef/stable
+        required: true
+      microceph_expected_ceph_version:
+        description: Expected Ceph package version in the MicroCeph snap
+        default: 18.2.8-1jammy
+        required: true
 
 jobs:
   microceph-rgw:
@@ -9,7 +18,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
       - name: Install build dependencies
@@ -21,7 +30,7 @@ jobs:
       - name: Verify BPF load
         run: sudo scripts/verify-bpf-load.sh
       - name: Run MicroCeph RGW e2e
-        run: sudo MICROCEPH_CHANNEL=reef/stable MICROCEPH_EXPECTED_CEPH_VERSION=18.2.4-0ubuntu1~cloud0 tests/e2e/functional-test-microceph-rgw.sh
+        run: sudo MICROCEPH_CHANNEL='${{ inputs.microceph_channel }}' MICROCEPH_EXPECTED_CEPH_VERSION='${{ inputs.microceph_expected_ceph_version }}' tests/e2e/functional-test-microceph-rgw.sh
       - name: Stage e2e artifacts
         if: always()
         run: |
