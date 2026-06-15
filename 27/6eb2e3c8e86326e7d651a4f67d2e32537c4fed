@@ -1,0 +1,39 @@
+src/preflight.rs
+  s_6224e0c16c49ee::t_0af0cfca6b29de 333-349
+  s_6224e0c16c49ee::t_22bcbf1a1ede6b 61,163-171,190-208
+src/dwarf_native.rs
+  s_6224e0c16c49ee::t_b78cd4897bede4 6,55-61,75-78,80,86-174,178-181,185-197
+  s_6224e0c16c49ee::t_ab67fff4ed442c 175-177,182-184,1343-1346,1353-1356
+  s_6224e0c16c49ee::t_a261e913913938 1333-1342,1347-1352,1357-1358
+  s_6224e0c16c49ee::t_40a88780e1264e 53
+src/live/linux.rs
+  s_6224e0c16c49ee::t_1442ff0e4ea01b 47,160-166,182,362-363,366-367,471-497
+RUNBOOK.md
+  s_6224e0c16c49ee::t_8b63b16be2b9be 42-43
+src/cli.rs
+  s_6224e0c16c49ee::t_d244fc057838df 14-16
+src/main.rs
+  s_6224e0c16c49ee::t_d244fc057838df 43
+README.md
+  s_6224e0c16c49ee::t_8b63b16be2b9be 50-51,235
+src/targets.rs
+  s_6224e0c16c49ee::t_d244fc057838df 249
+src/dwarf_input.rs
+  s_6224e0c16c49ee::t_d244fc057838df 10,18-19,25,36-38,56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "276eb2e3c8e86326e7d651a4f67d2e32537c4fed",
+  "prompts": {},
+  "sessions": {
+    "s_6224e0c16c49ee": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1355de3c6ffek48FLGYLeujCQ9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
