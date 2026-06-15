@@ -9,6 +9,7 @@ PATH="/snap/bin:${PATH}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-e2e}"
 TRACE_SECONDS="${TRACE_SECONDS:-60}"
 TRACE_ATTACH_DELAY="${TRACE_ATTACH_DELAY:-6}"
+TRACE_TIMEOUT_GRACE="${TRACE_TIMEOUT_GRACE:-180}"
 MICROCEPH_OSDS="${MICROCEPH_OSDS:-3}"
 MICROCEPH_OSD_SIZE="${MICROCEPH_OSD_SIZE:-3G}"
 MICROCEPH_HEALTH_TIMEOUT="${MICROCEPH_HEALTH_TIMEOUT:-180}"
@@ -394,8 +395,10 @@ start_trace() {
         dwarf_args=(--dwarf-source json --import-json "${RGWTRACE_DWARF_JSON}")
     fi
 
-    info "starting rgwtrace capture for ${TRACE_SECONDS}s"
-    timeout "$((TRACE_SECONDS + TRACE_ATTACH_DELAY + 30))" \
+    local trace_timeout=$((TRACE_SECONDS + TRACE_ATTACH_DELAY + TRACE_TIMEOUT_GRACE))
+
+    info "starting rgwtrace capture for ${TRACE_SECONDS}s (process timeout ${trace_timeout}s)"
+    timeout "${trace_timeout}" \
         "${RGWTRACE_BIN}" \
         "${dwarf_args[@]}" \
         --pid "${rgw_pid}" \
