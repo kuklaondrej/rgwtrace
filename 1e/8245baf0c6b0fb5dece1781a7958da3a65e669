@@ -1,0 +1,30 @@
+tests/bpf_source.rs
+  s_6224e0c16c49ee::t_658fc00eddc07c 34
+  s_6224e0c16c49ee::t_be180eff87426e 29-33,35-39
+README.md
+  s_6224e0c16c49ee::t_b73e8464b50546 165-172
+.github/workflows/e2e.yml
+  s_6224e0c16c49ee::t_b73e8464b50546 18,21-22
+.github/workflows/bpf-verify-5-8.yml
+  s_6224e0c16c49ee::t_b73e8464b50546 1-17
+scripts/verify-bpf-load.sh
+  s_6224e0c16c49ee::t_324b82b4f06326 1-60
+bpf/rgwtrace.bpf.c
+  s_6224e0c16c49ee::t_0287e9b4f0cf18 384-392
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "1e8245baf0c6b0fb5dece1781a7958da3a65e669",
+  "prompts": {},
+  "sessions": {
+    "s_6224e0c16c49ee": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1355de3c6ffek48FLGYLeujCQ9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
