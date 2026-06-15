@@ -51,6 +51,16 @@ struct OtlpExporter {
     handle: JoinHandle<Result<otel::ExportDiagnostics>>,
 }
 
+struct OtlpExporterConfig {
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    compression: crate::cli::OtlpCompression,
+    max_spans_per_batch: usize,
+    max_bytes_per_batch: usize,
+    timeout: Duration,
+    retries: u32,
+}
+
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = preflight::validated_targets(cli, dwarf)?;
     let pid = cli.pid.unwrap_or(-1);
@@ -193,25 +203,16 @@ fn read_bpf_counter(map: &impl MapCore, counter: u32) -> Result<u64> {
 impl OtlpExporter {
     fn spawn(cli: &Cli) -> Self {
         let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
-        let endpoint = cli.otlp_endpoint.clone();
-        let headers = cli.otlp_header.clone();
-        let compression = cli.otlp_compression;
-        let max_spans_per_batch = cli.otlp_max_spans_per_batch;
-        let max_bytes_per_batch = cli.otlp_max_bytes_per_batch;
-        let timeout = cli.otlp_timeout;
-        let retries = cli.otlp_retries;
-        let handle = thread::spawn(move || {
-            run_otlp_exporter(
-                receiver,
-                endpoint,
-                headers,
-                compression,
-                max_spans_per_batch,
-                max_bytes_per_batch,
-                timeout,
-                retries,
-            )
-        });
+        let config = OtlpExporterConfig {
+            endpoint: cli.otlp_endpoint.clone(),
+            headers: cli.otlp_header.clone(),
+            compression: cli.otlp_compression,
+            max_spans_per_batch: cli.otlp_max_spans_per_batch,
+            max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
+            timeout: cli.otlp_timeout,
+            retries: cli.otlp_retries,
+        };
+        let handle = thread::spawn(move || run_otlp_exporter(receiver, config));
         Self { sender, handle }
     }
 
@@ -225,26 +226,20 @@ impl OtlpExporter {
 
 fn run_otlp_exporter(
     receiver: Receiver<TraceDocument>,
-    endpoint: String,
-    headers: Vec<(String, String)>,
-    compression: crate::cli::OtlpCompression,
-    max_spans_per_batch: usize,
-    max_bytes_per_batch: usize,
-    timeout: Duration,
-    retries: u32,
+    config: OtlpExporterConfig,
 ) -> Result<otel::ExportDiagnostics> {
     let mut total = otel::ExportDiagnostics::default();
     for trace in receiver {
         let spans = trace.spans.len();
         let export = otel::export_otlp_http(
             otel::ExportConfig {
-                endpoint: &endpoint,
-                headers: &headers,
-                compression,
-                max_spans_per_batch,
-                max_bytes_per_batch,
-                timeout,
-                retries,
+                endpoint: &config.endpoint,
+                headers: &config.headers,
+                compression: config.compression,
+                max_spans_per_batch: config.max_spans_per_batch,
+                max_bytes_per_batch: config.max_bytes_per_batch,
+                timeout: config.timeout,
+                retries: config.retries,
             },
             &trace,
         )?;
