@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_ceph_version_for_abi_layout() {
-        let mut rodata = types::rodata::default();
+        let mut rodata = rodata();
 
         let err = configure_rodata(&mut rodata, None).unwrap_err();
 
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn configures_pre_squid_abi_layout() {
-        let mut rodata = types::rodata::default();
+        let mut rodata = rodata();
 
         configure_rodata(&mut rodata, Some("18.2.8-1jammy")).unwrap();
 
@@ -632,7 +632,7 @@ mod tests {
 
     #[test]
     fn configures_squid_abi_layout() {
-        let mut rodata = types::rodata::default();
+        let mut rodata = rodata();
 
         configure_rodata(&mut rodata, Some("19.2.0")).unwrap();
 
@@ -653,5 +653,18 @@ mod tests {
         let mut bytes = [0; N];
         bytes[..value.len()].copy_from_slice(value.as_bytes());
         bytes
+    }
+
+    fn rodata() -> types::rodata {
+        types::rodata {
+            CEPH_OSD_OP_SIZE: 0,
+            CEPH_OSD_OP_EXTENT_OFFSET_OFFSET: 0,
+            CEPH_OSD_OP_EXTENT_LENGTH_OFFSET: 0,
+            CEPH_OSD_OP_CLS_CLASS_OFFSET: 0,
+            CEPH_OSD_OP_CLS_METHOD_OFFSET: 0,
+            CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET: 0,
+            CEPH_OSD_OP_BUFFER_RAW_OFFSET: 0,
+            CEPH_OSD_OP_BUFFER_DATA_OFFSET: 0,
+        }
     }
 }
