@@ -59,7 +59,7 @@ Fixed capture limits:
 - Class names are 8 bytes.
 - Method names are 32 bytes.
 
-BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans.
+BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans. A BPF diagnostics map also counts ring-buffer reservation failures, RADOS state-map failures, missing finish state, request-context map failures, and probe-read failures.
 
 ---
 
@@ -137,7 +137,7 @@ OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
-Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, and dropped OTLP queue spans. OTLP export logs add export batches, attempts, and failures.
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side drop/failure counters. OTLP export logs add export batches, attempts, and failures.
 
 It supports HTTP and HTTPS.
 

@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     cli::{Cli, OutputMode},
-    collector::{Collector, TraceDocument},
+    collector::{BpfDiagnostics, Collector, TraceDocument},
     dwarf_json::{basename, DwarfInfo, VarFieldKernel},
     events::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
@@ -39,6 +39,12 @@ use skel::*;
 const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
 const OTLP_EXPORT_QUEUE_CAPACITY: usize = 2;
+const BPF_DIAG_RINGBUF_REQUEST_DROPS: u32 = 0;
+const BPF_DIAG_RINGBUF_RADOS_DROPS: u32 = 1;
+const BPF_DIAG_RADOS_MAP_DROPS: u32 = 2;
+const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
+const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
+const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -118,6 +124,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         }
         if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
         {
+            merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
             if let Some(exporter) = &otlp_exporter {
                 queue_expired_otlp(cli, &collector, &exporter.sender)?;
             }
@@ -126,6 +133,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     }
 
     drop(ringbuf);
+    merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
     if let Some(exporter) = otlp_exporter {
         let export = exporter.finish()?;
         info!(
@@ -142,6 +150,44 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let trace = collector.into_trace_document(cli.service_name.clone());
     info!(spans = trace.spans.len(), "finished live tracing");
     Ok(trace)
+}
+
+fn merge_bpf_diagnostics(map: &impl MapCore, collector: &Arc<Mutex<Collector>>) -> Result<()> {
+    let diagnostics = read_bpf_diagnostics(map)?;
+    collector
+        .lock()
+        .expect("collector lock poisoned")
+        .merge_bpf_diagnostics(diagnostics);
+    Ok(())
+}
+
+fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
+    Ok(BpfDiagnostics {
+        ringbuf_request_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_REQUEST_DROPS)?,
+        ringbuf_rados_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_RADOS_DROPS)?,
+        rados_map_drops: read_bpf_counter(map, BPF_DIAG_RADOS_MAP_DROPS)?,
+        rados_finish_misses: read_bpf_counter(map, BPF_DIAG_RADOS_FINISH_MISSES)?,
+        request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
+        probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
+    })
+}
+
+fn read_bpf_counter(map: &impl MapCore, counter: u32) -> Result<u64> {
+    let key = counter.to_ne_bytes();
+    let Some(values) = map.lookup_percpu(&key, MapFlags::ANY)? else {
+        return Ok(0);
+    };
+    values.into_iter().try_fold(0_u64, |total, value| {
+        if value.len() < size_of::<u64>() {
+            bail!(
+                "BPF diagnostics counter value is too short: {}",
+                value.len()
+            );
+        }
+        let mut bytes = [0_u8; size_of::<u64>()];
+        bytes.copy_from_slice(&value[..size_of::<u64>()]);
+        Ok(total.saturating_add(u64::from_ne_bytes(bytes)))
+    })
 }
 
 impl OtlpExporter {

@@ -7,9 +7,39 @@
 #include <stdbool.h>
 
 #include "rgwtrace_events.h"
-#include "bpf_utils.h"
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __type(key, __u32);
+  __type(value, __u64);
+  __uint(max_entries, RGWTRACE_DIAG_COUNTERS);
+} diagnostics SEC(".maps");
+
+static __always_inline void count_diag(__u32 key) {
+  __u64 *counter = bpf_map_lookup_elem(&diagnostics, &key);
+  if (counter != 0)
+    *counter += 1;
+}
+
+static __always_inline int rgwtrace_probe_read_user(void *dst, __u32 size,
+                                                    const void *unsafe_ptr) {
+  int ret = bpf_probe_read_user(dst, size, unsafe_ptr);
+  if (ret != 0)
+    count_diag(RGWTRACE_DIAG_PROBE_READ_FAILURES);
+  return ret;
+}
+
+static __always_inline int rgwtrace_probe_read_user_str(void *dst, __u32 size,
+                                                        const void *unsafe_ptr) {
+  int ret = bpf_probe_read_user_str(dst, size, unsafe_ptr);
+  if (ret < 0)
+    count_diag(RGWTRACE_DIAG_PROBE_READ_FAILURES);
+  return ret;
+}
+
+#include "bpf_utils.h"
 
 struct rados_op_state {
   struct rgwtrace_rados_event event;
@@ -64,8 +94,10 @@ static __always_inline void emit_request_event(__u32 type,
                                                struct rgw_request_ctx *ctx,
                                                __u64 end_ns) {
   struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-  if (e == 0)
+  if (e == 0) {
+    count_diag(RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS);
     return;
+  }
 
   __builtin_memset(e, 0, sizeof(*e));
   e->type = type;
@@ -91,10 +123,15 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
     fallback.start_ns = bpf_ktime_get_boot_ns();
     fallback.pid = get_pid();
     fallback.tid = thread_id;
-    bpf_map_update_elem(&rgw_requests, &thread_id, &fallback, 0);
-    request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
-    if (request == 0)
+    if (bpf_map_update_elem(&rgw_requests, &thread_id, &fallback, 0) != 0) {
+      count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
       return 0;
+    }
+    request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
+    if (request == 0) {
+      count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+      return 0;
+    }
   }
 
   struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
@@ -104,7 +141,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
 
   __u64 v = fetch_register(ctx, vf->varloc.reg);
   __u64 len_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&trans_id_len, sizeof(trans_id_len), (void *)len_addr);
+  rgwtrace_probe_read_user(&trans_id_len, sizeof(trans_id_len), (void *)len_addr);
 
   ++varid;
   vf = bpf_map_lookup_elem(&hprobes, &varid);
@@ -114,13 +151,13 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   __u64 trans_id_base = 0;
   v = fetch_register(ctx, vf->varloc.reg);
   __u64 base_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&trans_id_base, sizeof(trans_id_base), (void *)base_addr);
+  rgwtrace_probe_read_user(&trans_id_base, sizeof(trans_id_base), (void *)base_addr);
 
   if (trans_id_len > 0 && trans_id_base > 0) {
     if (trans_id_len >= MAX_TRANS_ID)
       request->flags |= RGWTRACE_TRUNC_TRANS_ID;
-    bpf_probe_read_user_str(request->trans_id, sizeof(request->trans_id),
-                            (void *)trans_id_base);
+    rgwtrace_probe_read_user_str(request->trans_id, sizeof(request->trans_id),
+                                 (void *)trans_id_base);
     emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
                        bpf_ktime_get_boot_ns());
   }
@@ -137,7 +174,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 tid_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&key.tid, sizeof(key.tid), (void *)tid_addr);
+    rgwtrace_probe_read_user(&key.tid, sizeof(key.tid), (void *)tid_addr);
   }
 
   ++varid;
@@ -145,13 +182,18 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&key.cid, sizeof(key.cid), (void *)cid_addr);
+    rgwtrace_probe_read_user(&key.cid, sizeof(key.cid), (void *)cid_addr);
   }
 
-  bpf_map_update_elem(&rados_ops, &key, &zero_rados_op, 0);
-  struct rados_op_state *state = bpf_map_lookup_elem(&rados_ops, &key);
-  if (state == 0)
+  if (bpf_map_update_elem(&rados_ops, &key, &zero_rados_op, 0) != 0) {
+    count_diag(RGWTRACE_DIAG_RADOS_MAP_DROPS);
     return 0;
+  }
+  struct rados_op_state *state = bpf_map_lookup_elem(&rados_ops, &key);
+  if (state == 0) {
+    count_diag(RGWTRACE_DIAG_RADOS_MAP_DROPS);
+    return 0;
+  }
 
   struct rgwtrace_rados_event *event = &state->event;
   __builtin_memset(event, 0, sizeof(*event));
@@ -172,8 +214,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 osd_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&event->target_osd, sizeof(event->target_osd),
-                        (void *)osd_addr);
+    rgwtrace_probe_read_user(&event->target_osd, sizeof(event->target_osd),
+                             (void *)osd_addr);
   }
 
   ++varid;
@@ -182,7 +224,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 len_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&name_len, sizeof(name_len), (void *)len_addr);
+    rgwtrace_probe_read_user(&name_len, sizeof(name_len), (void *)len_addr);
   }
 
   ++varid;
@@ -191,7 +233,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 name_base_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&name_base, sizeof(name_base), (void *)name_base_addr);
+    rgwtrace_probe_read_user(&name_base, sizeof(name_base),
+                             (void *)name_base_addr);
   }
 
   __u32 read_len = 0;
@@ -206,14 +249,14 @@ int uprobe_send_op(struct pt_regs *ctx) {
   read_len &= MAX_OBJECT_NAME - 1;
   asm volatile("%0 &= 127" : "+r"(read_len));
   if (read_len > 0 && name_base > 0)
-    bpf_probe_read_user(event->object_name, read_len, (void *)name_base);
+    rgwtrace_probe_read_user(event->object_name, read_len, (void *)name_base);
 
   ++varid;
   vf = bpf_map_lookup_elem(&hprobes, &varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 flags_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&event->rw, sizeof(event->rw), (void *)flags_addr);
+    rgwtrace_probe_read_user(&event->rw, sizeof(event->rw), (void *)flags_addr);
   }
 
   ++varid;
@@ -221,7 +264,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 pool_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&event->pool, sizeof(event->pool), (void *)pool_addr);
+    rgwtrace_probe_read_user(&event->pool, sizeof(event->pool), (void *)pool_addr);
   }
 
   ++varid;
@@ -229,8 +272,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 seed_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&event->pg_seed, sizeof(event->pg_seed),
-                        (void *)seed_addr);
+    rgwtrace_probe_read_user(&event->pg_seed, sizeof(event->pg_seed),
+                             (void *)seed_addr);
   }
 
   for (int i = 0; i < MAX_ACTING; ++i)
@@ -243,8 +286,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
     return 0;
   __u64 v = fetch_register(ctx, vf->varloc.reg);
   __u64 acting_start_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&acting_start, sizeof(acting_start),
-                      (void *)acting_start_addr);
+  rgwtrace_probe_read_user(&acting_start, sizeof(acting_start),
+                           (void *)acting_start_addr);
 
   ++varid;
   __u64 acting_finish = 0;
@@ -253,8 +296,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
   __u64 acting_finish_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&acting_finish, sizeof(acting_finish),
-                      (void *)acting_finish_addr);
+  rgwtrace_probe_read_user(&acting_finish, sizeof(acting_finish),
+                           (void *)acting_finish_addr);
 
   if (acting_start > 0 && acting_finish >= acting_start) {
     __u64 acting_bytes = acting_finish - acting_start;
@@ -267,8 +310,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
       for (int i = 0; i < MAX_ACTING; ++i) {
         if (i >= acting_size)
           break;
-        if (bpf_probe_read_user(&(event->acting[i]), sizeof(int),
-                                (void *)(acting_start + i * sizeof(int))) != 0) {
+        if (rgwtrace_probe_read_user(&(event->acting[i]), sizeof(int),
+                                     (void *)(acting_start + i * sizeof(int))) != 0) {
           event->acting[i] = -1;
           break;
         }
@@ -283,7 +326,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
   __u64 ops_start_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&ops_start, sizeof(ops_start), (void *)ops_start_addr);
+  rgwtrace_probe_read_user(&ops_start, sizeof(ops_start),
+                           (void *)ops_start_addr);
 
   ++varid;
   vf = bpf_map_lookup_elem(&hprobes, &varid);
@@ -291,8 +335,8 @@ int uprobe_send_op(struct pt_regs *ctx) {
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
   __u64 ops_size_addr = fetch_var_member_addr(v, vf);
-  bpf_probe_read_user(&event->ops_size, sizeof(event->ops_size),
-                      (void *)ops_size_addr);
+  rgwtrace_probe_read_user(&event->ops_size, sizeof(event->ops_size),
+                           (void *)ops_size_addr);
 
   if (event->ops_size > MAX_RADOS_OPS) {
     event->flags |= RGWTRACE_TRUNC_RADOS_OPS;
@@ -302,30 +346,32 @@ int uprobe_send_op(struct pt_regs *ctx) {
     if (i >= event->ops_size)
       break;
 
-    bpf_probe_read_user(&(event->ops[i]), sizeof(event->ops[i]),
-                        (void *)ops_start);
+    rgwtrace_probe_read_user(&(event->ops[i]), sizeof(event->ops[i]),
+                             (void *)ops_start);
     if (ceph_osd_op_extent(event->ops[i])) {
-      bpf_probe_read_user(&event->offset, sizeof(event->offset),
-                          (void *)(ops_start + CEPH_OSD_OP_EXTENT_OFFSET_OFFSET));
-      bpf_probe_read_user(&event->length, sizeof(event->length),
-                          (void *)(ops_start + CEPH_OSD_OP_EXTENT_LENGTH_OFFSET));
+      rgwtrace_probe_read_user(
+          &event->offset, sizeof(event->offset),
+          (void *)(ops_start + CEPH_OSD_OP_EXTENT_OFFSET_OFFSET));
+      rgwtrace_probe_read_user(
+          &event->length, sizeof(event->length),
+          (void *)(ops_start + CEPH_OSD_OP_EXTENT_LENGTH_OFFSET));
     } else if (ceph_osd_op_call(event->ops[i])) {
       __u8 cls_len = 0;
       __u8 method_len = 0;
-      bpf_probe_read_user(&cls_len, sizeof(cls_len),
-                          (void *)ops_start + CEPH_OSD_OP_CLS_CLASS_OFFSET);
-      bpf_probe_read_user(&method_len, sizeof(method_len),
-                          (void *)ops_start + CEPH_OSD_OP_CLS_METHOD_OFFSET);
+      rgwtrace_probe_read_user(&cls_len, sizeof(cls_len),
+                               (void *)ops_start + CEPH_OSD_OP_CLS_CLASS_OFFSET);
+      rgwtrace_probe_read_user(&method_len, sizeof(method_len),
+                               (void *)ops_start + CEPH_OSD_OP_CLS_METHOD_OFFSET);
 
       __u64 carriage = 0;
       __u64 raw = 0;
       __u64 data = 0;
-      bpf_probe_read_user(&carriage, sizeof(carriage),
-                          (void *)ops_start + CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET);
-      bpf_probe_read_user(&raw, sizeof(raw),
-                          (void *)carriage + CEPH_OSD_OP_BUFFER_RAW_OFFSET);
-      bpf_probe_read_user(&data, sizeof(data),
-                          (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
+      rgwtrace_probe_read_user(&carriage, sizeof(carriage),
+                               (void *)ops_start + CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET);
+      rgwtrace_probe_read_user(&raw, sizeof(raw),
+                               (void *)carriage + CEPH_OSD_OP_BUFFER_RAW_OFFSET);
+      rgwtrace_probe_read_user(&data, sizeof(data),
+                               (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
 
       if (cls_len >= sizeof(event->cls_ops[i].cls_name)) {
         event->flags |= RGWTRACE_TRUNC_CLS_NAME;
@@ -335,9 +381,9 @@ int uprobe_send_op(struct pt_regs *ctx) {
         event->flags |= RGWTRACE_TRUNC_METHOD_NAME;
         method_len = sizeof(event->cls_ops[i].method_name) - 1;
       }
-      bpf_probe_read_user(event->cls_ops[i].cls_name, cls_len, (void *)data);
-      bpf_probe_read_user(event->cls_ops[i].method_name, method_len,
-                          (void *)data + cls_len);
+      rgwtrace_probe_read_user(event->cls_ops[i].cls_name, cls_len, (void *)data);
+      rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_len,
+                               (void *)data + cls_len);
     }
 
     ops_start += CEPH_OSD_OP_SIZE;
@@ -355,7 +401,7 @@ int uprobe_finish_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 tid_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&key.tid, sizeof(key.tid), (void *)tid_addr);
+    rgwtrace_probe_read_user(&key.tid, sizeof(key.tid), (void *)tid_addr);
   }
 
   ++varid;
@@ -363,19 +409,24 @@ int uprobe_finish_op(struct pt_regs *ctx) {
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);
-    bpf_probe_read_user(&key.cid, sizeof(key.cid), (void *)cid_addr);
+    rgwtrace_probe_read_user(&key.cid, sizeof(key.cid), (void *)cid_addr);
   }
 
   struct rados_op_state *state = bpf_map_lookup_elem(&rados_ops, &key);
-  if (state == 0)
+  if (state == 0) {
+    count_diag(RGWTRACE_DIAG_RADOS_FINISH_MISSES);
     return 0;
+  }
 
   state->event.finish_ns = bpf_ktime_get_boot_ns();
   state->event.pid = get_pid();
 
   struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
-  if (e == 0)
+  if (e == 0) {
+    count_diag(RGWTRACE_DIAG_RINGBUF_RADOS_DROPS);
+    bpf_map_delete_elem(&rados_ops, &key);
     return 0;
+  }
 
   __builtin_memset(e, 0, sizeof(*e));
   e->type = RGWTRACE_EVENT_RADOS_OP;

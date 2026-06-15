@@ -61,7 +61,7 @@ sudo rgwtrace \
 
 For fallback validation, rerun with `--import-json 18.2.8-1jammy_dwarf_traceid.json`.
 
-Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, and expired spans.
+Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, expired spans, and BPF-side drop/failure counters.
 
 ---
 

@@ -46,6 +46,16 @@ pub struct TraceDocument {
     pub diagnostics: TraceDiagnostics,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BpfDiagnostics {
+    pub ringbuf_request_drops: u64,
+    pub ringbuf_rados_drops: u64,
+    pub rados_map_drops: u64,
+    pub rados_finish_misses: u64,
+    pub request_context_drops: u64,
+    pub probe_read_failures: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TraceDiagnostics {
     pub events_decoded: u64,
@@ -70,6 +80,12 @@ pub struct TraceDiagnostics {
     pub truncated_method_names: u64,
     pub otlp_queue_dropped_traces: u64,
     pub otlp_queue_dropped_spans: u64,
+    pub bpf_ringbuf_request_drops: u64,
+    pub bpf_ringbuf_rados_drops: u64,
+    pub bpf_rados_map_drops: u64,
+    pub bpf_rados_finish_misses: u64,
+    pub bpf_request_context_drops: u64,
+    pub bpf_probe_read_failures: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -196,6 +212,15 @@ impl Collector {
             .diagnostics
             .otlp_queue_dropped_spans
             .saturating_add(spans as u64);
+    }
+
+    pub fn merge_bpf_diagnostics(&mut self, diagnostics: BpfDiagnostics) {
+        self.diagnostics.bpf_ringbuf_request_drops = diagnostics.ringbuf_request_drops;
+        self.diagnostics.bpf_ringbuf_rados_drops = diagnostics.ringbuf_rados_drops;
+        self.diagnostics.bpf_rados_map_drops = diagnostics.rados_map_drops;
+        self.diagnostics.bpf_rados_finish_misses = diagnostics.rados_finish_misses;
+        self.diagnostics.bpf_request_context_drops = diagnostics.request_context_drops;
+        self.diagnostics.bpf_probe_read_failures = diagnostics.probe_read_failures;
     }
 
     pub fn drain_expired(
@@ -848,6 +873,28 @@ mod tests {
         let document = collector.into_trace_document("rgwtrace");
         assert_eq!(document.diagnostics.otlp_queue_dropped_traces, 2);
         assert_eq!(document.diagnostics.otlp_queue_dropped_spans, 5);
+    }
+
+    #[test]
+    fn merges_bpf_diagnostics() {
+        let mut collector = Collector::default();
+
+        collector.merge_bpf_diagnostics(BpfDiagnostics {
+            ringbuf_request_drops: 1,
+            ringbuf_rados_drops: 2,
+            rados_map_drops: 3,
+            rados_finish_misses: 4,
+            request_context_drops: 5,
+            probe_read_failures: 6,
+        });
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.bpf_ringbuf_request_drops, 1);
+        assert_eq!(document.diagnostics.bpf_ringbuf_rados_drops, 2);
+        assert_eq!(document.diagnostics.bpf_rados_map_drops, 3);
+        assert_eq!(document.diagnostics.bpf_rados_finish_misses, 4);
+        assert_eq!(document.diagnostics.bpf_request_context_drops, 5);
+        assert_eq!(document.diagnostics.bpf_probe_read_failures, 6);
     }
 
     #[test]

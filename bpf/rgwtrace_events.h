@@ -18,6 +18,16 @@ enum rgwtrace_truncation_flags {
   RGWTRACE_TRUNC_METHOD_NAME = 1 << 5,
 };
 
+enum rgwtrace_diag_counter {
+  RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS = 0,
+  RGWTRACE_DIAG_RINGBUF_RADOS_DROPS = 1,
+  RGWTRACE_DIAG_RADOS_MAP_DROPS = 2,
+  RGWTRACE_DIAG_RADOS_FINISH_MISSES = 3,
+  RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS = 4,
+  RGWTRACE_DIAG_PROBE_READ_FAILURES = 5,
+  RGWTRACE_DIAG_COUNTERS = 6,
+};
+
 struct rgwtrace_request_event {
   __u64 start_ns;
   __u64 end_ns;

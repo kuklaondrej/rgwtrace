@@ -76,7 +76,7 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   if (vf->varloc.stack) {
     cur_addr += vf->varloc.offset;
     if (vf->fields[1].pointer) {
-      bpf_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);
+      rgwtrace_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);
       cur_addr = tmpaddr;
     }
   }
@@ -87,7 +87,7 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
     if (i >= vf->size)
       break;
     if (vf->fields[i].pointer) {
-      bpf_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);
+      rgwtrace_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);
       cur_addr = tmpaddr + vf->fields[i].offset;
     } else {
       cur_addr += vf->fields[i].offset;
