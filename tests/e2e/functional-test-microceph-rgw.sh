@@ -32,6 +32,8 @@ TRACE_LOG="${ARTIFACT_DIR}/rgwtrace.log"
 WORKLOAD_JSONL="${ARTIFACT_DIR}/workload.jsonl"
 WORKLOAD_LOG="${ARTIFACT_DIR}/workload.log"
 VERIFY_LOG="${ARTIFACT_DIR}/verify.log"
+NATIVE_DWARF_JSON="${ARTIFACT_DIR}/native-dwarf.json"
+NATIVE_DWARF_LOG="${ARTIFACT_DIR}/native-dwarf.log"
 RGW_USER_JSON="${ARTIFACT_DIR}/rgw-user.json"
 RGW_ENABLE_LOG="${ARTIFACT_DIR}/microceph-rgw-enable.log"
 MICROCEPH_VERSION_FILE="${ARTIFACT_DIR}/microceph-version.txt"
@@ -368,6 +370,27 @@ find_rgw_pid() {
     return 1
 }
 
+prepare_dwarf_json() {
+    local rgw_pid="$1"
+
+    if [[ -n "${RGWTRACE_DWARF_JSON}" ]]; then
+        info "using caller-provided DWARF JSON ${RGWTRACE_DWARF_JSON}"
+        return 0
+    fi
+
+    info "exporting native DWARF metadata to ${NATIVE_DWARF_JSON}"
+    if ! "${RGWTRACE_BIN}" \
+        --dwarf-source native \
+        --pid "${rgw_pid}" \
+        --export-dwarf-json \
+        >"${NATIVE_DWARF_JSON}" 2>"${NATIVE_DWARF_LOG}"; then
+        err "native DWARF export failed; see ${NATIVE_DWARF_LOG}"
+        return 1
+    fi
+
+    RGWTRACE_DWARF_JSON="${NATIVE_DWARF_JSON}"
+}
+
 run_preflight() {
     local rgw_pid="$1"
     local dwarf_args=(--dwarf-source native)
@@ -434,6 +457,16 @@ verify_trace() {
 main() {
     require_root
     mkdir -p "${ARTIFACT_DIR}"
+    rm -f \
+        "${PREFLIGHT_JSON}" \
+        "${PREFLIGHT_LOG}" \
+        "${TRACE_JSON}" \
+        "${TRACE_LOG}" \
+        "${WORKLOAD_JSONL}" \
+        "${WORKLOAD_LOG}" \
+        "${VERIFY_LOG}" \
+        "${NATIVE_DWARF_JSON}" \
+        "${NATIVE_DWARF_LOG}"
     : >"${WORKLOAD_JSONL}"
 
     if [[ ! -x "${RGWTRACE_BIN}" ]]; then
@@ -453,6 +486,7 @@ main() {
     }
     info "found radosgw PID ${rgw_pid}"
 
+    prepare_dwarf_json "${rgw_pid}"
     run_preflight "${rgw_pid}"
     start_trace "${rgw_pid}"
     sleep "${TRACE_ATTACH_DELAY}"
