@@ -19,7 +19,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def write_record(handle, name, bucket, key, start_ns, end_ns, status, error=None):
+def request_id_from_response(response):
+    if not isinstance(response, dict):
+        return None
+
+    metadata = response.get("ResponseMetadata") or {}
+    headers = metadata.get("HTTPHeaders") or {}
+    return headers.get("x-amz-request-id") or metadata.get("RequestId")
+
+
+def write_record(handle, name, bucket, key, start_ns, end_ns, status, request_id=None, error=None):
     record = {
         "name": name,
         "bucket": bucket,
@@ -28,6 +37,8 @@ def write_record(handle, name, bucket, key, start_ns, end_ns, status, error=None
         "end_ns": end_ns,
         "status": status,
     }
+    if request_id:
+        record["x_amz_request_id"] = request_id
     if error:
         record["error"] = error
     handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -38,14 +49,18 @@ def run_op(handle, name, bucket, key, fn):
     start_ns = time.time_ns()
     status = "ok"
     error = None
+    request_id = None
     try:
-        return fn()
+        response = fn()
+        request_id = request_id_from_response(response)
+        return response
     except Exception as exc:
         status = "error"
         error = repr(exc)
+        request_id = request_id_from_response(getattr(exc, "response", None))
         raise
     finally:
-        write_record(handle, name, bucket, key, start_ns, time.time_ns(), status, error)
+        write_record(handle, name, bucket, key, start_ns, time.time_ns(), status, request_id, error)
 
 
 def main():
@@ -55,6 +70,7 @@ def main():
     copy_key = "copy-alpha.txt"
     multipart_key = "multipart.bin"
     uploaded_keys = set()
+    bucket_deleted = False
 
     client = boto3.client(
         "s3",
@@ -86,7 +102,11 @@ def main():
 
             def get_alpha():
                 response = client.get_object(Bucket=bucket, Key=alpha_key)
-                response["Body"].read()
+                try:
+                    response["Body"].read()
+                finally:
+                    response["Body"].close()
+                return response
 
             run_op(handle, "get_object", bucket, alpha_key, get_alpha)
             run_op(handle, "list_objects", bucket, None, lambda: client.list_objects_v2(Bucket=bucket, Prefix="alpha"))
@@ -104,32 +124,47 @@ def main():
             )
             uploaded_keys.add(copy_key)
 
-            def multipart_upload():
-                upload = client.create_multipart_upload(Bucket=bucket, Key=multipart_key)
-                upload_id = upload["UploadId"]
-                parts = []
-                try:
-                    for part_number, byte in [(1, b"a"), (2, b"b")]:
-                        body = io.BytesIO(byte * (5 * 1024 * 1024))
-                        response = client.upload_part(
+            upload = run_op(
+                handle,
+                "create_multipart_upload",
+                bucket,
+                multipart_key,
+                lambda: client.create_multipart_upload(Bucket=bucket, Key=multipart_key),
+            )
+            upload_id = upload["UploadId"]
+            parts = []
+            try:
+                for part_number, byte in [(1, b"a"), (2, b"b")]:
+                    body = io.BytesIO(byte * (5 * 1024 * 1024))
+                    response = run_op(
+                        handle,
+                        f"upload_part_{part_number}",
+                        bucket,
+                        multipart_key,
+                        lambda part_number=part_number, body=body: client.upload_part(
                             Bucket=bucket,
                             Key=multipart_key,
                             UploadId=upload_id,
                             PartNumber=part_number,
                             Body=body,
-                        )
-                        parts.append({"ETag": response["ETag"], "PartNumber": part_number})
-                    return client.complete_multipart_upload(
+                        ),
+                    )
+                    parts.append({"ETag": response["ETag"], "PartNumber": part_number})
+                run_op(
+                    handle,
+                    "complete_multipart_upload",
+                    bucket,
+                    multipart_key,
+                    lambda: client.complete_multipart_upload(
                         Bucket=bucket,
                         Key=multipart_key,
                         UploadId=upload_id,
                         MultipartUpload={"Parts": parts},
-                    )
-                except Exception:
-                    client.abort_multipart_upload(Bucket=bucket, Key=multipart_key, UploadId=upload_id)
-                    raise
-
-            run_op(handle, "multipart_upload", bucket, multipart_key, multipart_upload)
+                    ),
+                )
+            except Exception:
+                client.abort_multipart_upload(Bucket=bucket, Key=multipart_key, UploadId=upload_id)
+                raise
             uploaded_keys.add(multipart_key)
 
             for key in [copy_key, alpha_key, multipart_key]:
@@ -137,16 +172,18 @@ def main():
                 uploaded_keys.discard(key)
 
             run_op(handle, "delete_bucket", bucket, None, lambda: client.delete_bucket(Bucket=bucket))
+            bucket_deleted = True
         finally:
             for key in sorted(uploaded_keys):
                 try:
                     client.delete_object(Bucket=bucket, Key=key)
                 except Exception:
                     pass
-            try:
-                client.delete_bucket(Bucket=bucket)
-            except Exception:
-                pass
+            if not bucket_deleted:
+                try:
+                    client.delete_bucket(Bucket=bucket)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

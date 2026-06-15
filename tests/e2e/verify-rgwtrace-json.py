@@ -48,6 +48,16 @@ def span_overlaps(span, start_ns, end_ns, slack_ns):
     return span.get("end_ns", 0) >= start_ns - slack_ns and span.get("start_ns", 0) <= end_ns + slack_ns
 
 
+def duplicate_values(values):
+    seen = set()
+    duplicates = set()
+    for value in values:
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    return sorted(duplicates)
+
+
 def main():
     args = parse_args()
     errors = []
@@ -62,6 +72,8 @@ def main():
     rados_spans = [span for span in spans if span.get("name") == "rados.op"]
     background_spans = [span for span in spans if span.get("name") == "rgw.background.rados_op"]
     request_ids = {span.get("span_id") for span in request_spans}
+    workload_request_id_count = 0
+    trace_request_id_count = 0
 
     if diagnostics.get("decode_errors", 0) != 0:
         fail(errors, f"decode_errors must be 0, got {diagnostics.get('decode_errors')}")
@@ -143,11 +155,48 @@ def main():
         if keys and not any(any(key in obj for key in keys) for obj in rados_objects):
             fail(errors, f"no captured ceph.rados.object contains workload keys {sorted(keys)}")
 
+        missing_request_id_records = [record for record in successful_workload if not record.get("x_amz_request_id")]
+        if missing_request_id_records:
+            fail(
+                errors,
+                "successful workload records missing x-amz-request-id: "
+                f"{[record.get('name') for record in missing_request_id_records]}",
+            )
+
+        workload_request_ids = [record["x_amz_request_id"] for record in successful_workload if record.get("x_amz_request_id")]
+        trace_request_ids = []
+        for span in request_in_window:
+            trans_id = attr_map(span).get("rgw.trans_id")
+            if trans_id:
+                trace_request_ids.append(trans_id)
+
+        workload_request_id_count = len(workload_request_ids)
+        trace_request_id_count = len(trace_request_ids)
+
+        duplicate_workload_ids = duplicate_values(workload_request_ids)
+        if duplicate_workload_ids:
+            fail(errors, f"duplicate workload x-amz-request-id values: {duplicate_workload_ids}")
+
+        duplicate_trace_ids = duplicate_values(trace_request_ids)
+        if duplicate_trace_ids:
+            fail(errors, f"duplicate trace rgw.trans_id values in workload window: {duplicate_trace_ids}")
+
+        workload_request_id_set = set(workload_request_ids)
+        trace_request_id_set = set(trace_request_ids)
+        missing_trace_ids = sorted(workload_request_id_set - trace_request_id_set)
+        unexpected_trace_ids = sorted(trace_request_id_set - workload_request_id_set)
+        if missing_trace_ids:
+            fail(errors, f"workload x-amz-request-id values missing from trace rgw.trans_id: {missing_trace_ids}")
+        if unexpected_trace_ids:
+            fail(errors, f"trace rgw.trans_id values without matching workload x-amz-request-id: {unexpected_trace_ids}")
+
     summary = {
         "spans": len(spans),
         "request_spans": len(request_spans),
         "rados_spans": len(rados_spans),
         "background_spans": len(background_spans),
+        "workload_request_ids": workload_request_id_count,
+        "trace_request_ids_in_window": trace_request_id_count,
         "roles": sorted(role for role in roles if role),
         "diagnostics": diagnostics,
     }
