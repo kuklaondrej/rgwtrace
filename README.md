@@ -213,7 +213,7 @@ RADOS child spans include object, op list, pool, PG, PG seed, acting set, target
 
 RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason.
 
-Request spans include `rgw.duration_quality`. Current live captures normally use `marker` because the safe RGW probe observes a request marker rather than the full lifecycle. If future start/end probes are active, the value is `request_lifecycle`; request groups built only from RADOS bounds use `rados_bounds`.
+Request spans include `rgw.duration_quality`. Current live captures normally use `marker` because the safe RGW probe observes a request marker rather than the full lifecycle; the span still envelopes any correlated RADOS child bounds. If future start/end probes are active, the value is `request_lifecycle`; request groups built only from RADOS bounds use `rados_bounds`.
 
 When fixed BPF capture limits truncate values, RADOS spans include `rgwtrace.truncated` with affected fields.
 

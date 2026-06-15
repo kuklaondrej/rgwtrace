@@ -140,7 +140,7 @@ Do not assume background spans are errors. A rising background ratio is useful s
 
 Request spans include `rgw.duration_quality`.
 
-- `marker`: current live probe path observed a request marker, not full lifecycle latency.
+- `marker`: current live probe path observed a request marker, not full lifecycle latency. The request span still envelopes correlated RADOS child bounds.
 - `request_lifecycle`: both request start and end markers were observed.
 - `rados_bounds`: the request group was built from RADOS timestamps only.
 

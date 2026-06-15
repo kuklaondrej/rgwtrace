@@ -303,23 +303,23 @@ fn request_key(request: &RequestEvent) -> String {
 }
 
 fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
-    let start_ns = builder
-        .request
-        .as_ref()
-        .map(|request| request.start_ns)
-        .or_else(|| builder.rados.iter().map(|rados| rados.event.sent_ns).min())
+    let request_start_ns = builder.request.as_ref().map(|request| request.start_ns);
+    let rados_start_ns = builder.rados.iter().map(|rados| rados.event.sent_ns).min();
+    let start_ns = request_start_ns
+        .into_iter()
+        .chain(rados_start_ns)
+        .min()
         .unwrap_or_default();
-    let end_ns = builder
-        .request
-        .as_ref()
-        .map(|request| request.end_ns)
-        .or_else(|| {
-            builder
-                .rados
-                .iter()
-                .map(|rados| rados.event.finish_ns)
-                .max()
-        })
+    let request_end_ns = builder.request.as_ref().map(|request| request.end_ns);
+    let rados_end_ns = builder
+        .rados
+        .iter()
+        .map(|rados| rados.event.finish_ns)
+        .max();
+    let end_ns = request_end_ns
+        .into_iter()
+        .chain(rados_end_ns)
+        .max()
         .unwrap_or(start_ns);
     let trans_id = builder
         .request
@@ -791,6 +791,25 @@ mod tests {
         assert_eq!(
             string_attribute(&document.spans[0], "rgw.duration_quality"),
             Some("request_lifecycle")
+        );
+    }
+
+    #[test]
+    fn request_span_envelopes_child_rados_bounds() {
+        let mut collector = Collector::default();
+        let mut child = rados("object", "tx1");
+        child.sent_ns = 20;
+        child.finish_ns = 100;
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(TraceEvent::RequestEnd(request("tx1", 30, 40)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans[0].start_ns, 20);
+        assert_eq!(document.spans[0].end_ns, 100);
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.duration_quality"),
+            Some("marker")
         );
     }
 
