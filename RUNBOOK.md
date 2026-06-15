@@ -88,7 +88,7 @@ sudo rgwtrace \
   --correlation-ttl 120
 ```
 
-Use `--log-level info` or `RUST_LOG=rgwtrace=debug` to see export summaries and retry details.
+Use `--log-level info` or `RUST_LOG=rgwtrace=debug` to see export queue summaries, export attempts, and retry details.
 
 Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobuf payloads. The byte limit is checked before gzip compression; `0` disables byte-based splitting.
 

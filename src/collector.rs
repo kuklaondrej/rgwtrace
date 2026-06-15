@@ -68,6 +68,8 @@ pub struct TraceDiagnostics {
     pub truncated_rados_ops: u64,
     pub truncated_cls_names: u64,
     pub truncated_method_names: u64,
+    pub otlp_queue_dropped_traces: u64,
+    pub otlp_queue_dropped_spans: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -186,6 +188,14 @@ impl Collector {
 
     pub fn record_decode_error(&mut self) {
         self.diagnostics.decode_errors += 1;
+    }
+
+    pub fn record_otlp_queue_drop(&mut self, spans: usize) {
+        self.diagnostics.otlp_queue_dropped_traces += 1;
+        self.diagnostics.otlp_queue_dropped_spans = self
+            .diagnostics
+            .otlp_queue_dropped_spans
+            .saturating_add(spans as u64);
     }
 
     pub fn drain_expired(
@@ -826,6 +836,18 @@ mod tests {
             string_attribute(&document.spans[1], "rgwtrace.truncated"),
             Some("object_name,rados_ops")
         );
+    }
+
+    #[test]
+    fn records_otlp_queue_drops() {
+        let mut collector = Collector::default();
+
+        collector.record_otlp_queue_drop(3);
+        collector.record_otlp_queue_drop(2);
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.otlp_queue_dropped_traces, 2);
+        assert_eq!(document.diagnostics.otlp_queue_dropped_spans, 5);
     }
 
     #[test]

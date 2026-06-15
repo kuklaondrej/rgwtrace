@@ -114,13 +114,13 @@ sudo rgwtrace \
   --otlp-header 'Authorization:Bearer local-token'
 ```
 
-In OTLP mode, live tracing periodically exports spans whose correlation window has expired. `--otlp-flush-interval` controls how often expired spans are checked, and `--correlation-ttl` controls how long request/RADOS correlation state is retained before it is flushed.
+In OTLP mode, live tracing periodically queues spans whose correlation window has expired for a background exporter. `--otlp-flush-interval` controls how often expired spans are checked, and `--correlation-ttl` controls how long request/RADOS correlation state is retained before it is flushed.
 
 `--otlp-compression gzip` compresses request bodies and sets `Content-Encoding: gzip`. `--otlp-max-spans-per-batch` limits spans per OTLP request. `--otlp-max-bytes-per-batch` limits encoded protobuf bytes before compression; `0` disables byte-based splitting.
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, and expired background RADOS ops.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, and dropped OTLP queue spans.
 
 OTLP mode logs the same trace counters plus export batches, attempts, and failures when internal logging is enabled.
 

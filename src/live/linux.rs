@@ -5,8 +5,10 @@ use std::{
     ptr::NonNull,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -36,6 +38,12 @@ use skel::*;
 
 const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
+const OTLP_EXPORT_QUEUE_CAPACITY: usize = 2;
+
+struct OtlpExporter {
+    sender: SyncSender<TraceDocument>,
+    handle: JoinHandle<Result<otel::ExportDiagnostics>>,
+}
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = preflight::validated_targets(cli, dwarf)?;
@@ -56,6 +64,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     } else {
         Collector::default()
     }));
+    let otlp_exporter = matches!(cli.output, OutputMode::Otlp).then(|| OtlpExporter::spawn(cli));
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);
@@ -109,12 +118,23 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         }
         if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
         {
-            flush_expired_otlp(cli, &collector)?;
+            if let Some(exporter) = &otlp_exporter {
+                queue_expired_otlp(cli, &collector, &exporter.sender)?;
+            }
             last_flush = Instant::now();
         }
     }
 
     drop(ringbuf);
+    if let Some(exporter) = otlp_exporter {
+        let export = exporter.finish()?;
+        info!(
+            export_batches = export.batches,
+            export_attempts = export.attempts,
+            export_failures = export.failures,
+            "finished live OTLP exporter"
+        );
+    }
     let collector = Arc::try_unwrap(collector)
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
         .into_inner()
@@ -124,7 +144,82 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     Ok(trace)
 }
 
-fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()> {
+impl OtlpExporter {
+    fn spawn(cli: &Cli) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
+        let endpoint = cli.otlp_endpoint.clone();
+        let headers = cli.otlp_header.clone();
+        let compression = cli.otlp_compression;
+        let max_spans_per_batch = cli.otlp_max_spans_per_batch;
+        let max_bytes_per_batch = cli.otlp_max_bytes_per_batch;
+        let timeout = cli.otlp_timeout;
+        let retries = cli.otlp_retries;
+        let handle = thread::spawn(move || {
+            run_otlp_exporter(
+                receiver,
+                endpoint,
+                headers,
+                compression,
+                max_spans_per_batch,
+                max_bytes_per_batch,
+                timeout,
+                retries,
+            )
+        });
+        Self { sender, handle }
+    }
+
+    fn finish(self) -> Result<otel::ExportDiagnostics> {
+        drop(self.sender);
+        self.handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("OTLP exporter thread panicked"))?
+    }
+}
+
+fn run_otlp_exporter(
+    receiver: Receiver<TraceDocument>,
+    endpoint: String,
+    headers: Vec<(String, String)>,
+    compression: crate::cli::OtlpCompression,
+    max_spans_per_batch: usize,
+    max_bytes_per_batch: usize,
+    timeout: Duration,
+    retries: u32,
+) -> Result<otel::ExportDiagnostics> {
+    let mut total = otel::ExportDiagnostics::default();
+    for trace in receiver {
+        let spans = trace.spans.len();
+        let export = otel::export_otlp_http(
+            otel::ExportConfig {
+                endpoint: &endpoint,
+                headers: &headers,
+                compression,
+                max_spans_per_batch,
+                max_bytes_per_batch,
+                timeout,
+                retries,
+            },
+            &trace,
+        )?;
+        total.batches += export.batches;
+        total.attempts += export.attempts;
+        total.failures += export.failures;
+        info!(
+            spans,
+            export_attempts = export.attempts,
+            export_failures = export.failures,
+            "exported expired OTLP spans"
+        );
+    }
+    Ok(total)
+}
+
+fn queue_expired_otlp(
+    cli: &Cli,
+    collector: &Arc<Mutex<Collector>>,
+    sender: &SyncSender<TraceDocument>,
+) -> Result<()> {
     let ttl_ns = duration_ns(cli.correlation_ttl);
     let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
     let trace = collector
@@ -136,24 +231,26 @@ fn flush_expired_otlp(cli: &Cli, collector: &Arc<Mutex<Collector>>) -> Result<()
     };
 
     let spans = trace.spans.len();
-    let export = otel::export_otlp_http(
-        otel::ExportConfig {
-            endpoint: &cli.otlp_endpoint,
-            headers: &cli.otlp_header,
-            compression: cli.otlp_compression,
-            max_spans_per_batch: cli.otlp_max_spans_per_batch,
-            max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
-            timeout: cli.otlp_timeout,
-            retries: cli.otlp_retries,
-        },
-        &trace,
-    )?;
-    info!(
-        spans,
-        export_attempts = export.attempts,
-        export_failures = export.failures,
-        "flushed expired OTLP spans"
-    );
+    match sender.try_send(trace) {
+        Ok(()) => info!(spans, "queued expired OTLP spans"),
+        Err(TrySendError::Full(trace)) => {
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_queue_drop(trace.spans.len());
+            warn!(
+                spans = trace.spans.len(),
+                "dropped expired OTLP spans; export queue is full"
+            );
+        }
+        Err(TrySendError::Disconnected(trace)) => {
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_queue_drop(trace.spans.len());
+            bail!("OTLP exporter worker stopped before accepting expired spans");
+        }
+    }
     Ok(())
 }
 

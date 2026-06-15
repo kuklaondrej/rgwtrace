@@ -77,7 +77,7 @@ Correlated RADOS spans are marked with `rgw.correlation = "same_thread"`. Backgr
 
 When `--correlate-inferred` is enabled, untagged RADOS events can be attached to a request only if there is exactly one same-PID candidate in the configured correlation window and the RADOS role is not classified as RGW background work. These spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`.
 
-For OTLP live mode, old request groups and background RADOS ops are flushed when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request.
+For OTLP live mode, old request groups and background RADOS ops are queued to a background exporter when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request without blocking ring-buffer polling on collector latency.
 
 ---
 
@@ -137,7 +137,7 @@ OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
-Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, and expired background RADOS ops. OTLP export logs add export batches, attempts, and failures.
+Trace diagnostics count decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, and dropped OTLP queue spans. OTLP export logs add export batches, attempts, and failures.
 
 It supports HTTP and HTTPS.
 

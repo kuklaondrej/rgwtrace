@@ -242,6 +242,8 @@
     "truncated_acting_sets": 0,
     "truncated_rados_ops": 0,
     "truncated_cls_names": 0,
-    "truncated_method_names": 0
+    "truncated_method_names": 0,
+    "otlp_queue_dropped_traces": 0,
+    "otlp_queue_dropped_spans": 0
   }
 }
