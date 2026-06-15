@@ -1,0 +1,19 @@
+tests/e2e/functional-test-microceph-rgw.sh
+  s_80a90a86d668f6::t_b947d42a49c885 35-36,373-393,460-469,489
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "b1fac5a04c5d028a6df219469d7eb6107d5c2a65",
+  "prompts": {},
+  "sessions": {
+    "s_80a90a86d668f6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_13f5d9f51ffeSEnxvxAQrKvyPj",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
