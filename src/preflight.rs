@@ -62,7 +62,11 @@ pub fn validated_targets(cli: &Cli, dwarf: &DwarfInfo) -> Result<ProbeTargets> {
     let targets = targets::discover(cli)?;
     validate_target_paths(&targets)?;
     validate_dwarf_targets(dwarf, &targets)?;
-    validate_build_ids(dwarf, &targets, cli.strict_build_id)?;
+    validate_build_ids(
+        dwarf,
+        &targets,
+        !cli.allow_build_id_mismatch || cli.strict_build_id,
+    )?;
     Ok(targets)
 }
 

@@ -49,7 +49,7 @@ sudo rgwtrace \
 
 Native mode also needs a Ceph version to select the `ceph_osd_op` ABI layout. `rgwtrace` resolves this from native metadata when possible; pass `--ceph-version 18.2.8-1jammy` or `--ceph-version 19.2.0` when the version cannot be discovered.
 
-Build ID mismatches are reported as warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched build IDs.
+Build ID mismatches fail preflight and live attach by default. Use `--allow-build-id-mismatch` only when the mismatch is understood.
 
 Run live tracing and flush JSON on `Ctrl-C`:
 
@@ -244,7 +244,7 @@ Native mode reads selected Ceph/RGW modules and their debug info directly. It di
 
 Live attach refuses to guess the Ceph ABI layout when no version is available. Use DWARF JSON with a `version` field or pass `--ceph-version` for native mode.
 
-`rgwtrace` validates required probe functions, field counts, and ELF build IDs. Build ID mismatches warn by default and fail with `--strict-build-id`.
+`rgwtrace` validates required probe functions, field counts, and ELF build IDs. Build ID mismatches fail by default and can be downgraded with `--allow-build-id-mismatch` only when the mismatch is understood.
 
 ---
 

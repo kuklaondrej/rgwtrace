@@ -43,7 +43,7 @@ Use `--import-json` when native debug info is unavailable or when comparing agai
 
 If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout.
 
-Build ID mismatches are warnings by default. Use `--strict-build-id` to fail preflight on missing or mismatched IDs.
+Build ID mismatches fail preflight and live attach by default. Use `--allow-build-id-mismatch` only when the mismatch is understood.
 
 ---
 
@@ -100,7 +100,7 @@ Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobu
 - `failed to discover ...`: pass the corresponding explicit path flag.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
-- `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun without `--strict-build-id` only if the mismatch is understood.
+- `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun with `--allow-build-id-mismatch` only if the mismatch is understood.
 
 ---
 

@@ -71,6 +71,9 @@ pub struct Cli {
     #[arg(long)]
     pub strict_build_id: bool,
 
+    #[arg(long, conflicts_with = "strict_build_id")]
+    pub allow_build_id_mismatch: bool,
+
     #[arg(long)]
     pub librados_path: Option<PathBuf>,
 

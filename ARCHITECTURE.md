@@ -153,7 +153,7 @@ It discovers debug data from embedded DWARF, `.gnu_debuglink`, and build-id path
 
 `cephtrace` JSON import remains supported as a stable fallback and oracle for native extraction.
 
-Build IDs are validated against discovered binaries. Mismatches warn by default and fail when `--strict-build-id` is set.
+Build IDs are validated against discovered binaries. Mismatches fail by default and require `--allow-build-id-mismatch` to continue.
 
 Field offsets can be wrong if native debug data or imported JSON does not match the runtime binaries.
 
