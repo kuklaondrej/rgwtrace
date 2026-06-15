@@ -1,0 +1,29 @@
+ARCHITECTURE.md
+  s_6224e0c16c49ee::t_423aa6d1875222 156
+src/cli.rs
+  s_6224e0c16c49ee::t_b4f979bcb13410 74-76
+README.md
+  s_6224e0c16c49ee::t_423aa6d1875222 52,247
+src/preflight.rs
+  s_6224e0c16c49ee::t_54900940af70f9 65-69
+src/targets.rs
+  s_6224e0c16c49ee::t_b4f979bcb13410 297
+RUNBOOK.md
+  s_6224e0c16c49ee::t_423aa6d1875222 46,103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "6512109c8d67a99f42541b06c82280432afbc141",
+  "prompts": {},
+  "sessions": {
+    "s_6224e0c16c49ee": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1355de3c6ffek48FLGYLeujCQ9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
