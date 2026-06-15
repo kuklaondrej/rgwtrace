@@ -1,0 +1,24 @@
+RUNBOOK.md
+  s_6224e0c16c49ee::t_bbdb4b09354023 28-29
+README.md
+  s_6224e0c16c49ee::t_bbdb4b09354023 79-80
+src/targets.rs
+  s_6224e0c16c49ee::t_59783331ee854e 181-184,213,334-358
+  s_6224e0c16c49ee::t_c4e7939b79f600 88-96,126-132,158,201,205,209,216-222
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "a0eaa929f51e89688a35d73bfad1b8727f2cb9ce",
+  "prompts": {},
+  "sessions": {
+    "s_6224e0c16c49ee": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_1355de3c6ffek48FLGYLeujCQ9",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
