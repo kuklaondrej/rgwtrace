@@ -1,0 +1,21 @@
+tests/e2e/s3-workload.py
+  s_ddaa0ba998ffae::t_ef0ebcf4cc3140 22-31,40-41,52,54-56,60,63,73,105-109,127-144,150-158,163-167,175,182-186
+tests/e2e/verify-rgwtrace-json.py
+  s_ddaa0ba998ffae::t_a9b8275b7adb79 51-60,75-76,158-192,198-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.6",
+  "base_commit_sha": "f90211ff500ec264d9bc1a3e06ad469ec2e3bf60",
+  "prompts": {},
+  "sessions": {
+    "s_ddaa0ba998ffae": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_135dbf24ffferksOhOam4Xu5Fd",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
