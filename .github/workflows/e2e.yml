@@ -9,7 +9,7 @@ on:
         required: true
       microceph_expected_ceph_version:
         description: Expected Ceph package version in the MicroCeph snap
-        default: 18.2.8-1jammy
+        default: 18.2.4-0ubuntu1~cloud0
         required: true
 
 jobs:
@@ -24,7 +24,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bpftool clang curl libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
+          sudo apt-get install -y --no-install-recommends bpftool clang curl libbpf-dev libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
       - name: Build release binary
         run: cargo build --release
       - name: Verify BPF load

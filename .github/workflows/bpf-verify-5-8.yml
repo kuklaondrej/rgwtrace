@@ -12,6 +12,6 @@ jobs:
       - name: Install BPF dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bpftool clang libelf-dev linux-libc-dev llvm
+          sudo apt-get install -y --no-install-recommends bpftool clang libbpf-dev libelf-dev linux-libc-dev llvm
       - name: Verify BPF load on Linux 5.8
         run: sudo scripts/verify-bpf-load.sh
