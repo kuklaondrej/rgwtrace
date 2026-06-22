@@ -434,24 +434,31 @@ start_trace() {
 
 run_workload() {
     info "running S3 workload against ${RGW_ENDPOINT}"
-    python3 "${SCRIPT_DIR}/s3-workload.py" \
+    if ! python3 "${SCRIPT_DIR}/s3-workload.py" \
         --endpoint "${RGW_ENDPOINT}" \
         --access-key "${RGW_ACCESS_KEY}" \
         --secret-key "${RGW_SECRET_KEY}" \
         --output "${WORKLOAD_JSONL}" \
-        >"${WORKLOAD_LOG}" 2>&1
+        >"${WORKLOAD_LOG}" 2>&1; then
+        err "S3 workload failed; see ${WORKLOAD_LOG} and ${WORKLOAD_JSONL}"
+        return 1
+    fi
 }
 
 verify_trace() {
     info "verifying rgwtrace JSON output"
-    python3 "${SCRIPT_DIR}/verify-rgwtrace-json.py" \
+    if ! python3 "${SCRIPT_DIR}/verify-rgwtrace-json.py" \
         --trace "${TRACE_JSON}" \
         --workload "${WORKLOAD_JSONL}" \
         --min-request-spans 3 \
         --min-rados-spans 3 \
         --expect-role data \
         --expect-any-role bucket_index,bucket_meta \
-        >"${VERIFY_LOG}" 2>&1
+        >"${VERIFY_LOG}" 2>&1; then
+        err "trace verification failed; see ${VERIFY_LOG}, ${TRACE_JSON}, and ${WORKLOAD_JSONL}"
+        err "rgwtrace stderr is in ${TRACE_LOG}; workload stderr/stdout is in ${WORKLOAD_LOG}"
+        return 1
+    fi
 }
 
 main() {
@@ -491,7 +498,10 @@ main() {
     start_trace "${rgw_pid}"
     sleep "${TRACE_ATTACH_DELAY}"
     run_workload
-    wait "${TRACE_PID}"
+    if ! wait "${TRACE_PID}"; then
+        err "rgwtrace capture failed or timed out; see ${TRACE_LOG} and ${TRACE_JSON}"
+        exit 1
+    fi
     TRACE_PID=""
     verify_trace
 

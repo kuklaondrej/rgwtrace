@@ -160,7 +160,7 @@ Run the fast no-cluster verification loop before live testing:
 ./scripts/verify.sh
 ```
 
-The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, and BPF source regressions. Linux CI also covers ring-buffer event decoding without attaching probes.
+The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, e2e JSON verifier self-tests, and BPF source regressions. Linux CI also covers ring-buffer event decoding without attaching probes.
 
 CI uses the pinned Rust toolchain in `rust-toolchain.toml` and runs `cargo audit`. Run the audit locally when dependency or toolchain inputs change:
 
