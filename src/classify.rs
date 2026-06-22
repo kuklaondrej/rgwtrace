@@ -75,13 +75,28 @@ fn classify_background_object(object: &str) -> Option<RadosRole> {
     if object.starts_with("notify.") {
         return Some(RadosRole::Notify);
     }
-    if object.starts_with("bucket.sync-") || object.starts_with("data_log") {
+    if object.starts_with("bucket.sync-")
+        || object.starts_with("data_log")
+        || object.starts_with("_sem_setdata_log")
+        || object.starts_with("meta.log.")
+    {
         return Some(RadosRole::Sync);
     }
     if matches!(
         object,
-        "default.realm" | "zone.user" | "zone.user.buckets" | "script.prerequest."
+        "default.realm"
+            | "default.region"
+            | "default.zonegroup"
+            | "region_map"
+            | "zone.user"
+            | "zone.user.buckets"
+            | "script.prerequest."
     ) || object.starts_with("realms.")
+        || object.starts_with("realm_names.")
+        || object.starts_with("region_info.")
+        || object.starts_with("zone_names.")
+        || object.starts_with("zonegroup_info.")
+        || object.starts_with("zonegroups_names.")
         || object.starts_with("periods.")
         || object.starts_with("zone_info.")
         || object.starts_with("default.zone.")
@@ -153,6 +168,32 @@ mod tests {
             classify_rados(&event("bucket.sync-source-hints.", "")),
             RadosRole::Sync
         );
+        assert_eq!(classify_rados(&event("data_log.0", "")), RadosRole::Sync);
+        assert_eq!(classify_rados(&event("data_log@G3.1", "")), RadosRole::Sync);
+        assert_eq!(
+            classify_rados(&event("_sem_setdata_log.0", "")),
+            RadosRole::Sync
+        );
+        assert_eq!(
+            classify_rados(&event("meta.log.012345.7", "")),
+            RadosRole::Sync
+        );
+        assert_eq!(
+            classify_rados(&event("default.zonegroup", "")),
+            RadosRole::Config
+        );
+        assert_eq!(
+            classify_rados(&event("zonegroup_info.123", "")),
+            RadosRole::Config
+        );
+        assert_eq!(
+            classify_rados(&event("zonegroups_names.default", "")),
+            RadosRole::Config
+        );
+        assert_eq!(
+            classify_rados(&event("realm_names.default", "")),
+            RadosRole::Config
+        );
     }
 
     #[test]
@@ -183,6 +224,19 @@ mod tests {
             RadosRole::Gc
         );
         assert_eq!(classify_rados(&event("data_log.1", "")), RadosRole::Sync);
+        assert_eq!(classify_rados(&event("region_map", "")), RadosRole::Config);
+        assert_eq!(
+            classify_rados(&event("default.region", "")),
+            RadosRole::Config
+        );
+        assert_eq!(
+            classify_rados(&event("region_info.default", "")),
+            RadosRole::Config
+        );
+        assert_eq!(
+            classify_rados(&event("zone_names.default", "")),
+            RadosRole::Config
+        );
         assert_eq!(
             classify_rados(&event("default.realm", "")),
             RadosRole::Config

@@ -58,6 +58,12 @@ def duplicate_values(values):
     return sorted(duplicates)
 
 
+def is_hex_id(value, length):
+    if not isinstance(value, str) or len(value) != length:
+        return False
+    return all(char in "0123456789abcdefABCDEF" for char in value)
+
+
 def main():
     args = parse_args()
     errors = []
@@ -71,9 +77,25 @@ def main():
     request_spans = [span for span in spans if span.get("name") == "rgw.request"]
     rados_spans = [span for span in spans if span.get("name") == "rados.op"]
     background_spans = [span for span in spans if span.get("name") == "rgw.background.rados_op"]
-    request_ids = {span.get("span_id") for span in request_spans}
+    request_by_id = {span.get("span_id"): span for span in request_spans}
+    request_ids = set(request_by_id)
     workload_request_id_count = 0
     trace_request_id_count = 0
+
+    span_ids = set()
+    for span in spans:
+        span_id = span.get("span_id")
+        trace_id = span.get("trace_id")
+        if not is_hex_id(trace_id, 32):
+            fail(errors, f"span {span.get('name')} has invalid trace_id={trace_id!r}")
+        if not is_hex_id(span_id, 16):
+            fail(errors, f"span {span.get('name')} has invalid span_id={span_id!r}")
+        if span_id in span_ids:
+            fail(errors, f"duplicate span_id={span_id!r}")
+        span_ids.add(span_id)
+        parent_span_id = span.get("parent_span_id")
+        if parent_span_id is not None and not is_hex_id(parent_span_id, 16):
+            fail(errors, f"span {span_id!r} has invalid parent_span_id={parent_span_id!r}")
 
     if diagnostics.get("decode_errors", 0) != 0:
         fail(errors, f"decode_errors must be 0, got {diagnostics.get('decode_errors')}")
@@ -87,6 +109,14 @@ def main():
         fail(errors, "expected same_thread_correlations > 0")
     if diagnostics.get("spans_produced") != len(spans):
         fail(errors, f"spans_produced={diagnostics.get('spans_produced')} but JSON has {len(spans)} spans")
+    if diagnostics.get("rados_ops") != len(rados_spans) + len(background_spans):
+        fail(errors, f"rados_ops={diagnostics.get('rados_ops')} but JSON has {len(rados_spans)} child and {len(background_spans)} background RADOS spans")
+    if diagnostics.get("correlated_rados_ops") != len(rados_spans):
+        fail(errors, f"correlated_rados_ops={diagnostics.get('correlated_rados_ops')} but JSON has {len(rados_spans)} rados.op spans")
+    if diagnostics.get("background_rados_ops") != len(background_spans):
+        fail(errors, f"background_rados_ops={diagnostics.get('background_rados_ops')} but JSON has {len(background_spans)} background spans")
+    if diagnostics.get("same_thread_correlations", 0) + diagnostics.get("inferred_correlations", 0) != diagnostics.get("correlated_rados_ops"):
+        fail(errors, "same_thread_correlations + inferred_correlations must equal correlated_rados_ops")
 
     if len(request_spans) < args.min_request_spans:
         fail(errors, f"expected at least {args.min_request_spans} rgw.request spans, got {len(request_spans)}")
@@ -99,6 +129,10 @@ def main():
             fail(errors, f"request span {span.get('span_id')} has rgw.request_class={attrs.get('rgw.request_class')!r}")
         if not attrs.get("rgw.trans_id"):
             fail(errors, f"request span {span.get('span_id')} has empty rgw.trans_id")
+        if attrs.get("rgw.duration_quality") not in {"marker", "request_lifecycle", "rados_bounds"}:
+            fail(errors, f"request span {span.get('span_id')} has invalid rgw.duration_quality={attrs.get('rgw.duration_quality')!r}")
+        if span.get("start_ns", 0) > span.get("end_ns", 0):
+            fail(errors, f"request span {span.get('span_id')} has start_ns > end_ns")
 
     roles = set()
     rados_objects = []
@@ -109,6 +143,12 @@ def main():
         parent = span.get("parent_span_id")
         if parent not in request_ids:
             fail(errors, f"rados.op span {span.get('span_id')} parent {parent!r} is not an rgw.request span")
+        else:
+            parent_span = request_by_id[parent]
+            if span.get("trace_id") != parent_span.get("trace_id"):
+                fail(errors, f"rados.op span {span.get('span_id')} trace_id does not match parent request")
+            if span.get("start_ns", 0) < parent_span.get("start_ns", 0) or span.get("end_ns", 0) > parent_span.get("end_ns", 0):
+                fail(errors, f"rados.op span {span.get('span_id')} is outside parent request bounds")
         if attrs.get("rgw.correlation") not in {"same_thread", "inferred"}:
             fail(errors, f"rados.op span {span.get('span_id')} has invalid rgw.correlation={attrs.get('rgw.correlation')!r}")
         if not attrs.get("ceph.rados.object"):
@@ -120,10 +160,19 @@ def main():
         attrs = attr_map(span)
         roles.add(attrs.get("rgw.rados_role"))
         rados_objects.append(str(attrs.get("ceph.rados.object", "")))
+        if span.get("parent_span_id") is not None:
+            fail(errors, f"background span {span.get('span_id')} unexpectedly has a parent")
         if attrs.get("rgw.correlation") != "none":
             fail(errors, f"background span {span.get('span_id')} has rgw.correlation={attrs.get('rgw.correlation')!r}")
-        if not attrs.get("rgw.correlation_reason"):
+        if attrs.get("rgw.correlation_reason") not in {
+            "missing_trans_id",
+            "classified_background_role",
+            "no_inference_candidate",
+            "ambiguous_inference_candidates",
+        }:
             fail(errors, f"background span {span.get('span_id')} is missing rgw.correlation_reason")
+        if not span.get("events"):
+            fail(errors, f"background span {span.get('span_id')} is missing its rados.op event")
 
     for role in args.expect_role:
         if role not in roles:

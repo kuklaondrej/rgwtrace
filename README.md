@@ -120,7 +120,7 @@ In OTLP mode, live tracing periodically queues spans whose correlation window ha
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
 
 OTLP mode logs the same trace counters plus export batches, attempts, and failures when internal logging is enabled.
 
@@ -225,7 +225,7 @@ rgw.background.rados_op
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
 
-RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason.
+RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`.
 
 Request spans include `rgw.duration_quality`. Current live captures normally use `marker` because the safe RGW probe observes a request marker rather than the full lifecycle; the span still envelopes any correlated RADOS child bounds. If future start/end probes are active, the value is `request_lifecycle`; request groups built only from RADOS bounds use `rados_bounds`.
 
@@ -262,7 +262,7 @@ It extracts module build IDs, probe PCs, variable locations, and member field pa
 
 Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter::_send_op` running with that context.
 
-Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans. `--correlate-inferred` enables conservative PID/time-window inference for unique candidates only.
+Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans. `--correlate-inferred` enables conservative PID/time-window inference for unique candidates only; ambiguous candidates remain background spans and are counted separately.
 
 ---
 

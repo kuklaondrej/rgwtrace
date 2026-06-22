@@ -126,13 +126,14 @@ Inspect:
 
 - `rgw.rados_role` for object classification.
 - `rgw.correlation = "none"`.
-- `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`.
+- `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`; with `--correlate-inferred`, it can also be `no_inference_candidate` or `ambiguous_inference_candidates`.
 - `trace.diagnostics.missing_trans_id_background_ops` for volume.
+- `trace.diagnostics.inference_no_candidate_rados_ops` and `trace.diagnostics.inference_ambiguous_rados_ops` when inferred correlation is enabled.
 - `trace.diagnostics.background_rados_by_role` and `trace.diagnostics.background_rados_by_reason` for breakdowns.
 
 Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether `--correlate-inferred` is warranted.
 
-`--correlate-inferred` can attach untagged RADOS ops to a request only when there is one same-PID candidate in the correlation window and the role does not look like RGW background work. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`.
+`--correlate-inferred` can attach untagged RADOS ops to a request only when there is one same-PID candidate in the correlation window and the role does not look like RGW background work. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`. Ambiguous or out-of-window candidates remain background spans.
 
 ---
 
