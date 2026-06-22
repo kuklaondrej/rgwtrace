@@ -1,0 +1,25 @@
+README.md
+  s_750a61e3dc7cde::t_c345e9ea9de596 163
+tests/e2e/verify-rgwtrace-json.py
+  s_750a61e3dc7cde::t_799910688c3231 3,6-50,55-57,68-71,117-188,205-206,219-224,228-229,248-252,261-264,269,274-275,280-282,294-297,303-305,310,312-321,348-354,405-594
+tests/e2e/functional-test-microceph-rgw.sh
+  s_750a61e3dc7cde::t_b94f21de44e381 437,442-445,450,457-461,501-504
+scripts/verify.sh
+  s_750a61e3dc7cde::t_001d2f4db8e81f 11,13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "4958044dc2cce6b61cd1b9a287b13bebc3a3545b",
+  "prompts": {},
+  "sessions": {
+    "s_750a61e3dc7cde": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eef30-e8d9-7642-8a29-6fcbaf545e46",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
