@@ -1,0 +1,39 @@
+src/collector.rs
+  s_4dc45c26af02b7::t_768b2a1267e510 904-921
+  s_4dc45c26af02b7::t_367fc592a3cdd1 593,798,903,935-936,938-968
+  s_4dc45c26af02b7::t_cec33955972445 1008,1010,1012-1013,1019,1021,1023-1024,1027
+  s_4dc45c26af02b7::t_34fff28cf110d0 16,36-41,48-62,90-91,184-210,213-217,233,238-244,289-290,292,294,319-320,408-409,413,524-528,536,540-541,543,545,585-592,594
+  s_4dc45c26af02b7::t_f5ba1da6b8a911 799-818
+  s_4dc45c26af02b7::t_fe65fb47148c21 852,854-858
+  s_4dc45c26af02b7::t_9929f3e952ee47 759-760
+ARCHITECTURE.md
+  s_4dc45c26af02b7::t_c4ec934083088d 76,78,126,140
+README.md
+  s_4dc45c26af02b7::t_a45301576a5af2 123,228,265
+tests/e2e/verify-rgwtrace-json.py
+  s_4dc45c26af02b7::t_67738d74a93561 61-66,80-81,85-99,112-119,132-135,146-151,163-164,167-172,174-175
+RUNBOOK.md
+  s_4dc45c26af02b7::t_ca4e57b88d2977 129,131,136
+src/classify.rs
+  s_4dc45c26af02b7::t_891b582114b2b0 171,173-196,227-239
+  s_4dc45c26af02b7::t_9400f927d2ec73 78-82,87-93,95-99
+  s_4dc45c26af02b7::t_fb9e52fab053e6 172
+tests/fixtures/collector_trace_golden.json
+  s_4dc45c26af02b7::t_080cf8d4b452c5 230-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.9",
+  "base_commit_sha": "150501e0f27b34782312d7549ccfb0c68f37e60e",
+  "prompts": {},
+  "sessions": {
+    "s_4dc45c26af02b7": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019eee49-579b-76f0-9d6b-c2a0ba18e1ce",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
