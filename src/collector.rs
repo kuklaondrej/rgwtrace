@@ -13,6 +13,7 @@ use crate::{
 pub struct Collector {
     starts_by_tid: BTreeMap<u32, RequestEvent>,
     requests: BTreeMap<String, RequestBuilder>,
+    pending_inference: Vec<RadosEvent>,
     background: Vec<BackgroundRados>,
     diagnostics: TraceDiagnostics,
     infer_correlation: bool,
@@ -176,72 +177,144 @@ impl Collector {
                 builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
                 builder.saw_request_start |= saw_request_start;
                 builder.request = Some(request);
+                self.retry_pending_inference();
             }
             TraceEvent::RadosOp(rados) => {
                 self.diagnostics.rados_ops += 1;
                 record_truncation(&mut self.diagnostics, rados.truncation);
                 if rados.trans_id.is_empty() {
                     let role = classify_rados(&rados);
-                    let reason = if self.infer_correlation && inferable_rados_role(role) {
+                    if self.infer_correlation && inferable_rados_role(role) {
                         match self.inferred_request_key(&rados) {
                             InferenceMatch::Match(key) => {
-                                self.diagnostics.correlated_rados_ops += 1;
-                                self.diagnostics.inferred_correlations += 1;
-                                let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
-                                let builder = self.requests.entry(key).or_default();
-                                builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
-                                builder.rados.push(CorrelatedRados {
-                                    event: rados,
-                                    correlation: RadosCorrelation::Inferred,
-                                });
-                                return;
+                                self.record_correlated_rados(
+                                    key,
+                                    rados,
+                                    RadosCorrelation::Inferred,
+                                );
                             }
-                            InferenceMatch::NoCandidate => {
-                                self.diagnostics.inference_no_candidate_rados_ops += 1;
-                                BackgroundReason::NoInferenceCandidate
+                            InferenceMatch::NoCandidate | InferenceMatch::Ambiguous => {
+                                self.pending_inference.push(rados);
                             }
-                            InferenceMatch::Ambiguous => {
-                                self.diagnostics.inference_ambiguous_rados_ops += 1;
-                                BackgroundReason::AmbiguousInferenceCandidates
-                            }
-                        }
+                        };
                     } else {
-                        background_reason_for_role(role)
-                    };
-                    self.diagnostics.background_rados_ops += 1;
-                    self.diagnostics.missing_trans_id_background_ops += 1;
-                    record_background_breakdown(&mut self.diagnostics, &rados, reason);
-                    self.background.push(BackgroundRados {
-                        event: rados,
-                        reason,
-                    });
+                        self.record_background_rados(rados, background_reason_for_role(role));
+                    }
                 } else {
-                    self.diagnostics.correlated_rados_ops += 1;
-                    self.diagnostics.same_thread_correlations += 1;
-                    let last_seen_ns = rados.finish_ns.max(rados.sent_ns);
-                    let builder = self.requests.entry(rados.trans_id.clone()).or_default();
-                    builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
-                    builder.rados.push(CorrelatedRados {
-                        event: rados,
-                        correlation: RadosCorrelation::SameThread,
-                    });
+                    self.record_correlated_rados(
+                        rados.trans_id.clone(),
+                        rados,
+                        RadosCorrelation::SameThread,
+                    );
                 }
             }
         }
     }
 
     fn inferred_request_key(&self, rados: &RadosEvent) -> InferenceMatch {
-        let mut candidates = self.requests.iter().filter_map(|(key, builder)| {
+        if rados.send_tid != 0 {
+            let same_thread_match =
+                unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
+                    let request = builder.request.as_ref()?;
+                    (request.tid == rados.send_tid
+                        && inferred_candidate(request, rados, self.inference_window_ns))
+                    .then(|| key.clone())
+                }));
+            if same_thread_match != InferenceMatch::NoCandidate {
+                return same_thread_match;
+            }
+        }
+
+        unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
             let request = builder.request.as_ref()?;
             inferred_candidate(request, rados, self.inference_window_ns).then(|| key.clone())
-        });
-        let Some(candidate) = candidates.next() else {
-            return InferenceMatch::NoCandidate;
-        };
-        if candidates.next().is_some() {
-            return InferenceMatch::Ambiguous;
+        }))
+    }
+
+    fn retry_pending_inference(&mut self) {
+        let mut remaining = Vec::new();
+        for rados in std::mem::take(&mut self.pending_inference) {
+            match self.inferred_request_key(&rados) {
+                InferenceMatch::Match(key) => {
+                    self.record_correlated_rados(key, rados, RadosCorrelation::Inferred);
+                }
+                InferenceMatch::NoCandidate | InferenceMatch::Ambiguous => remaining.push(rados),
+            }
         }
-        InferenceMatch::Match(candidate)
+        self.pending_inference = remaining;
+    }
+
+    fn finalize_expired_pending_inference(&mut self, cutoff_ns: u64) {
+        let mut remaining = Vec::new();
+        for rados in std::mem::take(&mut self.pending_inference) {
+            if rados_event_time_ns(&rados) <= cutoff_ns {
+                self.finalize_pending_inference(rados);
+            } else {
+                remaining.push(rados);
+            }
+        }
+        self.pending_inference = remaining;
+    }
+
+    fn finalize_all_pending_inference(&mut self) {
+        for rados in std::mem::take(&mut self.pending_inference) {
+            self.finalize_pending_inference(rados);
+        }
+    }
+
+    fn finalize_pending_inference(&mut self, rados: RadosEvent) {
+        match self.inferred_request_key(&rados) {
+            InferenceMatch::Match(key) => {
+                self.record_correlated_rados(key, rados, RadosCorrelation::Inferred);
+            }
+            InferenceMatch::NoCandidate => {
+                self.record_background_rados(rados, BackgroundReason::NoInferenceCandidate);
+            }
+            InferenceMatch::Ambiguous => {
+                self.record_background_rados(rados, BackgroundReason::AmbiguousInferenceCandidates);
+            }
+        }
+    }
+
+    fn record_correlated_rados(
+        &mut self,
+        key: String,
+        rados: RadosEvent,
+        correlation: RadosCorrelation,
+    ) {
+        self.diagnostics.correlated_rados_ops += 1;
+        match correlation {
+            RadosCorrelation::SameThread => self.diagnostics.same_thread_correlations += 1,
+            RadosCorrelation::Inferred => self.diagnostics.inferred_correlations += 1,
+        }
+        let last_seen_ns = rados_event_time_ns(&rados);
+        let builder = self.requests.entry(key).or_default();
+        builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
+        builder.rados.push(CorrelatedRados {
+            event: rados,
+            correlation,
+        });
+    }
+
+    fn record_background_rados(&mut self, rados: RadosEvent, reason: BackgroundReason) {
+        self.diagnostics.background_rados_ops += 1;
+        if rados.trans_id.is_empty() {
+            self.diagnostics.missing_trans_id_background_ops += 1;
+        }
+        match reason {
+            BackgroundReason::NoInferenceCandidate => {
+                self.diagnostics.inference_no_candidate_rados_ops += 1;
+            }
+            BackgroundReason::AmbiguousInferenceCandidates => {
+                self.diagnostics.inference_ambiguous_rados_ops += 1;
+            }
+            BackgroundReason::MissingTransId | BackgroundReason::ClassifiedBackgroundRole => {}
+        }
+        record_background_breakdown(&mut self.diagnostics, &rados, reason);
+        self.background.push(BackgroundRados {
+            event: rados,
+            reason,
+        });
     }
 
     pub fn record_decode_error(&mut self) {
@@ -272,6 +345,9 @@ impl Collector {
         ttl_ns: u64,
     ) -> Option<TraceDocument> {
         let cutoff_ns = now_ns.saturating_sub(ttl_ns);
+        self.retry_pending_inference();
+        self.finalize_expired_pending_inference(cutoff_ns);
+
         let mut spans = Vec::new();
         let mut remaining_requests = BTreeMap::new();
 
@@ -310,6 +386,9 @@ impl Collector {
     }
 
     pub fn into_trace_document(mut self, service_name: impl Into<String>) -> TraceDocument {
+        self.retry_pending_inference();
+        self.finalize_all_pending_inference();
+
         let mut spans = Vec::new();
 
         for (key, request) in self.requests {
@@ -327,6 +406,16 @@ impl Collector {
             diagnostics: self.diagnostics,
         }
     }
+}
+
+fn unique_inference_match(mut candidates: impl Iterator<Item = String>) -> InferenceMatch {
+    let Some(candidate) = candidates.next() else {
+        return InferenceMatch::NoCandidate;
+    };
+    if candidates.next().is_some() {
+        return InferenceMatch::Ambiguous;
+    }
+    InferenceMatch::Match(candidate)
 }
 
 fn rados_event_time_ns(rados: &RadosEvent) -> u64 {
@@ -550,8 +639,11 @@ fn inferred_candidate(request: &RequestEvent, rados: &RadosEvent, window_ns: u64
     if request.pid != rados.pid {
         return false;
     }
+    let request_start = request.start_ns.min(request.end_ns);
     let request_end = request.end_ns.max(request.start_ns);
-    rados.sent_ns >= request.start_ns && rados.sent_ns <= request_end.saturating_add(window_ns)
+    let rados_start = rados.sent_ns.min(rados.finish_ns);
+    let rados_end = rados.finish_ns.max(rados.sent_ns);
+    rados_end >= request_start && rados_start <= request_end.saturating_add(window_ns)
 }
 
 fn inferable_rados_role(role: RadosRole) -> bool {
@@ -689,6 +781,7 @@ mod tests {
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
             pid: 42,
+            send_tid: 7,
             cid: 1,
             tid: 2,
             sent_ns: 10,
@@ -867,6 +960,75 @@ mod tests {
     }
 
     #[test]
+    fn defers_untagged_rados_until_request_marker_arrives() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        let mut event = rados("object", "");
+        event.sent_ns = 20;
+        event.finish_ns = 25;
+        collector.push(TraceEvent::RadosOp(event));
+
+        collector.push(TraceEvent::RequestEnd(request("tx1", 1, 30)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 0);
+        assert_eq!(document.diagnostics.inference_no_candidate_rados_ops, 0);
+        assert_eq!(document.diagnostics.inference_ambiguous_rados_ops, 0);
+        assert_eq!(
+            string_attribute(&document.spans[1], "rgw.correlation"),
+            Some("inferred")
+        );
+    }
+
+    #[test]
+    fn sender_tid_preferred_over_same_pid_candidates() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        collector.push(TraceEvent::RequestEnd(request_with_tid("tx1", 7, 1, 30)));
+        collector.push(TraceEvent::RequestEnd(request_with_tid("tx2", 9, 1, 30)));
+        let mut event = rados("object", "");
+        event.send_tid = 9;
+        event.sent_ns = 40;
+        event.finish_ns = 45;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 1);
+        assert_eq!(document.diagnostics.inference_ambiguous_rados_ops, 0);
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected inferred rados child span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+        assert_eq!(string_attribute(parent, "rgw.trans_id"), Some("tx2"));
+    }
+
+    #[test]
+    fn infers_when_rados_interval_overlaps_request_start() {
+        let mut collector = Collector::with_inferred_correlation(0);
+        collector.push(TraceEvent::RequestEnd(request("tx1", 10, 30)));
+        let mut event = rados("object", "");
+        event.sent_ns = 5;
+        event.finish_ns = 15;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 0);
+    }
+
+    #[test]
     fn marks_request_lifecycle_duration_when_start_was_seen() {
         let mut collector = Collector::default();
         collector.push(TraceEvent::RequestStart(request("", 1, 0)));
@@ -966,6 +1128,32 @@ mod tests {
             string_attribute(&document.spans[1], "rgw.correlation_reason"),
             Some("no_inference_candidate")
         );
+    }
+
+    #[test]
+    fn drain_expired_finalizes_pending_no_candidate_once() {
+        let mut collector = Collector::with_inferred_correlation(5);
+        let mut event = rados("object", "");
+        event.sent_ns = 10;
+        event.finish_ns = 20;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.drain_expired("rgwtrace", 200, 100).unwrap();
+
+        assert_eq!(document.spans.len(), 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 1);
+        assert_eq!(document.diagnostics.inference_no_candidate_rados_ops, 1);
+        assert_eq!(document.diagnostics.inference_ambiguous_rados_ops, 0);
+        assert_eq!(document.diagnostics.expired_background_rados_ops, 1);
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.correlation_reason"),
+            Some("no_inference_candidate")
+        );
+
+        let remaining = collector.into_trace_document("rgwtrace");
+        assert_eq!(remaining.spans.len(), 0);
+        assert_eq!(remaining.diagnostics.background_rados_ops, 1);
+        assert_eq!(remaining.diagnostics.inference_no_candidate_rados_ops, 1);
     }
 
     #[test]
@@ -1115,11 +1303,15 @@ mod tests {
     }
 
     fn request(trans_id: &str, start_ns: u64, end_ns: u64) -> RequestEvent {
+        request_with_tid(trans_id, 7, start_ns, end_ns)
+    }
+
+    fn request_with_tid(trans_id: &str, tid: u32, start_ns: u64, end_ns: u64) -> RequestEvent {
         RequestEvent {
             start_ns,
             end_ns,
             pid: 42,
-            tid: 7,
+            tid,
             trans_id: trans_id.to_string(),
             truncation: CaptureTruncation::default(),
         }

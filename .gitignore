@@ -1,5 +1,7 @@
 /target
 /dist
+.DS_Store
+trace-data/
 *.o
 *.skel.rs
 *.tmp.bpf.o

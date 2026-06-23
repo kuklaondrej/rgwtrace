@@ -49,6 +49,7 @@ struct rgwtrace_rados_event {
   __u64 offset;
   __u64 length;
   __u32 pid;
+  __u32 send_tid;
   __u32 target_osd;
   __u32 pg_seed;
   __u16 rw;

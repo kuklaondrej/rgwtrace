@@ -47,6 +47,7 @@ pub struct RawRadosEvent {
     pub offset: u64,
     pub length: u64,
     pub pid: u32,
+    pub send_tid: u32,
     pub target_osd: u32,
     pub pg_seed: u32,
     pub rw: u16,
@@ -101,6 +102,7 @@ pub struct RequestEvent {
 #[derive(Clone, Debug, Serialize)]
 pub struct RadosEvent {
     pub pid: u32,
+    pub send_tid: u32,
     pub cid: u64,
     pub tid: u64,
     pub sent_ns: u64,
@@ -243,6 +245,7 @@ impl From<RawRadosEvent> for RadosEvent {
 
         Self {
             pid: raw.pid,
+            send_tid: raw.send_tid,
             cid: raw.cid,
             tid: raw.tid,
             sent_ns: raw.sent_ns,
@@ -295,6 +298,7 @@ mod tests {
     fn timestamp_offset_preserves_rados_duration() {
         let mut event = TraceEvent::RadosOp(RadosEvent {
             pid: 1,
+            send_tid: 4,
             cid: 2,
             tid: 3,
             sent_ns: 100,
@@ -362,6 +366,7 @@ mod tests {
             offset: 64,
             length: 4096,
             pid: 42,
+            send_tid: 77,
             target_osd: 7,
             pg_seed: 0x2a,
             rw: 0x0020,
@@ -387,6 +392,7 @@ mod tests {
         let event = RadosEvent::from(raw);
 
         assert_eq!(event.pid, 42);
+        assert_eq!(event.send_tid, 77);
         assert_eq!(event.cid, 9);
         assert_eq!(event.tid, 10);
         assert_eq!(event.duration_ns, 0);

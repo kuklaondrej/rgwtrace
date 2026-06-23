@@ -47,6 +47,9 @@ pub struct Cli {
     #[arg(long)]
     pub correlate_inferred: bool,
 
+    #[arg(long, default_value = "1", value_parser = parse_duration_secs)]
+    pub inference_window: Duration,
+
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
 

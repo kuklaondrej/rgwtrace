@@ -76,7 +76,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
     let collector = Arc::new(Mutex::new(if cli.correlate_inferred {
-        Collector::with_inferred_correlation(duration_ns(cli.correlation_ttl))
+        Collector::with_inferred_correlation(duration_ns(cli.inference_window))
     } else {
         Collector::default()
     }));
@@ -550,6 +550,7 @@ mod tests {
             offset: 64,
             length: 4096,
             pid: 42,
+            send_tid: 77,
             target_osd: 7,
             pg_seed: 0x2a,
             rw: 0,
@@ -571,6 +572,7 @@ mod tests {
             panic!("expected rados event");
         };
         assert_eq!(rados.sent_ns, 100);
+        assert_eq!(rados.send_tid, 77);
         assert_eq!(rados.duration_ns, 50);
         assert_eq!(rados.acting, vec![1, 2]);
         assert_eq!(rados.ops[0].name, "read");

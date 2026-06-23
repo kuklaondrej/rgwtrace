@@ -133,6 +133,7 @@ mod tests {
     fn event(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
             pid: 42,
+            send_tid: 7,
             cid: 1,
             tid: 2,
             sent_ns: 10,

@@ -205,6 +205,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   event->cid = key.cid;
 
   __u32 thread_id = get_tid();
+  event->send_tid = thread_id;
   struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
   if (request != 0) {
     event->flags |= request->flags & RGWTRACE_TRUNC_TRANS_ID;

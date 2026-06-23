@@ -1,4 +1,5 @@
 const RGWTRACE_BPF: &str = include_str!("../bpf/rgwtrace.bpf.c");
+const RGWTRACE_EVENTS: &str = include_str!("../bpf/rgwtrace_events.h");
 const BPF_UTILS: &str = include_str!("../bpf/bpf_utils.h");
 const DWARF_NATIVE: &str = include_str!("../src/dwarf_native.rs");
 
@@ -23,6 +24,13 @@ fn bpf_records_drop_and_probe_read_diagnostics() {
     assert!(RGWTRACE_BPF.contains("RGWTRACE_DIAG_PROBE_READ_FAILURES"));
     assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_RINGBUF_RADOS_DROPS)"));
     assert!(BPF_UTILS.contains("rgwtrace_probe_read_user"));
+}
+
+#[test]
+fn bpf_records_rados_sender_thread_id() {
+    assert!(RGWTRACE_EVENTS.contains("__u32 send_tid;"));
+    assert!(RGWTRACE_BPF.contains("__u32 thread_id = get_tid();"));
+    assert!(RGWTRACE_BPF.contains("event->send_tid = thread_id;"));
 }
 
 #[test]

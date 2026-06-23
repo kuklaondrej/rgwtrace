@@ -133,7 +133,7 @@ Inspect:
 
 Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether `--correlate-inferred` is warranted.
 
-`--correlate-inferred` can attach untagged RADOS ops to a request only when there is one same-PID candidate in the correlation window and the role does not look like RGW background work. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`. Ambiguous or out-of-window candidates remain background spans.
+`--correlate-inferred` can attach untagged RADOS ops to a request only when there is one conservative candidate in `--inference-window` and the role does not look like RGW background work. A unique matching RADOS send thread is preferred over same-PID/time-window candidates. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`. Ambiguous or out-of-window candidates remain background spans.
 
 ---
 

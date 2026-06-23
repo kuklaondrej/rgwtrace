@@ -116,6 +116,8 @@ sudo rgwtrace \
 
 In OTLP mode, live tracing periodically queues spans whose correlation window has expired for a background exporter. `--otlp-flush-interval` controls how often expired spans are checked, and `--correlation-ttl` controls how long request/RADOS correlation state is retained before it is flushed.
 
+When `--correlate-inferred` is enabled, `--inference-window` controls the conservative time window, in seconds, used for untagged RADOS inference. It is separate from `--correlation-ttl`.
+
 `--otlp-compression gzip` compresses request bodies and sets `Content-Encoding: gzip`. `--otlp-max-spans-per-batch` limits spans per OTLP request. `--otlp-max-bytes-per-batch` limits encoded protobuf bytes before compression; `0` disables byte-based splitting.
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
@@ -262,7 +264,7 @@ It extracts module build IDs, probe PCs, variable locations, and member field pa
 
 Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter::_send_op` running with that context.
 
-Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans. `--correlate-inferred` enables conservative PID/time-window inference for unique candidates only; ambiguous candidates remain background spans and are counted separately.
+Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans. `--correlate-inferred` enables conservative inference for unique candidates only. It first prefers a unique request whose Linux thread ID matches the RADOS send thread, then falls back to same-PID/time-window matching. Ambiguous candidates remain background spans and are counted separately.
 
 ---
 
