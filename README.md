@@ -180,7 +180,31 @@ The repository also has a manual `BPF Verify Linux 5.8` workflow for a self-host
 
 Use live RGW/Ceph testing only after the fast suite passes or when validating probe attachment against a real runtime.
 
-Run the privileged MicroCeph RGW e2e test on Linux when validating live request capture:
+The GitHub `E2E` workflow runs the privileged MicroCeph RGW test inside a fresh LXD VM sandbox on a self-hosted Linux runner. The runner host must have LXD installed and initialized ahead of time; CI does not install or initialize LXD.
+
+Prepare the self-hosted runner host once:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends snapd
+sudo snap install lxd
+sudo lxd init
+sudo usermod -aG lxd <runner-user>
+```
+
+When prompted by `lxd init`, create a local bridge and choose an IPv4 subnet that does not overlap host routes, such as `10.250.0.1/24`; enable IPv4 NAT and disable IPv6 if it is not needed.
+
+Restart the GitHub runner service so the `lxd` group membership applies.
+
+Verify as the runner user with `lxc info`; optionally smoke-test a VM:
+
+```sh
+lxc info
+lxc launch ubuntu:24.04 rgwtrace-smoke --vm
+lxc delete -f rgwtrace-smoke
+```
+
+Run the privileged MicroCeph RGW e2e test directly on Linux when validating live request capture:
 
 ```sh
 cargo build --release
@@ -189,13 +213,13 @@ sudo tests/e2e/functional-test-microceph-rgw.sh
 
 The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
 
-By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.8-1jammy`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `/tmp/rgwtrace-e2e` so the traced version is explicit.
+By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.4-0ubuntu1~cloud0`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `/tmp/rgwtrace-e2e` so the traced version is explicit.
 
 Override the pin when needed:
 
 ```sh
 sudo MICROCEPH_CHANNEL=reef/stable \
-  MICROCEPH_EXPECTED_CEPH_VERSION=18.2.8-1jammy \
+  MICROCEPH_EXPECTED_CEPH_VERSION=18.2.4-0ubuntu1~cloud0 \
   tests/e2e/functional-test-microceph-rgw.sh
 ```
 

@@ -12,36 +12,110 @@ on:
         default: 18.2.4-0ubuntu1~cloud0
         required: true
 
+concurrency:
+  group: microceph-rgw-e2e
+  cancel-in-progress: false
+
 jobs:
   microceph-rgw:
     runs-on: [self-hosted, linux, x64]
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      E2E_VM_ARTIFACT_DIR: /tmp/rgwtrace-e2e
+      E2E_VM_IMAGE: ubuntu:24.04
+      E2E_VM_NAME: rgwtrace-e2e-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
-      - name: Install build dependencies
+      - name: Install host build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bpftool clang curl libbpf-dev libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
+          sudo apt-get install -y --no-install-recommends clang libbpf-dev libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev
+      - name: Verify LXD sandbox support
+        run: |
+          if ! command -v lxc >/dev/null 2>&1; then
+            printf 'lxc was not found. Install and initialize LXD on the self-hosted runner before running this workflow.\n' >&2
+            exit 1
+          fi
+          if ! lxc info >/dev/null 2>&1; then
+            printf 'lxc cannot talk to LXD. Ensure LXD is initialized and the runner user is in the lxd group.\n' >&2
+            exit 1
+          fi
       - name: Build release binary
         run: cargo build --release
-      - name: Verify BPF load
-        run: sudo scripts/verify-bpf-load.sh
-      - name: Run MicroCeph RGW e2e
-        run: sudo MICROCEPH_CHANNEL='${{ inputs.microceph_channel }}' MICROCEPH_EXPECTED_CEPH_VERSION='${{ inputs.microceph_expected_ceph_version }}' tests/e2e/functional-test-microceph-rgw.sh
+      - name: Launch E2E sandbox VM
+        run: |
+          if lxc info "${E2E_VM_NAME}" >/dev/null 2>&1; then
+            lxc delete "${E2E_VM_NAME}" --force
+          fi
+          lxc launch "${E2E_VM_IMAGE}" "${E2E_VM_NAME}" --vm \
+            -c limits.cpu=4 \
+            -c limits.memory=8GiB \
+            -d root,size=35GiB
+          for _ in {1..120}; do
+            if lxc exec "${E2E_VM_NAME}" -- true >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          lxc exec "${E2E_VM_NAME}" -- true
+          lxc exec "${E2E_VM_NAME}" -- cloud-init status --wait
+      - name: Install sandbox dependencies
+        run: |
+          lxc exec "${E2E_VM_NAME}" -- bash -euxo pipefail -c '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends bpftool clang curl libbpf-dev libelf-dev linux-libc-dev llvm pkg-config python3-boto3 snapd zlib1g-dev
+            systemctl enable --now snapd.socket
+            snap wait system seed.loaded
+          '
+      - name: Copy workspace to sandbox
+        run: |
+          lxc exec "${E2E_VM_NAME}" -- mkdir -p /root/rgwtrace/target/release
+          tar --exclude=.git --exclude=target --exclude=e2e-artifacts -C "${GITHUB_WORKSPACE}" -cf - . \
+            | lxc exec "${E2E_VM_NAME}" -- tar -C /root/rgwtrace -xf -
+          lxc file push "${GITHUB_WORKSPACE}/target/release/rgwtrace" "${E2E_VM_NAME}/root/rgwtrace/target/release/rgwtrace"
+          lxc exec "${E2E_VM_NAME}" -- chmod +x /root/rgwtrace/target/release/rgwtrace
+      - name: Verify BPF load in sandbox
+        run: |
+          lxc exec "${E2E_VM_NAME}" -- bash -euxo pipefail -c '
+            cd /root/rgwtrace
+            scripts/verify-bpf-load.sh
+          '
+      - name: Run MicroCeph RGW e2e in sandbox
+        env:
+          MICROCEPH_CHANNEL: ${{ inputs.microceph_channel }}
+          MICROCEPH_EXPECTED_CEPH_VERSION: ${{ inputs.microceph_expected_ceph_version }}
+        run: |
+          lxc exec "${E2E_VM_NAME}" \
+            --env MICROCEPH_CHANNEL="${MICROCEPH_CHANNEL}" \
+            --env MICROCEPH_EXPECTED_CEPH_VERSION="${MICROCEPH_EXPECTED_CEPH_VERSION}" \
+            --env ARTIFACT_DIR="${E2E_VM_ARTIFACT_DIR}" \
+            -- bash -euxo pipefail -c '
+              cd /root/rgwtrace
+              tests/e2e/functional-test-microceph-rgw.sh
+            '
       - name: Stage e2e artifacts
         if: always()
         run: |
+          rm -rf e2e-artifacts
           mkdir -p e2e-artifacts
-          sudo cp -a /tmp/rgwtrace-e2e/. e2e-artifacts/ 2>/dev/null || true
-          sudo chown -R "$USER" e2e-artifacts
+          if command -v lxc >/dev/null 2>&1 && lxc info "${E2E_VM_NAME}" >/dev/null 2>&1; then
+            lxc file pull --recursive "${E2E_VM_NAME}${E2E_VM_ARTIFACT_DIR}" e2e-artifacts/ || true
+          fi
+      - name: Destroy E2E sandbox VM
+        if: always()
+        run: |
+          if command -v lxc >/dev/null 2>&1 && lxc info "${E2E_VM_NAME}" >/dev/null 2>&1; then
+            lxc delete "${E2E_VM_NAME}" --force
+          fi
       - name: Upload e2e artifacts
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: microceph-rgw-e2e-artifacts
+          name: microceph-rgw-e2e-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
           path: e2e-artifacts/
           retention-days: 14
           if-no-files-found: ignore
