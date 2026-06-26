@@ -30,6 +30,7 @@ BPF_FAILURE_DIAGNOSTICS = [
     "bpf_ringbuf_request_drops",
     "bpf_ringbuf_rados_drops",
     "bpf_rados_map_drops",
+    "bpf_rados_finish_misses",
     "bpf_request_context_drops",
     "bpf_probe_read_failures",
 ]
@@ -47,7 +48,11 @@ RADOS_ATTRIBUTE_KEYS = [
     "ceph.rados.length",
     "rgw.rados_role",
     "rgw.correlation",
+    "rgw.correlation_source",
 ]
+DIRECT_RADOS_CORRELATIONS = {"op_submit_context", "active_context", "same_thread"}
+VALID_CHILD_RADOS_CORRELATIONS = DIRECT_RADOS_CORRELATIONS | {"inferred"}
+VALID_CORRELATION_SOURCES = DIRECT_RADOS_CORRELATIONS | {"none"}
 
 
 def parse_args():
@@ -65,6 +70,21 @@ def parse_args():
         help="comma-separated role alternatives; at least one must be present",
     )
     parser.add_argument("--time-slack-ms", type=int, default=2000)
+    parser.add_argument(
+        "--require-context-correlation",
+        action="store_true",
+        help="require at least one op_submit_context or active_context RADOS correlation",
+    )
+    parser.add_argument(
+        "--require-get-read-correlation",
+        action="store_true",
+        help="require visible get_object workload keys to have correlated read RADOS spans",
+    )
+    parser.add_argument(
+        "--require-put-write-correlation",
+        action="store_true",
+        help="require visible put/upload workload keys to have correlated write RADOS spans",
+    )
     args = parser.parse_args()
     if not args.self_test and (not args.trace or not args.workload):
         parser.error("--trace and --workload are required unless --self-test is used")
@@ -96,6 +116,36 @@ def fail(errors, message):
 
 def span_overlaps(span, start_ns, end_ns, slack_ns):
     return span.get("end_ns", 0) >= start_ns - slack_ns and span.get("start_ns", 0) <= end_ns + slack_ns
+
+
+def record_overlaps_span(record, span, slack_ns):
+    return span_overlaps(span, record["start_ns"], record["end_ns"], slack_ns)
+
+
+def workload_records_for_object(records, object_name, span, slack_ns):
+    return [
+        record
+        for record in records
+        if record.get("key")
+        and record.get("x_amz_request_id")
+        and record["key"] in object_name
+        and record_overlaps_span(record, span, slack_ns)
+    ]
+
+
+def rados_matches_workload_record(span, record, request_by_id, slack_ns, rw=None):
+    attrs = attr_map(span)
+    object_name = str(attrs.get("ceph.rados.object", ""))
+    if not record.get("key") or record["key"] not in object_name:
+        return False
+    if not record_overlaps_span(record, span, slack_ns):
+        return False
+    if rw is not None and attrs.get("ceph.rados.rw") != rw:
+        return False
+    parent = request_by_id.get(span.get("parent_span_id"))
+    if parent is None:
+        return False
+    return attr_map(parent).get("rgw.trans_id") == record.get("x_amz_request_id")
 
 
 def duplicate_values(values):
@@ -233,8 +283,19 @@ def verify_document(args, document, workload):
         fail(errors, "expected rados_ops > 0")
     if diagnostics.get("correlated_rados_ops", 0) <= 0:
         fail(errors, "expected correlated_rados_ops > 0")
-    if diagnostics.get("same_thread_correlations", 0) <= 0:
-        fail(errors, "expected same_thread_correlations > 0")
+    direct_correlations = (
+        diagnostics.get("same_thread_correlations", 0)
+        + diagnostics.get("op_submit_context_correlations", 0)
+        + diagnostics.get("active_context_correlations", 0)
+    )
+    context_correlations = (
+        diagnostics.get("op_submit_context_correlations", 0)
+        + diagnostics.get("active_context_correlations", 0)
+    )
+    if direct_correlations <= 0:
+        fail(errors, "expected op_submit_context, active_context, or same_thread correlations > 0")
+    if args.require_context_correlation and context_correlations <= 0:
+        fail(errors, "expected op_submit_context or active_context correlations > 0")
     if diagnostics.get("spans_produced") != len(spans):
         fail(errors, f"spans_produced={diagnostics.get('spans_produced')} but JSON has {len(spans)} spans")
     if diagnostics.get("rados_ops") != len(rados_spans) + len(background_spans):
@@ -243,8 +304,8 @@ def verify_document(args, document, workload):
         fail(errors, f"correlated_rados_ops={diagnostics.get('correlated_rados_ops')} but JSON has {len(rados_spans)} rados.op spans")
     if diagnostics.get("background_rados_ops") != len(background_spans):
         fail(errors, f"background_rados_ops={diagnostics.get('background_rados_ops')} but JSON has {len(background_spans)} background spans")
-    if diagnostics.get("same_thread_correlations", 0) + diagnostics.get("inferred_correlations", 0) != diagnostics.get("correlated_rados_ops"):
-        fail(errors, "same_thread_correlations + inferred_correlations must equal correlated_rados_ops")
+    if direct_correlations + diagnostics.get("inferred_correlations", 0) != diagnostics.get("correlated_rados_ops"):
+        fail(errors, "direct correlations + inferred_correlations must equal correlated_rados_ops")
     if diagnostics.get("missing_trans_id_background_ops") != diagnostics.get("background_rados_ops"):
         fail(errors, "missing_trans_id_background_ops must equal background_rados_ops")
     for key in BPF_FAILURE_DIAGNOSTICS:
@@ -289,10 +350,19 @@ def verify_document(args, document, workload):
                 fail(errors, f"rados.op span {span.get('span_id')} trace_id does not match parent request")
             if span.get("start_ns", 0) < parent_span.get("start_ns", 0) or span.get("end_ns", 0) > parent_span.get("end_ns", 0):
                 fail(errors, f"rados.op span {span.get('span_id')} is outside parent request bounds")
-        if attrs.get("rgw.correlation") not in {"same_thread", "inferred"}:
+        if attrs.get("rgw.correlation") not in VALID_CHILD_RADOS_CORRELATIONS:
             fail(errors, f"rados.op span {span.get('span_id')} has invalid rgw.correlation={attrs.get('rgw.correlation')!r}")
-        if attrs.get("rgw.correlation") == "same_thread" and attrs.get("rgw.correlation_reason") is not None:
+        source = attrs.get("rgw.correlation_source")
+        if source not in VALID_CORRELATION_SOURCES:
+            fail(errors, f"rados.op span {span.get('span_id')} has invalid rgw.correlation_source={source!r}")
+        if attrs.get("rgw.correlation") in DIRECT_RADOS_CORRELATIONS and attrs.get("rgw.correlation_reason") is not None:
             fail(errors, f"rados.op span {span.get('span_id')} has unexpected rgw.correlation_reason")
+        if attrs.get("rgw.correlation") in {"op_submit_context", "active_context"} and source != attrs.get("rgw.correlation"):
+            fail(errors, f"rados.op span {span.get('span_id')} has rgw.correlation_source={source!r} for {attrs.get('rgw.correlation')!r} correlation")
+        if attrs.get("rgw.correlation") == "same_thread" and source not in {"same_thread", "none"}:
+            fail(errors, f"rados.op span {span.get('span_id')} has rgw.correlation_source={source!r} for same_thread correlation")
+        if attrs.get("rgw.correlation") == "inferred" and source != "none":
+            fail(errors, f"rados.op span {span.get('span_id')} has rgw.correlation_source={source!r} for inferred correlation")
         if attrs.get("rgw.correlation") == "inferred" and attrs.get("rgw.correlation_reason") != "pid_time_window":
             fail(errors, f"rados.op span {span.get('span_id')} has invalid inferred correlation reason")
 
@@ -307,6 +377,8 @@ def verify_document(args, document, workload):
             fail(errors, f"background span {span.get('span_id')} unexpectedly has a parent")
         if attrs.get("rgw.correlation") != "none":
             fail(errors, f"background span {span.get('span_id')} has rgw.correlation={attrs.get('rgw.correlation')!r}")
+        if attrs.get("rgw.correlation_source") != "none":
+            fail(errors, f"background span {span.get('span_id')} has rgw.correlation_source={attrs.get('rgw.correlation_source')!r}")
         if attrs.get("rgw.correlation_reason") not in VALID_BACKGROUND_REASONS:
             fail(errors, f"background span {span.get('span_id')} is missing rgw.correlation_reason")
         validate_background_event(errors, span, attrs)
@@ -356,6 +428,63 @@ def verify_document(args, document, workload):
         keys = {record.get("key") for record in successful_workload if record.get("key")}
         if keys and not any(any(key in obj for key in keys) for obj in rados_objects):
             fail(errors, f"no captured ceph.rados.object contains workload keys {sorted(keys)}")
+
+        keyed_workload = [
+            record
+            for record in successful_workload
+            if record.get("key") and record.get("x_amz_request_id")
+        ]
+        for span in rados_spans:
+            attrs = attr_map(span)
+            object_name = str(attrs.get("ceph.rados.object", ""))
+            candidates = workload_records_for_object(keyed_workload, object_name, span, slack_ns)
+            if len(candidates) == 1:
+                expected_request_id = candidates[0]["x_amz_request_id"]
+                parent = request_by_id.get(span.get("parent_span_id"))
+                parent_trans_id = attr_map(parent).get("rgw.trans_id") if parent else None
+                if parent_trans_id != expected_request_id:
+                    fail(
+                        errors,
+                        f"rados.op span {span.get('span_id')} for object {object_name!r} "
+                        f"attached to request {parent_trans_id!r}; expected {expected_request_id!r}",
+                    )
+
+        for span in background_spans:
+            attrs = attr_map(span)
+            object_name = str(attrs.get("ceph.rados.object", ""))
+            candidates = workload_records_for_object(keyed_workload, object_name, span, slack_ns)
+            if candidates:
+                fail(
+                    errors,
+                    f"background span {span.get('span_id')} for workload object {object_name!r} "
+                    f"overlaps request ids {[record['x_amz_request_id'] for record in candidates]}",
+                )
+
+        if args.require_get_read_correlation:
+            get_records = [
+                record
+                for record in keyed_workload
+                if record.get("name") == "get_object" or str(record.get("name", "")).startswith("concurrent_get_")
+            ]
+            if not get_records:
+                fail(errors, "workload has no successful get_object/concurrent_get record to validate")
+            for record in get_records:
+                if not any(rados_matches_workload_record(span, record, request_by_id, slack_ns, rw="read") for span in rados_spans):
+                    fail(errors, f"{record.get('name')} request {record.get('x_amz_request_id')!r} for key {record.get('key')!r} has no correlated read RADOS span")
+
+        if args.require_put_write_correlation:
+            write_records = [
+                record
+                for record in keyed_workload
+                if record.get("name") == "put_object"
+                or str(record.get("name", "")).startswith("upload_part_")
+                or str(record.get("name", "")).startswith("concurrent_put_")
+            ]
+            if not write_records:
+                fail(errors, "workload has no successful put_object/upload_part/concurrent_put record to validate")
+            for record in write_records:
+                if not any(rados_matches_workload_record(span, record, request_by_id, slack_ns, rw="write") for span in rados_spans):
+                    fail(errors, f"{record.get('name')} request {record.get('x_amz_request_id')!r} for key {record.get('key')!r} has no correlated write RADOS span")
 
         missing_request_id_records = [record for record in successful_workload if not record.get("x_amz_request_id")]
         if missing_request_id_records:
@@ -412,6 +541,9 @@ def self_test_args():
         expect_role=["data"],
         expect_any_role=[],
         time_slack_ms=2000,
+        require_context_correlation=True,
+        require_get_read_correlation=True,
+        require_put_write_correlation=True,
     )
 
 
@@ -420,25 +552,95 @@ def attr(key, value):
 
 
 def valid_self_test_document():
-    request_attrs = [
-        attr("rgw.trans_id", "tx-selftest"),
+    get_request_attrs = [
+        attr("rgw.trans_id", "tx-get-selftest"),
         attr("rgw.request_class", "s3_request"),
         attr("rgw.duration_quality", "marker"),
     ]
-    rados_attrs = [
+    put_request_attrs = [
+        attr("rgw.trans_id", "tx-put-selftest"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    concurrent_put_request_attrs = [
+        attr("rgw.trans_id", "tx-concurrent-put-selftest"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    concurrent_get_request_attrs = [
+        attr("rgw.trans_id", "tx-concurrent-get-selftest"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    tied_notify_request_attrs = [
+        attr("rgw.trans_id", "tx-notify-selftest"),
+        attr("rgw.req_id", "req-notify-selftest"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    read_rados_attrs = [
         attr("ceph.rados.duration_ns", 60),
         attr("ceph.rados.pool", 1),
         attr("ceph.rados.pg", "1.2a"),
         attr("ceph.rados.pg_seed", 42),
         attr("ceph.rados.target_osd", 0),
         attr("ceph.rados.acting", "[0,1,2]"),
-        attr("ceph.rados.object", "bucket/selftest-object"),
+        attr("ceph.rados.object", "bucket/selftest-get-object"),
         attr("ceph.rados.ops", "read"),
         attr("ceph.rados.rw", "read"),
         attr("ceph.rados.offset", 0),
         attr("ceph.rados.length", 0),
         attr("rgw.rados_role", "data"),
-        attr("rgw.correlation", "same_thread"),
+        attr("rgw.correlation", "op_submit_context"),
+        attr("rgw.correlation_source", "op_submit_context"),
+    ]
+    write_rados_attrs = [
+        attr("ceph.rados.duration_ns", 70),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2b"),
+        attr("ceph.rados.pg_seed", 43),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/selftest-put-object"),
+        attr("ceph.rados.ops", "writefull"),
+        attr("ceph.rados.rw", "write"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 4096),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "active_context"),
+        attr("rgw.correlation_source", "active_context"),
+    ]
+    concurrent_write_rados_attrs = [
+        attr("ceph.rados.duration_ns", 50),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2c"),
+        attr("ceph.rados.pg_seed", 44),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/selftest-concurrent-object"),
+        attr("ceph.rados.ops", "writefull"),
+        attr("ceph.rados.rw", "write"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 1024),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "op_submit_context"),
+        attr("rgw.correlation_source", "op_submit_context"),
+    ]
+    concurrent_read_rados_attrs = [
+        attr("ceph.rados.duration_ns", 40),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2d"),
+        attr("ceph.rados.pg_seed", 45),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/selftest-concurrent-object"),
+        attr("ceph.rados.ops", "read"),
+        attr("ceph.rados.rw", "read"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 1024),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "op_submit_context"),
+        attr("rgw.correlation_source", "op_submit_context"),
     ]
     background_attrs = [
         attr("ceph.rados.duration_ns", 20),
@@ -454,7 +656,26 @@ def valid_self_test_document():
         attr("ceph.rados.length", 0),
         attr("rgw.rados_role", "notify"),
         attr("rgw.correlation", "none"),
+        attr("rgw.correlation_source", "none"),
         attr("rgw.correlation_reason", "classified_background_role"),
+    ]
+    tied_notify_attrs = [
+        attr("ceph.rados.duration_ns", 60),
+        attr("ceph.rados.pool", 2),
+        attr("ceph.rados.pg", "2.8"),
+        attr("ceph.rados.pg_seed", 8),
+        attr("ceph.rados.target_osd", 1),
+        attr("ceph.rados.acting", "[1,2,3]"),
+        attr("ceph.rados.object", "notify.0"),
+        attr("ceph.rados.ops", "read"),
+        attr("ceph.rados.rw", "read"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 0),
+        attr("rgw.rados_role", "notify"),
+        attr("rgw.correlation", "op_submit_context"),
+        attr("rgw.correlation_source", "op_submit_context"),
+        attr("rgw.req_id", "req-notify-selftest"),
+        attr("rgw.trans_id", "tx-notify-selftest"),
     ]
     return {
         "service_name": "rgwtrace-e2e",
@@ -465,8 +686,8 @@ def valid_self_test_document():
                 "parent_span_id": None,
                 "name": "rgw.request",
                 "start_ns": 100,
-                "end_ns": 300,
-                "attributes": request_attrs,
+                "end_ns": 220,
+                "attributes": get_request_attrs,
                 "events": [],
             },
             {
@@ -476,7 +697,67 @@ def valid_self_test_document():
                 "name": "rados.op",
                 "start_ns": 120,
                 "end_ns": 180,
-                "attributes": rados_attrs,
+                "attributes": read_rados_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "4" * 32,
+                "span_id": "4" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 230,
+                "end_ns": 360,
+                "attributes": put_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "4" * 32,
+                "span_id": "5" * 16,
+                "parent_span_id": "4" * 16,
+                "name": "rados.op",
+                "start_ns": 250,
+                "end_ns": 320,
+                "attributes": write_rados_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "8" * 32,
+                "span_id": "8" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 500,
+                "end_ns": 620,
+                "attributes": concurrent_put_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "8" * 32,
+                "span_id": "9" * 16,
+                "parent_span_id": "8" * 16,
+                "name": "rados.op",
+                "start_ns": 520,
+                "end_ns": 570,
+                "attributes": concurrent_write_rados_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "a" * 32,
+                "span_id": "a" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 630,
+                "end_ns": 740,
+                "attributes": concurrent_get_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "a" * 32,
+                "span_id": "b" * 16,
+                "parent_span_id": "a" * 16,
+                "name": "rados.op",
+                "start_ns": 650,
+                "end_ns": 690,
+                "attributes": concurrent_read_rados_attrs,
                 "events": [],
             },
             {
@@ -495,20 +776,42 @@ def valid_self_test_document():
                     }
                 ],
             },
+            {
+                "trace_id": "6" * 32,
+                "span_id": "6" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 3_000_000_000,
+                "end_ns": 3_000_000_100,
+                "attributes": tied_notify_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "6" * 32,
+                "span_id": "7" * 16,
+                "parent_span_id": "6" * 16,
+                "name": "rados.op",
+                "start_ns": 3_000_000_020,
+                "end_ns": 3_000_000_080,
+                "attributes": tied_notify_attrs,
+                "events": [],
+            },
         ],
         "diagnostics": {
-            "events_decoded": 3,
+            "events_decoded": 11,
             "decode_errors": 0,
-            "request_markers": 1,
-            "rados_ops": 2,
-            "correlated_rados_ops": 1,
+            "request_markers": 5,
+            "rados_ops": 6,
+            "correlated_rados_ops": 5,
             "background_rados_ops": 1,
-            "same_thread_correlations": 1,
+            "same_thread_correlations": 0,
+            "op_submit_context_correlations": 4,
+            "active_context_correlations": 1,
             "inferred_correlations": 0,
             "missing_trans_id_background_ops": 1,
             "background_rados_by_role": {"notify": 1},
             "background_rados_by_reason": {"classified_background_role": 1},
-            "spans_produced": 3,
+            "spans_produced": 11,
         },
     }
 
@@ -516,13 +819,37 @@ def valid_self_test_document():
 def valid_self_test_workload():
     return [
         {
-            "name": "put-object",
+            "name": "get_object",
             "status": "ok",
             "start_ns": 110,
             "end_ns": 190,
-            "key": "selftest-object",
-            "x_amz_request_id": "tx-selftest",
-        }
+            "key": "selftest-get-object",
+            "x_amz_request_id": "tx-get-selftest",
+        },
+        {
+            "name": "put_object",
+            "status": "ok",
+            "start_ns": 240,
+            "end_ns": 330,
+            "key": "selftest-put-object",
+            "x_amz_request_id": "tx-put-selftest",
+        },
+        {
+            "name": "concurrent_put_0",
+            "status": "ok",
+            "start_ns": 510,
+            "end_ns": 580,
+            "key": "selftest-concurrent-object",
+            "x_amz_request_id": "tx-concurrent-put-selftest",
+        },
+        {
+            "name": "concurrent_get_0",
+            "status": "ok",
+            "start_ns": 640,
+            "end_ns": 700,
+            "key": "selftest-concurrent-object",
+            "x_amz_request_id": "tx-concurrent-get-selftest",
+        },
     ]
 
 
@@ -555,8 +882,18 @@ def run_self_test():
             "unexpected rgw.correlation_reason",
         ),
         (
+            "rados source",
+            lambda document: document["spans"][1]["attributes"][13].update({"value": "none"}),
+            "rgw.correlation_source",
+        ),
+        (
+            "workload parent",
+            lambda document: document["spans"][0]["attributes"][0].update({"value": "tx-wrong"}),
+            "attached to request",
+        ),
+        (
             "background event",
-            lambda document: document["spans"][2]["events"][0].update({"time_ns": 421}),
+            lambda document: document["spans"][8]["events"][0].update({"time_ns": 421}),
             "event time_ns does not match",
         ),
         (
@@ -568,6 +905,16 @@ def run_self_test():
             "workload request marker",
             lambda document: document["spans"][0]["attributes"][2].update({"value": "rados_bounds"}),
             "missing RGW request markers",
+        ),
+        (
+            "concurrent write correlation",
+            lambda document: document["spans"].pop(5),
+            "concurrent_put_0",
+        ),
+        (
+            "concurrent read correlation",
+            lambda document: document["spans"].pop(7),
+            "concurrent_get_0",
         ),
     ]
 

@@ -452,6 +452,9 @@ verify_trace() {
         --workload "${WORKLOAD_JSONL}" \
         --min-request-spans 3 \
         --min-rados-spans 3 \
+        --require-context-correlation \
+        --require-get-read-correlation \
+        --require-put-write-correlation \
         --expect-role data \
         --expect-any-role bucket_index,bucket_meta \
         >"${VERIFY_LOG}" 2>&1; then
