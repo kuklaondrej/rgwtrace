@@ -1,0 +1,28 @@
+ARCHITECTURE.md
+  s_47f3a4fd57c70a::t_7782c14d8132c5 27,73,75,77-80,82-84,131-134,152,162
+  s_47f3a4fd57c70a::t_49f428dfc22f2d 29
+  s_47f3a4fd57c70a::t_c40959bbb8b5ed 25,36-37,43,71
+README.md
+  s_47f3a4fd57c70a::t_95c40e02579699 81-82
+  s_47f3a4fd57c70a::t_6334b58bdf9056 287,291
+  s_47f3a4fd57c70a::t_809573e32c0734 127,167,216,256
+RUNBOOK.md
+  s_47f3a4fd57c70a::t_9e750f823fd076 64-65
+  s_47f3a4fd57c70a::t_2b0d2a9b5e9563 123,131,133,135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "3f1a4d49e93e5399b89f8f4560bd76b53a882f3e",
+  "prompts": {},
+  "sessions": {
+    "s_47f3a4fd57c70a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ef9c4-cee3-7601-a6d5-e0664115827a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
