@@ -1,0 +1,44 @@
+tests/e2e/verify-rgwtrace-json.py
+  s_47f3a4fd57c70a::t_592b330c51fb04 909,915,917
+  s_47f3a4fd57c70a::t_bb3779cb9467f3 464-468,470,479-481,484
+  s_47f3a4fd57c70a::t_d8338d8f19d2d4 896
+  s_47f3a4fd57c70a::t_aedf107f90a4cb 33
+  s_47f3a4fd57c70a::t_f0fd9a227754ab 473
+  s_47f3a4fd57c70a::t_2deea0a39e00ff 51,53-54,77,286-298,307-308,353,355-358,659
+  s_47f3a4fd57c70a::t_2f5115d1104937 916
+  s_47f3a4fd57c70a::t_872374e54d1a36 884,888-889,893,910-914,918
+  s_47f3a4fd57c70a::t_be7c622ef36562 562-574,612-643,670-672,675-676,679,721-760,779-798,801,803-805,807-808,814,836-852
+  s_47f3a4fd57c70a::t_1a6dfd1e1c956e 73,75,78-87,121-148,462-463,469,471-472,474-478,482-483,485-488,544-546,555-561,581,588,594-611,689-690,700-720,809,822,826-835
+  s_47f3a4fd57c70a::t_cad2de4bb03da7 55
+  s_47f3a4fd57c70a::t_2df78df5cdaeb7 74
+  s_47f3a4fd57c70a::t_5aaf59c45f5a39 76
+  s_47f3a4fd57c70a::t_98dd4a7e782541 149-150
+  s_47f3a4fd57c70a::t_62a017a4a876c8 459-461
+  s_47f3a4fd57c70a::t_4ef7b25a00ac43 575-577
+  s_47f3a4fd57c70a::t_0687417fdb14eb 667-669
+  s_47f3a4fd57c70a::t_25c5770b4b1741 673-674
+  s_47f3a4fd57c70a::t_7debcd778ea064 677-678
+  s_47f3a4fd57c70a::t_7c5d316112f17e 885-887
+  s_47f3a4fd57c70a::t_4606dd79fde64f 890-892
+  s_47f3a4fd57c70a::t_03db6c7c3e6248 360-365,380-381,432-458,662-666
+tests/e2e/functional-test-microceph-rgw.sh
+  s_47f3a4fd57c70a::t_83abf18cc56dc0 455-457
+tests/e2e/s3-workload.py
+  s_47f3a4fd57c70a::t_f61867de834c93 3,6,21,34,47-54,57,72-111,123,126,212-228,233-236
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "b40f5cbd7267c006464e365759831a9e2740c2b9",
+  "prompts": {},
+  "sessions": {
+    "s_47f3a4fd57c70a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ef9c4-cee3-7601-a6d5-e0664115827a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
