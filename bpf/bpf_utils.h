@@ -100,4 +100,19 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   return cur_addr;
 }
 
+static __always_inline __u64 fetch_var_value(const struct pt_regs *const ctx,
+                                             struct VarField *vf) {
+  if (vf == 0)
+    return 0;
+
+  __u64 value = fetch_register(ctx, vf->varloc.reg);
+  if (vf->varloc.stack) {
+    __u64 addr = value + vf->varloc.offset;
+    rgwtrace_probe_read_user(&value, sizeof(value), (void *)addr);
+  } else {
+    value += vf->varloc.offset;
+  }
+  return value;
+}
+
 #endif
