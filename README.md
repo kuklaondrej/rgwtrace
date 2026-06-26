@@ -78,6 +78,8 @@ sudo rgwtrace \
 
 When `--pid` is used, discovered target paths are resolved through `/proc/<pid>/root` so attaches work for RGW processes running in a different mount namespace, including container runtimes.
 
+Scoped RGW RADOS return probes are disabled by default because some kernel/RGW combinations have been observed to fault unsafe uretprobe returns. Use `--attach-scoped-return-probes` only when validating a host where uretprobes are known to be safe; it attaches return probes to `rgw_rados_operate`, `RadosWriter::process`, and `RadosWriter::write_exclusive` to clear scoped active context at function return.
+
 ---
 
 ## Export
@@ -122,7 +124,7 @@ When `--correlate-inferred` is enabled, `--inference-window` controls the conser
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, `op_submit_context`, `active_context`, same-thread, and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
 
 OTLP mode logs the same trace counters plus export batches, attempts, and failures when internal logging is enabled.
 
@@ -162,7 +164,7 @@ Run the fast no-cluster verification loop before live testing:
 ./scripts/verify.sh
 ```
 
-The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, e2e JSON verifier self-tests, and BPF source regressions. Linux CI also covers ring-buffer event decoding without attaching probes.
+The default tests cover imported DWARF dry-run CLI output, synthetic collector trace golden output, raw event conversion, OTLP encoding, native DWARF parsing helpers, e2e JSON verifier self-tests, and BPF source regressions. The collector tests also pin internal RGW request identity grouping and direct-context precedence. Linux CI covers ring-buffer event decoding without attaching probes.
 
 CI uses the pinned Rust toolchain in `rust-toolchain.toml` and runs `cargo audit`. Run the audit locally when dependency or toolchain inputs change:
 
@@ -211,7 +213,7 @@ cargo build --release
 sudo tests/e2e/functional-test-microceph-rgw.sh
 ```
 
-The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
+The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, direct RGW context correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
 
 By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.4-0ubuntu1~cloud0`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `/tmp/rgwtrace-e2e` so the traced version is explicit.
 
@@ -251,7 +253,7 @@ rgw.background.rados_op
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
 
-RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`.
+RADOS spans also include `rgw.correlation` and `rgw.correlation_source`. Correlated request children prefer `op_submit_context`, then `active_context`, then `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`.
 
 Request spans include `rgw.duration_quality`. Current live captures normally use `marker` because the safe RGW probe observes a request marker rather than the full lifecycle; the span still envelopes any correlated RADOS child bounds. If future start/end probes are active, the value is `request_lifecycle`; request groups built only from RADOS bounds use `rados_bounds`.
 
@@ -282,11 +284,11 @@ Live attach refuses to guess the Ceph ABI layout when no version is available. U
 
 ## Limit
 
-Native DWARF support is implemented for the current live probe set: `Objecter::_send_op`, `Objecter::_finish_op`, and `RGWREST::get_handler`.
+Native DWARF support is implemented for the current live probe set: `process_request`, `RGWREST::get_handler`, `RGWOp::init`, put-object processor `prepare` methods, `rgw_rados_operate` overloads, optional `RadosWriter::RadosWriter`, `RadosWriter::process`, `RadosWriter::write_exclusive`, `Objecter::op_submit`, `Objecter::_send_op`, and `Objecter::_finish_op`.
 
 It extracts module build IDs, probe PCs, variable locations, and member field paths from local binary/debug data. `cephtrace` JSON import remains the stable fallback and oracle for validating native output.
 
-Correlation depends on `RGWREST::get_handler` seeing a `trans_id` and `Objecter::_send_op` running with that context.
+Correlation starts from `process_request()` and `RGWREST::get_handler()`, maps `RGWOp*` through `RGWOp::init()`, maps embedded put-object `RadosWriter*` instances from processor `prepare` methods, caches `RadosWriter*` request context when writer `dpp` resolves to a captured request-scoped `DoutPrefixProvider` (`RGWOp*` or `req_state*`), and narrowly falls back to the current same-thread request at the `RadosWriter` boundary when the writer `dpp` is not one of those captured request-scoped pointers. It carries short-lived scoped RGW RADOS context through boundary probes and prefers `Objecter::Op*` context captured at `Objecter::op_submit()` before falling back to active context, same-thread `trans_id` matching, and optional conservative inference. The default live path avoids scoped return-probe attachment because some kernels fail unsafe uretprobe returns with `SIGILL`; `--attach-scoped-return-probes` enables the scoped return probes explicitly.
 
 Late async, cross-thread, startup, and background operations may appear as standalone `rgw.background.rados_op` spans. `--correlate-inferred` enables conservative inference for unique candidates only. It first prefers a unique request whose Linux thread ID matches the RADOS send thread, then falls back to same-PID/time-window matching. Ambiguous candidates remain background spans and are counted separately.
 

@@ -61,6 +61,8 @@ sudo rgwtrace \
 
 For fallback validation, rerun with `--import-json 18.2.8-1jammy_dwarf_traceid.json`.
 
+Leave scoped return probes disabled unless this host has been validated with safe uretprobe returns. `--attach-scoped-return-probes` attaches RGW RADOS boundary return probes for tighter active-context cleanup, but unsafe uretprobe returns have crashed some RGW builds with `SIGILL`.
+
 Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, expired spans, and BPF-side drop/failure counters.
 
 ---
@@ -118,7 +120,7 @@ Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobu
 
 ## Background RADOS Spans
 
-`rgw.background.rados_op` means no RGW `trans_id` was available when the RADOS op was captured.
+`rgw.background.rados_op` means no usable RGW request identity was available when the RADOS op was captured, or optional inferred correlation could not choose exactly one safe request candidate.
 
 Expected causes include RGW startup work, GC, notify/sync/config work, late async work, cross-thread work, and true background RADOS operations.
 
@@ -126,8 +128,11 @@ Inspect:
 
 - `rgw.rados_role` for object classification.
 - `rgw.correlation = "none"`.
+- `rgw.correlation_source = "none"`.
 - `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`; with `--correlate-inferred`, it can also be `no_inference_candidate` or `ambiguous_inference_candidates`.
+- Child `rados.op` spans should show `rgw.correlation_source` as `op_submit_context`, `active_context`, or `same_thread` when direct BPF context was captured.
 - `trace.diagnostics.missing_trans_id_background_ops` for volume.
+- `trace.diagnostics.op_submit_context_correlations`, `trace.diagnostics.active_context_correlations`, and `trace.diagnostics.same_thread_correlations` for direct correlation coverage.
 - `trace.diagnostics.inference_no_candidate_rados_ops` and `trace.diagnostics.inference_ambiguous_rados_ops` when inferred correlation is enabled.
 - `trace.diagnostics.background_rados_by_role` and `trace.diagnostics.background_rados_by_reason` for breakdowns.
 
