@@ -4,6 +4,7 @@ use serde::Serialize;
 
 pub const MAX_ACTING: usize = 16;
 pub const MAX_TRANS_ID: usize = 128;
+pub const MAX_RGW_REQ_ID: usize = 128;
 pub const MAX_OBJECT_NAME: usize = 128;
 pub const MAX_RADOS_OPS: usize = 3;
 
@@ -18,6 +19,11 @@ pub const RGWTRACE_TRUNC_RADOS_OPS: u32 = 1 << 3;
 pub const RGWTRACE_TRUNC_CLS_NAME: u32 = 1 << 4;
 pub const RGWTRACE_TRUNC_METHOD_NAME: u32 = 1 << 5;
 
+pub const RGWTRACE_CORRELATION_NONE: u32 = 0;
+pub const RGWTRACE_CORRELATION_OP_SUBMIT_CONTEXT: u32 = 1;
+pub const RGWTRACE_CORRELATION_ACTIVE_CONTEXT: u32 = 2;
+pub const RGWTRACE_CORRELATION_SAME_THREAD: u32 = 3;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawClsOp {
@@ -30,10 +36,12 @@ pub struct RawClsOp {
 pub struct RawRequestEvent {
     pub start_ns: u64,
     pub end_ns: u64,
+    pub rgw_request_id: u64,
     pub pid: u32,
     pub tid: u32,
     pub flags: u32,
     pub trans_id: [u8; MAX_TRANS_ID],
+    pub rgw_req_id: [u8; MAX_RGW_REQ_ID],
 }
 
 #[repr(C)]
@@ -43,6 +51,7 @@ pub struct RawRadosEvent {
     pub tid: u64,
     pub sent_ns: u64,
     pub finish_ns: u64,
+    pub rgw_request_id: u64,
     pub pool: u64,
     pub offset: u64,
     pub length: u64,
@@ -53,10 +62,12 @@ pub struct RawRadosEvent {
     pub rw: u16,
     pub ops_size: u32,
     pub flags: u32,
+    pub correlation_source: u32,
     pub acting: [i32; MAX_ACTING],
     pub ops: [u16; MAX_RADOS_OPS],
     pub cls_ops: [RawClsOp; MAX_RADOS_OPS],
     pub trans_id: [u8; MAX_TRANS_ID],
+    pub rgw_req_id: [u8; MAX_RGW_REQ_ID],
     pub object_name: [u8; MAX_OBJECT_NAME],
 }
 
@@ -93,8 +104,10 @@ impl TraceEvent {
 pub struct RequestEvent {
     pub start_ns: u64,
     pub end_ns: u64,
+    pub rgw_request_id: u64,
     pub pid: u32,
     pub tid: u32,
+    pub rgw_req_id: String,
     pub trans_id: String,
     pub truncation: CaptureTruncation,
 }
@@ -114,7 +127,10 @@ pub struct RadosEvent {
     pub acting: Vec<i32>,
     pub rw: RadosDirection,
     pub object_name: String,
+    pub rgw_req_id: String,
+    pub rgw_request_id: u64,
     pub trans_id: String,
+    pub correlation_source: RadosCorrelationSource,
     pub truncation: CaptureTruncation,
     pub ops: Vec<RadosOp>,
     pub offset: u64,
@@ -126,6 +142,38 @@ pub struct RadosEvent {
 pub enum RadosDirection {
     Read,
     Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RadosCorrelationSource {
+    None,
+    OpSubmitContext,
+    ActiveContext,
+    SameThread,
+    Unknown(u32),
+}
+
+impl RadosCorrelationSource {
+    pub fn from_raw(raw: u32) -> Self {
+        match raw {
+            RGWTRACE_CORRELATION_NONE => Self::None,
+            RGWTRACE_CORRELATION_OP_SUBMIT_CONTEXT => Self::OpSubmitContext,
+            RGWTRACE_CORRELATION_ACTIVE_CONTEXT => Self::ActiveContext,
+            RGWTRACE_CORRELATION_SAME_THREAD => Self::SameThread,
+            other => Self::Unknown(other),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::OpSubmitContext => "op_submit_context",
+            Self::ActiveContext => "active_context",
+            Self::SameThread => "same_thread",
+            Self::Unknown(_) => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -216,8 +264,10 @@ impl From<RawRequestEvent> for RequestEvent {
         Self {
             start_ns: raw.start_ns,
             end_ns: raw.end_ns,
+            rgw_request_id: raw.rgw_request_id,
             pid: raw.pid,
             tid: raw.tid,
+            rgw_req_id: nul_terminated_string(&raw.rgw_req_id),
             trans_id: nul_terminated_string(&raw.trans_id),
             truncation: CaptureTruncation::from_flags(raw.flags),
         }
@@ -261,7 +311,10 @@ impl From<RawRadosEvent> for RadosEvent {
                 RadosDirection::Read
             },
             object_name: nul_terminated_string(&raw.object_name),
+            rgw_req_id: nul_terminated_string(&raw.rgw_req_id),
+            rgw_request_id: raw.rgw_request_id,
             trans_id: nul_terminated_string(&raw.trans_id),
+            correlation_source: RadosCorrelationSource::from_raw(raw.correlation_source),
             truncation: CaptureTruncation::from_flags(raw.flags),
             ops,
             offset: raw.offset,
@@ -279,8 +332,10 @@ mod tests {
         let mut event = TraceEvent::RequestStart(RequestEvent {
             start_ns: 10,
             end_ns: 0,
+            rgw_request_id: 0,
             pid: 1,
             tid: 2,
+            rgw_req_id: String::new(),
             trans_id: String::new(),
             truncation: CaptureTruncation::default(),
         });
@@ -304,13 +359,16 @@ mod tests {
             sent_ns: 100,
             finish_ns: 125,
             duration_ns: 25,
+            rgw_request_id: 0,
             pool: 4,
             target_osd: 7,
             pg_seed: 5,
             acting: Vec::new(),
             rw: RadosDirection::Read,
             object_name: String::new(),
+            rgw_req_id: String::new(),
             trans_id: String::new(),
+            correlation_source: RadosCorrelationSource::None,
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
@@ -332,16 +390,20 @@ mod tests {
         let request = RequestEvent::from(RawRequestEvent {
             start_ns: 10,
             end_ns: 20,
+            rgw_request_id: 123,
             pid: 42,
             tid: 7,
             flags: RGWTRACE_TRUNC_TRANS_ID,
             trans_id: bytes("tx0001"),
+            rgw_req_id: bytes("req0001"),
         });
 
         assert_eq!(request.start_ns, 10);
         assert_eq!(request.end_ns, 20);
+        assert_eq!(request.rgw_request_id, 123);
         assert_eq!(request.pid, 42);
         assert_eq!(request.tid, 7);
+        assert_eq!(request.rgw_req_id, "req0001");
         assert_eq!(request.trans_id, "tx0001");
         assert!(request.truncation.trans_id);
         assert!(!request.truncation.object_name);
@@ -362,6 +424,7 @@ mod tests {
             tid: 10,
             sent_ns: 200,
             finish_ns: 150,
+            rgw_request_id: 456,
             pool: 16,
             offset: 64,
             length: 4096,
@@ -375,6 +438,7 @@ mod tests {
                 | RGWTRACE_TRUNC_RADOS_OPS
                 | RGWTRACE_TRUNC_CLS_NAME
                 | RGWTRACE_TRUNC_METHOD_NAME,
+            correlation_source: RGWTRACE_CORRELATION_OP_SUBMIT_CONTEXT,
             acting,
             ops: [0x2202, 0x1401, 0xffff],
             cls_ops: [
@@ -386,6 +450,7 @@ mod tests {
                 empty_cls_op,
             ],
             trans_id: bytes("tx0002"),
+            rgw_req_id: bytes("req0002"),
             object_name: bytes("bucket-object"),
         };
 
@@ -395,6 +460,7 @@ mod tests {
         assert_eq!(event.send_tid, 77);
         assert_eq!(event.cid, 9);
         assert_eq!(event.tid, 10);
+        assert_eq!(event.rgw_request_id, 456);
         assert_eq!(event.duration_ns, 0);
         assert_eq!(event.pool, 16);
         assert_eq!(event.target_osd, 7);
@@ -402,7 +468,12 @@ mod tests {
         assert_eq!(event.acting, vec![1, 2]);
         assert_eq!(event.rw, RadosDirection::Write);
         assert_eq!(event.object_name, "bucket-object");
+        assert_eq!(event.rgw_req_id, "req0002");
         assert_eq!(event.trans_id, "tx0002");
+        assert_eq!(
+            event.correlation_source,
+            RadosCorrelationSource::OpSubmitContext
+        );
         assert_eq!(event.offset, 64);
         assert_eq!(event.length, 4096);
         assert_eq!(event.ops.len(), MAX_RADOS_OPS);

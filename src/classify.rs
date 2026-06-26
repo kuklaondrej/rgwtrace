@@ -61,7 +61,7 @@ pub fn classify_rados(event: &RadosEvent) -> RadosRole {
     if looks_like_access_key(object) {
         return RadosRole::AuthMeta;
     }
-    if !event.trans_id.is_empty() {
+    if !event.trans_id.is_empty() || !event.rgw_req_id.is_empty() || event.rgw_request_id != 0 {
         return RadosRole::Data;
     }
 
@@ -139,13 +139,16 @@ mod tests {
             sent_ns: 10,
             finish_ns: 20,
             duration_ns: 10,
+            rgw_request_id: 0,
             pool: 16,
             target_osd: 7,
             pg_seed: 1,
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
+            rgw_req_id: String::new(),
             trans_id: trans_id.to_string(),
+            correlation_source: crate::events::RadosCorrelationSource::None,
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,

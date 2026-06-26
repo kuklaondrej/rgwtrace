@@ -83,6 +83,14 @@
         {
           "key": "rgw.correlation",
           "value": "same_thread"
+        },
+        {
+          "key": "rgw.correlation_source",
+          "value": "none"
+        },
+        {
+          "key": "rgw.trans_id",
+          "value": "tx-golden"
         }
       ],
       "events": []
@@ -148,6 +156,10 @@
           "value": "none"
         },
         {
+          "key": "rgw.correlation_source",
+          "value": "none"
+        },
+        {
           "key": "rgw.correlation_reason",
           "value": "classified_background_role"
         }
@@ -210,6 +222,10 @@
               "value": "none"
             },
             {
+              "key": "rgw.correlation_source",
+              "value": "none"
+            },
+            {
               "key": "rgw.correlation_reason",
               "value": "classified_background_role"
             }
@@ -226,6 +242,8 @@
     "correlated_rados_ops": 1,
     "background_rados_ops": 1,
     "same_thread_correlations": 1,
+    "op_submit_context_correlations": 0,
+    "active_context_correlations": 0,
     "inferred_correlations": 0,
     "inference_no_candidate_rados_ops": 0,
     "inference_ambiguous_rados_ops": 0,
@@ -252,6 +270,24 @@
     "bpf_rados_map_drops": 0,
     "bpf_rados_finish_misses": 0,
     "bpf_request_context_drops": 0,
-    "bpf_probe_read_failures": 0
+    "bpf_probe_read_failures": 0,
+    "bpf_rgw_rados_operate_hits": 0,
+    "bpf_rgw_rados_operate_contexts": 0,
+    "bpf_rados_writer_process_hits": 0,
+    "bpf_rados_writer_process_contexts": 0,
+    "bpf_rados_writer_write_exclusive_hits": 0,
+    "bpf_rados_writer_write_exclusive_contexts": 0,
+    "bpf_objecter_op_submit_hits": 0,
+    "bpf_objecter_op_submit_active_contexts": 0,
+    "bpf_objecter_op_submit_same_thread_contexts": 0,
+    "bpf_objecter_op_submit_misses": 0,
+    "bpf_rados_writer_ctor_hits": 0,
+    "bpf_rados_writer_ctor_contexts": 0,
+    "bpf_put_processor_prepare_hits": 0,
+    "bpf_put_processor_prepare_contexts": 0,
+    "bpf_head_object_processor_process_hits": 0,
+    "bpf_head_object_processor_process_contexts": 0,
+    "bpf_rgw_write_meta_hits": 0,
+    "bpf_rgw_write_meta_contexts": 0
   }
 }

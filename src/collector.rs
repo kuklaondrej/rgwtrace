@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::{
     classify::{classify_rados, classify_request, RadosRole, RequestClass},
-    events::{RadosEvent, RequestEvent, TraceEvent},
+    events::{RadosCorrelationSource, RadosEvent, RequestEvent, TraceEvent},
 };
 
 #[derive(Debug, Default)]
@@ -42,6 +42,8 @@ struct BackgroundRados {
 
 #[derive(Clone, Copy, Debug)]
 enum RadosCorrelation {
+    OpSubmitContext,
+    ActiveContext,
     SameThread,
     Inferred,
 }
@@ -76,6 +78,24 @@ pub struct BpfDiagnostics {
     pub rados_finish_misses: u64,
     pub request_context_drops: u64,
     pub probe_read_failures: u64,
+    pub rgw_rados_operate_hits: u64,
+    pub rgw_rados_operate_contexts: u64,
+    pub rados_writer_process_hits: u64,
+    pub rados_writer_process_contexts: u64,
+    pub rados_writer_write_exclusive_hits: u64,
+    pub rados_writer_write_exclusive_contexts: u64,
+    pub objecter_op_submit_hits: u64,
+    pub objecter_op_submit_active_contexts: u64,
+    pub objecter_op_submit_same_thread_contexts: u64,
+    pub objecter_op_submit_misses: u64,
+    pub rados_writer_ctor_hits: u64,
+    pub rados_writer_ctor_contexts: u64,
+    pub put_processor_prepare_hits: u64,
+    pub put_processor_prepare_contexts: u64,
+    pub head_object_processor_process_hits: u64,
+    pub head_object_processor_process_contexts: u64,
+    pub rgw_write_meta_hits: u64,
+    pub rgw_write_meta_contexts: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -87,6 +107,8 @@ pub struct TraceDiagnostics {
     pub correlated_rados_ops: u64,
     pub background_rados_ops: u64,
     pub same_thread_correlations: u64,
+    pub op_submit_context_correlations: u64,
+    pub active_context_correlations: u64,
     pub inferred_correlations: u64,
     pub inference_no_candidate_rados_ops: u64,
     pub inference_ambiguous_rados_ops: u64,
@@ -110,6 +132,24 @@ pub struct TraceDiagnostics {
     pub bpf_rados_finish_misses: u64,
     pub bpf_request_context_drops: u64,
     pub bpf_probe_read_failures: u64,
+    pub bpf_rgw_rados_operate_hits: u64,
+    pub bpf_rgw_rados_operate_contexts: u64,
+    pub bpf_rados_writer_process_hits: u64,
+    pub bpf_rados_writer_process_contexts: u64,
+    pub bpf_rados_writer_write_exclusive_hits: u64,
+    pub bpf_rados_writer_write_exclusive_contexts: u64,
+    pub bpf_objecter_op_submit_hits: u64,
+    pub bpf_objecter_op_submit_active_contexts: u64,
+    pub bpf_objecter_op_submit_same_thread_contexts: u64,
+    pub bpf_objecter_op_submit_misses: u64,
+    pub bpf_rados_writer_ctor_hits: u64,
+    pub bpf_rados_writer_ctor_contexts: u64,
+    pub bpf_put_processor_prepare_hits: u64,
+    pub bpf_put_processor_prepare_contexts: u64,
+    pub bpf_head_object_processor_process_hits: u64,
+    pub bpf_head_object_processor_process_contexts: u64,
+    pub bpf_rgw_write_meta_hits: u64,
+    pub bpf_rgw_write_meta_contexts: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -167,6 +207,15 @@ impl Collector {
                 let saw_request_start = if let Some(start) = self.starts_by_tid.remove(&request.tid)
                 {
                     request.start_ns = start.start_ns;
+                    if request.rgw_request_id == 0 {
+                        request.rgw_request_id = start.rgw_request_id;
+                    }
+                    if request.rgw_req_id.is_empty() {
+                        request.rgw_req_id = start.rgw_req_id;
+                    }
+                    if request.trans_id.is_empty() {
+                        request.trans_id = start.trans_id;
+                    }
                     true
                 } else {
                     false
@@ -182,7 +231,11 @@ impl Collector {
             TraceEvent::RadosOp(rados) => {
                 self.diagnostics.rados_ops += 1;
                 record_truncation(&mut self.diagnostics, rados.truncation);
-                if rados.trans_id.is_empty() {
+                if let Some(key) = rados_request_key(&rados) {
+                    let correlation = RadosCorrelation::from_source(rados.correlation_source)
+                        .unwrap_or(RadosCorrelation::SameThread);
+                    self.record_correlated_rados(key, rados, correlation);
+                } else {
                     let role = classify_rados(&rados);
                     if self.infer_correlation && inferable_rados_role(role) {
                         match self.inferred_request_key(&rados) {
@@ -200,12 +253,6 @@ impl Collector {
                     } else {
                         self.record_background_rados(rados, background_reason_for_role(role));
                     }
-                } else {
-                    self.record_correlated_rados(
-                        rados.trans_id.clone(),
-                        rados,
-                        RadosCorrelation::SameThread,
-                    );
                 }
             }
         }
@@ -284,6 +331,10 @@ impl Collector {
     ) {
         self.diagnostics.correlated_rados_ops += 1;
         match correlation {
+            RadosCorrelation::OpSubmitContext => {
+                self.diagnostics.op_submit_context_correlations += 1
+            }
+            RadosCorrelation::ActiveContext => self.diagnostics.active_context_correlations += 1,
             RadosCorrelation::SameThread => self.diagnostics.same_thread_correlations += 1,
             RadosCorrelation::Inferred => self.diagnostics.inferred_correlations += 1,
         }
@@ -336,6 +387,32 @@ impl Collector {
         self.diagnostics.bpf_rados_finish_misses = diagnostics.rados_finish_misses;
         self.diagnostics.bpf_request_context_drops = diagnostics.request_context_drops;
         self.diagnostics.bpf_probe_read_failures = diagnostics.probe_read_failures;
+        self.diagnostics.bpf_rgw_rados_operate_hits = diagnostics.rgw_rados_operate_hits;
+        self.diagnostics.bpf_rgw_rados_operate_contexts = diagnostics.rgw_rados_operate_contexts;
+        self.diagnostics.bpf_rados_writer_process_hits = diagnostics.rados_writer_process_hits;
+        self.diagnostics.bpf_rados_writer_process_contexts =
+            diagnostics.rados_writer_process_contexts;
+        self.diagnostics.bpf_rados_writer_write_exclusive_hits =
+            diagnostics.rados_writer_write_exclusive_hits;
+        self.diagnostics.bpf_rados_writer_write_exclusive_contexts =
+            diagnostics.rados_writer_write_exclusive_contexts;
+        self.diagnostics.bpf_objecter_op_submit_hits = diagnostics.objecter_op_submit_hits;
+        self.diagnostics.bpf_objecter_op_submit_active_contexts =
+            diagnostics.objecter_op_submit_active_contexts;
+        self.diagnostics.bpf_objecter_op_submit_same_thread_contexts =
+            diagnostics.objecter_op_submit_same_thread_contexts;
+        self.diagnostics.bpf_objecter_op_submit_misses = diagnostics.objecter_op_submit_misses;
+        self.diagnostics.bpf_rados_writer_ctor_hits = diagnostics.rados_writer_ctor_hits;
+        self.diagnostics.bpf_rados_writer_ctor_contexts = diagnostics.rados_writer_ctor_contexts;
+        self.diagnostics.bpf_put_processor_prepare_hits = diagnostics.put_processor_prepare_hits;
+        self.diagnostics.bpf_put_processor_prepare_contexts =
+            diagnostics.put_processor_prepare_contexts;
+        self.diagnostics.bpf_head_object_processor_process_hits =
+            diagnostics.head_object_processor_process_hits;
+        self.diagnostics.bpf_head_object_processor_process_contexts =
+            diagnostics.head_object_processor_process_contexts;
+        self.diagnostics.bpf_rgw_write_meta_hits = diagnostics.rgw_write_meta_hits;
+        self.diagnostics.bpf_rgw_write_meta_contexts = diagnostics.rgw_write_meta_contexts;
     }
 
     pub fn drain_expired(
@@ -423,7 +500,9 @@ fn rados_event_time_ns(rados: &RadosEvent) -> u64 {
 }
 
 fn request_key(request: &RequestEvent) -> String {
-    if request.trans_id.is_empty() {
+    if let Some(key) = internal_request_key(&request.rgw_req_id, request.rgw_request_id) {
+        key
+    } else if request.trans_id.is_empty() {
         format!(
             "pid:{}:tid:{}:start:{}",
             request.pid, request.tid, request.start_ns
@@ -431,6 +510,79 @@ fn request_key(request: &RequestEvent) -> String {
     } else {
         request.trans_id.clone()
     }
+}
+
+fn rados_request_key(rados: &RadosEvent) -> Option<String> {
+    internal_request_key(&rados.rgw_req_id, rados.rgw_request_id)
+        .or_else(|| (!rados.trans_id.is_empty()).then(|| rados.trans_id.clone()))
+}
+
+fn internal_request_key(rgw_req_id: &str, rgw_request_id: u64) -> Option<String> {
+    if !rgw_req_id.is_empty() {
+        Some(format!("rgw_req_id:{rgw_req_id}"))
+    } else if rgw_request_id != 0 {
+        Some(format!("rgw_request_id:{rgw_request_id}"))
+    } else {
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+struct RequestIdentity {
+    rgw_req_id: String,
+    rgw_request_id: u64,
+    trans_id: String,
+    span_key: String,
+}
+
+fn request_identity(key: &str, builder: &RequestBuilder) -> RequestIdentity {
+    let mut identity = RequestIdentity {
+        rgw_req_id: builder
+            .request
+            .as_ref()
+            .map(|request| request.rgw_req_id.clone())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                builder.rados.iter().find_map(|rados| {
+                    (!rados.event.rgw_req_id.is_empty()).then(|| rados.event.rgw_req_id.clone())
+                })
+            })
+            .unwrap_or_default(),
+        rgw_request_id: builder
+            .request
+            .as_ref()
+            .map(|request| request.rgw_request_id)
+            .filter(|value| *value != 0)
+            .or_else(|| {
+                builder.rados.iter().find_map(|rados| {
+                    (rados.event.rgw_request_id != 0).then_some(rados.event.rgw_request_id)
+                })
+            })
+            .unwrap_or_default(),
+        trans_id: builder
+            .request
+            .as_ref()
+            .map(|request| request.trans_id.clone())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                builder.rados.iter().find_map(|rados| {
+                    (!rados.event.trans_id.is_empty()).then(|| rados.event.trans_id.clone())
+                })
+            })
+            .unwrap_or_default(),
+        span_key: String::new(),
+    };
+
+    identity.span_key = if !identity.rgw_req_id.is_empty() {
+        format!("rgw_req_id:{}", identity.rgw_req_id)
+    } else if identity.rgw_request_id != 0 {
+        format!("rgw_request_id:{}", identity.rgw_request_id)
+    } else if !identity.trans_id.is_empty() {
+        identity.trans_id.clone()
+    } else {
+        key.to_string()
+    };
+    identity
 }
 
 fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
@@ -452,22 +604,36 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         .chain(rados_end_ns)
         .max()
         .unwrap_or(start_ns);
-    let trans_id = builder
-        .request
-        .as_ref()
-        .map(|request| request.trans_id.as_str())
-        .filter(|trans_id| !trans_id.is_empty())
-        .unwrap_or(key.as_str());
+    let identity = request_identity(&key, &builder);
     let request_class = classify_request(
-        trans_id,
+        &identity.trans_id,
         builder
             .rados
             .first()
             .map(|rados| rados.event.object_name.as_str()),
     );
-    let trace_id = trace_id(trans_id);
-    let request_span_id = span_id(&format!("request:{trans_id}"));
+    let request_class = if !identity.trans_id.is_empty()
+        || !identity.rgw_req_id.is_empty()
+        || identity.rgw_request_id != 0
+    {
+        RequestClass::S3Request
+    } else {
+        request_class
+    };
+    let trace_id = trace_id(&identity.span_key);
+    let request_span_id = span_id(&format!("request:{}", identity.span_key));
     let duration_quality = request_duration_quality(&builder);
+    let mut attributes = vec![
+        string_attr("rgw.trans_id", &identity.trans_id),
+        string_attr("rgw.request_class", request_class_name(request_class)),
+        string_attr("rgw.duration_quality", duration_quality),
+    ];
+    if !identity.rgw_req_id.is_empty() {
+        attributes.push(string_attr("rgw.req_id", &identity.rgw_req_id));
+    }
+    if identity.rgw_request_id != 0 {
+        attributes.push(u64_attr("rgw.request_id", identity.rgw_request_id));
+    }
 
     let mut spans = vec![SpanDocument {
         trace_id: trace_id.clone(),
@@ -476,11 +642,7 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         name: "rgw.request".to_string(),
         start_ns,
         end_ns,
-        attributes: vec![
-            string_attr("rgw.trans_id", trans_id),
-            string_attr("rgw.request_class", request_class_name(request_class)),
-            string_attr("rgw.duration_quality", duration_quality),
-        ],
+        attributes,
         events: Vec::new(),
     }];
 
@@ -575,7 +737,17 @@ fn rados_attributes(
         u64_attr("ceph.rados.length", rados.length),
         string_attr("rgw.rados_role", rados_role_name(role)),
         string_attr("rgw.correlation", correlation),
+        string_attr("rgw.correlation_source", rados.correlation_source.name()),
     ];
+    if !rados.rgw_req_id.is_empty() {
+        attributes.push(string_attr("rgw.req_id", &rados.rgw_req_id));
+    }
+    if rados.rgw_request_id != 0 {
+        attributes.push(u64_attr("rgw.request_id", rados.rgw_request_id));
+    }
+    if !rados.trans_id.is_empty() {
+        attributes.push(string_attr("rgw.trans_id", &rados.trans_id));
+    }
     if let Some(reason) = correlation_reason {
         attributes.push(string_attr("rgw.correlation_reason", reason));
     }
@@ -659,8 +831,19 @@ fn inferable_rados_role(role: RadosRole) -> bool {
 }
 
 impl RadosCorrelation {
+    fn from_source(source: RadosCorrelationSource) -> Option<Self> {
+        match source {
+            RadosCorrelationSource::OpSubmitContext => Some(Self::OpSubmitContext),
+            RadosCorrelationSource::ActiveContext => Some(Self::ActiveContext),
+            RadosCorrelationSource::SameThread => Some(Self::SameThread),
+            RadosCorrelationSource::None | RadosCorrelationSource::Unknown(_) => None,
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
+            Self::OpSubmitContext => "op_submit_context",
+            Self::ActiveContext => "active_context",
             Self::SameThread => "same_thread",
             Self::Inferred => "inferred",
         }
@@ -668,7 +851,7 @@ impl RadosCorrelation {
 
     fn reason(self) -> Option<&'static str> {
         match self {
-            Self::SameThread => None,
+            Self::OpSubmitContext | Self::ActiveContext | Self::SameThread => None,
             Self::Inferred => Some("pid_time_window"),
         }
     }
@@ -776,7 +959,10 @@ fn fnv1a64_with_seed(bytes: &[u8], seed: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RadosOp, RequestEvent};
+    use crate::events::{
+        CaptureTruncation, RadosCorrelationSource, RadosDirection, RadosEvent, RadosOp,
+        RequestEvent,
+    };
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
@@ -787,13 +973,16 @@ mod tests {
             sent_ns: 10,
             finish_ns: 20,
             duration_ns: 10,
+            rgw_request_id: 0,
             pool: 16,
             target_osd: 7,
             pg_seed: 1,
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
+            rgw_req_id: String::new(),
             trans_id: trans_id.to_string(),
+            correlation_source: RadosCorrelationSource::None,
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
@@ -805,14 +994,7 @@ mod tests {
     fn emits_rados_ops_as_request_child_spans() {
         let mut collector = Collector::default();
         collector.push(TraceEvent::RadosOp(rados("object", "tx1")));
-        collector.push(TraceEvent::RequestEnd(RequestEvent {
-            start_ns: 1,
-            end_ns: 30,
-            pid: 42,
-            tid: 7,
-            trans_id: "tx1".to_string(),
-            truncation: CaptureTruncation::default(),
-        }));
+        collector.push(TraceEvent::RequestEnd(request("tx1", 1, 30)));
 
         let document = collector.into_trace_document("rgwtrace");
 
@@ -851,6 +1033,225 @@ mod tests {
         );
         assert_eq!(rados.parent_span_id, Some(request.span_id.clone()));
         assert_ne!(rados.span_id, request.span_id);
+    }
+
+    #[test]
+    fn correlates_by_rgw_req_id_when_trans_id_is_missing() {
+        let mut collector = Collector::default();
+        let mut request = request("", 1, 30);
+        request.rgw_req_id = "req-internal".to_string();
+        collector.push(TraceEvent::RequestEnd(request));
+
+        let mut child = rados("object", "");
+        child.rgw_req_id = "req-internal".to_string();
+        child.correlation_source = RadosCorrelationSource::OpSubmitContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        let request = &document.spans[0];
+        let rados = &document.spans[1];
+        assert_eq!(
+            rados.parent_span_id.as_deref(),
+            Some(request.span_id.as_str())
+        );
+        assert_eq!(
+            string_attribute(request, "rgw.req_id"),
+            Some("req-internal")
+        );
+        assert_eq!(string_attribute(request, "rgw.trans_id"), Some(""));
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("op_submit_context")
+        );
+        assert_eq!(document.diagnostics.op_submit_context_correlations, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 0);
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+    }
+
+    #[test]
+    fn active_context_correlates_by_numeric_request_id_when_trans_id_is_missing() {
+        let mut collector = Collector::default();
+        let mut request = request("", 1, 30);
+        request.rgw_request_id = 4242;
+        collector.push(TraceEvent::RequestEnd(request));
+
+        let mut child = rados("object", "");
+        child.rgw_request_id = 4242;
+        child.correlation_source = RadosCorrelationSource::ActiveContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        let request = &document.spans[0];
+        let rados = &document.spans[1];
+        assert_eq!(
+            rados.parent_span_id.as_deref(),
+            Some(request.span_id.as_str())
+        );
+        assert_eq!(u64_attribute(request, "rgw.request_id"), Some(4242));
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("active_context")
+        );
+        assert_eq!(document.diagnostics.active_context_correlations, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 0);
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+    }
+
+    #[test]
+    fn op_submit_context_identity_precedes_conflicting_trans_id() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx-same-thread", 1, 30)));
+        let mut target = request("", 1, 30);
+        target.rgw_req_id = "req-op-submit".to_string();
+        collector.push(TraceEvent::RequestEnd(target));
+
+        let mut child = rados("object", "tx-same-thread");
+        child.rgw_req_id = "req-op-submit".to_string();
+        child.correlation_source = RadosCorrelationSource::OpSubmitContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected correlated rados span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+
+        assert_eq!(
+            string_attribute(parent, "rgw.req_id"),
+            Some("req-op-submit")
+        );
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("op_submit_context")
+        );
+    }
+
+    #[test]
+    fn op_submit_same_thread_identity_precedes_conflicting_trans_id() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx-stale-thread", 1, 30)));
+        let mut target = request("", 1, 30);
+        target.rgw_req_id = "req-op-submit-same-thread".to_string();
+        collector.push(TraceEvent::RequestEnd(target));
+
+        let mut child = rados("object", "tx-stale-thread");
+        child.rgw_req_id = "req-op-submit-same-thread".to_string();
+        child.correlation_source = RadosCorrelationSource::SameThread;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected correlated rados span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+
+        assert_eq!(
+            string_attribute(parent, "rgw.req_id"),
+            Some("req-op-submit-same-thread")
+        );
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("same_thread")
+        );
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation_source"),
+            Some("same_thread")
+        );
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.op_submit_context_correlations, 0);
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+    }
+
+    #[test]
+    fn active_context_identity_precedes_conflicting_trans_id() {
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx-same-thread", 1, 30)));
+        let mut target = request("", 1, 30);
+        target.rgw_request_id = 9001;
+        collector.push(TraceEvent::RequestEnd(target));
+
+        let mut child = rados("object", "tx-same-thread");
+        child.rgw_request_id = 9001;
+        child.correlation_source = RadosCorrelationSource::ActiveContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected correlated rados span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+
+        assert_eq!(u64_attribute(parent, "rgw.request_id"), Some(9001));
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("active_context")
+        );
+        assert_eq!(document.diagnostics.active_context_correlations, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 0);
+    }
+
+    #[test]
+    fn same_thread_identity_precedes_inferred_candidate() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        collector.push(TraceEvent::RequestEnd(request_with_tid(
+            "tx-inferred",
+            8,
+            1,
+            30,
+        )));
+        collector.push(TraceEvent::RequestEnd(request_with_tid(
+            "tx-same-thread",
+            7,
+            1,
+            30,
+        )));
+
+        let mut child = rados("object", "tx-same-thread");
+        child.sent_ns = 40;
+        child.finish_ns = 45;
+        child.correlation_source = RadosCorrelationSource::SameThread;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 0);
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected correlated rados span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+        assert_eq!(
+            string_attribute(parent, "rgw.trans_id"),
+            Some("tx-same-thread")
+        );
     }
 
     #[test]
@@ -906,6 +1307,42 @@ mod tests {
         assert_eq!(
             document.diagnostics.background_rados_by_role.get("sync"),
             Some(&1)
+        );
+    }
+
+    #[test]
+    fn explicit_request_identity_correlates_background_role_objects() {
+        let mut collector = Collector::default();
+        let mut request = request("tx1", 1, 30);
+        request.rgw_req_id = "req1".to_string();
+        collector.push(TraceEvent::RequestEnd(request));
+
+        let mut child = rados("notify.0", "");
+        child.rgw_req_id = "req1".to_string();
+        child.correlation_source = RadosCorrelationSource::OpSubmitContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.background_rados_ops, 0);
+        assert_eq!(document.diagnostics.op_submit_context_correlations, 1);
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected correlated rados span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+        assert_eq!(string_attribute(parent, "rgw.req_id"), Some("req1"));
+        assert_eq!(string_attribute(rados, "rgw.rados_role"), Some("notify"));
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("op_submit_context")
         );
     }
 
@@ -1040,6 +1477,36 @@ mod tests {
         assert_eq!(
             string_attribute(&document.spans[0], "rgw.duration_quality"),
             Some("request_lifecycle")
+        );
+    }
+
+    #[test]
+    fn request_start_identity_is_preserved_for_later_rados_context() {
+        let mut collector = Collector::default();
+        let mut start = request("", 1, 0);
+        start.rgw_request_id = 123;
+        collector.push(TraceEvent::RequestStart(start));
+        collector.push(TraceEvent::RequestEnd(request("tx1", 10, 30)));
+
+        let mut child = rados("object", "");
+        child.rgw_request_id = 123;
+        child.correlation_source = RadosCorrelationSource::OpSubmitContext;
+        collector.push(TraceEvent::RadosOp(child));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 2);
+        let request = &document.spans[0];
+        let rados = &document.spans[1];
+        assert_eq!(u64_attribute(request, "rgw.request_id"), Some(123));
+        assert_eq!(string_attribute(request, "rgw.trans_id"), Some("tx1"));
+        assert_eq!(
+            rados.parent_span_id.as_deref(),
+            Some(request.span_id.as_str())
+        );
+        assert_eq!(
+            string_attribute(rados, "rgw.correlation"),
+            Some("op_submit_context")
         );
     }
 
@@ -1239,6 +1706,24 @@ mod tests {
             rados_finish_misses: 4,
             request_context_drops: 5,
             probe_read_failures: 6,
+            rgw_rados_operate_hits: 7,
+            rgw_rados_operate_contexts: 8,
+            rados_writer_process_hits: 9,
+            rados_writer_process_contexts: 10,
+            rados_writer_write_exclusive_hits: 11,
+            rados_writer_write_exclusive_contexts: 12,
+            objecter_op_submit_hits: 13,
+            objecter_op_submit_active_contexts: 14,
+            objecter_op_submit_same_thread_contexts: 15,
+            objecter_op_submit_misses: 16,
+            rados_writer_ctor_hits: 17,
+            rados_writer_ctor_contexts: 18,
+            put_processor_prepare_hits: 19,
+            put_processor_prepare_contexts: 20,
+            head_object_processor_process_hits: 21,
+            head_object_processor_process_contexts: 22,
+            rgw_write_meta_hits: 23,
+            rgw_write_meta_contexts: 24,
         });
 
         let document = collector.into_trace_document("rgwtrace");
@@ -1248,6 +1733,48 @@ mod tests {
         assert_eq!(document.diagnostics.bpf_rados_finish_misses, 4);
         assert_eq!(document.diagnostics.bpf_request_context_drops, 5);
         assert_eq!(document.diagnostics.bpf_probe_read_failures, 6);
+        assert_eq!(document.diagnostics.bpf_rgw_rados_operate_hits, 7);
+        assert_eq!(document.diagnostics.bpf_rgw_rados_operate_contexts, 8);
+        assert_eq!(document.diagnostics.bpf_rados_writer_process_hits, 9);
+        assert_eq!(document.diagnostics.bpf_rados_writer_process_contexts, 10);
+        assert_eq!(
+            document.diagnostics.bpf_rados_writer_write_exclusive_hits,
+            11
+        );
+        assert_eq!(
+            document
+                .diagnostics
+                .bpf_rados_writer_write_exclusive_contexts,
+            12
+        );
+        assert_eq!(document.diagnostics.bpf_objecter_op_submit_hits, 13);
+        assert_eq!(
+            document.diagnostics.bpf_objecter_op_submit_active_contexts,
+            14
+        );
+        assert_eq!(
+            document
+                .diagnostics
+                .bpf_objecter_op_submit_same_thread_contexts,
+            15
+        );
+        assert_eq!(document.diagnostics.bpf_objecter_op_submit_misses, 16);
+        assert_eq!(document.diagnostics.bpf_rados_writer_ctor_hits, 17);
+        assert_eq!(document.diagnostics.bpf_rados_writer_ctor_contexts, 18);
+        assert_eq!(document.diagnostics.bpf_put_processor_prepare_hits, 19);
+        assert_eq!(document.diagnostics.bpf_put_processor_prepare_contexts, 20);
+        assert_eq!(
+            document.diagnostics.bpf_head_object_processor_process_hits,
+            21
+        );
+        assert_eq!(
+            document
+                .diagnostics
+                .bpf_head_object_processor_process_contexts,
+            22
+        );
+        assert_eq!(document.diagnostics.bpf_rgw_write_meta_hits, 23);
+        assert_eq!(document.diagnostics.bpf_rgw_write_meta_contexts, 24);
     }
 
     #[test]
@@ -1310,8 +1837,10 @@ mod tests {
         RequestEvent {
             start_ns,
             end_ns,
+            rgw_request_id: 0,
             pid: 42,
             tid,
+            rgw_req_id: String::new(),
             trans_id: trans_id.to_string(),
             truncation: CaptureTruncation::default(),
         }
