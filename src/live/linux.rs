@@ -45,6 +45,24 @@ const BPF_DIAG_RADOS_MAP_DROPS: u32 = 2;
 const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
 const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
 const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
+const BPF_DIAG_RGW_RADOS_OPERATE_HITS: u32 = 6;
+const BPF_DIAG_RGW_RADOS_OPERATE_CONTEXTS: u32 = 7;
+const BPF_DIAG_RADOS_WRITER_PROCESS_HITS: u32 = 8;
+const BPF_DIAG_RADOS_WRITER_PROCESS_CONTEXTS: u32 = 9;
+const BPF_DIAG_RADOS_WRITER_WRITE_EXCLUSIVE_HITS: u32 = 10;
+const BPF_DIAG_RADOS_WRITER_WRITE_EXCLUSIVE_CONTEXTS: u32 = 11;
+const BPF_DIAG_OBJECTER_OP_SUBMIT_HITS: u32 = 12;
+const BPF_DIAG_OBJECTER_OP_SUBMIT_ACTIVE_CONTEXTS: u32 = 13;
+const BPF_DIAG_OBJECTER_OP_SUBMIT_SAME_THREAD_CONTEXTS: u32 = 14;
+const BPF_DIAG_OBJECTER_OP_SUBMIT_MISSES: u32 = 15;
+const BPF_DIAG_RADOS_WRITER_CTOR_HITS: u32 = 16;
+const BPF_DIAG_RADOS_WRITER_CTOR_CONTEXTS: u32 = 17;
+const BPF_DIAG_PUT_PROCESSOR_PREPARE_HITS: u32 = 18;
+const BPF_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS: u32 = 19;
+const BPF_DIAG_HEAD_OBJECT_PROCESSOR_PROCESS_HITS: u32 = 20;
+const BPF_DIAG_HEAD_OBJECT_PROCESSOR_PROCESS_CONTEXTS: u32 = 21;
+const BPF_DIAG_RGW_WRITE_META_HITS: u32 = 22;
+const BPF_DIAG_RGW_WRITE_META_CONTEXTS: u32 = 23;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -68,11 +86,21 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
     let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
-    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref())?;
+    configure_rodata(
+        open.maps.rodata_data,
+        dwarf.version.as_deref(),
+        cli.attach_scoped_return_probes,
+    )?;
     let mut skel = open.load()?;
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
-    let _links = attach_probes(&mut skel, dwarf, &targets, pid)?;
+    let _links = attach_probes(
+        &mut skel,
+        dwarf,
+        &targets,
+        pid,
+        cli.attach_scoped_return_probes,
+    )?;
     let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
     let collector = Arc::new(Mutex::new(if cli.correlate_inferred {
@@ -179,6 +207,48 @@ fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
         rados_finish_misses: read_bpf_counter(map, BPF_DIAG_RADOS_FINISH_MISSES)?,
         request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
         probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
+        rgw_rados_operate_hits: read_bpf_counter(map, BPF_DIAG_RGW_RADOS_OPERATE_HITS)?,
+        rgw_rados_operate_contexts: read_bpf_counter(map, BPF_DIAG_RGW_RADOS_OPERATE_CONTEXTS)?,
+        rados_writer_process_hits: read_bpf_counter(map, BPF_DIAG_RADOS_WRITER_PROCESS_HITS)?,
+        rados_writer_process_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_RADOS_WRITER_PROCESS_CONTEXTS,
+        )?,
+        rados_writer_write_exclusive_hits: read_bpf_counter(
+            map,
+            BPF_DIAG_RADOS_WRITER_WRITE_EXCLUSIVE_HITS,
+        )?,
+        rados_writer_write_exclusive_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_RADOS_WRITER_WRITE_EXCLUSIVE_CONTEXTS,
+        )?,
+        objecter_op_submit_hits: read_bpf_counter(map, BPF_DIAG_OBJECTER_OP_SUBMIT_HITS)?,
+        objecter_op_submit_active_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_OBJECTER_OP_SUBMIT_ACTIVE_CONTEXTS,
+        )?,
+        objecter_op_submit_same_thread_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_OBJECTER_OP_SUBMIT_SAME_THREAD_CONTEXTS,
+        )?,
+        objecter_op_submit_misses: read_bpf_counter(map, BPF_DIAG_OBJECTER_OP_SUBMIT_MISSES)?,
+        rados_writer_ctor_hits: read_bpf_counter(map, BPF_DIAG_RADOS_WRITER_CTOR_HITS)?,
+        rados_writer_ctor_contexts: read_bpf_counter(map, BPF_DIAG_RADOS_WRITER_CTOR_CONTEXTS)?,
+        put_processor_prepare_hits: read_bpf_counter(map, BPF_DIAG_PUT_PROCESSOR_PREPARE_HITS)?,
+        put_processor_prepare_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS,
+        )?,
+        head_object_processor_process_hits: read_bpf_counter(
+            map,
+            BPF_DIAG_HEAD_OBJECT_PROCESSOR_PROCESS_HITS,
+        )?,
+        head_object_processor_process_contexts: read_bpf_counter(
+            map,
+            BPF_DIAG_HEAD_OBJECT_PROCESSOR_PROCESS_CONTEXTS,
+        )?,
+        rgw_write_meta_hits: read_bpf_counter(map, BPF_DIAG_RGW_WRITE_META_HITS)?,
+        rgw_write_meta_contexts: read_bpf_counter(map, BPF_DIAG_RGW_WRITE_META_CONTEXTS)?,
     })
 }
 
@@ -295,7 +365,11 @@ fn queue_expired_otlp(
     Ok(())
 }
 
-fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result<()> {
+fn configure_rodata(
+    rodata: &mut types::rodata,
+    version: Option<&str>,
+    attach_scoped_return_probes: bool,
+) -> Result<()> {
     let version = version.context(
         "Ceph version is required to select ceph_osd_op ABI offsets; pass --ceph-version or use DWARF JSON with a version",
     )?;
@@ -317,6 +391,7 @@ fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result
     rodata.CEPH_OSD_OP_CLS_METHOD_OFFSET = 7;
     rodata.CEPH_OSD_OP_BUFFER_RAW_OFFSET = 8;
     rodata.CEPH_OSD_OP_BUFFER_DATA_OFFSET = 32;
+    rodata.RGWTRACE_ATTACH_SCOPED_RETURN_PROBES = attach_scoped_return_probes;
     Ok(())
 }
 
@@ -336,10 +411,20 @@ fn attach_probes(
     dwarf: &DwarfInfo,
     targets: &targets::ProbeTargets,
     pid: i32,
+    attach_scoped_return_probes: bool,
 ) -> Result<Vec<Link>> {
     let mut links = Vec::new();
 
     for path in targets.rados_libraries() {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_objecter_op_submit,
+            false,
+            pid,
+            path,
+            dwarf,
+            "Objecter::op_submit",
+        )?;
         attach_if_present(
             &mut links,
             &skel.progs.uprobe_send_op,
@@ -362,6 +447,16 @@ fn attach_probes(
 
     attach_if_present(
         &mut links,
+        &skel.progs.uprobe_process_request,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "process_request",
+    )?;
+
+    attach_if_present(
+        &mut links,
         &skel.progs.uprobe_rgw_get_handler,
         false,
         pid,
@@ -369,6 +464,161 @@ fn attach_probes(
         dwarf,
         "RGWREST::get_handler",
     )?;
+
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_rgw_op_init,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RGWOp::init",
+    )?;
+
+    attach_all_present(
+        &mut links,
+        &skel.progs.uprobe_rgw_rados_operate,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "rgw_rados_operate",
+    )?;
+    if attach_scoped_return_probes {
+        attach_all_present(
+            &mut links,
+            &skel.progs.uretprobe_rgw_rados_scope,
+            true,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            "rgw_rados_operate",
+        )?;
+    }
+
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_rados_writer_ctor,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RadosWriter::RadosWriter",
+    )?;
+
+    for function in [
+        "AtomicObjectProcessor::prepare",
+        "MultipartObjectProcessor::prepare",
+        "AppendObjectProcessor::prepare",
+    ] {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_put_processor_prepare,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            function,
+        )?;
+    }
+
+    for function in [
+        "AtomicObjectProcessor::process_first_chunk",
+        "MultipartObjectProcessor::process_first_chunk",
+        "AppendObjectProcessor::process_first_chunk",
+    ] {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_put_processor_process_first_chunk,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            function,
+        )?;
+    }
+
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_head_object_processor_process,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "HeadObjectProcessor::process",
+    )?;
+
+    for function in [
+        "RGWRados::Object::Write::write_meta",
+        "RGWRados::Object::Write::_do_write_meta",
+    ] {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_rgw_write_meta,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            function,
+        )?;
+    }
+
+    for function in [
+        "AtomicObjectProcessor::complete",
+        "MultipartObjectProcessor::complete",
+        "AppendObjectProcessor::complete",
+    ] {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_put_processor_complete,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            function,
+        )?;
+    }
+
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_rados_writer_process,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RadosWriter::process",
+    )?;
+    if attach_scoped_return_probes {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uretprobe_rgw_rados_scope,
+            true,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            "RadosWriter::process",
+        )?;
+    }
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_rados_writer_write_exclusive,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RadosWriter::write_exclusive",
+    )?;
+    if attach_scoped_return_probes {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uretprobe_rgw_rados_scope,
+            true,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            "RadosWriter::write_exclusive",
+        )?;
+    }
 
     if links.is_empty() {
         bail!("no uprobes were attached; check DWARF JSON and target paths")
@@ -396,6 +646,26 @@ fn attach_if_present(
     let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
         .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
     links.push(link);
+    Ok(())
+}
+
+fn attach_all_present(
+    links: &mut Vec<Link>,
+    prog: &libbpf_rs::ProgramMut<'_>,
+    retprobe: bool,
+    pid: i32,
+    path: &Path,
+    dwarf: &DwarfInfo,
+    function: &str,
+) -> Result<()> {
+    let Some(module) = basename(path) else {
+        return Ok(());
+    };
+    for addr in dwarf.function_addrs(module, function) {
+        let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
+            .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
+        links.push(link);
+    }
     Ok(())
 }
 
@@ -520,10 +790,12 @@ mod tests {
         let raw = RawRequestEvent {
             start_ns: 10,
             end_ns: 0,
+            rgw_request_id: 123,
             pid: 42,
             tid: 7,
             flags: 0,
             trans_id: bytes("tx0001"),
+            rgw_req_id: bytes("req0001"),
         };
 
         let event = decode_event(&event_data(RGWTRACE_EVENT_REQUEST_START, &raw)).unwrap();
@@ -532,7 +804,9 @@ mod tests {
             panic!("expected request start event");
         };
         assert_eq!(request.start_ns, 10);
+        assert_eq!(request.rgw_request_id, 123);
         assert_eq!(request.pid, 42);
+        assert_eq!(request.rgw_req_id, "req0001");
         assert_eq!(request.trans_id, "tx0001");
     }
 
@@ -546,6 +820,7 @@ mod tests {
             tid: 10,
             sent_ns: 100,
             finish_ns: 150,
+            rgw_request_id: 456,
             pool: 16,
             offset: 64,
             length: 4096,
@@ -556,6 +831,7 @@ mod tests {
             rw: 0,
             ops_size: 1,
             flags: 0,
+            correlation_source: crate::events::RGWTRACE_CORRELATION_ACTIVE_CONTEXT,
             acting,
             ops: [0x1201, 0, 0],
             cls_ops: [RawClsOp {
@@ -563,6 +839,7 @@ mod tests {
                 method_name: [0; 32],
             }; MAX_RADOS_OPS],
             trans_id: bytes("tx0002"),
+            rgw_req_id: bytes("req0002"),
             object_name: bytes("bucket-object"),
         };
 
@@ -573,11 +850,17 @@ mod tests {
         };
         assert_eq!(rados.sent_ns, 100);
         assert_eq!(rados.send_tid, 77);
+        assert_eq!(rados.rgw_request_id, 456);
         assert_eq!(rados.duration_ns, 50);
         assert_eq!(rados.acting, vec![1, 2]);
         assert_eq!(rados.ops[0].name, "read");
         assert_eq!(rados.object_name, "bucket-object");
+        assert_eq!(rados.rgw_req_id, "req0002");
         assert_eq!(rados.trans_id, "tx0002");
+        assert_eq!(
+            rados.correlation_source,
+            crate::events::RadosCorrelationSource::ActiveContext
+        );
     }
 
     #[test]
@@ -612,7 +895,7 @@ mod tests {
     fn rejects_missing_ceph_version_for_abi_layout() {
         let mut rodata = rodata();
 
-        let err = configure_rodata(&mut rodata, None).unwrap_err();
+        let err = configure_rodata(&mut rodata, None, false).unwrap_err();
 
         assert!(err.to_string().contains("Ceph version is required"));
     }
@@ -621,20 +904,22 @@ mod tests {
     fn configures_pre_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("18.2.8-1jammy")).unwrap();
+        configure_rodata(&mut rodata, Some("18.2.8-1jammy"), false).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 152);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 96);
+        assert!(!rodata.RGWTRACE_ATTACH_SCOPED_RETURN_PROBES);
     }
 
     #[test]
     fn configures_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("19.2.0")).unwrap();
+        configure_rodata(&mut rodata, Some("19.2.0"), true).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 112);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 56);
+        assert!(rodata.RGWTRACE_ATTACH_SCOPED_RETURN_PROBES);
     }
 
     fn event_data<T: Copy>(event_type: u32, payload: &T) -> Vec<u8> {
@@ -662,6 +947,7 @@ mod tests {
             CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_RAW_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_DATA_OFFSET: 0,
+            RGWTRACE_ATTACH_SCOPED_RETURN_PROBES: false,
         }
     }
 }

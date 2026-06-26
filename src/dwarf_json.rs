@@ -81,6 +81,25 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("Objecter::_send_op", 0),
     ("Objecter::_finish_op", 20),
     ("RGWREST::get_handler", 30),
+    ("process_request", 40),
+    ("RGWOp::init", 50),
+    ("rgw_rados_operate", 60),
+    ("RadosWriter::process", 70),
+    ("RadosWriter::write_exclusive", 80),
+    ("Objecter::op_submit", 90),
+    ("RadosWriter::RadosWriter", 100),
+    ("AtomicObjectProcessor::prepare", 110),
+    ("MultipartObjectProcessor::prepare", 111),
+    ("AppendObjectProcessor::prepare", 112),
+    ("AtomicObjectProcessor::process_first_chunk", 120),
+    ("MultipartObjectProcessor::process_first_chunk", 130),
+    ("AppendObjectProcessor::process_first_chunk", 140),
+    ("HeadObjectProcessor::process", 150),
+    ("AtomicObjectProcessor::complete", 160),
+    ("MultipartObjectProcessor::complete", 170),
+    ("AppendObjectProcessor::complete", 180),
+    ("RGWRados::Object::Write::write_meta", 190),
+    ("RGWRados::Object::Write::_do_write_meta", 191),
 ];
 
 impl DwarfInfo {
@@ -157,6 +176,18 @@ impl DwarfInfo {
             .filter(|addr| *addr != 0)
     }
 
+    #[allow(dead_code)]
+    pub fn function_addrs(&self, module_basename: &str, function: &str) -> Vec<u64> {
+        self.modules
+            .get(module_basename)
+            .into_iter()
+            .flat_map(|module| module.func2pc.iter())
+            .filter_map(|(name, addr)| {
+                (function_key_matches(name, function) && *addr != 0).then_some(*addr)
+            })
+            .collect()
+    }
+
     pub fn function_var_field_count(&self, module_basename: &str, function: &str) -> Option<usize> {
         self.modules
             .get(module_basename)
@@ -218,9 +249,28 @@ pub struct DwarfSummary {
 }
 
 fn function_base_id(function: &str) -> Option<i32> {
-    FUNCTION_BASE_IDS
-        .iter()
-        .find_map(|(name, id)| (*name == function).then_some(*id))
+    FUNCTION_BASE_IDS.iter().find_map(|(name, id)| {
+        if function == *name {
+            return Some(*id);
+        }
+        if *name == "rgw_rados_operate" {
+            return overload_index(function, name).and_then(|idx| (idx < 10).then_some(*id + idx));
+        }
+        None
+    })
+}
+
+pub fn function_key_matches(function: &str, wanted: &str) -> bool {
+    function == wanted
+        || function
+            .strip_prefix(wanted)
+            .is_some_and(|suffix| suffix.starts_with('#'))
+}
+
+fn overload_index(function: &str, wanted: &str) -> Option<i32> {
+    let suffix = function.strip_prefix(wanted)?;
+    let index = suffix.strip_prefix('#')?.parse::<i32>().ok()?;
+    (index > 0).then_some(index)
 }
 
 #[cfg(test)]
@@ -261,5 +311,96 @@ mod tests {
         assert_eq!(entries[0].key, 0);
         assert_eq!(entries[0].field.size, 2);
         assert_eq!(entries[0].field.fields[1].offset, 1144);
+    }
+
+    #[test]
+    fn hprobe_entries_ignore_non_overload_suffixes() {
+        let json = r#"
+        {
+          "version": "18.2.8-1jammy",
+          "arch": "amd64",
+          "radosgw": {
+            "func2pc": {
+              "process_request": 1,
+              "process_request#1": 2,
+              "rgw_rados_operate": 3,
+              "rgw_rados_operate#1": 4
+            },
+            "func2vf": {
+              "process_request": {
+                "var_fields": [
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []}
+                ]
+              },
+              "process_request#1": {
+                "var_fields": [
+                  {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": []}
+                ]
+              },
+              "rgw_rados_operate": {
+                "var_fields": [
+                  {"location": {"reg": 6, "offset": 0, "stack": false}, "fields": []}
+                ]
+              },
+              "rgw_rados_operate#1": {
+                "var_fields": [
+                  {"location": {"reg": 7, "offset": 0, "stack": false}, "fields": []}
+                ]
+              }
+            }
+          }
+        }
+        "#;
+
+        let entries = DwarfInfo::from_str(json).unwrap().hprobe_entries();
+        let keys = entries.iter().map(|entry| entry.key).collect::<Vec<_>>();
+
+        assert_eq!(keys, vec![40, 60, 61]);
+    }
+
+    #[test]
+    fn hprobe_entries_space_put_processor_process_first_chunk_fields() {
+        let json = r#"
+        {
+          "version": "18.2.8-1jammy",
+          "arch": "amd64",
+          "radosgw": {
+            "func2pc": {
+              "AtomicObjectProcessor::process_first_chunk": 1,
+              "MultipartObjectProcessor::process_first_chunk": 2,
+              "AppendObjectProcessor::process_first_chunk": 3
+            },
+            "func2vf": {
+              "AtomicObjectProcessor::process_first_chunk": {
+                "var_fields": [
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []}
+                ]
+              },
+              "MultipartObjectProcessor::process_first_chunk": {
+                "var_fields": [
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []}
+                ]
+              },
+              "AppendObjectProcessor::process_first_chunk": {
+                "var_fields": [
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": []},
+                  {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []}
+                ]
+              }
+            }
+          }
+        }
+        "#;
+
+        let entries = DwarfInfo::from_str(json).unwrap().hprobe_entries();
+        let mut keys = entries.iter().map(|entry| entry.key).collect::<Vec<_>>();
+        keys.sort_unstable();
+
+        assert_eq!(keys, vec![120, 121, 122, 130, 131, 132, 140, 141, 142]);
     }
 }

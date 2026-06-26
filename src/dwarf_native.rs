@@ -15,17 +15,77 @@ use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::debug;
 
 use crate::dwarf_json::{
-    basename, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
+    basename, function_key_matches, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields,
+    VarFieldJson, VarLocationJson,
 };
 
 const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
     "Objecter::_finish_op",
+    "Objecter::op_submit",
+    "process_request",
     "RGWREST::get_handler",
+    "RGWOp::init",
+    "rgw_rados_operate",
+    "RadosWriter::RadosWriter",
+    "RadosWriter::process",
+    "RadosWriter::write_exclusive",
+    "AtomicObjectProcessor::prepare",
+    "MultipartObjectProcessor::prepare",
+    "AppendObjectProcessor::prepare",
+    "AtomicObjectProcessor::process_first_chunk",
+    "MultipartObjectProcessor::process_first_chunk",
+    "AppendObjectProcessor::process_first_chunk",
+    "HeadObjectProcessor::process",
+    "AtomicObjectProcessor::complete",
+    "MultipartObjectProcessor::complete",
+    "AppendObjectProcessor::complete",
+    "RGWRados::Object::Write::write_meta",
+    "RGWRados::Object::Write::_do_write_meta",
 ];
-const OBJECTER_PROBE_FUNCTIONS: &[&str] = &["Objecter::_send_op", "Objecter::_finish_op"];
-const RGW_PROBE_FUNCTIONS: &[&str] = &["RGWREST::get_handler"];
-const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &["_send_op", "_finish_op", "get_handler"];
+const OBJECTER_PROBE_FUNCTIONS: &[&str] = &[
+    "Objecter::_send_op",
+    "Objecter::_finish_op",
+    "Objecter::op_submit",
+];
+const RGW_PROBE_FUNCTIONS: &[&str] = &[
+    "process_request",
+    "RGWREST::get_handler",
+    "RGWOp::init",
+    "rgw_rados_operate",
+    "RadosWriter::RadosWriter",
+    "RadosWriter::process",
+    "RadosWriter::write_exclusive",
+    "AtomicObjectProcessor::prepare",
+    "MultipartObjectProcessor::prepare",
+    "AppendObjectProcessor::prepare",
+    "AtomicObjectProcessor::process_first_chunk",
+    "MultipartObjectProcessor::process_first_chunk",
+    "AppendObjectProcessor::process_first_chunk",
+    "HeadObjectProcessor::process",
+    "AtomicObjectProcessor::complete",
+    "MultipartObjectProcessor::complete",
+    "AppendObjectProcessor::complete",
+    "RGWRados::Object::Write::write_meta",
+    "RGWRados::Object::Write::_do_write_meta",
+];
+const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &[
+    "_send_op",
+    "_finish_op",
+    "op_submit",
+    "process_request",
+    "get_handler",
+    "init",
+    "rgw_rados_operate",
+    "RadosWriter",
+    "process",
+    "write_exclusive",
+    "prepare",
+    "process_first_chunk",
+    "complete",
+    "write_meta",
+    "_do_write_meta",
+];
 const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
     &["op", "tid"],
     &["this", "monc", "global_id"],
@@ -46,9 +106,25 @@ const OBJECTER_SEND_OP_FIELDS: &[&[&str]] = &[
     &["op", "ops", "m_holder", "m_size"],
 ];
 const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
+    &["s", "id"],
+    &["s", "req_id", "_M_string_length"],
+    &["s", "req_id", "_M_dataplus", "_M_p"],
     &["s", "trans_id", "_M_string_length"],
     &["s", "trans_id", "_M_dataplus", "_M_p"],
 ];
+const PROCESS_REQUEST_FIELDS: &[&[&str]] = &[&["req", "id"]];
+const RGW_OP_INIT_FIELDS: &[&[&str]] = &[&["this"], &["s"]];
+const RGW_RADOS_OPERATE_FIELDS: &[&[&str]] = &[&["dpp"]];
+const RADOS_WRITER_CTOR_FIELDS: &[&[&str]] = &[&["this"], &["dpp"]];
+const RADOS_WRITER_PROCESS_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
+const RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
+const PUT_PROCESSOR_PREPARE_FIELDS: &[&[&str]] = &[&["this"]];
+const PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS: &[&[&str]] =
+    &[&["this"], &["processor"], &["this", "dpp"]];
+const HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS: &[&[&str]] = &[&["this"]];
+const PUT_PROCESSOR_COMPLETE_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
+const RGW_WRITE_META_FIELDS: &[&[&str]] = &[&["dpp"]];
+const OBJECTER_OP_SUBMIT_FIELDS: &[&[&str]] = &[&["op"]];
 
 #[allow(dead_code)]
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
@@ -252,7 +328,34 @@ fn probe_functions_for_module(module_name: &str) -> &'static [&'static str] {
 }
 
 fn has_all_functions<T>(result: &BTreeMap<String, T>, wanted: &[&str]) -> bool {
-    wanted.iter().all(|function| result.contains_key(*function))
+    wanted
+        .iter()
+        .all(|function| result.keys().any(|key| function_key_matches(key, function)))
+}
+
+fn can_stop_function_search<T>(result: &BTreeMap<String, T>, wanted: &[&str]) -> bool {
+    has_all_functions(result, wanted) && !wanted.contains(&"rgw_rados_operate")
+}
+
+fn canonical_probe_function_name(function: &str, wanted: &[&str]) -> Option<String> {
+    wanted.iter().find_map(|candidate| {
+        (function == *candidate || function.ends_with(&format!("::{candidate}")))
+            .then(|| (*candidate).to_string())
+    })
+}
+
+fn insert_function_pc(result: &mut BTreeMap<String, u64>, function: String, pc: u64) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = result.entry(function.clone()) {
+        entry.insert(pc);
+        return;
+    }
+    for idx in 1..256 {
+        let key = format!("{function}#{idx}");
+        if let std::collections::btree_map::Entry::Vacant(entry) = result.entry(key) {
+            entry.insert(pc);
+            return;
+        }
+    }
 }
 
 fn function_pcs<R: Reader>(dwarf: &Dwarf<R>, wanted: &[&str]) -> Result<BTreeMap<String, u64>> {
@@ -263,7 +366,7 @@ fn function_pcs<R: Reader>(dwarf: &Dwarf<R>, wanted: &[&str]) -> Result<BTreeMap
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
         collect_function_pcs(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
-        if has_all_functions(&result, wanted) {
+        if can_stop_function_search(&result, wanted) {
             break;
         }
     }
@@ -281,7 +384,7 @@ fn function_var_fields<R: Reader>(
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
         collect_function_var_fields(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
-        if has_all_functions(&result, wanted) {
+        if can_stop_function_search(&result, wanted) {
             break;
         }
     }
@@ -296,7 +399,7 @@ fn collect_function_var_fields<R: Reader>(
     result: &mut BTreeMap<String, FunctionVarFields>,
     wanted: &[&str],
 ) -> Result<()> {
-    if has_all_functions(result, wanted) {
+    if can_stop_function_search(result, wanted) {
         return Ok(());
     }
 
@@ -308,14 +411,14 @@ fn collect_function_var_fields<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, unit, entry, scopes)? {
-            if !wanted.contains(&fullname.as_str()) {
+            let Some(canonical_name) = canonical_probe_function_name(&fullname, wanted) else {
                 continue;
-            }
-            if let Some(paths) = probe_field_paths(&fullname) {
+            };
+            if let Some(paths) = probe_field_paths(&canonical_name) {
                 if let Some(fields) =
-                    probe_function_var_fields(dwarf, unit, entry, &fullname, paths)?
+                    probe_function_var_fields(dwarf, unit, entry, &canonical_name, paths)?
                 {
-                    result.entry(fullname).or_insert(fields);
+                    insert_function_var_fields(result, canonical_name, fields);
                 }
             }
         }
@@ -328,7 +431,7 @@ fn collect_function_var_fields<R: Reader>(
     let mut children = node.children();
     while let Some(child) = children.next()? {
         collect_function_var_fields(dwarf, unit, child, scopes, result, wanted)?;
-        if has_all_functions(result, wanted) {
+        if can_stop_function_search(result, wanted) {
             break;
         }
     }
@@ -337,6 +440,24 @@ fn collect_function_var_fields<R: Reader>(
         scopes.pop();
     }
     Ok(())
+}
+
+fn insert_function_var_fields(
+    result: &mut BTreeMap<String, FunctionVarFields>,
+    function: String,
+    fields: FunctionVarFields,
+) {
+    if let std::collections::btree_map::Entry::Vacant(entry) = result.entry(function.clone()) {
+        entry.insert(fields);
+        return;
+    }
+    for idx in 1..256 {
+        let key = format!("{function}#{idx}");
+        if let std::collections::btree_map::Entry::Vacant(entry) = result.entry(key) {
+            entry.insert(fields);
+            return;
+        }
+    }
 }
 
 fn probe_function_var_fields<R: Reader>(
@@ -397,7 +518,32 @@ fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]
     match function {
         "Objecter::_send_op" => Some(OBJECTER_SEND_OP_FIELDS),
         "Objecter::_finish_op" => Some(OBJECTER_FINISH_OP_FIELDS),
+        "Objecter::op_submit" => Some(OBJECTER_OP_SUBMIT_FIELDS),
+        "process_request" => Some(PROCESS_REQUEST_FIELDS),
         "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
+        "RGWOp::init" => Some(RGW_OP_INIT_FIELDS),
+        "rgw_rados_operate" => Some(RGW_RADOS_OPERATE_FIELDS),
+        "RadosWriter::RadosWriter" => Some(RADOS_WRITER_CTOR_FIELDS),
+        "RadosWriter::process" => Some(RADOS_WRITER_PROCESS_FIELDS),
+        "RadosWriter::write_exclusive" => Some(RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS),
+        "AtomicObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
+        "MultipartObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
+        "AppendObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
+        "AtomicObjectProcessor::process_first_chunk" => {
+            Some(PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS)
+        }
+        "MultipartObjectProcessor::process_first_chunk" => {
+            Some(PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS)
+        }
+        "AppendObjectProcessor::process_first_chunk" => {
+            Some(PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS)
+        }
+        "HeadObjectProcessor::process" => Some(HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS),
+        "AtomicObjectProcessor::complete" => Some(PUT_PROCESSOR_COMPLETE_FIELDS),
+        "MultipartObjectProcessor::complete" => Some(PUT_PROCESSOR_COMPLETE_FIELDS),
+        "AppendObjectProcessor::complete" => Some(PUT_PROCESSOR_COMPLETE_FIELDS),
+        "RGWRados::Object::Write::write_meta" => Some(RGW_WRITE_META_FIELDS),
+        "RGWRados::Object::Write::_do_write_meta" => Some(RGW_WRITE_META_FIELDS),
         _ => None,
     }
 }
@@ -415,14 +561,18 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
         let Ok(name) = symbol.name() else {
             continue;
         };
-        let Some(function) = demangle_function_name(name) else {
-            continue;
-        };
-        if wanted.contains(&function.as_str()) {
-            result.entry(function).or_insert(symbol.address());
+        if let Some(canonical_name) = symbol_probe_function_name(name, wanted) {
+            insert_function_pc(&mut result, canonical_name, symbol.address());
         }
     }
     result
+}
+
+fn symbol_probe_function_name(name: &str, wanted: &[&str]) -> Option<String> {
+    demangle_function_name(name)
+        .and_then(|function| canonical_probe_function_name(&function, wanted))
+        .or_else(|| canonical_probe_function_name(name, wanted))
+        .or_else(|| canonical_probe_function_name(name.strip_prefix('_').unwrap_or(name), wanted))
 }
 
 fn collect_function_pcs<R: Reader>(
@@ -433,7 +583,7 @@ fn collect_function_pcs<R: Reader>(
     result: &mut BTreeMap<String, u64>,
     wanted: &[&str],
 ) -> Result<()> {
-    if has_all_functions(result, wanted) {
+    if can_stop_function_search(result, wanted) {
         return Ok(());
     }
 
@@ -445,9 +595,9 @@ fn collect_function_pcs<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, unit, entry, scopes)? {
-            if wanted.contains(&fullname.as_str()) {
+            if let Some(canonical_name) = canonical_probe_function_name(&fullname, wanted) {
                 if let Some(pc) = entry_pc(dwarf, unit, entry)? {
-                    result.entry(fullname).or_insert(pc);
+                    insert_function_pc(result, canonical_name, pc);
                 }
             }
         }
@@ -460,7 +610,7 @@ fn collect_function_pcs<R: Reader>(
     let mut children = node.children();
     while let Some(child) = children.next()? {
         collect_function_pcs(dwarf, unit, child, scopes, result, wanted)?;
-        if has_all_functions(result, wanted) {
+        if can_stop_function_search(result, wanted) {
             break;
         }
     }
@@ -501,7 +651,7 @@ fn add_referenced_function_names<R: Reader>(
 
     let already_qualified = names[before..]
         .iter()
-        .any(|name| PROBE_FUNCTIONS.contains(&name.as_str()));
+        .any(|name| canonical_probe_function_name(name, PROBE_FUNCTIONS).is_some());
     if !already_qualified {
         if let Some(name) = die_name(dwarf, unit, &referenced)? {
             if PROBE_FUNCTION_LEAF_NAMES.contains(&name.as_str()) {
@@ -550,6 +700,10 @@ fn referenced_entry<'unit, R: Reader>(
     };
     match attr.value() {
         AttributeValue::UnitRef(offset) => Ok(Some(unit.entry(offset)?)),
+        AttributeValue::DebugInfoRef(offset) => Ok(offset
+            .to_unit_offset(&unit.header)
+            .map(|offset| unit.entry(offset))
+            .transpose()?),
         _ => Ok(None),
     }
 }
@@ -1150,7 +1304,13 @@ fn debug_data<'data>(
     data: &'data [u8],
     build_id: Option<&str>,
 ) -> Result<Cow<'data, [u8]>> {
-    if file.has_debug_symbols() {
+    if let Some(debug_path) = dsym_debug_file(path) {
+        return fs::read(&debug_path)
+            .map(Cow::Owned)
+            .with_context(|| format!("failed to read dSYM file {}", debug_path.display()));
+    }
+
+    if has_dwarf_sections(file) {
         return Ok(Cow::Borrowed(data));
     }
 
@@ -1174,12 +1334,30 @@ fn debug_data<'data>(
     Ok(Cow::Borrowed(data))
 }
 
+fn has_dwarf_sections(file: &object::File<'_>) -> bool {
+    file.section_by_name(gimli::SectionId::DebugInfo.name())
+        .or_else(|| file.section_by_name(&macho_section_name(gimli::SectionId::DebugInfo.name())))
+        .is_some()
+}
+
 fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf>> {
     let Some((filename, _crc)) = file.gnu_debuglink()? else {
         return Ok(None);
     };
     let filename = std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
     Ok(first_existing(debuglink_candidates(path, filename)))
+}
+
+fn dsym_debug_file(path: &Path) -> Option<PathBuf> {
+    let filename = path.file_name()?;
+    let dsym_name = format!("{}.dSYM", filename.to_string_lossy());
+    let candidate = path
+        .with_file_name(dsym_name)
+        .join("Contents")
+        .join("Resources")
+        .join("DWARF")
+        .join(filename);
+    candidate.is_file().then_some(candidate)
 }
 
 fn build_id_debug_file(path: &Path, build_id: &str) -> Option<PathBuf> {
@@ -1452,12 +1630,89 @@ mod tests {
             return;
         };
 
-        assert_eq!(fields.var_fields.len(), 2);
-        assert_eq!(fields.var_fields[0].fields.len(), 3);
+        assert_eq!(fields.var_fields.len(), 5);
+        assert_eq!(fields.var_fields[0].fields.len(), 2);
         assert!(fields.var_fields[0].fields[1].pointer);
-        assert_eq!(fields.var_fields[0].fields[2].offset, 8);
-        assert_eq!(fields.var_fields[1].fields.len(), 4);
+        assert_eq!(fields.var_fields[1].fields.len(), 3);
         assert!(fields.var_fields[1].fields[1].pointer);
+        assert_eq!(fields.var_fields[2].fields.len(), 4);
+        assert!(fields.var_fields[2].fields[1].pointer);
+        assert_eq!(fields.var_fields[3].fields.len(), 3);
+        assert!(fields.var_fields[3].fields[1].pointer);
+        assert_eq!(fields.var_fields[4].fields.len(), 4);
+        assert!(fields.var_fields[4].fields[1].pointer);
+    }
+
+    #[test]
+    fn extracts_rgw_request_context_var_fields_from_cpp_fixture() {
+        let Some(binary) = compile_rgw_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+
+        let process_request = module.func2vf.get("process_request").unwrap();
+        assert_eq!(process_request.var_fields.len(), 1);
+        assert_eq!(process_request.var_fields[0].fields.len(), 2);
+        assert!(process_request.var_fields[0].fields[1].pointer);
+
+        let init = module.func2vf.get("RGWOp::init").unwrap();
+        assert_eq!(init.var_fields.len(), 2);
+        assert_eq!(init.var_fields[0].fields.len(), 1);
+        assert_eq!(init.var_fields[1].fields.len(), 1);
+
+        let operate = module.func2vf.get("rgw_rados_operate").unwrap();
+        assert_eq!(operate.var_fields.len(), 1);
+        assert_eq!(operate.var_fields[0].fields.len(), 1);
+
+        let writer_ctor = module.func2vf.get("RadosWriter::RadosWriter").unwrap();
+        assert_eq!(writer_ctor.var_fields.len(), 2);
+        assert_eq!(writer_ctor.var_fields[0].fields.len(), 1);
+        assert_eq!(writer_ctor.var_fields[1].fields.len(), 1);
+
+        let writer_process = module.func2vf.get("RadosWriter::process").unwrap();
+        assert_eq!(writer_process.var_fields.len(), 2);
+        assert_eq!(writer_process.var_fields[0].fields.len(), 1);
+        assert_eq!(writer_process.var_fields[1].fields.len(), 2);
+        assert!(writer_process.var_fields[1].fields[1].pointer);
+
+        let writer_write_exclusive = module.func2vf.get("RadosWriter::write_exclusive").unwrap();
+        assert_eq!(writer_write_exclusive.var_fields.len(), 2);
+        assert_eq!(writer_write_exclusive.var_fields[0].fields.len(), 1);
+        assert_eq!(writer_write_exclusive.var_fields[1].fields.len(), 2);
+        assert!(writer_write_exclusive.var_fields[1].fields[1].pointer);
+    }
+
+    #[test]
+    fn preserves_rgw_rados_operate_overload_addresses_from_cpp_fixture() {
+        let Some(binary) = compile_rgw_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let addrs = module
+            .func2pc
+            .keys()
+            .filter(|function| function_key_matches(function, "rgw_rados_operate"))
+            .count();
+
+        assert!(addrs >= 2);
+        let fields = module
+            .func2vf
+            .keys()
+            .filter(|function| function_key_matches(function, "rgw_rados_operate"))
+            .count();
+        assert!(fields >= 2);
+        let hprobe_keys = info
+            .hprobe_entries()
+            .into_iter()
+            .filter(|entry| function_key_matches(&entry.function, "rgw_rados_operate"))
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+        assert!(hprobe_keys.contains(&60));
+        assert!(hprobe_keys.contains(&61));
     }
 
     #[test]
@@ -1479,6 +1734,22 @@ mod tests {
         assert!(fields.var_fields[1].fields[1].pointer);
         assert_eq!(fields.var_fields[2].fields.len(), 3);
         assert!(fields.var_fields[2].fields[1].pointer);
+    }
+
+    #[test]
+    fn extracts_objecter_op_submit_var_fields_from_cpp_fixture() {
+        let Some(binary) = compile_objecter_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get("Objecter::op_submit") else {
+            return;
+        };
+
+        assert_eq!(fields.var_fields.len(), 1);
+        assert_eq!(fields.var_fields[0].fields.len(), 1);
     }
 
     #[test]
@@ -1754,24 +2025,81 @@ mod tests {
               DataPtr _M_dataplus;
               unsigned long _M_string_length;
             };
+            struct RGWRequest {
+              unsigned long id;
+            };
             struct ReqState {
+              unsigned long id;
+              StringLike req_id;
               StringLike trans_id;
+            };
+            struct DoutPrefixProvider {
+              unsigned long marker;
             };
             class RGWREST {
             public:
               __attribute__((noinline)) void get_handler(ReqState* s);
               volatile unsigned long sink = 0;
             };
+            class RGWHandler {};
+            class Driver {};
+            class RGWOp {
+            public:
+              __attribute__((noinline)) void init(Driver* driver, ReqState* s, RGWHandler* handler);
+              volatile unsigned long sink = 0;
+            };
+            class RadosWriter {
+              DoutPrefixProvider* dpp;
+            public:
+              __attribute__((noinline)) explicit RadosWriter(DoutPrefixProvider* dpp) : dpp(dpp) {}
+              __attribute__((noinline)) int process();
+              __attribute__((noinline)) int write_exclusive();
+            };
+            __attribute__((noinline)) int process_request(RGWRequest* const req) {
+              return req->id;
+            }
             void RGWREST::get_handler(ReqState* s) {
+              sink += s->id;
+              sink += s->req_id._M_string_length;
+              sink += (unsigned long)s->req_id._M_dataplus._M_p;
               sink += s->trans_id._M_string_length;
               sink += (unsigned long)s->trans_id._M_dataplus._M_p;
             }
+            void RGWOp::init(Driver* driver, ReqState* s, RGWHandler* handler) {
+              sink += (unsigned long)driver;
+              sink += (unsigned long)s;
+              sink += (unsigned long)handler;
+            }
+            __attribute__((noinline)) int rgw_rados_operate(DoutPrefixProvider* dpp, int op) {
+              return dpp->marker + op;
+            }
+            __attribute__((noinline)) int rgw_rados_operate(DoutPrefixProvider* dpp, long op) {
+              return dpp->marker + op;
+            }
+            int RadosWriter::process() {
+              return dpp->marker;
+            }
+            int RadosWriter::write_exclusive() {
+              return dpp->marker + 1;
+            }
             int main() {
               char value = 0;
-              ReqState state = {{{&value}, 12}};
+              RGWRequest request = {42};
+              ReqState state = {42, {{&value}, 7}, {{&value}, 12}};
+              DoutPrefixProvider dpp = {5};
+              Driver driver;
+              RGWHandler handler;
               RGWREST rest;
+              RGWOp op;
+              RadosWriter writer(&dpp);
+              unsigned long result = process_request(&request);
               rest.get_handler(&state);
-              return 0;
+              op.init(&driver, &state, &handler);
+              result += rgw_rados_operate(&dpp, 1);
+              result += rgw_rados_operate(&dpp, 2L);
+              result += writer.process();
+              result += writer.write_exclusive();
+              return result == 0;
             }
             "#,
         )
@@ -1831,6 +2159,7 @@ mod tests {
             public:
               __attribute__((noinline)) void _send_op(Op* op);
               __attribute__((noinline)) void _finish_op(Op* op);
+              __attribute__((noinline)) void op_submit(Op* op);
               MonClient monc;
               volatile unsigned long sink = 0;
             };
@@ -1853,6 +2182,9 @@ mod tests {
               sink += monc.global_id;
               sink += op->target.osd;
             }
+            void Objecter::op_submit(Op* op) {
+              sink += op->tid;
+            }
             int main() {
               char name = 0;
               char ops = 0;
@@ -1864,6 +2196,7 @@ mod tests {
               };
               Objecter objecter;
               objecter.monc.global_id = 9;
+              objecter.op_submit(&op);
               objecter._send_op(&op);
               objecter._finish_op(&op);
               return 0;

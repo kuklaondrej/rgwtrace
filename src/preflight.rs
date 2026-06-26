@@ -12,11 +12,43 @@ use crate::{
 
 const SEND_OP: &str = "Objecter::_send_op";
 const FINISH_OP: &str = "Objecter::_finish_op";
+const OP_SUBMIT: &str = "Objecter::op_submit";
+const PROCESS_REQUEST: &str = "process_request";
 const GET_HANDLER: &str = "RGWREST::get_handler";
+const RGW_OP_INIT: &str = "RGWOp::init";
+const RGW_RADOS_OPERATE: &str = "rgw_rados_operate";
+const RADOS_WRITER_PROCESS: &str = "RadosWriter::process";
+const RADOS_WRITER_WRITE_EXCLUSIVE: &str = "RadosWriter::write_exclusive";
+const ATOMIC_OBJECT_PROCESSOR_PREPARE: &str = "AtomicObjectProcessor::prepare";
+const MULTIPART_OBJECT_PROCESSOR_PREPARE: &str = "MultipartObjectProcessor::prepare";
+const APPEND_OBJECT_PROCESSOR_PREPARE: &str = "AppendObjectProcessor::prepare";
+const ATOMIC_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK: &str =
+    "AtomicObjectProcessor::process_first_chunk";
+const MULTIPART_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK: &str =
+    "MultipartObjectProcessor::process_first_chunk";
+const APPEND_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK: &str =
+    "AppendObjectProcessor::process_first_chunk";
+const HEAD_OBJECT_PROCESSOR_PROCESS: &str = "HeadObjectProcessor::process";
+const ATOMIC_OBJECT_PROCESSOR_COMPLETE: &str = "AtomicObjectProcessor::complete";
+const MULTIPART_OBJECT_PROCESSOR_COMPLETE: &str = "MultipartObjectProcessor::complete";
+const APPEND_OBJECT_PROCESSOR_COMPLETE: &str = "AppendObjectProcessor::complete";
+const RGW_WRITE_META: &str = "RGWRados::Object::Write::write_meta";
+const RGW_DO_WRITE_META: &str = "RGWRados::Object::Write::_do_write_meta";
 
 const SEND_OP_FIELDS: usize = 12;
 const FINISH_OP_FIELDS: usize = 3;
-const GET_HANDLER_FIELDS: usize = 2;
+const OP_SUBMIT_FIELDS: usize = 1;
+const PROCESS_REQUEST_FIELDS: usize = 1;
+const GET_HANDLER_FIELDS: usize = 5;
+const RGW_OP_INIT_FIELDS: usize = 2;
+const RGW_RADOS_OPERATE_FIELDS: usize = 1;
+const RADOS_WRITER_PROCESS_FIELDS: usize = 2;
+const RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS: usize = 2;
+const PUT_PROCESSOR_PREPARE_FIELDS: usize = 1;
+const PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS: usize = 3;
+const HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS: usize = 1;
+const PUT_PROCESSOR_COMPLETE_FIELDS: usize = 2;
+const RGW_WRITE_META_FIELDS: usize = 1;
 
 #[derive(Debug, Serialize)]
 pub struct PreflightReport {
@@ -125,13 +157,91 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
     }
 
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
+    require_function(dwarf, radosgw, PROCESS_REQUEST, PROCESS_REQUEST_FIELDS)?;
     require_function(dwarf, radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
+    require_function(dwarf, radosgw, RGW_OP_INIT, RGW_OP_INIT_FIELDS)?;
+    require_function(dwarf, radosgw, RGW_RADOS_OPERATE, RGW_RADOS_OPERATE_FIELDS)?;
+    require_function(
+        dwarf,
+        radosgw,
+        RADOS_WRITER_PROCESS,
+        RADOS_WRITER_PROCESS_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        RADOS_WRITER_WRITE_EXCLUSIVE,
+        RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        ATOMIC_OBJECT_PROCESSOR_PREPARE,
+        PUT_PROCESSOR_PREPARE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        MULTIPART_OBJECT_PROCESSOR_PREPARE,
+        PUT_PROCESSOR_PREPARE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        APPEND_OBJECT_PROCESSOR_PREPARE,
+        PUT_PROCESSOR_PREPARE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        ATOMIC_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK,
+        PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        MULTIPART_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK,
+        PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        APPEND_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK,
+        PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        HEAD_OBJECT_PROCESSOR_PROCESS,
+        HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        ATOMIC_OBJECT_PROCESSOR_COMPLETE,
+        PUT_PROCESSOR_COMPLETE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        MULTIPART_OBJECT_PROCESSOR_COMPLETE,
+        PUT_PROCESSOR_COMPLETE_FIELDS,
+    )?;
+    require_function(
+        dwarf,
+        radosgw,
+        APPEND_OBJECT_PROCESSOR_COMPLETE,
+        PUT_PROCESSOR_COMPLETE_FIELDS,
+    )?;
+    require_function(dwarf, radosgw, RGW_WRITE_META, RGW_WRITE_META_FIELDS)?;
+    require_function(dwarf, radosgw, RGW_DO_WRITE_META, RGW_WRITE_META_FIELDS)?;
     Ok(())
 }
 
 fn module_supports_rados(dwarf: &DwarfInfo, module: &str) -> bool {
     require_function(dwarf, module, SEND_OP, SEND_OP_FIELDS).is_ok()
         && require_function(dwarf, module, FINISH_OP, FINISH_OP_FIELDS).is_ok()
+        && require_function(dwarf, module, OP_SUBMIT, OP_SUBMIT_FIELDS).is_ok()
 }
 
 fn require_function(
@@ -186,7 +296,9 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
         PreflightCheck {
             name: "rgw_probe".to_string(),
             status: "ok",
-            detail: format!("{GET_HANDLER} available in {radosgw}"),
+            detail: format!(
+                "{PROCESS_REQUEST}, {GET_HANDLER}, {RGW_OP_INIT}, {RGW_RADOS_OPERATE}, {RADOS_WRITER_PROCESS}, {RADOS_WRITER_WRITE_EXCLUSIVE}, {ATOMIC_OBJECT_PROCESSOR_PREPARE}, {MULTIPART_OBJECT_PROCESSOR_PREPARE}, {APPEND_OBJECT_PROCESSOR_PREPARE}, {ATOMIC_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}, {MULTIPART_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}, {APPEND_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}, and {HEAD_OBJECT_PROCESSOR_PROCESS} available in {radosgw}"
+            ),
         },
     ]
 }
@@ -316,12 +428,14 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_finish_op_fields() {
+        let counts = ProbeFieldCounts {
+            finish_op: FINISH_OP_FIELDS - 1,
+            ..ProbeFieldCounts::default()
+        };
         let dwarf = DwarfInfo::from_str(&dwarf_json_with_field_counts(
             "libceph-common.so.2",
             "radosgw",
-            SEND_OP_FIELDS,
-            FINISH_OP_FIELDS - 1,
-            GET_HANDLER_FIELDS,
+            counts,
         ))
         .unwrap();
         let targets = ProbeTargets {
@@ -352,41 +466,154 @@ mod tests {
     }
 
     fn dwarf_json(rados_module: &str, rgw_module: &str) -> String {
-        dwarf_json_with_field_counts(
-            rados_module,
-            rgw_module,
-            SEND_OP_FIELDS,
-            FINISH_OP_FIELDS,
-            GET_HANDLER_FIELDS,
-        )
+        dwarf_json_with_field_counts(rados_module, rgw_module, ProbeFieldCounts::default())
+    }
+
+    struct ProbeFieldCounts {
+        send_op: usize,
+        finish_op: usize,
+        op_submit: usize,
+        process_request: usize,
+        get_handler: usize,
+        rgw_op_init: usize,
+        rgw_rados_operate: usize,
+        rados_writer_process: usize,
+        rados_writer_write_exclusive: usize,
+        atomic_object_processor_prepare: usize,
+        multipart_object_processor_prepare: usize,
+        append_object_processor_prepare: usize,
+        atomic_object_processor_process_first_chunk: usize,
+        multipart_object_processor_process_first_chunk: usize,
+        append_object_processor_process_first_chunk: usize,
+        head_object_processor_process: usize,
+        atomic_object_processor_complete: usize,
+        multipart_object_processor_complete: usize,
+        append_object_processor_complete: usize,
+        rgw_write_meta: usize,
+        rgw_do_write_meta: usize,
+    }
+
+    impl Default for ProbeFieldCounts {
+        fn default() -> Self {
+            Self {
+                send_op: SEND_OP_FIELDS,
+                finish_op: FINISH_OP_FIELDS,
+                op_submit: OP_SUBMIT_FIELDS,
+                process_request: PROCESS_REQUEST_FIELDS,
+                get_handler: GET_HANDLER_FIELDS,
+                rgw_op_init: RGW_OP_INIT_FIELDS,
+                rgw_rados_operate: RGW_RADOS_OPERATE_FIELDS,
+                rados_writer_process: RADOS_WRITER_PROCESS_FIELDS,
+                rados_writer_write_exclusive: RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS,
+                atomic_object_processor_prepare: PUT_PROCESSOR_PREPARE_FIELDS,
+                multipart_object_processor_prepare: PUT_PROCESSOR_PREPARE_FIELDS,
+                append_object_processor_prepare: PUT_PROCESSOR_PREPARE_FIELDS,
+                atomic_object_processor_process_first_chunk:
+                    PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+                multipart_object_processor_process_first_chunk:
+                    PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+                append_object_processor_process_first_chunk:
+                    PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS,
+                head_object_processor_process: HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS,
+                atomic_object_processor_complete: PUT_PROCESSOR_COMPLETE_FIELDS,
+                multipart_object_processor_complete: PUT_PROCESSOR_COMPLETE_FIELDS,
+                append_object_processor_complete: PUT_PROCESSOR_COMPLETE_FIELDS,
+                rgw_write_meta: RGW_WRITE_META_FIELDS,
+                rgw_do_write_meta: RGW_WRITE_META_FIELDS,
+            }
+        }
     }
 
     fn dwarf_json_with_field_counts(
         rados_module: &str,
         rgw_module: &str,
-        send_field_count: usize,
-        finish_field_count: usize,
-        handler_field_count: usize,
+        counts: ProbeFieldCounts,
     ) -> String {
         format!(
             r#"{{
               "version": "18.2.8-1jammy",
               "arch": "amd64",
               "{rados_module}": {{
-                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2}},
+                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2, "{OP_SUBMIT}": 3}},
                 "func2vf": {{
                   "{SEND_OP}": {{"var_fields": {send_fields}}},
-                  "{FINISH_OP}": {{"var_fields": {finish_fields}}}
+                  "{FINISH_OP}": {{"var_fields": {finish_fields}}},
+                  "{OP_SUBMIT}": {{"var_fields": {op_submit_fields}}}
                 }}
               }},
               "{rgw_module}": {{
-                "func2pc": {{"{GET_HANDLER}": 3}},
-                "func2vf": {{"{GET_HANDLER}": {{"var_fields": {handler_fields}}}}}
+                "func2pc": {{
+                  "{PROCESS_REQUEST}": 4,
+                  "{GET_HANDLER}": 5,
+                  "{RGW_OP_INIT}": 6,
+                  "{RGW_RADOS_OPERATE}": 7,
+                  "{RADOS_WRITER_PROCESS}": 8,
+                  "{RADOS_WRITER_WRITE_EXCLUSIVE}": 9,
+                  "{ATOMIC_OBJECT_PROCESSOR_PREPARE}": 10,
+                  "{MULTIPART_OBJECT_PROCESSOR_PREPARE}": 11,
+                  "{APPEND_OBJECT_PROCESSOR_PREPARE}": 12,
+                  "{ATOMIC_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": 13,
+                  "{MULTIPART_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": 14,
+                  "{APPEND_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": 15,
+                  "{HEAD_OBJECT_PROCESSOR_PROCESS}": 16,
+                  "{ATOMIC_OBJECT_PROCESSOR_COMPLETE}": 17,
+                  "{MULTIPART_OBJECT_PROCESSOR_COMPLETE}": 18,
+                  "{APPEND_OBJECT_PROCESSOR_COMPLETE}": 19,
+                  "{RGW_WRITE_META}": 20,
+                  "{RGW_DO_WRITE_META}": 21
+                }},
+                "func2vf": {{
+                  "{PROCESS_REQUEST}": {{"var_fields": {process_request_fields}}},
+                  "{GET_HANDLER}": {{"var_fields": {handler_fields}}},
+                  "{RGW_OP_INIT}": {{"var_fields": {rgw_op_init_fields}}},
+                  "{RGW_RADOS_OPERATE}": {{"var_fields": {rgw_rados_operate_fields}}},
+                  "{RADOS_WRITER_PROCESS}": {{"var_fields": {rados_writer_process_fields}}},
+                  "{RADOS_WRITER_WRITE_EXCLUSIVE}": {{"var_fields": {rados_writer_write_exclusive_fields}}},
+                  "{ATOMIC_OBJECT_PROCESSOR_PREPARE}": {{"var_fields": {atomic_object_processor_prepare_fields}}},
+                  "{MULTIPART_OBJECT_PROCESSOR_PREPARE}": {{"var_fields": {multipart_object_processor_prepare_fields}}},
+                  "{APPEND_OBJECT_PROCESSOR_PREPARE}": {{"var_fields": {append_object_processor_prepare_fields}}},
+                  "{ATOMIC_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": {{"var_fields": {atomic_object_processor_process_first_chunk_fields}}},
+                  "{MULTIPART_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": {{"var_fields": {multipart_object_processor_process_first_chunk_fields}}},
+                  "{APPEND_OBJECT_PROCESSOR_PROCESS_FIRST_CHUNK}": {{"var_fields": {append_object_processor_process_first_chunk_fields}}},
+                  "{HEAD_OBJECT_PROCESSOR_PROCESS}": {{"var_fields": {head_object_processor_process_fields}}},
+                  "{ATOMIC_OBJECT_PROCESSOR_COMPLETE}": {{"var_fields": {atomic_object_processor_complete_fields}}},
+                  "{MULTIPART_OBJECT_PROCESSOR_COMPLETE}": {{"var_fields": {multipart_object_processor_complete_fields}}},
+                  "{APPEND_OBJECT_PROCESSOR_COMPLETE}": {{"var_fields": {append_object_processor_complete_fields}}},
+                  "{RGW_WRITE_META}": {{"var_fields": {rgw_write_meta_fields}}},
+                  "{RGW_DO_WRITE_META}": {{"var_fields": {rgw_do_write_meta_fields}}}
+                }}
               }}
             }}"#,
-            send_fields = var_fields(send_field_count),
-            finish_fields = var_fields(finish_field_count),
-            handler_fields = var_fields(handler_field_count),
+            send_fields = var_fields(counts.send_op),
+            finish_fields = var_fields(counts.finish_op),
+            op_submit_fields = var_fields(counts.op_submit),
+            process_request_fields = var_fields(counts.process_request),
+            handler_fields = var_fields(counts.get_handler),
+            rgw_op_init_fields = var_fields(counts.rgw_op_init),
+            rgw_rados_operate_fields = var_fields(counts.rgw_rados_operate),
+            rados_writer_process_fields = var_fields(counts.rados_writer_process),
+            rados_writer_write_exclusive_fields = var_fields(counts.rados_writer_write_exclusive),
+            atomic_object_processor_prepare_fields =
+                var_fields(counts.atomic_object_processor_prepare),
+            multipart_object_processor_prepare_fields =
+                var_fields(counts.multipart_object_processor_prepare),
+            append_object_processor_prepare_fields =
+                var_fields(counts.append_object_processor_prepare),
+            atomic_object_processor_process_first_chunk_fields =
+                var_fields(counts.atomic_object_processor_process_first_chunk),
+            multipart_object_processor_process_first_chunk_fields =
+                var_fields(counts.multipart_object_processor_process_first_chunk),
+            append_object_processor_process_first_chunk_fields =
+                var_fields(counts.append_object_processor_process_first_chunk),
+            head_object_processor_process_fields = var_fields(counts.head_object_processor_process),
+            atomic_object_processor_complete_fields =
+                var_fields(counts.atomic_object_processor_complete),
+            multipart_object_processor_complete_fields =
+                var_fields(counts.multipart_object_processor_complete),
+            append_object_processor_complete_fields =
+                var_fields(counts.append_object_processor_complete),
+            rgw_write_meta_fields = var_fields(counts.rgw_write_meta),
+            rgw_do_write_meta_fields = var_fields(counts.rgw_do_write_meta),
         )
     }
 
