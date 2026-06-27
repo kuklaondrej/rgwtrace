@@ -89,8 +89,8 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("Objecter::op_submit", 90),
     ("RadosWriter::RadosWriter", 100),
     ("AtomicObjectProcessor::prepare", 110),
-    ("MultipartObjectProcessor::prepare", 111),
-    ("AppendObjectProcessor::prepare", 112),
+    ("MultipartObjectProcessor::prepare", 114),
+    ("AppendObjectProcessor::prepare", 117),
     ("AtomicObjectProcessor::process_first_chunk", 120),
     ("MultipartObjectProcessor::process_first_chunk", 130),
     ("AppendObjectProcessor::process_first_chunk", 140),
@@ -100,6 +100,12 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("AppendObjectProcessor::complete", 180),
     ("RGWRados::Object::Write::write_meta", 190),
     ("RGWRados::Object::Write::_do_write_meta", 191),
+    ("ManifestObjectProcessor::ManifestObjectProcessor", 200),
+    ("RadosWriter::set_stripe_obj", 210),
+    ("RGWSI_RADOS::Obj::aio_operate", 220),
+    ("BlockingAioThrottle::get", 230),
+    ("YieldingAioThrottle::get", 231),
+    ("RGWSI_RADOS::Obj::operate", 240),
 ];
 
 impl DwarfInfo {
@@ -254,6 +260,17 @@ fn function_base_id(function: &str) -> Option<i32> {
             return Some(*id);
         }
         if *name == "rgw_rados_operate" {
+            return overload_index(function, name).and_then(|idx| (idx < 10).then_some(*id + idx));
+        }
+        if *name == "ManifestObjectProcessor::ManifestObjectProcessor"
+            && function_key_matches(function, name)
+        {
+            return Some(*id);
+        }
+        if *name == "RGWSI_RADOS::Obj::aio_operate" {
+            return overload_index(function, name).and_then(|idx| (idx < 10).then_some(*id + idx));
+        }
+        if *name == "RGWSI_RADOS::Obj::operate" {
             return overload_index(function, name).and_then(|idx| (idx < 10).then_some(*id + idx));
         }
         None

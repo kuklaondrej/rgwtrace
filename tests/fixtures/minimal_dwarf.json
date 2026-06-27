@@ -49,6 +49,7 @@
       "rgw_rados_operate#1": 32768,
       "RadosWriter::process": 36864,
       "RadosWriter::write_exclusive": 40960,
+      "RadosWriter::set_stripe_obj": 43008,
       "RadosWriter::RadosWriter": 45056,
       "AtomicObjectProcessor::prepare": 49152,
       "MultipartObjectProcessor::prepare": 53248,
@@ -61,7 +62,13 @@
       "MultipartObjectProcessor::complete": 81920,
       "AppendObjectProcessor::complete": 86016,
       "RGWRados::Object::Write::write_meta": 90112,
-      "RGWRados::Object::Write::_do_write_meta": 94208
+      "RGWRados::Object::Write::_do_write_meta": 94208,
+      "ManifestObjectProcessor::ManifestObjectProcessor": 98304,
+      "RGWSI_RADOS::Obj::aio_operate": 102400,
+      "BlockingAioThrottle::get": 106496,
+      "YieldingAioThrottle::get": 110592,
+      "RGWSI_RADOS::Obj::operate#0": 114688,
+      "RGWSI_RADOS::Obj::operate#1": 118784
     },
     "func2vf": {
       "process_request": {
@@ -101,6 +108,12 @@
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 8, "pointer": false}]}
         ]
       },
+      "RadosWriter::set_stripe_obj": {
+        "var_fields": [
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 16, "pointer": true}]}
+        ]
+      },
       "RadosWriter::RadosWriter": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
@@ -109,38 +122,47 @@
       },
       "AtomicObjectProcessor::prepare": {
         "var_fields": [
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "MultipartObjectProcessor::prepare": {
         "var_fields": [
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "AppendObjectProcessor::prepare": {
         "var_fields": [
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "AtomicObjectProcessor::process_first_chunk": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
           {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "MultipartObjectProcessor::process_first_chunk": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
           {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "AppendObjectProcessor::process_first_chunk": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
           {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "HeadObjectProcessor::process": {
@@ -151,19 +173,22 @@
       "AtomicObjectProcessor::complete": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "MultipartObjectProcessor::complete": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "AppendObjectProcessor::complete": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
-          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]}
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 3952, "pointer": true}]},
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 712, "pointer": true}]}
         ]
       },
       "RGWRados::Object::Write::write_meta": {
@@ -172,6 +197,38 @@
         ]
       },
       "RGWRados::Object::Write::_do_write_meta": {
+        "var_fields": [
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "ManifestObjectProcessor::ManifestObjectProcessor": {
+        "var_fields": [
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]},
+          {"location": {"reg": 4, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "RGWSI_RADOS::Obj::aio_operate": {
+        "var_fields": [
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "RGWSI_RADOS::Obj::operate#0": {
+        "var_fields": [
+          {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "RGWSI_RADOS::Obj::operate#1": {
+        "var_fields": [
+          {"location": {"reg": 1, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "BlockingAioThrottle::get": {
+        "var_fields": [
+          {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
+        ]
+      },
+      "YieldingAioThrottle::get": {
         "var_fields": [
           {"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}
         ]

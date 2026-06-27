@@ -49,11 +49,20 @@ fn bpf_propagates_rgw_context_to_objecter_ops() {
     assert!(RGWTRACE_BPF.contains("} rgw_req_states SEC(\".maps\");"));
     assert!(RGWTRACE_BPF.contains("} rgw_ops SEC(\".maps\");"));
     assert!(RGWTRACE_BPF.contains("} rados_writers SEC(\".maps\");"));
+    assert!(RGWTRACE_BPF.contains("} rgw_rados_objs SEC(\".maps\");"));
     assert!(RGWTRACE_BPF.contains("} objecter_ops SEC(\".maps\");"));
     assert!(RGWTRACE_BPF.contains("} pending_data_processors SEC(\".maps\");"));
+    assert!(RGWTRACE_BPF.contains("} pending_stripe_objs SEC(\".maps\");"));
     assert!(RGWTRACE_BPF.contains("int uprobe_process_request"));
     assert!(RGWTRACE_BPF.contains("int uprobe_rgw_op_init"));
     assert!(RGWTRACE_BPF.contains("int uprobe_rados_writer_ctor"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_manifest_processor_ctor"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_rados_writer_set_stripe_obj"));
+    assert!(RGWTRACE_BPF.contains("int uretprobe_rados_writer_set_stripe_obj"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_rgw_rados_obj_aio_operate"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_rgw_rados_obj_operate"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_aio_get"));
+    assert!(RGWTRACE_BPF.contains("int uprobe_librados_operate"));
     assert!(RGWTRACE_BPF.contains("int uprobe_put_processor_prepare"));
     assert!(RGWTRACE_BPF.contains("int uprobe_put_processor_process_first_chunk"));
     assert!(RGWTRACE_BPF.contains("int uretprobe_put_processor_process_first_chunk"));
@@ -74,13 +83,16 @@ fn bpf_propagates_rgw_context_to_objecter_ops() {
     assert!(RGWTRACE_BPF
         .contains("struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_ops, &dpp);"));
     assert!(RGWTRACE_BPF.contains("request = bpf_map_lookup_elem(&rgw_req_states, &dpp);"));
-    assert!(RGWTRACE_BPF.contains("return bpf_map_lookup_elem(&rgw_dpps, &dpp);"));
+    assert!(RGWTRACE_BPF.contains("request = bpf_map_lookup_elem(&rgw_dpps, &dpp);"));
+    assert!(RGWTRACE_BPF.contains("prefer_newer_current_thread_request(request)"));
+    assert!(RGWTRACE_BPF.contains("lookup_current_thread_request(void)"));
+    assert!(RGWTRACE_BPF.contains("push_current_request_ctx_no_clear(void)"));
     assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rados_writers, &writer, request, 0)"));
     assert!(RGWTRACE_BPF.contains("bpf_map_lookup_elem(&rgw_aios, &aio)"));
     assert!(RGWTRACE_BPF.contains("return lookup_request_ctx_for_dpp(aio);"));
     assert!(RGWTRACE_BPF.contains("if (writer != 0 &&"));
     assert!(RGWTRACE_BPF.contains("push_context_for_writer_no_clear(writer)"));
-    assert!(RGWTRACE_BPF.contains("request = bpf_map_lookup_elem(&rgw_requests, &thread_id);"));
+    assert!(RGWTRACE_BPF.contains("request = lookup_current_thread_request();"));
     assert!(RGWTRACE_BPF.contains("#define RGWTRACE_RADOS_WRITER_AIO_OFFSET 0x08"));
     assert!(RGWTRACE_BPF.contains("#define RGWTRACE_RADOS_WRITER_DPP_OFFSET 0x2f8"));
     assert!(RGWTRACE_BPF.contains("#define RGWTRACE_RADOS_WRITER_CTOR_SLOT_OFFSET 0x1a8"));
@@ -103,27 +115,49 @@ fn bpf_propagates_rgw_context_to_objecter_ops() {
         "processor +\n                                    RGWTRACE_MANIFEST_PROCESSOR_DPP_OFFSET"
     ));
     assert!(RGWTRACE_BPF.contains("writer - RGWTRACE_PUT_PROCESSOR_WRITER_OFFSET"));
+    assert!(!RGWTRACE_BPF.contains("request = lookup_request_ctx_for_writer_aio(writer);"));
     assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rados_writers, &processor, request, 0)"));
     assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rgw_dpps, &dpp, request, 0)"));
     assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rgw_aios, &aio, request, 0)"));
     assert!(RGWTRACE_BPF.contains("aio + RGWTRACE_RADOS_WRITER_CTOR_SLOT_OFFSET"));
     assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 102)"));
-    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 110)"));
-    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 120, 121, 122)"));
-    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 130, 131, 132)"));
-    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 140, 141, 142)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 200)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 201)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 202)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 210)"));
+    assert!(RGWTRACE_BPF.contains("member_address(ctx, 211)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 220)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 221)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 240)"));
+    assert!(RGWTRACE_BPF.contains("direct_var_value(ctx, 241)"));
+    assert!(
+        RGWTRACE_BPF.contains("push_context_for_rados_obj_no_clear(direct_var_value(ctx, 230))")
+    );
+    assert!(
+        RGWTRACE_BPF.contains("push_context_for_rados_obj_no_clear(direct_var_value(ctx, 231))")
+    );
+    assert!(RGWTRACE_BPF.contains("cache_manifest_processor_ctor_context(processor, dpp, aio)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 110, 111, 112)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 114, 115, 116)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 117, 118, 119)"));
+    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 120, 121, 122, 123)"));
+    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 130, 131, 132, 133)"));
+    assert!(RGWTRACE_BPF.contains("cache_data_processor_output(ctx, 140, 141, 142, 143)"));
+    assert!(RGWTRACE_BPF.contains("__u64 writer = member_address(ctx, writer_varid);"));
     assert!(RGWTRACE_BPF.contains("__u64 dpp = pointer_member_value(ctx, dpp_varid);"));
     assert!(RGWTRACE_BPF.contains("int uprobe_put_processor_complete"));
     assert!(RGWTRACE_BPF.contains("int uprobe_rgw_write_meta"));
-    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 160, 161)"));
-    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 170, 171)"));
-    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 180, 181)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 160, 161, 162)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 170, 171, 172)"));
+    assert!(RGWTRACE_BPF.contains("cache_processor_context(ctx, 180, 181, 182)"));
     assert!(RGWTRACE_BPF.contains("push_context_for_dpp_no_clear(direct_var_value(ctx, 190))"));
     assert!(RGWTRACE_BPF.contains("push_context_for_dpp_no_clear(direct_var_value(ctx, 191))"));
+    assert!(RGWTRACE_BPF.contains("copy_current_active_request_ctx(&active, false)"));
     assert!(RGWTRACE_BPF.contains("__u64 dpp = pointer_member_value(ctx, 71);"));
     assert!(RGWTRACE_BPF.contains("__u64 dpp = pointer_member_value(ctx, 81);"));
     assert!(RGWTRACE_BPF.contains("__u64 writer = fetch_register(ctx, RGWTRACE_ABI_THIS_REG);"));
     assert!(RGWTRACE_BPF.contains("rgwtrace_probe_read_user(&processor, sizeof(processor),"));
+    assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rgw_rados_objs, &pending->stripe_obj"));
     assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_HITS)"));
     assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS)"));
     assert!(LIVE_LINUX.contains("\"AtomicObjectProcessor::prepare\""));
@@ -133,15 +167,30 @@ fn bpf_propagates_rgw_context_to_objecter_ops() {
     assert!(LIVE_LINUX.contains("\"MultipartObjectProcessor::process_first_chunk\""));
     assert!(LIVE_LINUX.contains("\"AppendObjectProcessor::process_first_chunk\""));
     assert!(LIVE_LINUX.contains("\"HeadObjectProcessor::process\""));
+    assert!(LIVE_LINUX.contains("\"ManifestObjectProcessor::ManifestObjectProcessor\""));
     assert!(LIVE_LINUX.contains("\"AtomicObjectProcessor::complete\""));
     assert!(LIVE_LINUX.contains("\"MultipartObjectProcessor::complete\""));
     assert!(LIVE_LINUX.contains("\"AppendObjectProcessor::complete\""));
     assert!(LIVE_LINUX.contains("\"RGWRados::Object::Write::write_meta\""));
     assert!(LIVE_LINUX.contains("\"RGWRados::Object::Write::_do_write_meta\""));
+    assert!(LIVE_LINUX.contains("\"RadosWriter::set_stripe_obj\""));
+    assert!(LIVE_LINUX.contains("\"RGWSI_RADOS::Obj::aio_operate\""));
+    assert!(LIVE_LINUX.contains("\"RGWSI_RADOS::Obj::operate\""));
+    assert!(LIVE_LINUX.contains("\"librados::v14_2_0::IoCtx::operate\""));
+    assert!(LIVE_LINUX.contains("\"librados::v14_2_0::IoCtx::aio_operate\""));
+    assert!(LIVE_LINUX.contains("\"BlockingAioThrottle::get\""));
+    assert!(LIVE_LINUX.contains("\"YieldingAioThrottle::get\""));
     assert!(LIVE_LINUX.contains("uprobe_put_processor_process_first_chunk"));
     assert!(LIVE_LINUX.contains("uprobe_put_processor_complete"));
     assert!(LIVE_LINUX.contains("uprobe_rgw_write_meta"));
     assert!(LIVE_LINUX.contains("uprobe_head_object_processor_process"));
+    assert!(LIVE_LINUX.contains("uprobe_manifest_processor_ctor"));
+    assert!(LIVE_LINUX.contains("uprobe_rados_writer_set_stripe_obj"));
+    assert!(LIVE_LINUX.contains("uretprobe_rados_writer_set_stripe_obj"));
+    assert!(LIVE_LINUX.contains("uprobe_rgw_rados_obj_aio_operate"));
+    assert!(LIVE_LINUX.contains("uprobe_rgw_rados_obj_operate"));
+    assert!(LIVE_LINUX.contains("uprobe_librados_operate"));
+    assert!(LIVE_LINUX.contains("uprobe_aio_get"));
     assert!(!LIVE_LINUX.contains("uretprobe_put_processor_process_first_chunk"));
     assert!(!LIVE_LINUX.contains("uretprobe_head_object_processor_process"));
     assert!(RGWTRACE_BPF.contains("RGWTRACE_CORRELATION_OP_SUBMIT_CONTEXT"));
@@ -157,7 +206,9 @@ fn bpf_propagates_rgw_context_to_objecter_ops() {
     assert!(RGWTRACE_BPF.contains("clear_active_request_ctx();"));
     assert!(RGWTRACE_BPF.contains("struct objecter_op_ctx"));
     assert!(RGWTRACE_BPF.contains("copy_current_active_request_ctx(&op_ctx.request, false)"));
-    assert!(RGWTRACE_BPF.contains("bpf_map_lookup_elem(&rgw_requests, &thread_id);"));
+    assert!(
+        RGWTRACE_BPF.contains("struct rgw_request_ctx *request = lookup_current_thread_request();")
+    );
     assert!(RGWTRACE_BPF.contains("op_ctx.source = RGWTRACE_CORRELATION_SAME_THREAD;"));
     assert!(
         RGWTRACE_BPF.contains("copy_request_ctx_to_rados_event(event, request, op_ctx->source);")

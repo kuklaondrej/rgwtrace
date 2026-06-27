@@ -443,6 +443,20 @@ fn attach_probes(
             dwarf,
             "Objecter::_finish_op",
         )?;
+        for function in [
+            "librados::v14_2_0::IoCtx::operate",
+            "librados::v14_2_0::IoCtx::aio_operate",
+        ] {
+            attach_all_present(
+                &mut links,
+                &skel.progs.uprobe_librados_operate,
+                false,
+                pid,
+                path,
+                dwarf,
+                function,
+            )?;
+        }
     }
 
     attach_if_present(
@@ -506,6 +520,16 @@ fn attach_probes(
         "RadosWriter::RadosWriter",
     )?;
 
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_manifest_processor_ctor,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "ManifestObjectProcessor::ManifestObjectProcessor",
+    )?;
+
     for function in [
         "AtomicObjectProcessor::prepare",
         "MultipartObjectProcessor::prepare",
@@ -561,6 +585,17 @@ fn attach_probes(
             dwarf,
             function,
         )?;
+        if attach_scoped_return_probes {
+            attach_if_present(
+                &mut links,
+                &skel.progs.uretprobe_rgw_rados_scope,
+                true,
+                pid,
+                &targets.radosgw,
+                dwarf,
+                function,
+            )?;
+        }
     }
 
     for function in [
@@ -618,6 +653,79 @@ fn attach_probes(
             dwarf,
             "RadosWriter::write_exclusive",
         )?;
+    }
+
+    attach_if_present(
+        &mut links,
+        &skel.progs.uprobe_rados_writer_set_stripe_obj,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RadosWriter::set_stripe_obj",
+    )?;
+    attach_if_present(
+        &mut links,
+        &skel.progs.uretprobe_rados_writer_set_stripe_obj,
+        true,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RadosWriter::set_stripe_obj",
+    )?;
+
+    attach_all_present(
+        &mut links,
+        &skel.progs.uprobe_rgw_rados_obj_aio_operate,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RGWSI_RADOS::Obj::aio_operate",
+    )?;
+    if attach_scoped_return_probes {
+        attach_all_present(
+            &mut links,
+            &skel.progs.uretprobe_rgw_rados_scope,
+            true,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            "RGWSI_RADOS::Obj::aio_operate",
+        )?;
+    }
+
+    attach_all_present(
+        &mut links,
+        &skel.progs.uprobe_rgw_rados_obj_operate,
+        false,
+        pid,
+        &targets.radosgw,
+        dwarf,
+        "RGWSI_RADOS::Obj::operate",
+    )?;
+
+    for function in ["BlockingAioThrottle::get", "YieldingAioThrottle::get"] {
+        attach_all_present(
+            &mut links,
+            &skel.progs.uprobe_aio_get,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            function,
+        )?;
+        if attach_scoped_return_probes {
+            attach_all_present(
+                &mut links,
+                &skel.progs.uretprobe_rgw_rados_scope,
+                true,
+                pid,
+                &targets.radosgw,
+                dwarf,
+                function,
+            )?;
+        }
     }
 
     if links.is_empty() {

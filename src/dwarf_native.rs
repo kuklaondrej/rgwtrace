@@ -23,6 +23,8 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
     "Objecter::_finish_op",
     "Objecter::op_submit",
+    "librados::v14_2_0::IoCtx::operate",
+    "librados::v14_2_0::IoCtx::aio_operate",
     "process_request",
     "RGWREST::get_handler",
     "RGWOp::init",
@@ -30,6 +32,11 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "RadosWriter::RadosWriter",
     "RadosWriter::process",
     "RadosWriter::write_exclusive",
+    "RadosWriter::set_stripe_obj",
+    "RGWSI_RADOS::Obj::aio_operate",
+    "RGWSI_RADOS::Obj::operate",
+    "BlockingAioThrottle::get",
+    "YieldingAioThrottle::get",
     "AtomicObjectProcessor::prepare",
     "MultipartObjectProcessor::prepare",
     "AppendObjectProcessor::prepare",
@@ -42,6 +49,7 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "AppendObjectProcessor::complete",
     "RGWRados::Object::Write::write_meta",
     "RGWRados::Object::Write::_do_write_meta",
+    "ManifestObjectProcessor::ManifestObjectProcessor",
 ];
 const OBJECTER_PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
@@ -56,6 +64,11 @@ const RGW_PROBE_FUNCTIONS: &[&str] = &[
     "RadosWriter::RadosWriter",
     "RadosWriter::process",
     "RadosWriter::write_exclusive",
+    "RadosWriter::set_stripe_obj",
+    "RGWSI_RADOS::Obj::aio_operate",
+    "RGWSI_RADOS::Obj::operate",
+    "BlockingAioThrottle::get",
+    "YieldingAioThrottle::get",
     "AtomicObjectProcessor::prepare",
     "MultipartObjectProcessor::prepare",
     "AppendObjectProcessor::prepare",
@@ -68,6 +81,7 @@ const RGW_PROBE_FUNCTIONS: &[&str] = &[
     "AppendObjectProcessor::complete",
     "RGWRados::Object::Write::write_meta",
     "RGWRados::Object::Write::_do_write_meta",
+    "ManifestObjectProcessor::ManifestObjectProcessor",
 ];
 const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &[
     "_send_op",
@@ -78,8 +92,16 @@ const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &[
     "init",
     "rgw_rados_operate",
     "RadosWriter",
+    "IoCtx",
+    "ManifestObjectProcessor",
+    "BlockingAioThrottle",
+    "YieldingAioThrottle",
+    "get",
+    "aio_operate",
+    "operate",
     "process",
     "write_exclusive",
+    "set_stripe_obj",
     "prepare",
     "process_first_chunk",
     "complete",
@@ -118,12 +140,23 @@ const RGW_RADOS_OPERATE_FIELDS: &[&[&str]] = &[&["dpp"]];
 const RADOS_WRITER_CTOR_FIELDS: &[&[&str]] = &[&["this"], &["dpp"]];
 const RADOS_WRITER_PROCESS_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
 const RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
-const PUT_PROCESSOR_PREPARE_FIELDS: &[&[&str]] = &[&["this"]];
-const PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS: &[&[&str]] =
-    &[&["this"], &["processor"], &["this", "dpp"]];
+const RADOS_WRITER_SET_STRIPE_OBJ_FIELDS: &[&[&str]] = &[&["this"], &["this", "stripe_obj"]];
+const RGW_RADOS_OBJ_AIO_OPERATE_FIELDS: &[&[&str]] = &[&["this"]];
+const RGW_RADOS_OBJ_OPERATE_FIELDS: &[&[&str]] = &[&["dpp"]];
+const AIO_GET_FIELDS: &[&[&str]] = &[&["obj"]];
+const PUT_PROCESSOR_PREPARE_FIELDS: &[&[&str]] =
+    &[&["this"], &["this", "dpp"], &["this", "writer"]];
+const PUT_PROCESSOR_PROCESS_FIRST_CHUNK_FIELDS: &[&[&str]] = &[
+    &["this"],
+    &["processor"],
+    &["this", "dpp"],
+    &["this", "writer"],
+];
 const HEAD_OBJECT_PROCESSOR_PROCESS_FIELDS: &[&[&str]] = &[&["this"]];
-const PUT_PROCESSOR_COMPLETE_FIELDS: &[&[&str]] = &[&["this"], &["this", "dpp"]];
+const PUT_PROCESSOR_COMPLETE_FIELDS: &[&[&str]] =
+    &[&["this"], &["this", "dpp"], &["this", "writer"]];
 const RGW_WRITE_META_FIELDS: &[&[&str]] = &[&["dpp"]];
+const MANIFEST_PROCESSOR_CTOR_FIELDS: &[&[&str]] = &[&["this"], &["dpp"], &["aio"]];
 const OBJECTER_OP_SUBMIT_FIELDS: &[&[&str]] = &[&["op"]];
 
 #[allow(dead_code)]
@@ -557,6 +590,11 @@ fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]
         "RadosWriter::RadosWriter" => Some(RADOS_WRITER_CTOR_FIELDS),
         "RadosWriter::process" => Some(RADOS_WRITER_PROCESS_FIELDS),
         "RadosWriter::write_exclusive" => Some(RADOS_WRITER_WRITE_EXCLUSIVE_FIELDS),
+        "RadosWriter::set_stripe_obj" => Some(RADOS_WRITER_SET_STRIPE_OBJ_FIELDS),
+        "RGWSI_RADOS::Obj::aio_operate" => Some(RGW_RADOS_OBJ_AIO_OPERATE_FIELDS),
+        "RGWSI_RADOS::Obj::operate" => Some(RGW_RADOS_OBJ_OPERATE_FIELDS),
+        "BlockingAioThrottle::get" => Some(AIO_GET_FIELDS),
+        "YieldingAioThrottle::get" => Some(AIO_GET_FIELDS),
         "AtomicObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
         "MultipartObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
         "AppendObjectProcessor::prepare" => Some(PUT_PROCESSOR_PREPARE_FIELDS),
@@ -575,6 +613,7 @@ fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]
         "AppendObjectProcessor::complete" => Some(PUT_PROCESSOR_COMPLETE_FIELDS),
         "RGWRados::Object::Write::write_meta" => Some(RGW_WRITE_META_FIELDS),
         "RGWRados::Object::Write::_do_write_meta" => Some(RGW_WRITE_META_FIELDS),
+        "ManifestObjectProcessor::ManifestObjectProcessor" => Some(MANIFEST_PROCESSOR_CTOR_FIELDS),
         _ => None,
     }
 }
@@ -1768,6 +1807,71 @@ mod tests {
         assert_eq!(writer_write_exclusive.var_fields[0].fields.len(), 1);
         assert_eq!(writer_write_exclusive.var_fields[1].fields.len(), 2);
         assert!(writer_write_exclusive.var_fields[1].fields[1].pointer);
+
+        let writer_set_stripe = module.func2vf.get("RadosWriter::set_stripe_obj").unwrap();
+        assert_eq!(writer_set_stripe.var_fields.len(), 2);
+        assert_eq!(writer_set_stripe.var_fields[0].fields.len(), 1);
+        assert_eq!(writer_set_stripe.var_fields[1].fields.len(), 2);
+        assert!(writer_set_stripe.var_fields[1].fields[1].pointer);
+
+        let aio_operate = module.func2vf.get("RGWSI_RADOS::Obj::aio_operate").unwrap();
+        assert_eq!(aio_operate.var_fields.len(), 1);
+        assert_eq!(aio_operate.var_fields[0].fields.len(), 1);
+
+        let obj_operate = module.func2vf.get("RGWSI_RADOS::Obj::operate").unwrap();
+        assert_eq!(obj_operate.var_fields.len(), 1);
+        assert_eq!(obj_operate.var_fields[0].fields.len(), 1);
+
+        let blocking_get = module.func2vf.get("BlockingAioThrottle::get").unwrap();
+        assert_eq!(blocking_get.var_fields.len(), 1);
+        assert_eq!(blocking_get.var_fields[0].fields.len(), 1);
+
+        let yielding_get = module.func2vf.get("YieldingAioThrottle::get").unwrap();
+        assert_eq!(yielding_get.var_fields.len(), 1);
+        assert_eq!(yielding_get.var_fields[0].fields.len(), 1);
+
+        let manifest_ctor = module
+            .func2vf
+            .get("ManifestObjectProcessor::ManifestObjectProcessor")
+            .unwrap();
+        assert_eq!(manifest_ctor.var_fields.len(), 3);
+        assert_eq!(manifest_ctor.var_fields[0].fields.len(), 1);
+        assert_eq!(manifest_ctor.var_fields[1].fields.len(), 1);
+        assert_eq!(manifest_ctor.var_fields[2].fields.len(), 1);
+
+        let first_chunk = module
+            .func2vf
+            .get("AtomicObjectProcessor::process_first_chunk")
+            .unwrap();
+        assert_eq!(first_chunk.var_fields.len(), 4);
+        assert_eq!(first_chunk.var_fields[0].fields.len(), 1);
+        assert_eq!(first_chunk.var_fields[1].fields.len(), 1);
+        assert_eq!(first_chunk.var_fields[2].fields.len(), 2);
+        assert!(first_chunk.var_fields[2].fields[1].pointer);
+        assert_eq!(first_chunk.var_fields[3].fields.len(), 2);
+        assert!(first_chunk.var_fields[3].fields[1].pointer);
+
+        let prepare = module
+            .func2vf
+            .get("AtomicObjectProcessor::prepare")
+            .unwrap();
+        assert_eq!(prepare.var_fields.len(), 3);
+        assert_eq!(prepare.var_fields[0].fields.len(), 1);
+        assert_eq!(prepare.var_fields[1].fields.len(), 2);
+        assert!(prepare.var_fields[1].fields[1].pointer);
+        assert_eq!(prepare.var_fields[2].fields.len(), 2);
+        assert!(prepare.var_fields[2].fields[1].pointer);
+
+        let complete = module
+            .func2vf
+            .get("AtomicObjectProcessor::complete")
+            .unwrap();
+        assert_eq!(complete.var_fields.len(), 3);
+        assert_eq!(complete.var_fields[0].fields.len(), 1);
+        assert_eq!(complete.var_fields[1].fields.len(), 2);
+        assert!(complete.var_fields[1].fields[1].pointer);
+        assert_eq!(complete.var_fields[2].fields.len(), 2);
+        assert!(complete.var_fields[2].fields[1].pointer);
     }
 
     #[test]
@@ -2122,6 +2226,9 @@ mod tests {
             struct DoutPrefixProvider {
               unsigned long marker;
             };
+            struct Aio {
+              unsigned long marker;
+            };
             class RGWREST {
             public:
               __attribute__((noinline)) void get_handler(ReqState* s);
@@ -2136,10 +2243,49 @@ mod tests {
             };
             class RadosWriter {
               DoutPrefixProvider* dpp;
+              DoutPrefixProvider stripe_obj;
             public:
-              __attribute__((noinline)) explicit RadosWriter(DoutPrefixProvider* dpp) : dpp(dpp) {}
+              __attribute__((noinline)) explicit RadosWriter(DoutPrefixProvider* dpp)
+                : dpp(dpp), stripe_obj{0} {}
               __attribute__((noinline)) int process();
               __attribute__((noinline)) int write_exclusive();
+              __attribute__((noinline)) int set_stripe_obj(DoutPrefixProvider* obj);
+            };
+            namespace RGWSI_RADOS {
+            class Obj {
+            public:
+              volatile unsigned long sink = 0;
+              __attribute__((noinline)) int aio_operate(int* completion, int* op);
+              __attribute__((noinline)) int operate(DoutPrefixProvider const* dpp, int* op);
+            };
+            }
+            namespace rgw {
+            class BlockingAioThrottle {
+            public:
+              volatile unsigned long sink = 0;
+              __attribute__((noinline)) int get(RGWSI_RADOS::Obj& obj, int cost);
+            };
+            class YieldingAioThrottle {
+            public:
+              volatile unsigned long sink = 0;
+              __attribute__((noinline)) int get(RGWSI_RADOS::Obj& obj, int cost);
+            };
+            }
+            class ManifestObjectProcessor {
+            protected:
+              RadosWriter writer;
+              DoutPrefixProvider* dpp;
+              Aio* aio;
+            public:
+              __attribute__((noinline)) ManifestObjectProcessor(Aio* aio, DoutPrefixProvider* dpp);
+              __attribute__((noinline)) int process();
+            };
+            class AtomicObjectProcessor : public ManifestObjectProcessor {
+            public:
+              __attribute__((noinline)) AtomicObjectProcessor(Aio* aio, DoutPrefixProvider* dpp);
+              __attribute__((noinline)) int prepare();
+              __attribute__((noinline)) int process_first_chunk(DoutPrefixProvider* data, RadosWriter** processor);
+              __attribute__((noinline)) int complete();
             };
             __attribute__((noinline)) int process_request(RGWRequest* const req) {
               return req->id;
@@ -2162,29 +2308,87 @@ mod tests {
             __attribute__((noinline)) int rgw_rados_operate(DoutPrefixProvider* dpp, long op) {
               return dpp->marker + op;
             }
+            ManifestObjectProcessor::ManifestObjectProcessor(Aio* aio, DoutPrefixProvider* dpp)
+              : writer(dpp), dpp(dpp), aio(aio) {
+              this->aio->marker += this->dpp->marker;
+            }
+            AtomicObjectProcessor::AtomicObjectProcessor(Aio* aio, DoutPrefixProvider* dpp)
+              : ManifestObjectProcessor(aio, dpp) {}
+            int AtomicObjectProcessor::prepare() {
+              return dpp->marker + writer.process();
+            }
+            int AtomicObjectProcessor::process_first_chunk(DoutPrefixProvider* data, RadosWriter** processor) {
+              *processor = &writer;
+              return data->marker + dpp->marker;
+            }
+            int AtomicObjectProcessor::complete() {
+              return dpp->marker + writer.write_exclusive();
+            }
             int RadosWriter::process() {
               return dpp->marker;
             }
             int RadosWriter::write_exclusive() {
               return dpp->marker + 1;
             }
+            int RadosWriter::set_stripe_obj(DoutPrefixProvider* obj) {
+              stripe_obj = *obj;
+              return stripe_obj.marker;
+            }
+            int ManifestObjectProcessor::process() {
+              return writer.process() + dpp->marker + aio->marker;
+            }
+            int RGWSI_RADOS::Obj::aio_operate(int* completion, int* op) {
+              sink += (unsigned long)completion;
+              sink += (unsigned long)op;
+              return sink;
+            }
+            int RGWSI_RADOS::Obj::operate(DoutPrefixProvider const* dpp, int* op) {
+              sink += dpp->marker;
+              sink += (unsigned long)op;
+              return sink;
+            }
+            int rgw::BlockingAioThrottle::get(RGWSI_RADOS::Obj& obj, int cost) {
+              sink += obj.sink + cost;
+              return sink;
+            }
+            int rgw::YieldingAioThrottle::get(RGWSI_RADOS::Obj& obj, int cost) {
+              sink += obj.sink + cost;
+              return sink;
+            }
             int main() {
               char value = 0;
               RGWRequest request = {42};
               ReqState state = {42, {{&value}, 7}, {{&value}, 12}};
               DoutPrefixProvider dpp = {5};
+              Aio aio = {9};
               Driver driver;
               RGWHandler handler;
               RGWREST rest;
               RGWOp op;
               RadosWriter writer(&dpp);
+              ManifestObjectProcessor processor(&aio, &dpp);
+              AtomicObjectProcessor atomic_processor(&aio, &dpp);
+              RGWSI_RADOS::Obj rados_obj;
+              rgw::BlockingAioThrottle blocking_aio;
+              rgw::YieldingAioThrottle yielding_aio;
+              RadosWriter* next = nullptr;
               unsigned long result = process_request(&request);
               rest.get_handler(&state);
               op.init(&driver, &state, &handler);
               result += rgw_rados_operate(&dpp, 1);
               result += rgw_rados_operate(&dpp, 2L);
+              result += writer.set_stripe_obj(&dpp);
               result += writer.process();
               result += writer.write_exclusive();
+              result += processor.process();
+              result += atomic_processor.prepare();
+              result += atomic_processor.process_first_chunk(&dpp, &next);
+              result += atomic_processor.complete();
+              result += rados_obj.aio_operate((int*)&result, (int*)&value);
+              result += rados_obj.operate(&dpp, (int*)&value);
+              result += blocking_aio.get(rados_obj, 3);
+              result += yielding_aio.get(rados_obj, 4);
+              if (next) result += next->process();
               return result == 0;
             }
             "#,

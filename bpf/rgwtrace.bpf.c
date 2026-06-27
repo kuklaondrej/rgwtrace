@@ -95,6 +95,12 @@ struct pending_data_processor_ctx {
   __u64 dpp;
 };
 
+struct pending_stripe_obj_ctx {
+  __u64 writer;
+  __u64 stripe_obj;
+  struct rgw_request_ctx request;
+};
+
 static struct rados_op_state zero_rados_op = {};
 static struct active_rgw_context_stack zero_active_stack = {};
 
@@ -155,6 +161,13 @@ struct {
 } rados_writers SEC(".maps");
 
 struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, __u64);
+  __type(value, struct rgw_request_ctx);
+  __uint(max_entries, 16384);
+} rgw_rados_objs SEC(".maps");
+
+struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, __u64);
   __type(value, struct objecter_op_ctx);
@@ -174,6 +187,13 @@ struct {
   __type(value, struct pending_data_processor_ctx);
   __uint(max_entries, 8192);
 } pending_data_processors SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, __u32);
+  __type(value, struct pending_stripe_obj_ctx);
+  __uint(max_entries, 8192);
+} pending_stripe_objs SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -365,15 +385,43 @@ static __always_inline int copy_current_active_request_ctx(
 }
 
 static __always_inline struct rgw_request_ctx *
+lookup_current_thread_request(void) {
+  __u32 thread_id = get_tid();
+  return bpf_map_lookup_elem(&rgw_requests, &thread_id);
+}
+
+static __always_inline struct rgw_request_ctx *
+prefer_newer_current_thread_request(struct rgw_request_ctx *request) {
+  if (request == 0)
+    return 0;
+
+  struct rgw_request_ctx *current = lookup_current_thread_request();
+  if (current != 0 && current->start_ns > request->start_ns)
+    return current;
+
+  return request;
+}
+
+static __always_inline int push_current_request_ctx_no_clear(void) {
+  struct rgw_request_ctx *request = lookup_current_thread_request();
+  if (request == 0)
+    return 0;
+
+  push_active_request_ctx(request);
+  return 1;
+}
+
+static __always_inline struct rgw_request_ctx *
 lookup_request_ctx_for_dpp(__u64 dpp) {
   if (dpp != 0) {
     struct rgw_request_ctx *request = bpf_map_lookup_elem(&rgw_ops, &dpp);
     if (request != 0)
-      return request;
+      return prefer_newer_current_thread_request(request);
     request = bpf_map_lookup_elem(&rgw_req_states, &dpp);
     if (request != 0)
-      return request;
-    return bpf_map_lookup_elem(&rgw_dpps, &dpp);
+      return prefer_newer_current_thread_request(request);
+    request = bpf_map_lookup_elem(&rgw_dpps, &dpp);
+    return prefer_newer_current_thread_request(request);
   }
   return 0;
 }
@@ -390,8 +438,7 @@ static __always_inline int cache_writer_context_from_dpp(__u64 writer,
                                                          __u64 dpp) {
   struct rgw_request_ctx *request = lookup_request_ctx_for_dpp(dpp);
   if (request == 0) {
-    __u32 thread_id = get_tid();
-    request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
+    request = lookup_current_thread_request();
   }
   if (request == 0)
     return 0;
@@ -444,7 +491,8 @@ lookup_request_ctx_for_writer_aio(__u64 writer) {
   return lookup_request_ctx_for_dpp(aio);
 }
 
-static __always_inline int push_context_for_writer_no_clear(__u64 writer) {
+static __always_inline struct rgw_request_ctx *
+lookup_request_ctx_for_writer(__u64 writer) {
   struct rgw_request_ctx *request = 0;
   if (writer != 0) {
     request = bpf_map_lookup_elem(&rados_writers, &writer);
@@ -452,9 +500,23 @@ static __always_inline int push_context_for_writer_no_clear(__u64 writer) {
       __u64 processor = writer - RGWTRACE_PUT_PROCESSOR_WRITER_OFFSET;
       request = bpf_map_lookup_elem(&rados_writers, &processor);
     }
-    if (request == 0)
-      request = lookup_request_ctx_for_writer_aio(writer);
   }
+  return prefer_newer_current_thread_request(request);
+}
+
+static __always_inline int push_context_for_rados_obj_no_clear(__u64 obj) {
+  struct rgw_request_ctx *request = 0;
+  if (obj != 0)
+    request = bpf_map_lookup_elem(&rgw_rados_objs, &obj);
+  if (request == 0)
+    return 0;
+  request = prefer_newer_current_thread_request(request);
+  push_active_request_ctx(request);
+  return 1;
+}
+
+static __always_inline int push_context_for_writer_no_clear(__u64 writer) {
+  struct rgw_request_ctx *request = lookup_request_ctx_for_writer(writer);
   if (request == 0)
     return 0;
   cache_writer_for_request(writer, request);
@@ -470,6 +532,37 @@ static __always_inline int cache_writer_from_active_context(__u64 writer) {
     return 0;
   cache_writer_for_request(writer, &active);
   push_active_request_ctx(&active);
+  return 1;
+}
+
+static __always_inline int
+cache_manifest_processor_ctor_context(__u64 processor, __u64 dpp, __u64 aio) {
+  if (processor == 0)
+    return 0;
+
+  struct rgw_request_ctx *request = lookup_request_ctx_for_dpp(dpp);
+  if (request == 0) {
+    request = lookup_current_thread_request();
+  }
+  if (request == 0)
+    return 0;
+
+  if (bpf_map_update_elem(&rados_writers, &processor, request, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+
+  __u64 writer = processor + RGWTRACE_PUT_PROCESSOR_WRITER_OFFSET;
+  if (bpf_map_update_elem(&rados_writers, &writer, request, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+
+  if (dpp != 0 &&
+      bpf_map_update_elem(&rgw_dpps, &dpp, request, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+
+  if (aio != 0 &&
+      bpf_map_update_elem(&rgw_aios, &aio, request, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+
+  push_active_request_ctx(request);
   return 1;
 }
 
@@ -491,6 +584,15 @@ static __always_inline __u64 pointer_member_value(struct pt_regs *ctx,
   __u64 member = 0;
   rgwtrace_probe_read_user(&member, sizeof(member), (void *)member_addr);
   return member;
+}
+
+static __always_inline __u64 member_address(struct pt_regs *ctx, int varid) {
+  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  if (vf == 0)
+    return 0;
+
+  __u64 base = fetch_var_value(ctx, vf);
+  return fetch_var_member_addr(base, vf);
 }
 
 static __always_inline int
@@ -552,8 +654,7 @@ lookup_request_ctx_for_processor_or_dpp(__u64 processor, __u64 dpp) {
   if (request != 0)
     return request;
 
-  __u32 thread_id = get_tid();
-  request = bpf_map_lookup_elem(&rgw_requests, &thread_id);
+  request = lookup_current_thread_request();
   if (request != 0)
     return request;
 
@@ -581,7 +682,8 @@ static __always_inline int cache_embedded_writer_from_processor(__u64 processor)
 static __always_inline int cache_data_processor_output(struct pt_regs *ctx,
                                                        int processor_varid,
                                                        int out_varid,
-                                                       int dpp_varid) {
+                                                       int dpp_varid,
+                                                       int writer_varid) {
   __u64 processor = direct_var_value(ctx, processor_varid);
   __u64 out_processor = direct_var_value(ctx, out_varid);
   __u64 dpp = pointer_member_value(ctx, dpp_varid);
@@ -598,6 +700,10 @@ static __always_inline int cache_data_processor_output(struct pt_regs *ctx,
   if (processor != 0)
     cache_embedded_writer_from_processor(processor);
 
+  __u64 writer = member_address(ctx, writer_varid);
+  if (writer != 0)
+    cache_writer_for_request(writer, request);
+
   if (out_processor == 0)
     return 0;
 
@@ -613,7 +719,8 @@ static __always_inline int cache_data_processor_output(struct pt_regs *ctx,
 
 static __always_inline int cache_processor_context(struct pt_regs *ctx,
                                                    int processor_varid,
-                                                   int dpp_varid) {
+                                                   int dpp_varid,
+                                                   int writer_varid) {
   __u64 processor = direct_var_value(ctx, processor_varid);
   __u64 dpp = pointer_member_value(ctx, dpp_varid);
   struct rgw_request_ctx *request =
@@ -625,7 +732,15 @@ static __always_inline int cache_processor_context(struct pt_regs *ctx,
       bpf_map_update_elem(&rgw_dpps, &dpp, request, 0) != 0)
     count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
 
-  return cache_embedded_writer_for_request(processor, request);
+  int cached = cache_embedded_writer_for_request(processor, request);
+  __u64 writer = member_address(ctx, writer_varid);
+  if (writer != 0) {
+    cache_writer_for_request(writer, request);
+    if (cached == 0)
+      push_active_request_ctx(request);
+    cached = 1;
+  }
+  return cached;
 }
 
 static __always_inline void emit_request_event(__u32 type,
@@ -791,17 +906,28 @@ int uprobe_rados_writer_ctor(struct pt_regs *ctx) {
 }
 
 SEC("uprobe")
+int uprobe_manifest_processor_ctor(struct pt_regs *ctx) {
+  count_diag(RGWTRACE_DIAG_RADOS_WRITER_CTOR_HITS);
+  __u64 processor = direct_var_value(ctx, 200);
+  __u64 dpp = direct_var_value(ctx, 201);
+  __u64 aio = direct_var_value(ctx, 202);
+  if (cache_manifest_processor_ctor_context(processor, dpp, aio) != 0)
+    count_diag(RGWTRACE_DIAG_RADOS_WRITER_CTOR_CONTEXTS);
+  return 0;
+}
+
+SEC("uprobe")
 int uprobe_put_processor_prepare(struct pt_regs *ctx) {
   count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_HITS);
-  if (cache_embedded_writer_from_processor(direct_var_value(ctx, 110)) != 0) {
+  if (cache_processor_context(ctx, 110, 111, 112) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_embedded_writer_from_processor(direct_var_value(ctx, 111)) != 0) {
+  if (cache_processor_context(ctx, 114, 115, 116) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_embedded_writer_from_processor(direct_var_value(ctx, 112)) != 0) {
+  if (cache_processor_context(ctx, 117, 118, 119) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
@@ -811,15 +937,15 @@ int uprobe_put_processor_prepare(struct pt_regs *ctx) {
 SEC("uprobe")
 int uprobe_put_processor_process_first_chunk(struct pt_regs *ctx) {
   count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_HITS);
-  if (cache_data_processor_output(ctx, 120, 121, 122) != 0) {
+  if (cache_data_processor_output(ctx, 120, 121, 122, 123) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_data_processor_output(ctx, 130, 131, 132) != 0) {
+  if (cache_data_processor_output(ctx, 130, 131, 132, 133) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_data_processor_output(ctx, 140, 141, 142) != 0)
+  if (cache_data_processor_output(ctx, 140, 141, 142, 143) != 0)
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
   return 0;
 }
@@ -827,16 +953,63 @@ int uprobe_put_processor_process_first_chunk(struct pt_regs *ctx) {
 SEC("uprobe")
 int uprobe_put_processor_complete(struct pt_regs *ctx) {
   count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_HITS);
-  if (cache_processor_context(ctx, 160, 161) != 0) {
+  if (cache_processor_context(ctx, 160, 161, 162) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_processor_context(ctx, 170, 171) != 0) {
+  if (cache_processor_context(ctx, 170, 171, 172) != 0) {
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
     return 0;
   }
-  if (cache_processor_context(ctx, 180, 181) != 0)
+  if (cache_processor_context(ctx, 180, 181, 182) != 0)
     count_diag(RGWTRACE_DIAG_PUT_PROCESSOR_PREPARE_CONTEXTS);
+  return 0;
+}
+
+SEC("uprobe")
+int uprobe_rados_writer_set_stripe_obj(struct pt_regs *ctx) {
+  __u64 writer = direct_var_value(ctx, 210);
+  __u64 stripe_obj = member_address(ctx, 211);
+  if (writer == 0 || stripe_obj == 0)
+    return 0;
+
+  struct pending_stripe_obj_ctx pending = {};
+  pending.writer = writer;
+  pending.stripe_obj = stripe_obj;
+
+  struct rgw_request_ctx *request = lookup_request_ctx_for_writer(writer);
+  if (request != 0) {
+    copy_request_ctx(&pending.request, request);
+  } else if (copy_current_active_request_ctx(&pending.request, false) == 0) {
+    request = lookup_current_thread_request();
+    if (request == 0)
+      return 0;
+    copy_request_ctx(&pending.request, request);
+  }
+
+  cache_writer_for_request(writer, &pending.request);
+  push_active_request_ctx(&pending.request);
+
+  __u32 thread_id = get_tid();
+  if (bpf_map_update_elem(&pending_stripe_objs, &thread_id, &pending, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+  return 0;
+}
+
+SEC("uretprobe")
+int uretprobe_rados_writer_set_stripe_obj(struct pt_regs *ctx) {
+  __u32 thread_id = get_tid();
+  struct pending_stripe_obj_ctx *pending =
+      bpf_map_lookup_elem(&pending_stripe_objs, &thread_id);
+  if (pending == 0)
+    return 0;
+
+  if (pending->stripe_obj != 0 &&
+      bpf_map_update_elem(&rgw_rados_objs, &pending->stripe_obj,
+                          &pending->request, 0) != 0)
+    count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+  push_active_request_ctx(&pending->request);
+  bpf_map_delete_elem(&pending_stripe_objs, &thread_id);
   return 0;
 }
 
@@ -911,6 +1084,16 @@ int uprobe_rgw_rados_operate(struct pt_regs *ctx) {
     count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
     return 0;
   }
+  struct rgw_request_ctx active = {};
+  if (copy_current_active_request_ctx(&active, false) != 0) {
+    push_active_request_ctx(&active);
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_current_request_ctx_no_clear() != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
   clear_active_request_ctx();
   return 0;
 }
@@ -923,6 +1106,16 @@ int uprobe_rgw_write_meta(struct pt_regs *ctx) {
     return 0;
   }
   if (push_context_for_dpp_no_clear(direct_var_value(ctx, 191)) != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_WRITE_META_CONTEXTS);
+    return 0;
+  }
+  struct rgw_request_ctx active = {};
+  if (copy_current_active_request_ctx(&active, false) != 0) {
+    push_active_request_ctx(&active);
+    count_diag(RGWTRACE_DIAG_RGW_WRITE_META_CONTEXTS);
+    return 0;
+  }
+  if (push_current_request_ctx_no_clear() != 0) {
     count_diag(RGWTRACE_DIAG_RGW_WRITE_META_CONTEXTS);
     return 0;
   }
@@ -972,6 +1165,73 @@ int uprobe_rados_writer_write_exclusive(struct pt_regs *ctx) {
   return 0;
 }
 
+SEC("uprobe")
+int uprobe_rgw_rados_obj_aio_operate(struct pt_regs *ctx) {
+  __u64 obj = direct_var_value(ctx, 220);
+  struct rgw_request_ctx *request = 0;
+  if (obj != 0)
+    request = bpf_map_lookup_elem(&rgw_rados_objs, &obj);
+  if (request == 0) {
+    obj = direct_var_value(ctx, 221);
+    if (obj != 0)
+      request = bpf_map_lookup_elem(&rgw_rados_objs, &obj);
+  }
+  if (request == 0)
+    return 0;
+
+  push_active_request_ctx(request);
+  return 0;
+}
+
+SEC("uprobe")
+int uprobe_rgw_rados_obj_operate(struct pt_regs *ctx) {
+  if (push_context_for_dpp_no_clear(direct_var_value(ctx, 240)) != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_context_for_dpp_no_clear(direct_var_value(ctx, 241)) != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_context_for_dpp_no_clear(direct_var_value(ctx, 242)) != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_context_for_dpp_no_clear(direct_var_value(ctx, 243)) != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_current_request_ctx_no_clear() != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  return 0;
+}
+
+SEC("uprobe")
+int uprobe_aio_get(struct pt_regs *ctx) {
+  if (push_context_for_rados_obj_no_clear(direct_var_value(ctx, 230)) != 0)
+    return 0;
+  if (push_context_for_rados_obj_no_clear(direct_var_value(ctx, 231)) != 0)
+    return 0;
+  return 0;
+}
+
+SEC("uprobe")
+int uprobe_librados_operate(struct pt_regs *ctx) {
+  struct rgw_request_ctx active = {};
+  if (copy_current_active_request_ctx(&active, false) != 0) {
+    push_active_request_ctx(&active);
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  if (push_current_request_ctx_no_clear() != 0) {
+    count_diag(RGWTRACE_DIAG_RGW_RADOS_OPERATE_CONTEXTS);
+    return 0;
+  }
+  return 0;
+}
+
 SEC("uretprobe")
 int uretprobe_rgw_rados_scope(struct pt_regs *ctx) {
   pop_active_request_ctx();
@@ -990,9 +1250,7 @@ int uprobe_objecter_op_submit(struct pt_regs *ctx) {
   struct objecter_op_ctx op_ctx = {};
   op_ctx.source = RGWTRACE_CORRELATION_OP_SUBMIT_CONTEXT;
   if (copy_current_active_request_ctx(&op_ctx.request, false) == 0) {
-    __u32 thread_id = get_tid();
-    struct rgw_request_ctx *request =
-        bpf_map_lookup_elem(&rgw_requests, &thread_id);
+    struct rgw_request_ctx *request = lookup_current_thread_request();
     if (request == 0) {
       count_diag(RGWTRACE_DIAG_OBJECTER_OP_SUBMIT_MISSES);
       return 0;
