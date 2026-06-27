@@ -308,7 +308,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
             func2pc.entry(function).or_insert(pc);
         }
     }
-    let func2vf = function_var_fields(&dwarf, wanted)?;
+    let func2vf = function_var_fields(&dwarf, debug_file.architecture(), wanted)?;
 
     Ok(DwarfModule {
         build_id,
@@ -375,6 +375,7 @@ fn function_pcs<R: Reader>(dwarf: &Dwarf<R>, wanted: &[&str]) -> Result<BTreeMap
 
 fn function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
+    arch: Architecture,
     wanted: &[&str],
 ) -> Result<BTreeMap<String, FunctionVarFields>> {
     let mut result = BTreeMap::new();
@@ -383,7 +384,15 @@ fn function_var_fields<R: Reader>(
         let unit = dwarf.unit(header)?;
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        collect_function_var_fields(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
+        collect_function_var_fields(
+            dwarf,
+            &unit,
+            root,
+            &mut Vec::new(),
+            &mut result,
+            arch,
+            wanted,
+        )?;
         if can_stop_function_search(&result, wanted) {
             break;
         }
@@ -397,6 +406,7 @@ fn collect_function_var_fields<R: Reader>(
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
+    arch: Architecture,
     wanted: &[&str],
 ) -> Result<()> {
     if can_stop_function_search(result, wanted) {
@@ -416,7 +426,7 @@ fn collect_function_var_fields<R: Reader>(
             };
             if let Some(paths) = probe_field_paths(&canonical_name) {
                 if let Some(fields) =
-                    probe_function_var_fields(dwarf, unit, entry, &canonical_name, paths)?
+                    probe_function_var_fields(dwarf, unit, entry, &canonical_name, paths, arch)?
                 {
                     insert_function_var_fields(result, canonical_name, fields);
                 }
@@ -430,7 +440,7 @@ fn collect_function_var_fields<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_var_fields(dwarf, unit, child, scopes, result, wanted)?;
+        collect_function_var_fields(dwarf, unit, child, scopes, result, arch, wanted)?;
         if can_stop_function_search(result, wanted) {
             break;
         }
@@ -466,6 +476,7 @@ fn probe_function_var_fields<R: Reader>(
     function: &DebuggingInformationEntry<R>,
     function_name: &str,
     paths: &[&[&str]],
+    arch: Architecture,
 ) -> Result<Option<FunctionVarFields>> {
     let Some(pc) = entry_pc(dwarf, unit, function)? else {
         debug!(
@@ -492,7 +503,13 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
-        let Some(location) = variable_location(dwarf, unit, function, &variable, pc)? else {
+        let location =
+            variable_location(dwarf, unit, function, &variable.entry, pc)?.or_else(|| {
+                variable
+                    .parameter_index
+                    .and_then(|index| abi_parameter_location(arch, index))
+            });
+        let Some(location) = location else {
             debug!(
                 function = function_name,
                 variable = *variable_name,
@@ -500,7 +517,7 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
-        let Some(fields) = translate_field_path(dwarf, unit, &variable, path)? else {
+        let Some(fields) = translate_field_path(dwarf, unit, &variable.entry, path)? else {
             debug!(
                 function = function_name,
                 path = path.join("."),
@@ -512,6 +529,20 @@ fn probe_function_var_fields<R: Reader>(
     }
 
     Ok(Some(FunctionVarFields { var_fields }))
+}
+
+fn abi_parameter_location(arch: Architecture, parameter_index: usize) -> Option<VarLocationJson> {
+    let reg = match arch {
+        Architecture::X86_64 => [5, 4, 1, 2, 8, 9].get(parameter_index).copied()?,
+        Architecture::Aarch64 => i32::try_from(parameter_index).ok().filter(|reg| *reg < 8)?,
+        _ => return None,
+    };
+
+    Some(VarLocationJson {
+        reg,
+        offset: 0,
+        stack: false,
+    })
 }
 
 fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]]> {
@@ -1081,28 +1112,28 @@ fn find_child_entry_by_name<'unit, R: Reader>(
     Ok(None)
 }
 
+struct FunctionVariable<'unit, R: Reader> {
+    entry: DebuggingInformationEntry<'unit, 'unit, R>,
+    parameter_index: Option<usize>,
+}
+
 fn find_function_variable<'unit, R: Reader>(
     dwarf: &Dwarf<R>,
     unit: &'unit gimli::Unit<R>,
     function: &DebuggingInformationEntry<R>,
     name: &str,
-) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
-    let variable_tags = &[gimli::DW_TAG_formal_parameter, gimli::DW_TAG_variable];
-    if let Some(variable) =
-        find_child_entry_by_name(dwarf, unit, function.offset(), variable_tags, name)?
-    {
+) -> Result<Option<FunctionVariable<'unit, R>>> {
+    if let Some(variable) = find_function_child_variable(dwarf, unit, function.offset(), name)? {
         return Ok(Some(variable));
     }
 
     if let Some(origin) = referenced_entry(unit, function, gimli::DW_AT_abstract_origin)? {
-        if let Some(variable) =
-            find_child_entry_by_name(dwarf, unit, origin.offset(), variable_tags, name)?
-        {
+        if let Some(variable) = find_function_child_variable(dwarf, unit, origin.offset(), name)? {
             return Ok(Some(variable));
         }
         if let Some(specification) = referenced_entry(unit, &origin, gimli::DW_AT_specification)? {
             if let Some(variable) =
-                find_child_entry_by_name(dwarf, unit, specification.offset(), variable_tags, name)?
+                find_function_child_variable(dwarf, unit, specification.offset(), name)?
             {
                 return Ok(Some(variable));
             }
@@ -1111,7 +1142,7 @@ fn find_function_variable<'unit, R: Reader>(
 
     if let Some(specification) = referenced_entry(unit, function, gimli::DW_AT_specification)? {
         if let Some(variable) =
-            find_child_entry_by_name(dwarf, unit, specification.offset(), variable_tags, name)?
+            find_function_child_variable(dwarf, unit, specification.offset(), name)?
         {
             return Ok(Some(variable));
         }
@@ -1120,11 +1151,55 @@ fn find_function_variable<'unit, R: Reader>(
     Ok(None)
 }
 
+fn find_function_child_variable<'unit, R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &'unit gimli::Unit<R>,
+    parent_offset: gimli::UnitOffset<R::Offset>,
+    name: &str,
+) -> Result<Option<FunctionVariable<'unit, R>>> {
+    let mut parameter_index = 0;
+    let mut tree = unit.entries_tree(Some(parent_offset))?;
+    let root = tree.root()?;
+    let mut children = root.children();
+    while let Some(child) = children.next()? {
+        let entry = child.entry();
+        let index = match entry.tag() {
+            gimli::DW_TAG_formal_parameter => {
+                let index = Some(parameter_index);
+                parameter_index += 1;
+                index
+            }
+            gimli::DW_TAG_variable => None,
+            _ => continue,
+        };
+        if die_name(dwarf, unit, entry)?.as_deref() == Some(name) {
+            return Ok(Some(FunctionVariable {
+                entry: unit.entry(entry.offset())?,
+                parameter_index: index,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn die_type<'unit, R: Reader>(
     unit: &'unit gimli::Unit<R>,
     entry: &DebuggingInformationEntry<R>,
 ) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
-    referenced_entry(unit, entry, gimli::DW_AT_type)
+    if let Some(typedie) = referenced_entry(unit, entry, gimli::DW_AT_type)? {
+        return Ok(Some(typedie));
+    }
+    if let Some(origin) = referenced_entry(unit, entry, gimli::DW_AT_abstract_origin)? {
+        if let Some(typedie) = die_type(unit, &origin)? {
+            return Ok(Some(typedie));
+        }
+    }
+    if let Some(specification) = referenced_entry(unit, entry, gimli::DW_AT_specification)? {
+        if let Some(typedie) = die_type(unit, &specification)? {
+            return Ok(Some(typedie));
+        }
+    }
+    Ok(None)
 }
 
 fn member_offset<R: Reader>(
