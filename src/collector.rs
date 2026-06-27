@@ -261,20 +261,24 @@ impl Collector {
     fn inferred_request_key(&self, rados: &RadosEvent) -> InferenceMatch {
         if rados.send_tid != 0 {
             let same_thread_match =
-                unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
+                nearest_inference_match(self.requests.iter().filter_map(|(key, builder)| {
                     let request = builder.request.as_ref()?;
-                    (request.tid == rados.send_tid
-                        && inferred_candidate(request, rados, self.inference_window_ns))
-                    .then(|| key.clone())
+                    (request.tid == rados.send_tid)
+                        .then(|| {
+                            inference_candidate_distance(request, rados, self.inference_window_ns)
+                                .map(|distance| (key.clone(), distance))
+                        })
+                        .flatten()
                 }));
             if same_thread_match != InferenceMatch::NoCandidate {
                 return same_thread_match;
             }
         }
 
-        unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
+        nearest_inference_match(self.requests.iter().filter_map(|(key, builder)| {
             let request = builder.request.as_ref()?;
-            inferred_candidate(request, rados, self.inference_window_ns).then(|| key.clone())
+            inference_candidate_distance(request, rados, self.inference_window_ns)
+                .map(|distance| (key.clone(), distance))
         }))
     }
 
@@ -485,14 +489,25 @@ impl Collector {
     }
 }
 
-fn unique_inference_match(mut candidates: impl Iterator<Item = String>) -> InferenceMatch {
-    let Some(candidate) = candidates.next() else {
+fn nearest_inference_match(mut candidates: impl Iterator<Item = (String, u64)>) -> InferenceMatch {
+    let Some((mut best_key, mut best_distance)) = candidates.next() else {
         return InferenceMatch::NoCandidate;
     };
-    if candidates.next().is_some() {
-        return InferenceMatch::Ambiguous;
+    let mut ambiguous = false;
+    for (key, distance) in candidates {
+        if distance < best_distance {
+            best_key = key;
+            best_distance = distance;
+            ambiguous = false;
+        } else if distance == best_distance {
+            ambiguous = true;
+        }
     }
-    InferenceMatch::Match(candidate)
+    if ambiguous {
+        InferenceMatch::Ambiguous
+    } else {
+        InferenceMatch::Match(best_key)
+    }
 }
 
 fn rados_event_time_ns(rados: &RadosEvent) -> u64 {
@@ -807,15 +822,26 @@ fn background_reason_for_role(role: RadosRole) -> BackgroundReason {
     }
 }
 
-fn inferred_candidate(request: &RequestEvent, rados: &RadosEvent, window_ns: u64) -> bool {
+fn inference_candidate_distance(
+    request: &RequestEvent,
+    rados: &RadosEvent,
+    window_ns: u64,
+) -> Option<u64> {
     if request.pid != rados.pid {
-        return false;
+        return None;
     }
     let request_start = request.start_ns.min(request.end_ns);
     let request_end = request.end_ns.max(request.start_ns);
     let rados_start = rados.sent_ns.min(rados.finish_ns);
     let rados_end = rados.finish_ns.max(rados.sent_ns);
-    rados_end >= request_start && rados_start <= request_end.saturating_add(window_ns)
+    if rados_end < request_start || rados_start > request_end.saturating_add(window_ns) {
+        return None;
+    }
+    if rados_start <= request_end && rados_end >= request_start {
+        Some(0)
+    } else {
+        Some(rados_start.saturating_sub(request_end))
+    }
 }
 
 fn inferable_rados_role(role: RadosRole) -> bool {
@@ -1447,6 +1473,34 @@ mod tests {
             .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
             .expect("expected parent request span");
         assert_eq!(string_attribute(parent, "rgw.trans_id"), Some("tx2"));
+    }
+
+    #[test]
+    fn nearest_inference_candidate_wins_over_older_window_match() {
+        let mut collector = Collector::with_inferred_correlation(100);
+        collector.push(TraceEvent::RequestEnd(request("tx-older", 1, 30)));
+        collector.push(TraceEvent::RequestEnd(request("tx-nearest", 50, 60)));
+        let mut event = rados("object", "");
+        event.sent_ns = 64;
+        event.finish_ns = 70;
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.inferred_correlations, 1);
+        assert_eq!(document.diagnostics.inference_ambiguous_rados_ops, 0);
+        let rados = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("expected inferred rados child span");
+        let parent = document
+            .spans
+            .iter()
+            .find(|span| Some(span.span_id.as_str()) == rados.parent_span_id.as_deref())
+            .expect("expected parent request span");
+        assert_eq!(string_attribute(parent, "rgw.trans_id"), Some("tx-nearest"));
     }
 
     #[test]

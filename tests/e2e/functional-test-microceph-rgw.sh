@@ -427,6 +427,7 @@ start_trace() {
         --pid "${rgw_pid}" \
         --timeout "${TRACE_SECONDS}" \
         --output json \
+        --correlate-inferred \
         --service-name rgwtrace-e2e \
         >"${TRACE_JSON}" 2>"${TRACE_LOG}" &
     TRACE_PID=$!
