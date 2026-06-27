@@ -1,0 +1,24 @@
+tests/e2e/functional-test-microceph-rgw.sh
+  s_47f3a4fd57c70a::t_0fd93922ce02c6 430
+src/collector.rs
+  s_47f3a4fd57c70a::t_80954ffd7fe8ca 268-269
+  s_47f3a4fd57c70a::t_8fc693f2532041 1479-1503
+  s_47f3a4fd57c70a::t_50f63b7c2c2e5c 264,266-267,270-271,278,280-281,492-493,496-509,825-829,831,837-844,1504
+  s_47f3a4fd57c70a::t_f2380a677939bc 1478,1505
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "15ab73de585f8dfc543c17e74a34bb056cab7fb1",
+  "prompts": {},
+  "sessions": {
+    "s_47f3a4fd57c70a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ef9c4-cee3-7601-a6d5-e0664115827a",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
