@@ -929,13 +929,24 @@ fn variable_location<R: Reader>(
     let Some(mut locations) = dwarf.attr_locations(unit, attr.value())? else {
         return Ok(None);
     };
+    // GCC can start parameter location-list ranges after the first instruction.
+    // For entry uprobes, only register-only fallbacks are safe before prologue.
+    let mut entry_register_location = None;
     while let Some(location) = locations.next()? {
+        let decoded = decode_location_expression(unit, frame_base.clone(), location.data)?;
         if pc >= location.range.begin && pc < location.range.end {
-            return decode_location_expression(unit, frame_base, location.data);
+            return Ok(decoded);
+        }
+        if entry_register_location.is_none() {
+            if let Some(decoded) = decoded {
+                if !decoded.stack {
+                    entry_register_location = Some(decoded);
+                }
+            }
         }
     }
 
-    Ok(None)
+    Ok(entry_register_location)
 }
 
 fn decode_location_expression<R: Reader>(
