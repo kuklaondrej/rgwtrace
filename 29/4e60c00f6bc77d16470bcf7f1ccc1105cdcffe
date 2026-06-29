@@ -1,0 +1,23 @@
+bpf/rgwtrace.bpf.c
+  s_eabead4b3f2d8f::t_531368cee99bf1 916,920,924
+tests/bpf_source.rs
+  s_eabead4b3f2d8f::t_3993329ca3004b 104
+  s_eabead4b3f2d8f::t_228804511635c8 54,68,70,141-143
+  s_eabead4b3f2d8f::t_a4469c2b3c319e 157
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "294e60c00f6bc77d16470bcf7f1ccc1105cdcffe",
+  "prompts": {},
+  "sessions": {
+    "s_eabead4b3f2d8f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f0a0e-f46b-7e21-a775-79d8b9b415eb",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
