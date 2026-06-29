@@ -75,6 +75,13 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   if (vf == 0 || cur_addr == 0)
     return 0;
 
+  int raw_size = vf->size;
+  __u32 size = 0;
+  if (raw_size > 0)
+    size = raw_size;
+  if (size > 10)
+    size = 10;
+
   __u64 tmpaddr = 0;
   if (vf->varloc.stack) {
     cur_addr += vf->varloc.offset;
@@ -86,16 +93,28 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
 
   cur_addr += vf->fields[1].offset;
 
-  for (int i = 2; i < 10; i++) {
-    if (i >= vf->size)
-      break;
-    if (vf->fields[i].pointer) {
-      rgwtrace_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);
-      cur_addr = tmpaddr + vf->fields[i].offset;
-    } else {
-      cur_addr += vf->fields[i].offset;
-    }
-  }
+#define RGWTRACE_APPLY_VAR_FIELD(IDX)                                         \
+  do {                                                                        \
+    if (size <= (IDX))                                                        \
+      return cur_addr;                                                        \
+    if (vf->fields[IDX].pointer) {                                            \
+      rgwtrace_probe_read_user(&tmpaddr, sizeof(tmpaddr), (void *)cur_addr);  \
+      cur_addr = tmpaddr + vf->fields[IDX].offset;                            \
+    } else {                                                                  \
+      cur_addr += vf->fields[IDX].offset;                                     \
+    }                                                                         \
+  } while (0)
+
+  RGWTRACE_APPLY_VAR_FIELD(2);
+  RGWTRACE_APPLY_VAR_FIELD(3);
+  RGWTRACE_APPLY_VAR_FIELD(4);
+  RGWTRACE_APPLY_VAR_FIELD(5);
+  RGWTRACE_APPLY_VAR_FIELD(6);
+  RGWTRACE_APPLY_VAR_FIELD(7);
+  RGWTRACE_APPLY_VAR_FIELD(8);
+  RGWTRACE_APPLY_VAR_FIELD(9);
+
+#undef RGWTRACE_APPLY_VAR_FIELD
 
   return cur_addr;
 }
