@@ -1,0 +1,23 @@
+src/dwarf_json.rs
+  s_eabead4b3f2d8f::t_c8c02ea37bef3f 1-5,164,170-173,177,196-217,286-287,294-295,308-325,327-329,332
+  s_eabead4b3f2d8f::t_94ea20ffcbeab8 421-529
+  s_eabead4b3f2d8f::t_8019c101fca4db 420
+tests/cli_dry_run.rs
+  s_eabead4b3f2d8f::t_e10f6ba82aaea7 32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "9bc93fb6039072012d486a2485570cfea103bb96",
+  "prompts": {},
+  "sessions": {
+    "s_eabead4b3f2d8f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f0a0e-f46b-7e21-a775-79d8b9b415eb",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
