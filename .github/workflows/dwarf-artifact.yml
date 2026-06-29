@@ -1,0 +1,67 @@
+name: DWARF Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      ubuntu_version:
+        description: Ubuntu version for the export container
+        default: "22.04"
+        required: true
+      ceph_version:
+        description: Exact upstream Ceph version
+        default: "19.2.4"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-ceph-dwarf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ARTIFACTS_DIR: dwarf-artifacts
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        env:
+          UBUNTU_VERSION: ${{ inputs.ubuntu_version }}
+          CEPH_VERSION: ${{ inputs.ceph_version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${UBUNTU_VERSION}" =~ ^[0-9]{2}\.[0-9]{2}$ ]]; then
+            printf 'ubuntu_version must match NN.NN, got %s\n' "${UBUNTU_VERSION}" >&2
+            exit 1
+          fi
+          if [[ ! "${CEPH_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'ceph_version must match X.Y.Z, got %s\n' "${CEPH_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Export upstream Ceph DWARF JSON
+        env:
+          UBUNTU_VERSION: ${{ inputs.ubuntu_version }}
+          CEPH_VERSION: ${{ inputs.ceph_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${ARTIFACTS_DIR}"
+          docker pull --platform linux/amd64 "ubuntu:${UBUNTU_VERSION}"
+          docker run --rm \
+            --platform linux/amd64 \
+            -e CEPH_VERSION="${CEPH_VERSION}" \
+            -e ARTIFACT_DIR=/artifacts \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${GITHUB_WORKSPACE}/${ARTIFACTS_DIR}:/artifacts" \
+            -w /workspace \
+            "ubuntu:${UBUNTU_VERSION}" \
+            bash /workspace/scripts/export-upstream-ceph-dwarf.sh
+
+      - name: Upload DWARF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rgwtrace-dwarf-ubuntu-${{ inputs.ubuntu_version }}-ceph-${{ inputs.ceph_version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.ARTIFACTS_DIR }}/
+          retention-days: 14
+          if-no-files-found: warn
