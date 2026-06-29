@@ -1068,7 +1068,11 @@ fn attr_string_value<R: Reader>(
     if !is_string_attribute_value(&value) {
         return Ok(None);
     }
-    let string = dwarf.attr_string(unit, value)?;
+    let string = match dwarf.attr_string(unit, value) {
+        Ok(string) => string,
+        Err(gimli::Error::ExpectedStringAttributeValue) => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     Ok(Some(string.to_string_lossy()?.into_owned()))
 }
 
