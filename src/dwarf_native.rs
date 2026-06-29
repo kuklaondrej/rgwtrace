@@ -1043,8 +1043,7 @@ fn die_name<R: Reader>(
     let Some(attr) = entry.attr(gimli::DW_AT_name)? else {
         return Ok(None);
     };
-    let name = dwarf.attr_string(unit, attr.value())?;
-    Ok(Some(name.to_string_lossy()?.into_owned()))
+    attr_string_value(dwarf, unit, attr.value())
 }
 
 fn linkage_name<R: Reader>(
@@ -1058,8 +1057,30 @@ fn linkage_name<R: Reader>(
     else {
         return Ok(None);
     };
-    let name = dwarf.attr_string(unit, attr.value())?;
-    Ok(Some(name.to_string_lossy()?.into_owned()))
+    attr_string_value(dwarf, unit, attr.value())
+}
+
+fn attr_string_value<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    value: AttributeValue<R>,
+) -> Result<Option<String>> {
+    if !is_string_attribute_value(&value) {
+        return Ok(None);
+    }
+    let string = dwarf.attr_string(unit, value)?;
+    Ok(Some(string.to_string_lossy()?.into_owned()))
+}
+
+fn is_string_attribute_value<R: Reader>(value: &AttributeValue<R>) -> bool {
+    matches!(
+        value,
+        AttributeValue::String(_)
+            | AttributeValue::DebugStrRef(_)
+            | AttributeValue::DebugStrRefSup(_)
+            | AttributeValue::DebugLineStrRef(_)
+            | AttributeValue::DebugStrOffsetsIndex(_)
+    )
 }
 
 fn demangle_function_name(linkage_name: &str) -> Option<String> {
@@ -1327,6 +1348,16 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             "/tmp/root/usr/lib/debug/.build-id/ab/cdef.debug"
         )));
+    }
+
+    #[test]
+    fn string_attribute_classifier_rejects_non_string_forms() {
+        let string = EndianSlice::new(b"name", RunTimeEndian::Little);
+
+        assert!(is_string_attribute_value(&AttributeValue::String(string)));
+        assert!(!is_string_attribute_value(&AttributeValue::<
+            EndianSlice<'_, RunTimeEndian>,
+        >::Data1(1)));
     }
 
     #[test]
