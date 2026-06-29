@@ -247,8 +247,11 @@ run_preflight() {
         --preflight \
         --output json \
         >"${PREFLIGHT_JSON}" 2>"${PREFLIGHT_LOG}"; then
-        err "DWARF preflight failed; see ${PREFLIGHT_LOG} and ${PREFLIGHT_JSON}"
-        exit 1
+        err "DWARF preflight failed; continuing so the exported JSON can be tested"
+        if [[ ! -s "${PREFLIGHT_JSON}" ]]; then
+            printf '{"ok":false,"error":"DWARF preflight failed; see preflight.log"}\n' \
+                >"${PREFLIGHT_JSON}"
+        fi
     fi
 }
 
@@ -274,8 +277,9 @@ sudo rgwtrace \\
   --import-json /path/to/native-dwarf.json \\
   --output json
 
-Build IDs are recorded in preflight.json. Do not use this artifact with
-different Ceph/RGW binaries unless the build ID mismatch is understood.
+If preflight.json reports "ok": false, the artifact was still uploaded for
+manual testing. Do not use this artifact with different Ceph/RGW binaries
+unless the build ID mismatch is understood.
 EOF
 }
 
