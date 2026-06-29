@@ -566,15 +566,14 @@ cache_manifest_processor_ctor_context(__u64 processor, __u64 dpp, __u64 aio) {
   return 1;
 }
 
-static __always_inline __u64 direct_var_value(struct pt_regs *ctx, int varid) {
+static __noinline __u64 direct_var_value(struct pt_regs *ctx, int varid) {
   struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
   if (vf == 0)
     return 0;
   return fetch_var_value(ctx, vf);
 }
 
-static __always_inline __u64 pointer_member_value(struct pt_regs *ctx,
-                                                  int varid) {
+static __noinline __u64 pointer_member_value(struct pt_regs *ctx, int varid) {
   struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
   if (vf == 0)
     return 0;
@@ -586,7 +585,7 @@ static __always_inline __u64 pointer_member_value(struct pt_regs *ctx,
   return member;
 }
 
-static __always_inline __u64 member_address(struct pt_regs *ctx, int varid) {
+static __noinline __u64 member_address(struct pt_regs *ctx, int varid) {
   struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
   if (vf == 0)
     return 0;

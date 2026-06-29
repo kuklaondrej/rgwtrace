@@ -29,6 +29,8 @@ fn bpf_records_drop_and_probe_read_diagnostics() {
 
 #[test]
 fn varfield_member_addr_uses_fixed_field_offsets() {
+    assert!(BPF_UTILS.contains("static __noinline __u64 fetch_var_member_addr"));
+    assert!(BPF_UTILS.contains("static __noinline __u64 fetch_var_value"));
     assert!(BPF_UTILS.contains("int raw_size = vf->size;"));
     assert!(BPF_UTILS.contains("if (raw_size > 0)"));
     assert!(BPF_UTILS.contains("if (size > 10)"));
@@ -40,6 +42,13 @@ fn varfield_member_addr_uses_fixed_field_offsets() {
     for idx in 2..=9 {
         assert!(BPF_UTILS.contains(&format!("RGWTRACE_APPLY_VAR_FIELD({idx})")));
     }
+}
+
+#[test]
+fn varfield_accessors_are_bpf_subprograms() {
+    assert!(RGWTRACE_BPF.contains("static __noinline __u64 direct_var_value"));
+    assert!(RGWTRACE_BPF.contains("static __noinline __u64 pointer_member_value"));
+    assert!(RGWTRACE_BPF.contains("static __noinline __u64 member_address"));
 }
 
 #[test]

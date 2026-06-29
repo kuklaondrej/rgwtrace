@@ -70,8 +70,8 @@ static __noinline __u64 fetch_register(const struct pt_regs *const ctx, int reg)
   return 0;
 }
 
-static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
-                                                   struct VarField *vf) {
+static __noinline __u64 fetch_var_member_addr(__u64 cur_addr,
+                                              struct VarField *vf) {
   if (vf == 0 || cur_addr == 0)
     return 0;
 
@@ -119,8 +119,8 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   return cur_addr;
 }
 
-static __always_inline __u64 fetch_var_value(const struct pt_regs *const ctx,
-                                             struct VarField *vf) {
+static __noinline __u64 fetch_var_value(const struct pt_regs *const ctx,
+                                        struct VarField *vf) {
   if (vf == 0)
     return 0;
 
