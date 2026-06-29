@@ -8,8 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use gimli::{
-    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, EntriesTreeNode, Operation,
-    Reader, RunTimeEndian,
+    AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Dwarf, EndianSlice,
+    EntriesTreeNode, Operation, Reader, RunTimeEndian, UnitOffset,
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::debug;
@@ -370,6 +370,75 @@ fn can_stop_function_search<T>(result: &BTreeMap<String, T>, wanted: &[&str]) ->
     has_all_functions(result, wanted) && !wanted.contains(&"rgw_rados_operate")
 }
 
+#[derive(Clone, Copy)]
+struct DieRef<Offset> {
+    unit: usize,
+    offset: UnitOffset<Offset>,
+}
+
+struct DwarfUnitIndex<R: Reader> {
+    units: Vec<gimli::Unit<R>>,
+}
+
+impl<R: Reader> DwarfUnitIndex<R> {
+    fn load(dwarf: &Dwarf<R>) -> Result<Self> {
+        let mut units = Vec::new();
+        let mut headers = dwarf.units();
+        while let Some(header) = headers.next()? {
+            units.push(dwarf.unit(header)?);
+        }
+        Ok(Self { units })
+    }
+
+    fn len(&self) -> usize {
+        self.units.len()
+    }
+
+    fn unit(&self, index: usize) -> &gimli::Unit<R> {
+        &self.units[index]
+    }
+
+    fn entry(&self, die: DieRef<R::Offset>) -> Result<DebuggingInformationEntry<'_, '_, R>> {
+        self.unit(die.unit)
+            .entry(die.offset)
+            .context("failed to resolve DWARF entry")
+    }
+
+    fn referenced_die(
+        &self,
+        unit_index: usize,
+        entry: &DebuggingInformationEntry<R>,
+        attr: gimli::DwAt,
+    ) -> Result<Option<DieRef<R::Offset>>> {
+        let Some(attr) = entry.attr(attr)? else {
+            return Ok(None);
+        };
+        match attr.value() {
+            AttributeValue::UnitRef(offset) => Ok(Some(DieRef {
+                unit: unit_index,
+                offset,
+            })),
+            AttributeValue::DebugInfoRef(offset) => self.debug_info_ref(offset),
+            _ => Ok(None),
+        }
+    }
+
+    fn debug_info_ref(
+        &self,
+        offset: DebugInfoOffset<R::Offset>,
+    ) -> Result<Option<DieRef<R::Offset>>> {
+        for (unit_index, unit) in self.units.iter().enumerate() {
+            if let Some(offset) = offset.to_unit_offset(&unit.header) {
+                return Ok(Some(DieRef {
+                    unit: unit_index,
+                    offset,
+                }));
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn canonical_probe_function_name(function: &str, wanted: &[&str]) -> Option<String> {
     wanted.iter().find_map(|candidate| {
         (function == *candidate || function.ends_with(&format!("::{candidate}")))
@@ -393,12 +462,20 @@ fn insert_function_pc(result: &mut BTreeMap<String, u64>, function: String, pc: 
 
 fn function_pcs<R: Reader>(dwarf: &Dwarf<R>, wanted: &[&str]) -> Result<BTreeMap<String, u64>> {
     let mut result = BTreeMap::new();
-    let mut units = dwarf.units();
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
+    let index = DwarfUnitIndex::load(dwarf)?;
+    for unit_index in 0..index.len() {
+        let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        collect_function_pcs(dwarf, &unit, root, &mut Vec::new(), &mut result, wanted)?;
+        collect_function_pcs(
+            dwarf,
+            &index,
+            unit_index,
+            root,
+            &mut Vec::new(),
+            &mut result,
+            wanted,
+        )?;
         if can_stop_function_search(&result, wanted) {
             break;
         }
@@ -412,14 +489,15 @@ fn function_var_fields<R: Reader>(
     wanted: &[&str],
 ) -> Result<BTreeMap<String, FunctionVarFields>> {
     let mut result = BTreeMap::new();
-    let mut units = dwarf.units();
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
+    let index = DwarfUnitIndex::load(dwarf)?;
+    for unit_index in 0..index.len() {
+        let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
         collect_function_var_fields(
             dwarf,
-            &unit,
+            &index,
+            unit_index,
             root,
             &mut Vec::new(),
             &mut result,
@@ -435,7 +513,8 @@ fn function_var_fields<R: Reader>(
 
 fn collect_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
@@ -447,20 +526,26 @@ fn collect_function_var_fields<R: Reader>(
     }
 
     let entry = node.entry();
-    let scope = scope_name(dwarf, unit, entry)?;
+    let scope = scope_name(dwarf, index, unit_index, entry)?;
     if let Some(scope) = &scope {
         scopes.push(scope.clone());
     }
 
     if entry.tag() == gimli::DW_TAG_subprogram {
-        for fullname in function_names(dwarf, unit, entry, scopes)? {
+        for fullname in function_names(dwarf, index, unit_index, entry, scopes)? {
             let Some(canonical_name) = canonical_probe_function_name(&fullname, wanted) else {
                 continue;
             };
             if let Some(paths) = probe_field_paths(&canonical_name) {
-                if let Some(fields) =
-                    probe_function_var_fields(dwarf, unit, entry, &canonical_name, paths, arch)?
-                {
+                if let Some(fields) = probe_function_var_fields(
+                    dwarf,
+                    index,
+                    unit_index,
+                    entry,
+                    &canonical_name,
+                    paths,
+                    arch,
+                )? {
                     insert_function_var_fields(result, canonical_name, fields);
                 }
             }
@@ -473,7 +558,9 @@ fn collect_function_var_fields<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_var_fields(dwarf, unit, child, scopes, result, arch, wanted)?;
+        collect_function_var_fields(
+            dwarf, index, unit_index, child, scopes, result, arch, wanted,
+        )?;
         if can_stop_function_search(result, wanted) {
             break;
         }
@@ -505,12 +592,14 @@ fn insert_function_var_fields(
 
 fn probe_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     function: &DebuggingInformationEntry<R>,
     function_name: &str,
     paths: &[&[&str]],
     arch: Architecture,
 ) -> Result<Option<FunctionVarFields>> {
+    let unit = index.unit(unit_index);
     let Some(pc) = entry_pc(dwarf, unit, function)? else {
         debug!(
             function = function_name,
@@ -528,7 +617,9 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
-        let Some(variable) = find_function_variable(dwarf, unit, function, variable_name)? else {
+        let Some(variable) =
+            find_function_variable(dwarf, index, unit_index, function, variable_name)?
+        else {
             debug!(
                 function = function_name,
                 variable = *variable_name,
@@ -536,8 +627,10 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
-        let location =
-            variable_location(dwarf, unit, function, &variable.entry, pc)?.or_else(|| {
+        let variable_unit = index.unit(variable.die.unit);
+        let variable_entry = variable_unit.entry(variable.die.offset)?;
+        let location = variable_location(dwarf, variable_unit, function, &variable_entry, pc)?
+            .or_else(|| {
                 variable
                     .parameter_index
                     .and_then(|index| abi_parameter_location(arch, index))
@@ -550,7 +643,7 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
-        let Some(fields) = translate_field_path(dwarf, unit, &variable.entry, path)? else {
+        let Some(fields) = translate_field_path(dwarf, index, variable.die, path)? else {
             debug!(
                 function = function_name,
                 path = path.join("."),
@@ -647,7 +740,8 @@ fn symbol_probe_function_name(name: &str, wanted: &[&str]) -> Option<String> {
 
 fn collect_function_pcs<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, u64>,
@@ -657,14 +751,15 @@ fn collect_function_pcs<R: Reader>(
         return Ok(());
     }
 
+    let unit = index.unit(unit_index);
     let entry = node.entry();
-    let scope = scope_name(dwarf, unit, entry)?;
+    let scope = scope_name(dwarf, index, unit_index, entry)?;
     if let Some(scope) = &scope {
         scopes.push(scope.clone());
     }
 
     if entry.tag() == gimli::DW_TAG_subprogram {
-        for fullname in function_names(dwarf, unit, entry, scopes)? {
+        for fullname in function_names(dwarf, index, unit_index, entry, scopes)? {
             if let Some(canonical_name) = canonical_probe_function_name(&fullname, wanted) {
                 if let Some(pc) = entry_pc(dwarf, unit, entry)? {
                     insert_function_pc(result, canonical_name, pc);
@@ -679,7 +774,7 @@ fn collect_function_pcs<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_pcs(dwarf, unit, child, scopes, result, wanted)?;
+        collect_function_pcs(dwarf, index, unit_index, child, scopes, result, wanted)?;
         if can_stop_function_search(result, wanted) {
             break;
         }
@@ -693,14 +788,30 @@ fn collect_function_pcs<R: Reader>(
 
 fn function_names<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     entry: &DebuggingInformationEntry<R>,
     scopes: &[String],
 ) -> Result<Vec<String>> {
     let mut names = Vec::new();
+    let unit = index.unit(unit_index);
     add_entry_function_names(dwarf, unit, entry, scopes, &mut names)?;
-    add_referenced_function_names(dwarf, unit, entry, gimli::DW_AT_abstract_origin, &mut names)?;
-    add_referenced_function_names(dwarf, unit, entry, gimli::DW_AT_specification, &mut names)?;
+    add_referenced_function_names(
+        dwarf,
+        index,
+        unit_index,
+        entry,
+        gimli::DW_AT_abstract_origin,
+        &mut names,
+    )?;
+    add_referenced_function_names(
+        dwarf,
+        index,
+        unit_index,
+        entry,
+        gimli::DW_AT_specification,
+        &mut names,
+    )?;
     names.sort();
     names.dedup();
     Ok(names)
@@ -708,32 +819,47 @@ fn function_names<R: Reader>(
 
 fn add_referenced_function_names<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     entry: &DebuggingInformationEntry<R>,
     attr: gimli::DwAt,
     names: &mut Vec<String>,
 ) -> Result<()> {
-    let Some(referenced) = referenced_entry(unit, entry, attr)? else {
+    let Some(referenced) = index.referenced_die(unit_index, entry, attr)? else {
         return Ok(());
     };
+    let referenced_unit = index.unit(referenced.unit);
+    let referenced_entry = referenced_unit.entry(referenced.offset)?;
     let before = names.len();
-    add_entry_function_names(dwarf, unit, &referenced, &[], names)?;
+    add_entry_function_names(dwarf, referenced_unit, &referenced_entry, &[], names)?;
 
     let already_qualified = names[before..]
         .iter()
         .any(|name| canonical_probe_function_name(name, PROBE_FUNCTIONS).is_some());
     if !already_qualified {
-        if let Some(name) = die_name(dwarf, unit, &referenced)? {
+        if let Some(name) = die_name(dwarf, referenced_unit, &referenced_entry)? {
             if PROBE_FUNCTION_LEAF_NAMES.contains(&name.as_str()) {
-                let referenced_scopes =
-                    entry_scopes(dwarf, unit, referenced.offset())?.unwrap_or_default();
-                add_entry_function_names(dwarf, unit, &referenced, &referenced_scopes, names)?;
+                let referenced_scopes = entry_scopes(dwarf, index, referenced)?.unwrap_or_default();
+                add_entry_function_names(
+                    dwarf,
+                    referenced_unit,
+                    &referenced_entry,
+                    &referenced_scopes,
+                    names,
+                )?;
             }
         }
     }
 
     if attr == gimli::DW_AT_abstract_origin {
-        add_referenced_function_names(dwarf, unit, &referenced, gimli::DW_AT_specification, names)?;
+        add_referenced_function_names(
+            dwarf,
+            index,
+            referenced.unit,
+            &referenced_entry,
+            gimli::DW_AT_specification,
+            names,
+        )?;
     }
 
     Ok(())
@@ -760,37 +886,21 @@ fn add_entry_function_names<R: Reader>(
     Ok(())
 }
 
-fn referenced_entry<'unit, R: Reader>(
-    unit: &'unit gimli::Unit<R>,
-    entry: &DebuggingInformationEntry<R>,
-    attr: gimli::DwAt,
-) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
-    let Some(attr) = entry.attr(attr)? else {
-        return Ok(None);
-    };
-    match attr.value() {
-        AttributeValue::UnitRef(offset) => Ok(Some(unit.entry(offset)?)),
-        AttributeValue::DebugInfoRef(offset) => Ok(offset
-            .to_unit_offset(&unit.header)
-            .map(|offset| unit.entry(offset))
-            .transpose()?),
-        _ => Ok(None),
-    }
-}
-
 fn entry_scopes<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    offset: gimli::UnitOffset<R::Offset>,
+    index: &DwarfUnitIndex<R>,
+    die: DieRef<R::Offset>,
 ) -> Result<Option<Vec<String>>> {
+    let unit = index.unit(die.unit);
     let mut tree = unit.entries_tree(None)?;
     let root = tree.root()?;
-    find_entry_scopes(dwarf, unit, root, offset, &mut Vec::new())
+    find_entry_scopes(dwarf, index, die.unit, root, die.offset, &mut Vec::new())
 }
 
 fn find_entry_scopes<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     node: EntriesTreeNode<R>,
     offset: gimli::UnitOffset<R::Offset>,
     scopes: &mut Vec<String>,
@@ -800,14 +910,14 @@ fn find_entry_scopes<R: Reader>(
         return Ok(Some(scopes.clone()));
     }
 
-    let scope = scope_name(dwarf, unit, entry)?;
+    let scope = scope_name(dwarf, index, unit_index, entry)?;
     if let Some(scope) = &scope {
         scopes.push(scope.clone());
     }
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        if let Some(found) = find_entry_scopes(dwarf, unit, child, offset, scopes)? {
+        if let Some(found) = find_entry_scopes(dwarf, index, unit_index, child, offset, scopes)? {
             return Ok(Some(found));
         }
     }
@@ -822,54 +932,66 @@ fn find_entry_scopes<R: Reader>(
 #[allow(dead_code)]
 fn translate_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    variable: &DebuggingInformationEntry<R>,
+    index: &DwarfUnitIndex<R>,
+    variable: DieRef<R::Offset>,
     path: &[&str],
 ) -> Result<Option<Vec<FieldJson>>> {
-    let Some(typedie) = die_type(unit, variable)? else {
+    let Some(typedie) = die_type(index, variable)? else {
         return Ok(None);
     };
     let mut fields = vec![FieldJson::default(); path.len()];
     let mut resolving = Vec::new();
-    translate_field_path_from(dwarf, unit, typedie, &mut fields, 1, path, &mut resolving)
+    translate_field_path_from(dwarf, index, typedie, &mut fields, 1, path, &mut resolving)
 }
 
-fn translate_field_path_from<'unit, R: Reader>(
+fn translate_field_path_from<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &'unit gimli::Unit<R>,
-    mut typedie: DebuggingInformationEntry<'unit, 'unit, R>,
+    units: &DwarfUnitIndex<R>,
+    mut typedie: DieRef<R::Offset>,
     fields: &mut [FieldJson],
-    mut index: usize,
+    mut field_index: usize,
     path: &[&str],
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
-    while index < path.len() {
-        typedie = peel_type_qualifiers(unit, typedie)?;
-        match typedie.tag() {
+    while field_index < path.len() {
+        typedie = peel_type_qualifiers(units, typedie)?;
+        let typedie_unit = units.unit(typedie.unit);
+        let typedie_entry = typedie_unit.entry(typedie.offset)?;
+        match typedie_entry.tag() {
             gimli::DW_TAG_reference_type
             | gimli::DW_TAG_rvalue_reference_type
             | gimli::DW_TAG_pointer_type => {
-                fields[index].pointer = true;
-                let Some(next_type) = die_type(unit, &typedie)? else {
+                fields[field_index].pointer = true;
+                let Some(next_type) = die_type(units, typedie)? else {
                     return Ok(None);
                 };
                 typedie = next_type;
             }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
-                let Some(member) = find_member_entry(dwarf, unit, &typedie, path[index])? else {
+                let Some(member) = find_member_entry(dwarf, units, typedie, path[field_index])?
+                else {
                     if let Some(fields) = translate_declared_type_field_path(
-                        dwarf, unit, &typedie, fields, index, path, resolving,
+                        dwarf,
+                        units,
+                        typedie,
+                        fields,
+                        field_index,
+                        path,
+                        resolving,
                     )? {
                         return Ok(Some(fields));
                     }
                     return Ok(None);
                 };
-                fields[index].offset = member_offset(unit, &member)?.unwrap_or_default();
-                let Some(next_type) = die_type(unit, &member)? else {
+                let member_unit = units.unit(member.unit);
+                let member_entry = member_unit.entry(member.offset)?;
+                fields[field_index].offset =
+                    member_offset(member_unit, &member_entry)?.unwrap_or_default();
+                let Some(next_type) = die_type(units, member)? else {
                     return Ok(None);
                 };
                 typedie = next_type;
-                index += 1;
+                field_index += 1;
             }
             _ => return Ok(None),
         }
@@ -878,19 +1000,21 @@ fn translate_field_path_from<'unit, R: Reader>(
     Ok(Some(fields.to_vec()))
 }
 
-fn translate_declared_type_field_path<'unit, R: Reader>(
+fn translate_declared_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &'unit gimli::Unit<R>,
-    typedie: &DebuggingInformationEntry<'unit, 'unit, R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
     fields: &[FieldJson],
-    index: usize,
+    field_index: usize,
     path: &[&str],
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
-    if !entry_flag(typedie, gimli::DW_AT_declaration)? {
+    let unit = index.unit(typedie.unit);
+    let entry = unit.entry(typedie.offset)?;
+    if !entry_flag(&entry, gimli::DW_AT_declaration)? {
         return Ok(None);
     }
-    let Some(type_name) = die_name(dwarf, unit, typedie)? else {
+    let Some(type_name) = die_name(dwarf, unit, &entry)? else {
         return Ok(None);
     };
     if resolving.contains(&type_name) {
@@ -898,28 +1022,43 @@ fn translate_declared_type_field_path<'unit, R: Reader>(
     }
 
     resolving.push(type_name.clone());
-    let result = translate_named_type_field_path(dwarf, &type_name, fields, index, path, resolving);
+    let result = translate_named_type_field_path(
+        dwarf,
+        index,
+        &type_name,
+        fields,
+        field_index,
+        path,
+        resolving,
+    );
     resolving.pop();
     result
 }
 
 fn translate_named_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
     type_name: &str,
     fields: &[FieldJson],
-    index: usize,
+    field_index: usize,
     path: &[&str],
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
-    let mut units = dwarf.units();
-    while let Some(header) = units.next()? {
-        let unit = dwarf.unit(header)?;
+    for unit_index in 0..index.len() {
+        let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
         let search = NamedTypeFieldSearch { type_name, path };
-        if let Some(fields) =
-            find_named_type_field_path(dwarf, &unit, root, fields, index, &search, resolving)?
-        {
+        if let Some(fields) = find_named_type_field_path(
+            dwarf,
+            index,
+            unit_index,
+            root,
+            fields,
+            field_index,
+            &search,
+            resolving,
+        )? {
             return Ok(Some(fields));
         }
     }
@@ -933,13 +1072,15 @@ struct NamedTypeFieldSearch<'a> {
 
 fn find_named_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     node: EntriesTreeNode<R>,
     fields: &[FieldJson],
-    index: usize,
+    field_index: usize,
     search: &NamedTypeFieldSearch<'_>,
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
+    let unit = index.unit(unit_index);
     let entry = node.entry();
     if matches!(
         entry.tag(),
@@ -947,14 +1088,17 @@ fn find_named_type_field_path<R: Reader>(
     ) && die_name(dwarf, unit, entry)?.as_deref() == Some(search.type_name)
         && !entry_flag(entry, gimli::DW_AT_declaration)?
     {
-        let typedie = unit.entry(entry.offset())?;
+        let typedie = DieRef {
+            unit: unit_index,
+            offset: entry.offset(),
+        };
         let mut fields = fields.to_vec();
         if let Some(fields) = translate_field_path_from(
             dwarf,
-            unit,
+            index,
             typedie,
             &mut fields,
-            index,
+            field_index,
             search.path,
             resolving,
         )? {
@@ -964,9 +1108,16 @@ fn find_named_type_field_path<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        if let Some(fields) =
-            find_named_type_field_path(dwarf, unit, child, fields, index, search, resolving)?
-        {
+        if let Some(fields) = find_named_type_field_path(
+            dwarf,
+            index,
+            unit_index,
+            child,
+            fields,
+            field_index,
+            search,
+            resolving,
+        )? {
             return Ok(Some(fields));
         }
     }
@@ -1081,18 +1232,18 @@ fn add_location_offset(location: &mut VarLocationJson, offset: i64) -> Result<()
     Ok(())
 }
 
-fn peel_type_qualifiers<'unit, R: Reader>(
-    unit: &'unit gimli::Unit<R>,
-    mut typedie: DebuggingInformationEntry<'unit, 'unit, R>,
-) -> Result<DebuggingInformationEntry<'unit, 'unit, R>> {
+fn peel_type_qualifiers<R: Reader>(
+    index: &DwarfUnitIndex<R>,
+    mut typedie: DieRef<R::Offset>,
+) -> Result<DieRef<R::Offset>> {
     while matches!(
-        typedie.tag(),
+        index.entry(typedie)?.tag(),
         gimli::DW_TAG_typedef
             | gimli::DW_TAG_const_type
             | gimli::DW_TAG_volatile_type
             | gimli::DW_TAG_restrict_type
     ) {
-        let Some(next_type) = die_type(unit, &typedie)? else {
+        let Some(next_type) = die_type(index, typedie)? else {
             break;
         };
         typedie = next_type;
@@ -1100,28 +1251,33 @@ fn peel_type_qualifiers<'unit, R: Reader>(
     Ok(typedie)
 }
 
-fn find_member_entry<'unit, R: Reader>(
+fn find_member_entry<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &'unit gimli::Unit<R>,
-    typedie: &DebuggingInformationEntry<R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
     member_name: &str,
-) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
-    let mut queue = vec![typedie.offset()];
-    while let Some(offset) = queue.pop() {
-        let mut tree = unit.entries_tree(Some(offset))?;
+) -> Result<Option<DieRef<R::Offset>>> {
+    let mut queue = vec![typedie];
+    while let Some(parent) = queue.pop() {
+        let unit = index.unit(parent.unit);
+        let mut tree = unit.entries_tree(Some(parent.offset))?;
         let root = tree.root()?;
         let mut children = root.children();
         while let Some(child) = children.next()? {
             let entry = child.entry();
+            let child_ref = DieRef {
+                unit: parent.unit,
+                offset: entry.offset(),
+            };
             match entry.tag() {
                 gimli::DW_TAG_member => {
                     if die_name(dwarf, unit, entry)?.as_deref() == Some(member_name) {
-                        return Ok(Some(unit.entry(entry.offset())?));
+                        return Ok(Some(child_ref));
                     }
                 }
                 gimli::DW_TAG_inheritance => {
-                    if let Some(parent_type) = die_type(unit, entry)? {
-                        queue.push(parent_type.offset());
+                    if let Some(parent_type) = die_type(index, child_ref)? {
+                        queue.push(parent_type);
                     }
                 }
                 _ => {}
@@ -1151,38 +1307,48 @@ fn find_child_entry_by_name<'unit, R: Reader>(
     Ok(None)
 }
 
-struct FunctionVariable<'unit, R: Reader> {
-    entry: DebuggingInformationEntry<'unit, 'unit, R>,
+struct FunctionVariable<Offset> {
+    die: DieRef<Offset>,
     parameter_index: Option<usize>,
 }
 
-fn find_function_variable<'unit, R: Reader>(
+fn find_function_variable<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &'unit gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     function: &DebuggingInformationEntry<R>,
     name: &str,
-) -> Result<Option<FunctionVariable<'unit, R>>> {
-    if let Some(variable) = find_function_child_variable(dwarf, unit, function.offset(), name)? {
+) -> Result<Option<FunctionVariable<R::Offset>>> {
+    let function_ref = DieRef {
+        unit: unit_index,
+        offset: function.offset(),
+    };
+    if let Some(variable) = find_function_child_variable(dwarf, index, function_ref, name)? {
         return Ok(Some(variable));
     }
 
-    if let Some(origin) = referenced_entry(unit, function, gimli::DW_AT_abstract_origin)? {
-        if let Some(variable) = find_function_child_variable(dwarf, unit, origin.offset(), name)? {
+    if let Some(origin) =
+        index.referenced_die(unit_index, function, gimli::DW_AT_abstract_origin)?
+    {
+        if let Some(variable) = find_function_child_variable(dwarf, index, origin, name)? {
             return Ok(Some(variable));
         }
-        if let Some(specification) = referenced_entry(unit, &origin, gimli::DW_AT_specification)? {
-            if let Some(variable) =
-                find_function_child_variable(dwarf, unit, specification.offset(), name)?
+        let origin_unit = index.unit(origin.unit);
+        let origin_entry = origin_unit.entry(origin.offset)?;
+        if let Some(specification) =
+            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
+        {
+            if let Some(variable) = find_function_child_variable(dwarf, index, specification, name)?
             {
                 return Ok(Some(variable));
             }
         }
     }
 
-    if let Some(specification) = referenced_entry(unit, function, gimli::DW_AT_specification)? {
-        if let Some(variable) =
-            find_function_child_variable(dwarf, unit, specification.offset(), name)?
-        {
+    if let Some(specification) =
+        index.referenced_die(unit_index, function, gimli::DW_AT_specification)?
+    {
+        if let Some(variable) = find_function_child_variable(dwarf, index, specification, name)? {
             return Ok(Some(variable));
         }
     }
@@ -1190,18 +1356,23 @@ fn find_function_variable<'unit, R: Reader>(
     Ok(None)
 }
 
-fn find_function_child_variable<'unit, R: Reader>(
+fn find_function_child_variable<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &'unit gimli::Unit<R>,
-    parent_offset: gimli::UnitOffset<R::Offset>,
+    index: &DwarfUnitIndex<R>,
+    parent: DieRef<R::Offset>,
     name: &str,
-) -> Result<Option<FunctionVariable<'unit, R>>> {
+) -> Result<Option<FunctionVariable<R::Offset>>> {
+    let unit = index.unit(parent.unit);
     let mut parameter_index = 0;
-    let mut tree = unit.entries_tree(Some(parent_offset))?;
+    let mut tree = unit.entries_tree(Some(parent.offset))?;
     let root = tree.root()?;
     let mut children = root.children();
     while let Some(child) = children.next()? {
         let entry = child.entry();
+        let child_ref = DieRef {
+            unit: parent.unit,
+            offset: entry.offset(),
+        };
         let index = match entry.tag() {
             gimli::DW_TAG_formal_parameter => {
                 let index = Some(parameter_index);
@@ -1213,7 +1384,7 @@ fn find_function_child_variable<'unit, R: Reader>(
         };
         if die_name(dwarf, unit, entry)?.as_deref() == Some(name) {
             return Ok(Some(FunctionVariable {
-                entry: unit.entry(entry.offset())?,
+                die: child_ref,
                 parameter_index: index,
             }));
         }
@@ -1221,20 +1392,24 @@ fn find_function_child_variable<'unit, R: Reader>(
     Ok(None)
 }
 
-fn die_type<'unit, R: Reader>(
-    unit: &'unit gimli::Unit<R>,
-    entry: &DebuggingInformationEntry<R>,
-) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
-    if let Some(typedie) = referenced_entry(unit, entry, gimli::DW_AT_type)? {
+fn die_type<R: Reader>(
+    index: &DwarfUnitIndex<R>,
+    die: DieRef<R::Offset>,
+) -> Result<Option<DieRef<R::Offset>>> {
+    let unit = index.unit(die.unit);
+    let entry = unit.entry(die.offset)?;
+    if let Some(typedie) = index.referenced_die(die.unit, &entry, gimli::DW_AT_type)? {
         return Ok(Some(typedie));
     }
-    if let Some(origin) = referenced_entry(unit, entry, gimli::DW_AT_abstract_origin)? {
-        if let Some(typedie) = die_type(unit, &origin)? {
+    if let Some(origin) = index.referenced_die(die.unit, &entry, gimli::DW_AT_abstract_origin)? {
+        if let Some(typedie) = die_type(index, origin)? {
             return Ok(Some(typedie));
         }
     }
-    if let Some(specification) = referenced_entry(unit, entry, gimli::DW_AT_specification)? {
-        if let Some(typedie) = die_type(unit, &specification)? {
+    if let Some(specification) =
+        index.referenced_die(die.unit, &entry, gimli::DW_AT_specification)?
+    {
+        if let Some(typedie) = die_type(index, specification)? {
             return Ok(Some(typedie));
         }
     }
@@ -1303,9 +1478,11 @@ fn expression_offset<R: Reader>(
 
 fn scope_name<R: Reader>(
     dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
     entry: &DebuggingInformationEntry<R>,
 ) -> Result<Option<String>> {
+    let unit = index.unit(unit_index);
     match entry.tag() {
         gimli::DW_TAG_class_type | gimli::DW_TAG_structure_type | gimli::DW_TAG_namespace => {
             die_name(dwarf, unit, entry)
@@ -2576,10 +2753,11 @@ mod tests {
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
-        let mut units = dwarf.units();
-        while let Some(header) = units.next()? {
-            let unit = dwarf.unit(header)?;
-            let Some(function) = find_subprogram_by_name(&dwarf, &unit, "inspect")? else {
+        let index = DwarfUnitIndex::load(&dwarf)?;
+        for unit_index in 0..index.len() {
+            let unit = index.unit(unit_index);
+            let Some(function) = find_subprogram_by_name(&dwarf, &index, unit_index, "inspect")?
+            else {
                 continue;
             };
             let Some(param) = find_child_entry_by_name(
@@ -2592,7 +2770,15 @@ mod tests {
             else {
                 continue;
             };
-            return translate_field_path(&dwarf, &unit, &param, &["outer", "leaf", "value"]);
+            return translate_field_path(
+                &dwarf,
+                &index,
+                DieRef {
+                    unit: unit_index,
+                    offset: param.offset(),
+                },
+                &["outer", "leaf", "value"],
+            );
         }
 
         Ok(None)
@@ -2610,10 +2796,11 @@ mod tests {
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
-        let mut units = dwarf.units();
-        while let Some(header) = units.next()? {
-            let unit = dwarf.unit(header)?;
-            let Some(function) = find_subprogram_by_name(&dwarf, &unit, "inspect")? else {
+        let index = DwarfUnitIndex::load(&dwarf)?;
+        for unit_index in 0..index.len() {
+            let unit = index.unit(unit_index);
+            let Some(function) = find_subprogram_by_name(&dwarf, &index, unit_index, "inspect")?
+            else {
                 continue;
             };
             let Some(param) = find_child_entry_by_name(
@@ -2637,29 +2824,33 @@ mod tests {
 
     fn find_subprogram_by_name<'unit, R: Reader>(
         dwarf: &Dwarf<R>,
-        unit: &'unit gimli::Unit<R>,
+        index: &'unit DwarfUnitIndex<R>,
+        unit_index: usize,
         name: &str,
     ) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+        let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
-        find_subprogram_node(dwarf, unit, root, &mut Vec::new(), name)
+        find_subprogram_node(dwarf, index, unit_index, root, &mut Vec::new(), name)
     }
 
     fn find_subprogram_node<'unit, R: Reader>(
         dwarf: &Dwarf<R>,
-        unit: &'unit gimli::Unit<R>,
+        index: &'unit DwarfUnitIndex<R>,
+        unit_index: usize,
         node: EntriesTreeNode<R>,
         scopes: &mut Vec<String>,
         name: &str,
     ) -> Result<Option<DebuggingInformationEntry<'unit, 'unit, R>>> {
+        let unit = index.unit(unit_index);
         let entry = node.entry();
-        let scope = scope_name(dwarf, unit, entry)?;
+        let scope = scope_name(dwarf, index, unit_index, entry)?;
         if let Some(scope) = &scope {
             scopes.push(scope.clone());
         }
 
         if entry.tag() == gimli::DW_TAG_subprogram
-            && function_names(dwarf, unit, entry, scopes)?
+            && function_names(dwarf, index, unit_index, entry, scopes)?
                 .iter()
                 .any(|candidate| candidate == name)
         {
@@ -2668,7 +2859,9 @@ mod tests {
 
         let mut children = node.children();
         while let Some(child) = children.next()? {
-            if let Some(found) = find_subprogram_node(dwarf, unit, child, scopes, name)? {
+            if let Some(found) =
+                find_subprogram_node(dwarf, index, unit_index, child, scopes, name)?
+            {
                 return Ok(Some(found));
             }
         }
