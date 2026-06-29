@@ -1,0 +1,31 @@
+tests/bpf_source.rs
+  s_eabead4b3f2d8f::t_61158abaf7837b 42-43,157-158
+src/live/linux.rs
+  s_eabead4b3f2d8f::t_9b542ed2ca1f92 238
+  s_eabead4b3f2d8f::t_fe4d5c016ed112 60-61,237
+bpf/rgwtrace.bpf.c
+  s_eabead4b3f2d8f::t_61158abaf7837b 865,867,871,875,883,885,889,893,899,901,905,909
+bpf/rgwtrace_events.h
+  s_eabead4b3f2d8f::t_61158abaf7837b 52-53
+src/collector.rs
+  s_eabead4b3f2d8f::t_fe4d5c016ed112 93-94,147-148,411,1774-1775,1817-1818
+  s_eabead4b3f2d8f::t_9b542ed2ca1f92 412
+tests/fixtures/collector_trace_golden.json
+  s_eabead4b3f2d8f::t_fe4d5c016ed112 286-287
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.3",
+  "base_commit_sha": "a2abc2d3bdbc16399123eee0ce199ab6a536fc6c",
+  "prompts": {},
+  "sessions": {
+    "s_eabead4b3f2d8f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f0a0e-f46b-7e21-a775-79d8b9b415eb",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
