@@ -28,6 +28,21 @@ fn bpf_records_drop_and_probe_read_diagnostics() {
 }
 
 #[test]
+fn varfield_member_addr_uses_fixed_field_offsets() {
+    assert!(BPF_UTILS.contains("int raw_size = vf->size;"));
+    assert!(BPF_UTILS.contains("if (raw_size > 0)"));
+    assert!(BPF_UTILS.contains("if (size > 10)"));
+    assert!(BPF_UTILS.contains("#define RGWTRACE_APPLY_VAR_FIELD(IDX)"));
+    assert!(BPF_UTILS.contains("vf->fields[IDX].offset"));
+    assert!(!BPF_UTILS.contains("for (int i = 2; i < 10; i++)"));
+    assert!(!BPF_UTILS.contains("vf->fields[i]"));
+
+    for idx in 2..=9 {
+        assert!(BPF_UTILS.contains(&format!("RGWTRACE_APPLY_VAR_FIELD({idx})")));
+    }
+}
+
+#[test]
 fn bpf_records_rados_sender_thread_id() {
     assert!(RGWTRACE_EVENTS.contains("__u32 send_tid;"));
     assert!(RGWTRACE_BPF.contains("__u32 thread_id = get_tid();"));
