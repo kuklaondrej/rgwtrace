@@ -1,0 +1,110 @@
+# AGENTS.md
+
+Guidance for AI coding agents working in this repo. Keep it accurate as the code changes.
+
+## Overview
+
+`rgwtrace` is a Rust CLI that traces **Ceph RADOS Gateway (RGW)** request activity using **eBPF uprobes**, correlates each RGW request with its child RADOS ops, and exports request-oriented telemetry as JSON or OTLP/HTTP protobuf.
+
+Pipeline:
+
+```
+native DWARF or cephtrace JSON  ->  hprobes map  ->  eBPF uprobes  ->  ring buffer  ->  Rust events  ->  spans  ->  JSON or OTLP protobuf
+```
+
+Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostrace`). For depth, read `ARCHITECTURE.md` (stage-by-stage internals) and `RUNBOOK.md` (operations/troubleshooting); `README.md` has the overview.
+
+## Toolchain
+
+- Rust pinned to **1.90.0** (`rust-toolchain.toml`), edition 2021. Use this exact version.
+- Host build deps (Debian/Ubuntu): `clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev`.
+- Builds on macOS, but **live tracing is Linux-only** (x86_64/aarch64). `build.rs` no-ops off Linux and `live.rs` bails at runtime. `build.rs` generates the BPF skeleton (`rgwtrace.skel.rs`) from `bpf/rgwtrace.bpf.c` via `libbpf-cargo`.
+
+## Build / test / lint
+
+- Build: `cargo build` / `cargo build --release` (→ `target/release/rgwtrace`)
+- Format: `cargo fmt --check` (fix with `cargo fmt`)
+- Lint: `cargo clippy --all-targets -- -D warnings` (warnings are errors)
+- Test: `cargo test` (inline unit tests + `tests/cli_dry_run.rs`, `tests/bpf_source.rs`; fixtures in `tests/fixtures/`)
+- JSON self-test, no cluster: `python3 tests/e2e/verify-rgwtrace-json.py --self-test`
+- BPF verifier load check (Linux + root): `sudo scripts/verify-bpf-load.sh`
+
+**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test`, clippy (deny warnings), the Python self-test, and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) mirrors this gate and adds `cargo audit` + a release build.
+
+## Running locally
+
+- Dry run (works anywhere the binary builds):
+  ```
+  rgwtrace --import-json <dwarf.json> --dry-run --output json
+  ```
+- Live tracing (Linux + root):
+  ```
+  sudo rgwtrace --dwarf-source native --pid <pid> --preflight
+  sudo rgwtrace --dwarf-source native --pid <pid> --timeout 30 --output json
+  ```
+- Logging: `--log-level info` or `RUST_LOG=rgwtrace=debug`. Logs go to **stderr** so stdout stays clean for JSON output. All CLI flags live in `src/cli.rs`; operational recipes in `RUNBOOK.md`.
+
+## Layout
+
+- `src/main.rs` — orchestration (parses CLI, dispatches `--dry-run`/`--preflight`/`--export-dwarf-json`, then output mode)
+- `src/cli.rs` — clap `Cli` struct and enums; custom `value_parser` fns
+- `src/collector.rs` — **core** correlation engine, `TraceDocument`, diagnostics
+- `src/classify.rs` — RADOS role / request-class heuristics
+- `src/events.rs` — BPF↔Rust ABI: `Raw*` on-wire structs decoded into owned Rust forms
+- `src/dwarf_{input,json,native}.rs` — probe-metadata sources (`native` = gimli/object ELF+DWARF; `json` = cephtrace import); shared `DwarfInfo` model
+- `src/targets.rs` — locate `librados`/`librbd`/`libceph-common`/`radosgw` (via `/proc/<pid>/root`)
+- `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs)
+- `src/otel.rs` — OTLP/HTTP protobuf export
+- `src/live.rs` → `src/live/linux.rs` — Linux-only BPF load/attach/ring-buffer poll
+- `bpf/*.c`, `bpf/*.h` — eBPF program + C ABI mirror (`rgwtrace_events.h`, `ceph_abi.h`)
+- `build.rs` — skeleton generation; `scripts/`, `tests/`, `docker/`
+
+## Conventions
+
+- Standard Rust naming (`snake_case` / `CamelCase` / `SCREAMING_SNAKE_CASE`), enforced by fmt + clippy.
+- Errors: `anyhow` throughout (`Context`/`with_context`, `bail!`); no custom error enums.
+- Logging: `tracing` to stderr with structured fields (e.g. `info!(pid, "starting live tracing")`).
+- Serde: `#[serde(rename_all = "snake_case")]`; tagged enums for event types.
+- `Raw*` `#[repr(C)]` types are the on-wire BPF form; decode them into owned Rust forms with `String`/`Vec`.
+- Constants prefixed `RGWTRACE_*` (event types, `RGWTRACE_TRUNC_*`, `RGWTRACE_DIAG_*`) are mirrored **byte-for-byte** between `bpf/rgwtrace_events.h` and `src/events.rs` — keep them in sync.
+
+## Gotchas — do not break
+
+- **Do not re-add a `process_request` return probe** — live testing showed it can crash RGW. Request context is seeded from `RGWREST::get_handler` instead.
+- Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`.
+- Fixed capture caps (`MAX_TRANS_ID=128`, `MAX_OBJECT_NAME=128`, `MAX_ACTING=16`, `MAX_RADOS_OPS=3`, …). Overflow is surfaced via `RGWTRACE_TRUNC_*` flags (→ `rgwtrace.truncated` attr + counters), never silently dropped.
+- `dwarf_native.rs` hardcodes libstdc++ `std::string`/`std::vector` member names (`_M_dataplus`, `_M_string_length`, `_M_impl._M_start`) — ABI-coupled; touch with care.
+- Build-ID mismatch fails preflight/attach by default (`--allow-build-id-mismatch` overrides). Wrong DWARF yields silently wrong field offsets.
+- Correlation is intentionally conservative: RADOS ops join a request only via same-thread `trans_id`. Inference (`--correlate-inferred`) joins only a *unique* candidate within `--inference-window`.
+- Diagnostics counters (`TraceDiagnostics` and the BPF `diagnostics` map) are a first-class output contract, not just logs. Update them when you change event handling.
+
+## Testing guidelines
+
+Development is test-driven — write tests before or alongside implementation, not as an afterthought. Prefer inline `#[cfg(test)] mod tests` in the module under change (the established pattern, used in nearly every source file); use `tests/` for binary/integration behavior and `tests/fixtures/` golden JSON for output-shape assertions. For a **bug fix, first write a failing regression test** that reproduces it, then fix. Every change must leave `scripts/verify.sh` green.
+
+## Documentation
+
+Every feature or significant change updates docs in the **same PR**. Style is pragmatic and implementation-focused: code blocks, ASCII diagrams, shell/JSON examples. Map changes to the repo's root docs:
+
+- `ARCHITECTURE.md` — design / pipeline changes
+- `RUNBOOK.md` — operational or CLI-flag changes
+- `README.md` — overview and workflows
+
+For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` if it doesn't exist) explaining what happened, why, and the fix. Comments explain *why*, not *what*.
+
+## Code review checklist (self-review before PR)
+
+- Correctness and edge cases
+- Error paths carry `anyhow` context; no swallowed errors
+- BPF↔Rust ABI mirror stays in sync; truncation/caps handled
+- No secrets or raw payloads logged; stdout stays clean (logs to stderr)
+- Tests added/updated; docs updated
+- Diagnostics counters updated if event handling changed
+
+## Git, commits, PRs
+
+- Short imperative subjects (e.g. `Add inferred correlation window`, `Fix stale trans_id retry`); first line < 72 chars; body explains *why*.
+- Prefer smaller, focused commits over one bulky commit.
+- Work on feature branches and PR into `main`; **never force-push `main`**.
+- Do not commit generated or ignored paths: `target/`, `dist/`, `*.o`, `*.skel.rs`, `trace-data/`, local env files.
+- PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).
