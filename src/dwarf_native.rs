@@ -1203,8 +1203,10 @@ fn find_function_child_variable<R: Reader>(
         if matches!(
             entry.tag(),
             gimli::DW_TAG_formal_parameter | gimli::DW_TAG_variable
-        ) && die_name(dwarf, unit, entry)?.as_deref() == Some(name)
+        ) && child_variable_name_matches(dwarf, index, parent.unit, entry, name)?
         {
+            // Return the concrete child DIE (the one that carries
+            // `DW_AT_location`), never the name-bearing abstract origin.
             return Ok(Some(DieRef {
                 unit: parent.unit,
                 offset: entry.offset(),
@@ -1214,13 +1216,63 @@ fn find_function_child_variable<R: Reader>(
     Ok(None)
 }
 
+/// True if `entry` names the variable `name`, either directly via `DW_AT_name`
+/// or -- as on `-O2`/LTO builds where the concrete `DW_TAG_formal_parameter`
+/// carries only `DW_AT_location`+`DW_AT_abstract_origin` -- through the name of
+/// the DIE referenced by its `DW_AT_abstract_origin` (then, failing that,
+/// `DW_AT_specification`). Uses `index.referenced_die`, so cross-unit LTO
+/// origins encoded as `DW_FORM_ref_addr` (`DebugInfoRef`) resolve too.
+fn child_variable_name_matches<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
+    entry: &DebuggingInformationEntry<R>,
+    name: &str,
+) -> Result<bool> {
+    if die_name(dwarf, index.unit(unit_index), entry)?.as_deref() == Some(name) {
+        return Ok(true);
+    }
+    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+        let Some(origin) = index.referenced_die(unit_index, entry, attr)? else {
+            continue;
+        };
+        let origin_unit = index.unit(origin.unit);
+        let origin_entry = origin_unit.entry(origin.offset)?;
+        if die_name(dwarf, origin_unit, &origin_entry)?.as_deref() == Some(name) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn die_type<R: Reader>(
     index: &DwarfUnitIndex<R>,
     die: DieRef<R::Offset>,
 ) -> Result<Option<DieRef<R::Offset>>> {
     let unit = index.unit(die.unit);
     let entry = unit.entry(die.offset)?;
-    index.referenced_die(die.unit, &entry, gimli::DW_AT_type)
+    // A direct `DW_AT_type` always wins. On `-O2`/LTO builds the concrete DIE
+    // (e.g. a `DW_TAG_formal_parameter` carrying only location + origin) has no
+    // `DW_AT_type` of its own; the type lives on the abstract instance, so fall
+    // back to the `DW_AT_abstract_origin` target's type (then
+    // `DW_AT_specification`'s). Uses `index.referenced_die`, so cross-unit LTO
+    // origins encoded as `DW_FORM_ref_addr` (`DebugInfoRef`) resolve too.
+    if let Some(typedie) = index.referenced_die(die.unit, &entry, gimli::DW_AT_type)? {
+        return Ok(Some(typedie));
+    }
+    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+        let Some(origin) = index.referenced_die(die.unit, &entry, attr)? else {
+            continue;
+        };
+        let origin_unit = index.unit(origin.unit);
+        let origin_entry = origin_unit.entry(origin.offset)?;
+        if let Some(typedie) =
+            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_type)?
+        {
+            return Ok(Some(typedie));
+        }
+    }
+    Ok(None)
 }
 
 fn member_offset<R: Reader>(
@@ -1722,6 +1774,210 @@ mod tests {
     }
 
     #[test]
+    fn extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture() {
+        let Some(binary) = compile_rgw_optimized_fixture() else {
+            return;
+        };
+
+        let data = std::fs::read(&binary).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        let endian = if file.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf_cow = Dwarf::load(|section| load_section(&file, section)).unwrap();
+        #[allow(deprecated)]
+        let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+        let index = DwarfUnitIndex::load(&dwarf).unwrap();
+
+        // Locate the concrete out-of-line `get_handler` (the PC-bearing instance
+        // the collector probes).
+        let Some(function) = find_concrete_get_handler(&dwarf, &index).unwrap() else {
+            eprintln!(
+                "SKIPPED extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture: \
+                 no concrete RGWREST::get_handler instance found"
+            );
+            return;
+        };
+
+        // Shape guard: only meaningful if the toolchain emitted the optimized
+        // abstract/concrete split -- a concrete `s` parameter with
+        // `DW_AT_location`+`DW_AT_abstract_origin` but no `DW_AT_name` and no
+        // `DW_AT_type`. Skip loudly otherwise so this cannot masquerade as a pass.
+        if !concrete_param_has_target_shape(&dwarf, &index, function, "s").unwrap() {
+            eprintln!(
+                "SKIPPED extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture: \
+                 toolchain did not emit the abstract_origin/no-name/no-type parameter shape"
+            );
+            return;
+        }
+
+        let function_unit = index.unit(function.unit);
+        let function_entry = function_unit.entry(function.offset).unwrap();
+        let pc = entry_pc(&dwarf, function_unit, &function_entry)
+            .unwrap()
+            .expect("concrete get_handler has a PC");
+
+        // Fix 1: child-name matching follows abstract_origin and returns the
+        // CONCRETE parameter DIE (the one carrying `DW_AT_location`). Reverting
+        // fix 1 makes this resolve to the name-bearing abstract parameter, which
+        // has no location, so `variable_location` below yields None and the
+        // `.expect("fix 1 ...")` fails.
+        let variable = find_function_variable(&dwarf, &index, function.unit, &function_entry, "s")
+            .unwrap()
+            .expect("fix 1: concrete `s` parameter must be found via abstract_origin");
+        let variable_unit = index.unit(variable.unit);
+        let variable_entry = variable_unit.entry(variable.offset).unwrap();
+        let location =
+            variable_location(&dwarf, variable_unit, &function_entry, &variable_entry, pc)
+                .unwrap()
+                .expect("fix 1: location must resolve on the concrete parameter DIE");
+        assert!(location.reg >= 0);
+
+        // Fix 2: `die_type` follows abstract_origin when the concrete DIE has no
+        // `DW_AT_type`, so `translate_field_path` can walk the nested member path.
+        // Reverting fix 2 makes `die_type(variable)` return None here, so the
+        // `.expect("fix 2 ...")` fails even though fix 1 resolved the location.
+        let fields = translate_field_path(
+            &dwarf,
+            &index,
+            variable,
+            &["s", "trans_id", "_M_string_length"],
+        )
+        .unwrap()
+        .expect("fix 2: nested field path must translate via the abstract_origin type");
+        assert_eq!(fields.len(), 3);
+        assert!(fields[1].pointer);
+        assert_eq!(fields[2].offset, 8);
+
+        // End to end: the public entry point now surfaces both var_fields on the
+        // optimized shape (this is what silently returned nothing before).
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let var_fields = module
+            .func2vf
+            .get("RGWREST::get_handler")
+            .expect("optimized DWARF must yield RGWREST::get_handler var_fields");
+
+        assert_eq!(var_fields.var_fields.len(), 2);
+        for var_field in &var_fields.var_fields {
+            assert!(var_field.location.reg >= 0);
+            assert!(!var_field.fields.is_empty());
+        }
+        assert_eq!(var_fields.var_fields[0].fields.len(), 3);
+        assert!(var_fields.var_fields[0].fields[1].pointer);
+        assert_eq!(var_fields.var_fields[0].fields[2].offset, 8);
+        assert_eq!(var_fields.var_fields[1].fields.len(), 4);
+        assert!(var_fields.var_fields[1].fields[1].pointer);
+    }
+
+    /// Finds the concrete (PC-bearing) `RGWREST::get_handler` subprogram -- the
+    /// out-of-line instance the collector probes -- returning its cross-unit DIE
+    /// reference.
+    fn find_concrete_get_handler<R: Reader>(
+        dwarf: &Dwarf<R>,
+        index: &DwarfUnitIndex<R>,
+    ) -> Result<Option<DieRef<R::Offset>>> {
+        for unit_index in 0..index.len() {
+            let unit = index.unit(unit_index);
+            let mut tree = unit.entries_tree(None)?;
+            let root = tree.root()?;
+            if let Some(found) =
+                find_concrete_get_handler_node(dwarf, index, unit_index, root, &mut Vec::new())?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    fn find_concrete_get_handler_node<R: Reader>(
+        dwarf: &Dwarf<R>,
+        index: &DwarfUnitIndex<R>,
+        unit_index: usize,
+        node: EntriesTreeNode<R>,
+        scopes: &mut Vec<String>,
+    ) -> Result<Option<DieRef<R::Offset>>> {
+        let unit = index.unit(unit_index);
+        let entry = node.entry();
+        let scope = scope_name(dwarf, unit, entry)?;
+        if let Some(scope) = &scope {
+            scopes.push(scope.clone());
+        }
+
+        // Select the concrete out-of-line instance the same way the collector
+        // does: a subprogram that both has a PC and resolves to the probe name.
+        let mut found = None;
+        if entry.tag() == gimli::DW_TAG_subprogram
+            && entry_pc(dwarf, unit, entry)?.is_some()
+            && function_names(dwarf, index, unit_index, entry, scopes)?
+                .iter()
+                .any(|name| name == "RGWREST::get_handler")
+        {
+            found = Some(DieRef {
+                unit: unit_index,
+                offset: entry.offset(),
+            });
+        }
+
+        if found.is_none() {
+            let mut children = node.children();
+            while let Some(child) = children.next()? {
+                if let Some(result) =
+                    find_concrete_get_handler_node(dwarf, index, unit_index, child, scopes)?
+                {
+                    found = Some(result);
+                    break;
+                }
+            }
+        }
+
+        if scope.is_some() {
+            scopes.pop();
+        }
+        Ok(found)
+    }
+
+    fn concrete_param_has_target_shape<R: Reader>(
+        dwarf: &Dwarf<R>,
+        index: &DwarfUnitIndex<R>,
+        function: DieRef<R::Offset>,
+        name: &str,
+    ) -> Result<bool> {
+        let unit = index.unit(function.unit);
+        let mut tree = unit.entries_tree(Some(function.offset))?;
+        let root = tree.root()?;
+        let mut children = root.children();
+        while let Some(child) = children.next()? {
+            let entry = child.entry();
+            if entry.tag() != gimli::DW_TAG_formal_parameter {
+                continue;
+            }
+            if die_name(dwarf, unit, entry)?.is_some() {
+                continue;
+            }
+            if entry.attr(gimli::DW_AT_type)?.is_some() {
+                continue;
+            }
+            if entry.attr(gimli::DW_AT_location)?.is_none() {
+                continue;
+            }
+            let Some(origin) =
+                index.referenced_die(function.unit, entry, gimli::DW_AT_abstract_origin)?
+            else {
+                continue;
+            };
+            let origin_unit = index.unit(origin.unit);
+            let origin_entry = origin_unit.entry(origin.offset)?;
+            if die_name(dwarf, origin_unit, &origin_entry)?.as_deref() == Some(name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[test]
     fn extracts_objecter_finish_op_var_fields_from_cpp_fixture() {
         let Some(binary) = compile_objecter_fixture() else {
             return;
@@ -2038,6 +2294,53 @@ mod tests {
         )
     }
 
+    /// Compiled at `-g -O2` (no `-O0`/`-fno-inline` defaults) so GCC emits
+    /// `get_handler` as an abstract instance -- whose parameters carry
+    /// `DW_AT_name` and `DW_AT_type` -- plus a concrete out-of-line instance
+    /// whose parameters carry `DW_AT_location`+`DW_AT_abstract_origin` but no
+    /// `DW_AT_name` and no `DW_AT_type`. The member-function-pointer indirection
+    /// keeps the out-of-line copy alive while the direct call is inlined, which
+    /// is what triggers the abstract/concrete split this fixture exercises.
+    fn compile_rgw_optimized_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "rgw-optimized-fixture",
+            &[(
+                "rgw-optimized-fixture",
+                r#"
+                struct DataPtr {
+                  char* _M_p;
+                };
+                struct StringLike {
+                  DataPtr _M_dataplus;
+                  unsigned long _M_string_length;
+                };
+                struct ReqState {
+                  StringLike trans_id;
+                };
+                class RGWREST {
+                public:
+                  void get_handler(ReqState* s);
+                  volatile unsigned long sink = 0;
+                };
+                void RGWREST::get_handler(ReqState* s) {
+                  sink += s->trans_id._M_string_length;
+                  sink += (unsigned long)s->trans_id._M_dataplus._M_p;
+                }
+                static RGWREST rest;
+                void (RGWREST::*handler_ptr)(ReqState*) = &RGWREST::get_handler;
+                int main() {
+                  char value = 0;
+                  ReqState state = {{{&value}, 12}};
+                  rest.get_handler(&state);
+                  (rest.*handler_ptr)(&state);
+                  return 0;
+                }
+                "#,
+            )],
+            &["-g", "-O2"],
+        )
+    }
+
     fn compile_objecter_fixture() -> Option<std::path::PathBuf> {
         compile_cpp_source(
             "objecter-fixture",
@@ -2224,6 +2527,42 @@ mod tests {
 
     fn compile_cpp_sources(name: &str, sources: &[(&str, &str)]) -> Option<std::path::PathBuf> {
         compile_cpp_sources_with_flags(name, sources, &[])
+    }
+
+    /// Like `compile_cpp_sources_with_flags` but passes `flags` verbatim without
+    /// the default `-g -O0 -fno-inline`, so a fixture can be built optimized
+    /// (`-O2`) to exercise the abstract/concrete DWARF split.
+    fn compile_cpp_sources_flags_only(
+        name: &str,
+        sources: &[(&str, &str)],
+        flags: &[&str],
+    ) -> Option<std::path::PathBuf> {
+        let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "rgwtrace-dwarf-native-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let binary = dir.join(name);
+        let sources = sources
+            .iter()
+            .map(|(source_name, contents)| {
+                let source = dir.join(format!("{source_name}.cc"));
+                std::fs::write(&source, contents).ok()?;
+                Some(source)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut command = std::process::Command::new(compiler);
+        command.args(flags);
+        for source in &sources {
+            command.arg(source);
+        }
+        let status = command.arg("-o").arg(&binary).status().ok()?;
+        status.success().then_some(binary)
     }
 
     fn compile_cpp_sources_with_flags(
