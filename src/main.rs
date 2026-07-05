@@ -13,12 +13,12 @@ mod targets;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     cli::{Cli, OutputMode},
-    collector::Collector,
+    collector::{Collector, TraceDocument},
     dwarf_input::DwarfInput,
 };
 
@@ -67,15 +67,14 @@ fn main() -> Result<()> {
 
     match cli.output {
         OutputMode::Json => {
-            let output = serde_json::json!({
-                "dwarf": dwarf.summary(),
-                "trace": trace,
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&trace_output_document(&dwarf, &trace)?)?
+            );
         }
         OutputMode::Otlp => {
             let export = if trace.spans.is_empty() {
-                otel::ExportDiagnostics::default()
+                Ok(otel::ExportDiagnostics::default())
             } else {
                 otel::export_otlp_http(
                     otel::ExportConfig {
@@ -88,8 +87,47 @@ fn main() -> Result<()> {
                         retries: cli.otlp_retries,
                     },
                     &trace,
-                )?
+                )
             };
+            // Serialize once so a failed export can still preserve the trace.
+            let document = trace_output_document(&dwarf, &trace)?;
+            finish_otlp_export(export, &document, &trace, &mut std::io::stdout())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the `{dwarf, trace}` JSON document emitted by the `OutputMode::Json`
+/// arm. Shared so a failed OTLP export can dump the exact same shape to stdout.
+fn trace_output_document(
+    dwarf: &crate::dwarf_json::DwarfInfo,
+    trace: &TraceDocument,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "dwarf": dwarf.summary(),
+        "trace": trace,
+    }))
+}
+
+/// Finish an `OutputMode::Otlp` session given the outcome of the final
+/// synchronous export.
+///
+/// On success (including a partially-failed export that still returned
+/// diagnostics), logs the shutdown summary and returns `Ok`. On a hard export
+/// failure the collected trace would otherwise be lost, so it is dumped to `out`
+/// as the same pretty JSON `{dwarf, trace}` document as `OutputMode::Json`, the
+/// failure is logged and surfaced in the shutdown summary, and the session ends
+/// with an error that points the operator at the dumped trace. The failure is
+/// never masked, and the data is never silently discarded.
+fn finish_otlp_export(
+    export: Result<otel::ExportDiagnostics>,
+    document: &serde_json::Value,
+    trace: &TraceDocument,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    match export {
+        Ok(export) => {
             info!(
                 spans = trace.spans.len(),
                 events_decoded = trace.diagnostics.events_decoded,
@@ -99,12 +137,31 @@ fn main() -> Result<()> {
                 background_rados_ops = trace.diagnostics.background_rados_ops,
                 export_attempts = export.attempts,
                 export_failures = export.failures,
+                export_failed = false,
                 "rgwtrace shutdown summary"
             );
+            Ok(())
+        }
+        Err(err) => {
+            error!(
+                error = %format_args!("{err:#}"),
+                "final OTLP export failed; dumping the collected trace to stdout so it is not lost"
+            );
+            info!(
+                spans = trace.spans.len(),
+                events_decoded = trace.diagnostics.events_decoded,
+                decode_errors = trace.diagnostics.decode_errors,
+                rados_ops = trace.diagnostics.rados_ops,
+                correlated_rados_ops = trace.diagnostics.correlated_rados_ops,
+                background_rados_ops = trace.diagnostics.background_rados_ops,
+                export_failed = true,
+                "rgwtrace shutdown summary"
+            );
+            writeln!(out, "{}", serde_json::to_string_pretty(document)?)
+                .context("failed to dump the un-exported trace to stdout")?;
+            Err(err.context("OTLP export failed; the collected trace was dumped to stdout as JSON"))
         }
     }
-
-    Ok(())
 }
 
 fn export_dwarf_json(dwarf: &crate::dwarf_json::DwarfInfo) -> serde_json::Value {
@@ -136,4 +193,58 @@ fn init_logging(default_filter: &str) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_trace() -> TraceDocument {
+        Collector::default().into_trace_document("rgwtrace")
+    }
+
+    #[test]
+    fn finish_otlp_export_returns_ok_without_dumping_on_success() {
+        let trace = sample_trace();
+        let document = serde_json::json!({ "trace": &trace });
+        let mut out = Vec::new();
+
+        let result = finish_otlp_export(
+            Ok(otel::ExportDiagnostics::default()),
+            &document,
+            &trace,
+            &mut out,
+        );
+
+        assert!(result.is_ok(), "a successful export must not error");
+        assert!(
+            out.is_empty(),
+            "a successful export must not dump the trace to stdout"
+        );
+    }
+
+    #[test]
+    fn finish_otlp_export_dumps_trace_and_errors_on_failure() {
+        let trace = sample_trace();
+        let document = serde_json::json!({ "dwarf": "summary", "trace": &trace });
+        let mut out = Vec::new();
+
+        let result = finish_otlp_export(
+            Err(anyhow::anyhow!("connection refused")),
+            &document,
+            &trace,
+            &mut out,
+        );
+
+        let err = result.expect_err("a failed export must surface an error");
+        // The failure is not masked...
+        assert!(format!("{err:#}").contains("connection refused"));
+        // ...and the error tells the operator where the data went.
+        assert!(format!("{err}").contains("dumped to stdout"));
+        // ...and the trace document was actually written to the sink.
+        let dumped = String::from_utf8(out).expect("stdout dump must be valid UTF-8");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&dumped).expect("dumped trace must be valid JSON");
+        assert_eq!(parsed, document);
+    }
 }
