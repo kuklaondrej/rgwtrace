@@ -40,7 +40,21 @@ struct BackgroundRados {
 
 #[derive(Clone, Copy, Debug)]
 enum RadosCorrelation {
+    // Thread-UNRESOLVED at ingest: a non-empty `trans_id` proves the RADOS op
+    // carries a request identity, but whether it ran on the request's own
+    // execute thread (`same_thread`) or was inherited via the cross-thread
+    // re-seed bridge (`cross_thread`) can only be decided in `request_spans`,
+    // once the request marker's `tid` is known. RADOS events can arrive before
+    // their marker, so committing to `same_thread` here would be wrong.
+    TransId,
+    Inferred,
+}
+
+// Late-derived, thread-resolved correlation used only when rendering spans.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolvedCorrelation {
     SameThread,
+    CrossThread,
     Inferred,
 }
 
@@ -89,6 +103,7 @@ pub struct TraceDiagnostics {
     pub correlated_rados_ops: u64,
     pub background_rados_ops: u64,
     pub same_thread_correlations: u64,
+    pub cross_thread_correlations: u64,
     pub inferred_correlations: u64,
     pub inference_no_candidate_rados_ops: u64,
     pub inference_ambiguous_rados_ops: u64,
@@ -203,10 +218,13 @@ impl Collector {
                         self.record_background_rados(rados, background_reason_for_role(role));
                     }
                 } else {
+                    // A non-empty `trans_id` correlates the op to its request,
+                    // but the same_thread/cross_thread split is derived late in
+                    // `request_spans` (the marker's `tid` may not be known yet).
                     self.record_correlated_rados(
                         rados.trans_id.clone(),
                         rados,
-                        RadosCorrelation::SameThread,
+                        RadosCorrelation::TransId,
                     );
                 }
             }
@@ -286,7 +304,10 @@ impl Collector {
     ) {
         self.diagnostics.correlated_rados_ops += 1;
         match correlation {
-            RadosCorrelation::SameThread => self.diagnostics.same_thread_correlations += 1,
+            // `TransId` is thread-unresolved at ingest: it counts toward
+            // `correlated_rados_ops` here, but its same_thread/cross_thread
+            // tally is deferred to `request_spans` when the marker is known.
+            RadosCorrelation::TransId => {}
             RadosCorrelation::Inferred => self.diagnostics.inferred_correlations += 1,
         }
         let last_seen_ns = rados_event_time_ns(&rados);
@@ -360,7 +381,7 @@ impl Collector {
         for (key, request) in std::mem::take(&mut self.requests) {
             if request.last_seen_ns != 0 && request.last_seen_ns <= cutoff_ns {
                 self.diagnostics.expired_request_groups += 1;
-                spans.extend(request_spans(key, request));
+                spans.extend(request_spans(key, request, &mut self.diagnostics));
             } else {
                 remaining_requests.insert(key, request);
             }
@@ -398,7 +419,7 @@ impl Collector {
         let mut spans = Vec::new();
 
         for (key, request) in self.requests {
-            spans.extend(request_spans(key, request));
+            spans.extend(request_spans(key, request, &mut self.diagnostics));
         }
 
         for background in self.background {
@@ -439,7 +460,11 @@ fn request_key(request: &RequestEvent) -> String {
     }
 }
 
-fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
+fn request_spans(
+    key: String,
+    builder: RequestBuilder,
+    diagnostics: &mut TraceDiagnostics,
+) -> Vec<SpanDocument> {
     let request_start_ns = builder.request.as_ref().map(|request| request.start_ns);
     let rados_start_ns = builder.rados.iter().map(|rados| rados.event.sent_ns).min();
     let start_ns = request_start_ns
@@ -483,6 +508,11 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
     let trace_id = trace_id(trans_id);
     let request_span_id = span_id(&format!("request:{trans_id}"));
     let duration_quality = request_duration_quality(&builder);
+    // The marker's thread ID is the late-derivation evidence for the
+    // same_thread/cross_thread split. A group reconstructed purely from RADOS
+    // bounds (no marker) has no thread evidence, so its `TransId` ops stay
+    // `same_thread` -- cross_thread requires marker evidence (design §3).
+    let marker_tid = builder.request.as_ref().map(|request| request.tid);
 
     let mut spans = vec![SpanDocument {
         trace_id: trace_id.clone(),
@@ -499,14 +529,43 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         events: Vec::new(),
     }];
 
-    spans.extend(
-        builder
-            .rados
-            .into_iter()
-            .map(|rados| rados_child_span(rados, trace_id.clone(), request_span_id.clone())),
-    );
+    for rados in builder.rados {
+        let resolved = resolve_correlation(rados.correlation, &rados.event, marker_tid);
+        // Tally the late-derived split here (Inferred was already counted at
+        // ingest); this keeps the invariant
+        // `correlated_rados_ops == same_thread + cross_thread + inferred`.
+        match resolved {
+            ResolvedCorrelation::SameThread => diagnostics.same_thread_correlations += 1,
+            ResolvedCorrelation::CrossThread => diagnostics.cross_thread_correlations += 1,
+            ResolvedCorrelation::Inferred => {}
+        }
+        spans.push(rados_child_span(
+            rados,
+            resolved,
+            trace_id.clone(),
+            request_span_id.clone(),
+        ));
+    }
 
     spans
+}
+
+fn resolve_correlation(
+    correlation: RadosCorrelation,
+    event: &RadosEvent,
+    marker_tid: Option<u32>,
+) -> ResolvedCorrelation {
+    match correlation {
+        RadosCorrelation::Inferred => ResolvedCorrelation::Inferred,
+        // A `trans_id`-tagged op is `same_thread` when it was submitted on the
+        // request's own execute thread, and `cross_thread` only when a marker
+        // proves the send thread differed (the re-seed bridge inherited the
+        // identity onto another thread). No marker => keep `same_thread`.
+        RadosCorrelation::TransId => match marker_tid {
+            Some(tid) if event.send_tid != tid => ResolvedCorrelation::CrossThread,
+            _ => ResolvedCorrelation::SameThread,
+        },
+    }
 }
 
 fn background_span(background: BackgroundRados) -> SpanDocument {
@@ -551,6 +610,7 @@ fn rados_span_event(rados: RadosEvent, attributes: Vec<Attribute>) -> SpanEvent 
 
 fn rados_child_span(
     rados: CorrelatedRados,
+    resolved: ResolvedCorrelation,
     trace_id: String,
     parent_span_id: String,
 ) -> SpanDocument {
@@ -569,7 +629,7 @@ fn rados_child_span(
         // `background_span`); `end_ns - start_ns` then matches the
         // `ceph.rados.duration_ns` attribute (0 when timestamps invert).
         end_ns: rados_event_time_ns(&event),
-        attributes: rados_attributes(&event, rados.correlation.name(), rados.correlation.reason()),
+        attributes: rados_attributes(&event, resolved.name(), resolved.reason()),
         events: Vec::new(),
     }
 }
@@ -687,10 +747,11 @@ fn inferable_rados_role(role: RadosRole) -> bool {
     )
 }
 
-impl RadosCorrelation {
+impl ResolvedCorrelation {
     fn name(self) -> &'static str {
         match self {
             Self::SameThread => "same_thread",
+            Self::CrossThread => "cross_thread",
             Self::Inferred => "inferred",
         }
     }
@@ -698,6 +759,10 @@ impl RadosCorrelation {
     fn reason(self) -> Option<&'static str> {
         match self {
             Self::SameThread => None,
+            // The re-seed bridge inherited the request identity onto the
+            // submission thread (design §3); surfaced so consumers can tell a
+            // bridged correlation from a native same-thread one.
+            Self::CrossThread => Some("reseed_bridge"),
             Self::Inferred => Some("pid_time_window"),
         }
     }
@@ -1405,6 +1470,176 @@ mod tests {
         assert_eq!(
             actual, expected,
             "collector trace golden changed:\n{actual}"
+        );
+    }
+
+    #[test]
+    fn resolves_same_thread_when_marker_arrives_after_rados_op() {
+        // Ingest-order bug fixed: the RADOS op (send_tid 7) arrives BEFORE its
+        // request marker (tid 7). Committing to same_thread at ingest was wrong
+        // because the marker's tid is unknown then; the label must still resolve
+        // to same_thread once the marker lands.
+        let mut op = rados("object", "tx1");
+        op.send_tid = 7;
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(op));
+        collector.push(TraceEvent::RequestEnd(request_with_tid("tx1", 7, 1, 30)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span");
+        assert_eq!(
+            string_attribute(child, "rgw.correlation"),
+            Some("same_thread")
+        );
+        assert_eq!(string_attribute(child, "rgw.correlation_reason"), None);
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.cross_thread_correlations, 0);
+    }
+
+    #[test]
+    fn resolves_same_thread_when_marker_arrives_before_rados_op() {
+        // Reverse ingest order (marker first): must resolve identically.
+        let mut op = rados("object", "tx1");
+        op.send_tid = 7;
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request_with_tid("tx1", 7, 1, 30)));
+        collector.push(TraceEvent::RadosOp(op));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span");
+        assert_eq!(
+            string_attribute(child, "rgw.correlation"),
+            Some("same_thread")
+        );
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.cross_thread_correlations, 0);
+    }
+
+    #[test]
+    fn resolves_cross_thread_when_send_tid_differs_from_marker() {
+        // Bridged op: a valid trans_id but submitted on a different thread than
+        // the request marker (send_tid 99 != marker tid 7). This is exactly the
+        // re-seed-bridge case the late label exists to surface.
+        let mut op = rados("object", "tx1");
+        op.send_tid = 99;
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(op));
+        collector.push(TraceEvent::RequestEnd(request_with_tid("tx1", 7, 1, 30)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span");
+        assert_eq!(
+            string_attribute(child, "rgw.correlation"),
+            Some("cross_thread")
+        );
+        assert_eq!(
+            string_attribute(child, "rgw.correlation_reason"),
+            Some("reseed_bridge")
+        );
+        assert_eq!(document.diagnostics.correlated_rados_ops, 1);
+        assert_eq!(document.diagnostics.same_thread_correlations, 0);
+        assert_eq!(document.diagnostics.cross_thread_correlations, 1);
+    }
+
+    #[test]
+    fn marker_less_rados_bounds_group_stays_same_thread() {
+        // A group reconstructed purely from RADOS bounds (no request marker) has
+        // no thread evidence, so cross_thread cannot be asserted: it keeps
+        // same_thread (design §3), preserving today's behavior.
+        let mut op = rados("object", "tx1");
+        op.send_tid = 99; // would differ from a marker, but there is no marker
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(op));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span");
+        assert_eq!(
+            string_attribute(
+                document
+                    .spans
+                    .iter()
+                    .find(|span| span.name == "rgw.request")
+                    .expect("request span"),
+                "rgw.duration_quality"
+            ),
+            Some("rados_bounds")
+        );
+        assert_eq!(
+            string_attribute(child, "rgw.correlation"),
+            Some("same_thread")
+        );
+        assert_eq!(document.diagnostics.same_thread_correlations, 1);
+        assert_eq!(document.diagnostics.cross_thread_correlations, 0);
+    }
+
+    #[test]
+    fn correlation_counter_equation_holds_on_mixed_scenario() {
+        // correlated_rados_ops == same_thread + cross_thread + inferred, on a
+        // scenario mixing same_thread, cross_thread (bridged), inferred, and an
+        // uncorrelated background op.
+        let mut collector = Collector::with_inferred_correlation(100);
+
+        // same_thread: send_tid == marker tid.
+        collector.push(TraceEvent::RequestEnd(request_with_tid(
+            "tx-same", 7, 1, 30,
+        )));
+        let mut same = rados("same", "tx-same");
+        same.send_tid = 7;
+        collector.push(TraceEvent::RadosOp(same));
+
+        // cross_thread: bridged op, send_tid != marker tid.
+        collector.push(TraceEvent::RequestEnd(request_with_tid(
+            "tx-cross", 7, 1, 30,
+        )));
+        let mut cross = rados("cross", "tx-cross");
+        cross.send_tid = 4242;
+        collector.push(TraceEvent::RadosOp(cross));
+
+        // inferred: untagged op inside a lone request's window.
+        collector.push(TraceEvent::RequestEnd(request_with_tid(
+            "tx-inf", 55, 200, 230,
+        )));
+        let mut inferred = rados("inferred", "");
+        inferred.send_tid = 55;
+        inferred.sent_ns = 240;
+        inferred.finish_ns = 245;
+        collector.push(TraceEvent::RadosOp(inferred));
+
+        // background: untagged op with a classified background role.
+        collector.push(TraceEvent::RadosOp(rados("notify.0", "")));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let d = &document.diagnostics;
+
+        assert_eq!(d.same_thread_correlations, 1);
+        assert_eq!(d.cross_thread_correlations, 1);
+        assert_eq!(d.inferred_correlations, 1);
+        assert_eq!(d.background_rados_ops, 1);
+        assert_eq!(
+            d.correlated_rados_ops,
+            d.same_thread_correlations + d.cross_thread_correlations + d.inferred_correlations,
+            "counter equation must hold"
         );
     }
 
