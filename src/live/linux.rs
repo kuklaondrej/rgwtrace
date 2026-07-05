@@ -111,6 +111,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let started = Instant::now();
     let mut last_flush = Instant::now();
+    // Latches once the OTLP exporter thread dies so a single fatal/misconfig
+    // OTLP response cannot tear down the session or spam the log.
+    let mut otlp_export_disabled = false;
     loop {
         let ret = ringbuf.poll_raw(Duration::from_millis(250));
         if ret < 0 {
@@ -136,7 +139,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         {
             merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
             if let Some(exporter) = &otlp_exporter {
-                queue_expired_otlp(cli, &collector, &exporter.sender)?;
+                queue_expired_otlp(cli, &collector, &exporter.sender, &mut otlp_export_disabled)?;
             }
             last_flush = Instant::now();
         }
@@ -145,13 +148,21 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     drop(ringbuf);
     merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
     if let Some(exporter) = otlp_exporter {
-        let export = exporter.finish()?;
-        info!(
-            export_batches = export.batches,
-            export_attempts = export.attempts,
-            export_failures = export.failures,
-            "finished live OTLP exporter"
-        );
+        // The exporter thread returns `Err` after a fatal/exhausted OTLP export.
+        // Surface it for logging, but never let it abort the session: the
+        // collected spans below must still be emitted on the non-OTLP path.
+        match exporter.finish() {
+            Ok(export) => info!(
+                export_batches = export.batches,
+                export_attempts = export.attempts,
+                export_failures = export.failures,
+                "finished live OTLP exporter"
+            ),
+            Err(err) => warn!(
+                error = %format_args!("{err:#}"),
+                "live OTLP exporter thread ended with an error; continuing without OTLP export"
+            ),
+        }
     }
     let collector = Arc::try_unwrap(collector)
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
@@ -260,7 +271,15 @@ fn queue_expired_otlp(
     cli: &Cli,
     collector: &Arc<Mutex<Collector>>,
     sender: &SyncSender<TraceDocument>,
+    disabled: &mut bool,
 ) -> Result<()> {
+    // Once the exporter thread has gone away we permanently stop draining spans
+    // into the (dead) channel so the session keeps running and the end-of-run
+    // `into_trace_document` still produces output for the non-OTLP path.
+    if *disabled {
+        return Ok(());
+    }
+
     let ttl_ns = duration_ns(cli.correlation_ttl);
     let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
     let trace = collector
@@ -270,6 +289,33 @@ fn queue_expired_otlp(
     let Some(trace) = trace else {
         return Ok(());
     };
+
+    dispatch_expired_otlp(collector, sender, trace, disabled);
+    Ok(())
+}
+
+/// Hand a drained batch of expired spans to the OTLP exporter thread, degrading
+/// gracefully instead of aborting the session.
+///
+/// A dead exporter thread (channel `Disconnected`) is treated as a permanent,
+/// non-fatal condition: the drop is counted, OTLP export is disabled for the
+/// rest of the run via `disabled`, and a single warning is logged. Subsequent
+/// calls observe `disabled` and stay silent, so a transient/misconfig OTLP
+/// error can neither tear down live tracing nor spam the log.
+fn dispatch_expired_otlp(
+    collector: &Arc<Mutex<Collector>>,
+    sender: &SyncSender<TraceDocument>,
+    trace: TraceDocument,
+    disabled: &mut bool,
+) {
+    // Export already disabled: count the drop but do not re-log or re-send.
+    if *disabled {
+        collector
+            .lock()
+            .expect("collector lock poisoned")
+            .record_otlp_queue_drop(trace.spans.len());
+        return;
+    }
 
     let spans = trace.spans.len();
     match sender.try_send(trace) {
@@ -289,10 +335,13 @@ fn queue_expired_otlp(
                 .lock()
                 .expect("collector lock poisoned")
                 .record_otlp_queue_drop(trace.spans.len());
-            bail!("OTLP exporter worker stopped before accepting expired spans");
+            *disabled = true;
+            warn!(
+                spans = trace.spans.len(),
+                "OTLP exporter worker stopped; disabling OTLP export for the rest of this run and continuing to collect spans"
+            );
         }
     }
-    Ok(())
 }
 
 fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result<()> {
@@ -514,7 +563,96 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::{SpanDocument, TraceDiagnostics};
     use crate::events::{RawClsOp, MAX_ACTING, MAX_RADOS_OPS};
+
+    fn trace_document_with_spans(span_count: usize) -> TraceDocument {
+        TraceDocument {
+            service_name: "rgwtrace".to_string(),
+            spans: (0..span_count)
+                .map(|idx| SpanDocument {
+                    trace_id: format!("{idx:032x}"),
+                    span_id: format!("{idx:016x}"),
+                    parent_span_id: None,
+                    name: "rgw.request".to_string(),
+                    start_ns: 10,
+                    end_ns: 20,
+                    attributes: Vec::new(),
+                    events: Vec::new(),
+                })
+                .collect(),
+            diagnostics: TraceDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn dispatch_disconnected_otlp_does_not_abort_and_counts_drop_once_disabled() {
+        // Receiver dropped up front: every `try_send` sees `Disconnected`, the
+        // exact condition that previously `bail!`-ed and tore down the session.
+        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        drop(receiver);
+
+        let collector = Arc::new(Mutex::new(Collector::default()));
+        let mut disabled = false;
+
+        // First disconnected dispatch: must not panic/return Err, must count the
+        // drop, and must latch OTLP export off for the rest of the run.
+        dispatch_expired_otlp(
+            &collector,
+            &sender,
+            trace_document_with_spans(3),
+            &mut disabled,
+        );
+        assert!(disabled, "a disconnected exporter must disable OTLP export");
+
+        // Idempotent: repeated calls stay disabled and keep counting drops. The
+        // log-once guarantee is structural: only the first, transitioning call
+        // reaches the warning branch; later calls take the disabled path.
+        dispatch_expired_otlp(
+            &collector,
+            &sender,
+            trace_document_with_spans(2),
+            &mut disabled,
+        );
+        assert!(disabled, "export must remain disabled after repeated drops");
+
+        let diagnostics = Arc::try_unwrap(collector)
+            .expect("collector still referenced")
+            .into_inner()
+            .expect("collector lock poisoned")
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_queue_dropped_traces, 2);
+        assert_eq!(diagnostics.otlp_queue_dropped_spans, 5);
+    }
+
+    #[test]
+    fn dispatch_successful_otlp_send_keeps_export_enabled() {
+        // A live receiver: the batch is accepted, no drop is recorded, and OTLP
+        // export stays enabled.
+        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Arc::new(Mutex::new(Collector::default()));
+        let mut disabled = false;
+
+        dispatch_expired_otlp(
+            &collector,
+            &sender,
+            trace_document_with_spans(4),
+            &mut disabled,
+        );
+
+        assert!(!disabled, "a successful send must not disable export");
+        let received = receiver.try_recv().expect("batch should be queued");
+        assert_eq!(received.spans.len(), 4);
+
+        let diagnostics = Arc::try_unwrap(collector)
+            .expect("collector still referenced")
+            .into_inner()
+            .expect("collector lock poisoned")
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
+    }
 
     #[test]
     fn decodes_request_end_event() {
