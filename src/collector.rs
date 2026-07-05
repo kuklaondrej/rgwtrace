@@ -430,10 +430,15 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         .min()
         .unwrap_or_default();
     let request_end_ns = builder.request.as_ref().map(|request| request.end_ns);
+    // Use the clamped child-span end (`finish_ns.max(sent_ns)`), not the raw
+    // `finish_ns`. An inverted op whose `sent_ns` exceeds every `finish_ns` (and
+    // the marker's `end_ns`) would otherwise leave the parent ending before the
+    // clamped child span, pushing the child outside the parent bounds that the
+    // JSON validator enforces.
     let rados_end_ns = builder
         .rados
         .iter()
-        .map(|rados| rados.event.finish_ns)
+        .map(|rados| rados_event_time_ns(&rados.event))
         .max();
     let end_ns = request_end_ns
         .into_iter()
@@ -1108,6 +1113,31 @@ mod tests {
             string_attribute(&document.spans[0], "rgw.duration_quality"),
             Some("marker")
         );
+    }
+
+    #[test]
+    fn request_span_envelopes_inverted_child_clamped_end() {
+        // An inverted op (finish < sent) whose sent_ns exceeds the marker end
+        // and every raw finish_ns. The child span end is clamped to sent_ns, so
+        // the parent must also extend to sent_ns or the child escapes the parent
+        // bounds the JSON validator enforces.
+        let mut collector = Collector::default();
+        let mut child = rados("object", "tx1");
+        child.sent_ns = 200;
+        child.finish_ns = 150;
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(TraceEvent::RequestEnd(request("tx1", 50, 100)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let parent = &document.spans[0];
+        let rados = &document.spans[1];
+        assert_eq!(rados.name, "rados.op");
+        assert_eq!(rados.start_ns, 200);
+        assert_eq!(rados.end_ns, 200);
+        assert!(parent.start_ns <= rados.start_ns);
+        assert!(parent.end_ns >= rados.end_ns);
+        assert_eq!(parent.end_ns, 200);
     }
 
     #[test]
