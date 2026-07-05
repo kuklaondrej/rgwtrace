@@ -13,6 +13,7 @@ use crate::{
 const SEND_OP: &str = "Objecter::_send_op";
 const FINISH_OP: &str = "Objecter::_finish_op";
 const GET_HANDLER: &str = "RGWREST::get_handler";
+const RGW_PROCESS_AUTHENTICATED: &str = "rgw_process_authenticated";
 
 const SEND_OP_FIELDS: usize = 12;
 const FINISH_OP_FIELDS: usize = 3;
@@ -188,7 +189,40 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
             status: "ok",
             detail: format!("{GET_HANDLER} available in {radosgw}"),
         },
+        reseed_probe_check(dwarf, radosgw),
     ]
+}
+
+/// Advisory (non-fatal) availability of the Stage 3 cross-thread re-seed probe.
+/// A missing `rgw_process_authenticated` raw-pointer descriptor only degrades
+/// `--correlate-cross-thread` to same-thread behavior, so it is reported as a
+/// `warn` rather than failing preflight -- consistent with the build-id
+/// advisory style.
+fn reseed_probe_check(dwarf: &DwarfInfo, radosgw: &str) -> PreflightCheck {
+    let present = dwarf
+        .function_addr(radosgw, RGW_PROCESS_AUTHENTICATED)
+        .is_some()
+        && dwarf
+            .function_var_field_count(radosgw, RGW_PROCESS_AUTHENTICATED)
+            .is_some_and(|count| count >= 1);
+    if present {
+        PreflightCheck {
+            name: "cross_thread_reseed_probe".to_string(),
+            status: "ok",
+            detail: format!(
+                "{RGW_PROCESS_AUTHENTICATED} available in {radosgw}; --correlate-cross-thread can attach the re-seed bridge"
+            ),
+        }
+    } else {
+        PreflightCheck {
+            name: "cross_thread_reseed_probe".to_string(),
+            status: "warn",
+            detail: format!(
+                "{RGW_PROCESS_AUTHENTICATED} raw-pointer descriptor unavailable in {radosgw}; \
+                 --correlate-cross-thread will fall back to same-thread correlation"
+            ),
+        }
+    }
 }
 
 fn validate_ceph_version(dwarf: &DwarfInfo) -> Result<()> {

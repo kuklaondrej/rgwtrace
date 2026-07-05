@@ -75,6 +75,9 @@ pub struct BpfDiagnostics {
     pub request_context_drops: u64,
     pub probe_read_failures: u64,
     pub reqstate_map_drops: u64,
+    pub reseed_hits: u64,
+    pub reseed_misses: u64,
+    pub reseed_base_unresolved: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -110,6 +113,15 @@ pub struct TraceDiagnostics {
     pub bpf_request_context_drops: u64,
     pub bpf_probe_read_failures: u64,
     pub bpf_reqstate_map_drops: u64,
+    // Cross-thread re-seed bridge coverage counters (informational, not
+    // failures): populated only under --correlate-cross-thread. `reseed_hits`
+    // is the number of execute-thread re-seeds that inherited a request's
+    // context; `reseed_misses` counts fail-closed clears/keeps; and
+    // `reseed_base_unresolved` counts req_state* descriptors that were not
+    // register-resolvable at entry.
+    pub bpf_reseed_hits: u64,
+    pub bpf_reseed_misses: u64,
+    pub bpf_reseed_base_unresolved: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -327,6 +339,9 @@ impl Collector {
         self.diagnostics.bpf_request_context_drops = diagnostics.request_context_drops;
         self.diagnostics.bpf_probe_read_failures = diagnostics.probe_read_failures;
         self.diagnostics.bpf_reqstate_map_drops = diagnostics.reqstate_map_drops;
+        self.diagnostics.bpf_reseed_hits = diagnostics.reseed_hits;
+        self.diagnostics.bpf_reseed_misses = diagnostics.reseed_misses;
+        self.diagnostics.bpf_reseed_base_unresolved = diagnostics.reseed_base_unresolved;
     }
 
     pub fn drain_expired(
@@ -1321,6 +1336,9 @@ mod tests {
             request_context_drops: 5,
             probe_read_failures: 6,
             reqstate_map_drops: 7,
+            reseed_hits: 8,
+            reseed_misses: 9,
+            reseed_base_unresolved: 10,
         });
 
         let document = collector.into_trace_document("rgwtrace");
@@ -1331,6 +1349,9 @@ mod tests {
         assert_eq!(document.diagnostics.bpf_request_context_drops, 5);
         assert_eq!(document.diagnostics.bpf_probe_read_failures, 6);
         assert_eq!(document.diagnostics.bpf_reqstate_map_drops, 7);
+        assert_eq!(document.diagnostics.bpf_reseed_hits, 8);
+        assert_eq!(document.diagnostics.bpf_reseed_misses, 9);
+        assert_eq!(document.diagnostics.bpf_reseed_base_unresolved, 10);
     }
 
     #[test]

@@ -135,6 +135,8 @@ Do not assume background spans are errors. A rising background ratio is useful s
 
 `--correlate-inferred` can attach untagged RADOS ops to a request only when there is one conservative candidate in `--inference-window` and the role does not look like RGW background work. A unique matching RADOS send thread is preferred over same-PID/time-window candidates. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`. Ambiguous or out-of-window candidates remain background spans.
 
+`--correlate-cross-thread` (default off, opt-in) enables the fail-closed cross-thread bridge described in `docs/design-cross-thread-correlation.md`. It re-seeds request context on the request execute thread at `rgw_process_authenticated`, so RADOS ops submitted *synchronously* on that thread inherit the request's `trans_id` even though `get_handler` ran on a different thread. It is bounded and honest: on async-dispatch RGW builds (e.g. 18.2.8 beast) most data-path ops submit off the execute thread, so only the measured ~20–25% synchronous subset is recovered; the rest stay `background`/`inferred` by design. The bridge is fail-closed and zero-mis-correlation — a foreign or stale context lingering on a thread is cleared rather than mis-attributed. With the flag off the re-seed uprobe is never attached and behavior is byte-for-byte identical to not having the feature. Coverage/health is visible in the informational diagnostics `bpf_reseed_hits`, `bpf_reseed_misses`, and `bpf_reseed_base_unresolved` (never failure counters). `preflight` reports `cross_thread_reseed_probe` as an advisory `ok`/`warn` for whether the `rgw_process_authenticated` raw-pointer descriptor resolved.
+
 ---
 
 ## Capture Quality

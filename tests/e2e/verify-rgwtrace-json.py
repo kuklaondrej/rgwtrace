@@ -36,6 +36,15 @@ BPF_FAILURE_DIAGNOSTICS = [
     "bpf_probe_read_failures",
     "bpf_reqstate_map_drops",
 ]
+# Cross-thread re-seed bridge coverage counters (--correlate-cross-thread).
+# These are informational, NOT failures: hits are the wins, and misses/base
+# unresolved are the fail-closed/degraded cases the design expects. They must
+# never be asserted to be zero -- only checked to be valid non-negative counts.
+BPF_INFORMATIONAL_DIAGNOSTICS = [
+    "bpf_reseed_hits",
+    "bpf_reseed_misses",
+    "bpf_reseed_base_unresolved",
+]
 RADOS_ATTRIBUTE_KEYS = [
     "ceph.rados.duration_ns",
     "ceph.rados.pool",
@@ -398,6 +407,10 @@ def verify_document(args, document, workload, manifest=None):
     for key in BPF_FAILURE_DIAGNOSTICS:
         if diagnostics.get(key, 0) != 0:
             fail(errors, f"{key} must be 0, got {diagnostics.get(key)}")
+    for key in BPF_INFORMATIONAL_DIAGNOSTICS:
+        value = diagnostics.get(key, 0)
+        if not isinstance(value, int) or value < 0:
+            fail(errors, f"{key} must be a non-negative integer, got {value!r}")
 
     if len(request_spans) < args.min_request_spans:
         fail(errors, f"expected at least {args.min_request_spans} rgw.request spans, got {len(request_spans)}")

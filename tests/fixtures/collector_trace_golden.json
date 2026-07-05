@@ -253,6 +253,9 @@
     "bpf_rados_finish_misses": 0,
     "bpf_request_context_drops": 0,
     "bpf_probe_read_failures": 0,
-    "bpf_reqstate_map_drops": 0
+    "bpf_reqstate_map_drops": 0,
+    "bpf_reseed_hits": 0,
+    "bpf_reseed_misses": 0,
+    "bpf_reseed_base_unresolved": 0
   }
 }

@@ -22,10 +22,16 @@ const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
     "Objecter::_finish_op",
     "RGWREST::get_handler",
+    "rgw_process_authenticated",
 ];
 const OBJECTER_PROBE_FUNCTIONS: &[&str] = &["Objecter::_send_op", "Objecter::_finish_op"];
-const RGW_PROBE_FUNCTIONS: &[&str] = &["RGWREST::get_handler"];
-const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &["_send_op", "_finish_op", "get_handler"];
+const RGW_PROBE_FUNCTIONS: &[&str] = &["RGWREST::get_handler", "rgw_process_authenticated"];
+const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &[
+    "_send_op",
+    "_finish_op",
+    "get_handler",
+    "rgw_process_authenticated",
+];
 const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
     &["op", "tid"],
     &["this", "monc", "global_id"],
@@ -49,6 +55,12 @@ const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
     &["s", "trans_id", "_M_string_length"],
     &["s", "trans_id", "_M_dataplus", "_M_p"],
 ];
+/// Cross-thread re-seed bridge (design Stage 3). A single-element path names the
+/// `req_state* s` parameter's own pointer value with no member access -- the
+/// raw-pointer descriptor. It resolves to the parameter's entry-PC register
+/// location plus one sentinel field, and is dropped when the parameter is not
+/// register-resident at entry (see `probe_function_var_fields`).
+const RGW_PROCESS_AUTHENTICATED_FIELDS: &[&[&str]] = &[&["s"]];
 
 #[allow(dead_code)]
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
@@ -664,6 +676,30 @@ fn probe_function_var_fields<R: Reader>(
             );
             return Ok(None);
         };
+        // Raw-pointer descriptor (design Stage 3): a single-element path names
+        // the parameter's own pointer value with no member access. The BPF
+        // fetch_param_ptr reads it register-only, so a stack-located descriptor
+        // cannot encode it -- drop the whole function's var_fields
+        // (all-or-nothing, like every other probe) and fall back to baseline.
+        // The emitted field is the sentinel {offset:0, pointer:false}.
+        if path.len() == 1 {
+            if location.stack {
+                debug!(
+                    function = function_name,
+                    variable = *variable_name,
+                    "native DWARF probe rejected: raw-pointer parameter is stack-located at entry"
+                );
+                return Ok(None);
+            }
+            var_fields.push(VarFieldJson {
+                location,
+                fields: vec![FieldJson {
+                    offset: 0,
+                    pointer: false,
+                }],
+            });
+            continue;
+        }
         let Some(fields) = translate_field_path(dwarf, index, variable, path)? else {
             debug!(
                 function = function_name,
@@ -683,6 +719,7 @@ fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]
         "Objecter::_send_op" => Some(OBJECTER_SEND_OP_FIELDS),
         "Objecter::_finish_op" => Some(OBJECTER_FINISH_OP_FIELDS),
         "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
+        "rgw_process_authenticated" => Some(RGW_PROCESS_AUTHENTICATED_FIELDS),
         _ => None,
     }
 }
@@ -2300,6 +2337,80 @@ mod tests {
             }
         }
         Ok(false)
+    }
+
+    /// Free function taking `req_state* s` as its 4th parameter -- the Stage 3
+    /// re-seed site. Built at `-O1 -fno-inline` (not `-O0`) so the parameter is
+    /// register-resident at entry and `variable_location` can decode it; at
+    /// `-O0` this toolchain emits `DW_OP_fbreg`/CFA locations the decoder
+    /// rejects, matching the other optimized fixtures.
+    fn compile_rgw_process_authenticated_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "rgw-process-authenticated-fixture",
+            &[(
+                "rgw-process-authenticated-fixture",
+                r#"
+                struct req_state { unsigned long id; };
+                struct RGWHandler_REST { int x; };
+                struct RGWOp { int y; };
+                struct RGWRequest { int z; };
+                static volatile unsigned long sink;
+                __attribute__((noinline)) void rgw_process_authenticated(
+                    RGWHandler_REST* handler, RGWOp** op, RGWRequest* req,
+                    req_state* s) {
+                  sink += handler->x;
+                  sink += (*op)->y;
+                  sink += req->z;
+                  sink += s->id;
+                }
+                int main() {
+                  RGWHandler_REST h{1};
+                  RGWOp o{2};
+                  RGWOp* op = &o;
+                  RGWRequest r{3};
+                  req_state s{4};
+                  rgw_process_authenticated(&h, &op, &r, &s);
+                  return 0;
+                }
+                "#,
+            )],
+            &["-g", "-O1", "-fno-inline"],
+        )
+    }
+
+    #[test]
+    fn extracts_rgw_process_authenticated_raw_pointer_descriptor_from_cpp_fixture() {
+        let Some(binary) = compile_rgw_process_authenticated_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        // Function PC must resolve (proves the free-function name is matched).
+        assert!(module.func2pc.contains_key("rgw_process_authenticated"));
+
+        let Some(fields) = module.func2vf.get("rgw_process_authenticated") else {
+            // Toolchain did not emit a decodable register location for `s` at
+            // entry; the all-or-nothing raw-pointer path then drops the
+            // var_fields. Announce loudly so this does not look like a pass.
+            eprintln!(
+                "SKIPPED extracts_rgw_process_authenticated_raw_pointer_descriptor_from_cpp_fixture: \
+                 toolchain did not emit a decodable register location for the req_state* parameter"
+            );
+            return;
+        };
+
+        // Exactly one var_field: the raw-pointer descriptor. Its location is a
+        // register (never stack), and its single field is the sentinel
+        // {offset:0, pointer:false} -- the parameter's own value, no member
+        // access.
+        assert_eq!(fields.var_fields.len(), 1);
+        let raw = &fields.var_fields[0];
+        assert!(raw.location.reg >= 0, "descriptor must be register-located");
+        assert!(!raw.location.stack, "descriptor must not be stack-located");
+        assert_eq!(raw.fields.len(), 1);
+        assert_eq!(raw.fields[0].offset, 0);
+        assert!(!raw.fields[0].pointer);
     }
 
     #[test]
