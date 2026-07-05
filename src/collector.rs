@@ -489,7 +489,16 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
 fn background_span(background: BackgroundRados) -> SpanDocument {
     let rados = background.event;
     let start_ns = rados.sent_ns;
-    let end_ns = rados.finish_ns;
+    // `_send_op` and `_finish_op` run on different worker threads, so
+    // `bpf_ktime_get_boot_ns` can invert across CPUs and yield
+    // `finish_ns < sent_ns`. Clamp the span end so it never precedes the start,
+    // matching `request_spans`. The reported duration is the
+    // `ceph.rados.duration_ns` attribute (`finish_ns.saturating_sub(sent_ns)`,
+    // which is 0 when inverted); `end_ns - start_ns` is then also 0, keeping the
+    // span fields internally consistent for the JSON validator and OTLP backends.
+    // The trailing `rados.op` event's `time_ns` reuses the same clamped value so
+    // it keeps matching `end_ns`.
+    let end_ns = rados_event_time_ns(&rados);
     let trace_key = format!("background:{}:{}:{}", rados.pid, rados.tid, rados.sent_ns);
     let attributes = rados_attributes(&rados, "none", Some(background.reason.name()));
 
@@ -506,7 +515,9 @@ fn background_span(background: BackgroundRados) -> SpanDocument {
 }
 
 fn rados_span_event(rados: RadosEvent, attributes: Vec<Attribute>) -> SpanEvent {
-    let time_ns = rados.finish_ns;
+    // Match the clamped `background_span` end so the validator's
+    // `event.time_ns == span.end_ns` check holds even when timestamps invert.
+    let time_ns = rados_event_time_ns(&rados);
 
     SpanEvent {
         name: "rados.op".to_string(),
@@ -531,7 +542,10 @@ fn rados_child_span(
         parent_span_id: Some(parent_span_id),
         name: "rados.op".to_string(),
         start_ns: event.sent_ns,
-        end_ns: event.finish_ns,
+        // Clamp so the child span never ends before it starts (see
+        // `background_span`); `end_ns - start_ns` then matches the
+        // `ceph.rados.duration_ns` attribute (0 when timestamps invert).
+        end_ns: rados_event_time_ns(&event),
         attributes: rados_attributes(&event, rados.correlation.name(), rados.correlation.reason()),
         events: Vec::new(),
     }
@@ -1373,5 +1387,125 @@ mod tests {
             }
             None
         })
+    }
+
+    #[test]
+    fn child_span_clamps_inverted_timestamps() {
+        // The send and finish probes run on different worker threads, so
+        // boot-clock reads can invert across CPUs and give finish_ns < sent_ns.
+        let mut event = rados("bucket-object", "tx-inv");
+        event.sent_ns = 200;
+        event.finish_ns = 100;
+        // Mirror the production derivation (events.rs): saturating_sub -> 0.
+        event.duration_ns = event.finish_ns.saturating_sub(event.sent_ns);
+
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(event));
+        collector.push(TraceEvent::RequestEnd(request("tx-inv", 50, 300)));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span should exist");
+
+        assert!(
+            child.start_ns <= child.end_ns,
+            "child start_ns {} must not exceed end_ns {}",
+            child.start_ns,
+            child.end_ns
+        );
+        let duration = u64_attribute(child, "ceph.rados.duration_ns").expect("duration attribute");
+        assert_eq!(
+            duration,
+            child.end_ns - child.start_ns,
+            "reported duration must equal end-start"
+        );
+        assert_eq!(
+            duration, 0,
+            "inverted timestamps clamp to a zero-length span"
+        );
+    }
+
+    #[test]
+    fn background_span_clamps_inverted_timestamps() {
+        let mut event = rados("notify.0", "");
+        event.sent_ns = 200;
+        event.finish_ns = 100;
+        event.duration_ns = event.finish_ns.saturating_sub(event.sent_ns);
+
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(event));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let background = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rgw.background.rados_op")
+            .expect("background rados span should exist");
+
+        assert!(
+            background.start_ns <= background.end_ns,
+            "background start_ns {} must not exceed end_ns {}",
+            background.start_ns,
+            background.end_ns
+        );
+        let duration =
+            u64_attribute(background, "ceph.rados.duration_ns").expect("duration attribute");
+        assert_eq!(duration, background.end_ns - background.start_ns);
+        assert_eq!(duration, 0);
+        // The trailing rados.op event's time_ns must keep matching the clamped
+        // end_ns (the JSON validator enforces this equality).
+        assert_eq!(background.events.len(), 1);
+        assert_eq!(background.events[0].time_ns, background.end_ns);
+    }
+
+    #[test]
+    fn spans_keep_non_zero_duration_when_ordered() {
+        // Regression guard: correctly ordered timestamps must survive the clamp.
+        let mut child = rados("bucket-object", "tx-ok");
+        child.sent_ns = 100;
+        child.finish_ns = 175;
+        child.duration_ns = child.finish_ns - child.sent_ns;
+
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(TraceEvent::RequestEnd(request("tx-ok", 50, 300)));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let child_span = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("child rados span should exist");
+        assert_eq!(child_span.start_ns, 100);
+        assert_eq!(child_span.end_ns, 175);
+        assert_eq!(child_span.end_ns - child_span.start_ns, 75);
+        assert_eq!(
+            u64_attribute(child_span, "ceph.rados.duration_ns"),
+            Some(75)
+        );
+
+        let mut background = rados("notify.0", "");
+        background.sent_ns = 400;
+        background.finish_ns = 460;
+        background.duration_ns = background.finish_ns - background.sent_ns;
+
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RadosOp(background));
+
+        let document = collector.into_trace_document("rgwtrace");
+        let background_span = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rgw.background.rados_op")
+            .expect("background rados span should exist");
+        assert_eq!(background_span.end_ns - background_span.start_ns, 60);
+        assert_eq!(
+            u64_attribute(background_span, "ceph.rados.duration_ns"),
+            Some(60)
+        );
+        assert_eq!(background_span.events[0].time_ns, background_span.end_ns);
     }
 }
