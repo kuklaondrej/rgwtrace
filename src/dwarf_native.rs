@@ -207,7 +207,8 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     }
 
     let build_id = file.build_id()?.map(hex_string);
-    let debug_data = debug_data(path, &file, data.as_slice(), build_id.as_deref())?;
+    let (debug_data, debug_file_path) =
+        debug_data(path, &file, data.as_slice(), build_id.as_deref())?;
     let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
         format!(
             "debug info for {} is not a supported object file",
@@ -219,9 +220,34 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     } else {
         RunTimeEndian::Big
     };
-    let dwarf_cow = Dwarf::load(|section| load_section(&debug_file, section))?;
+
+    // el9/Fedora/RHEL debuginfo is DWZ-compressed: the debug file's
+    // `.gnu_debugaltlink` points at a shared supplementary object, and DIEs and
+    // strings reference it via `DW_FORM_GNU_ref_alt`/`DW_FORM_GNU_strp_alt`.
+    // Read the supplementary object's bytes up front so they outlive the `Dwarf`
+    // built below; missing/mismatched sup degrades to what resolves locally.
+    let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+    let sup_file = match &sup_data {
+        Some(bytes) => Some(object::File::parse(bytes.as_slice()).with_context(|| {
+            format!(
+                "DWZ supplementary file for {} is not a supported object file",
+                debug_file_path.display()
+            )
+        })?),
+        None => None,
+    };
+
+    // Load into owned `Vec<u8>` sections (not borrowed `Cow`s) so the main and
+    // supplementary section data share one owned type and no self-referential
+    // borrow is needed to attach the sup file.
+    let mut dwarf_owned =
+        Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))?;
+    if let Some(sup_file) = &sup_file {
+        dwarf_owned
+            .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))?;
+    }
     #[allow(deprecated)]
-    let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+    let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
     let mut func2pc = symbol_function_pcs(&debug_file, wanted);
     for (function, pc) in symbol_function_pcs(&file, wanted) {
@@ -275,18 +301,46 @@ struct DieRef<Offset> {
 /// on demand (as the previous single-unit code did) cannot return a DIE that
 /// outlives the temporary unit it came from.
 struct DwarfUnitIndex<R: Reader> {
+    /// Main-file compilation units first, then (if a DWZ supplementary file was
+    /// loaded) the supplementary file's units. A single vec keeps `DieRef.unit`
+    /// a plain index across both files.
     units: Vec<gimli::Unit<R>>,
-    /// `(.debug_info start offset, index into `units`)` for every loaded unit,
-    /// sorted ascending by start offset. Lets `debug_info_ref` binary-search the
-    /// owning unit instead of scanning every unit per reference. The stored
-    /// index maps back to the surviving unit, so gaps left by skipped
-    /// (malformed) units resolve correctly.
+    /// Number of main-file units; also the index where supplementary units
+    /// begin. Equal to `units.len()` when no supplementary file is loaded.
+    sup_start: usize,
+    /// `(.debug_info start offset, index into `units`)` for every main-file
+    /// unit, sorted ascending by start offset. Lets `debug_info_ref`
+    /// binary-search the owning unit instead of scanning every unit per
+    /// reference. The stored index maps back to the surviving unit, so gaps left
+    /// by skipped (malformed) units resolve correctly.
     unit_offsets: Vec<(R::Offset, usize)>,
+    /// Same as `unit_offsets` but for the supplementary file's `.debug_info`,
+    /// resolving `DW_FORM_GNU_ref_alt` (`DebugInfoRefSup`) references and
+    /// intra-supplementary `DebugInfoRef`s.
+    sup_unit_offsets: Vec<(R::Offset, usize)>,
 }
 
 impl<R: Reader> DwarfUnitIndex<R> {
     fn load(dwarf: &Dwarf<R>) -> Result<Self> {
         let mut units = Vec::new();
+        Self::load_units_into(dwarf, &mut units);
+        let sup_start = units.len();
+        if let Some(sup) = dwarf.sup() {
+            Self::load_units_into(sup, &mut units);
+        }
+
+        let unit_offsets = Self::offset_table(&units[..sup_start], 0);
+        let sup_unit_offsets = Self::offset_table(&units[sup_start..], sup_start);
+
+        Ok(Self {
+            units,
+            sup_start,
+            unit_offsets,
+            sup_unit_offsets,
+        })
+    }
+
+    fn load_units_into(dwarf: &Dwarf<R>, units: &mut Vec<gimli::Unit<R>>) {
         let mut headers = dwarf.units();
         loop {
             let header = match headers.next() {
@@ -315,29 +369,40 @@ impl<R: Reader> DwarfUnitIndex<R> {
                 }
             }
         }
+    }
 
-        let mut unit_offsets: Vec<(R::Offset, usize)> = units
+    /// Builds the `(start offset, absolute index)` table for `units`, whose
+    /// first element sits at absolute index `base` in the combined vec. Sorted
+    /// ascending so the binary search never depends on section order.
+    fn offset_table(units: &[gimli::Unit<R>], base: usize) -> Vec<(R::Offset, usize)> {
+        let mut offsets: Vec<(R::Offset, usize)> = units
             .iter()
             .enumerate()
             .filter_map(|(index, unit)| {
                 unit.header
                     .offset()
                     .as_debug_info_offset()
-                    .map(|offset| (offset.0, index))
+                    .map(|offset| (offset.0, base + index))
             })
             .collect();
-        // dwarf.units() yields headers in section order, but sort defensively so
-        // the binary search never depends on that assumption.
-        unit_offsets.sort_by_key(|(offset, _)| *offset);
-
-        Ok(Self {
-            units,
-            unit_offsets,
-        })
+        offsets.sort_by_key(|(offset, _)| *offset);
+        offsets
     }
 
     fn len(&self) -> usize {
         self.units.len()
+    }
+
+    /// Number of main-file units (the supplementary units follow them). Callers
+    /// that walk compilation units for subprograms (which are only defined in
+    /// the main file) iterate `0..main_len()`.
+    fn main_len(&self) -> usize {
+        self.sup_start
+    }
+
+    /// Whether `unit_index` names a supplementary-file unit.
+    fn is_sup(&self, unit_index: usize) -> bool {
+        unit_index >= self.sup_start
     }
 
     fn unit(&self, index: usize) -> &gimli::Unit<R> {
@@ -353,7 +418,9 @@ impl<R: Reader> DwarfUnitIndex<R> {
     /// Follows attribute `attr` on `entry` (which lives in unit `unit_index`) to
     /// the DIE it references. Intra-unit references (`UnitRef`) preserve the
     /// existing behavior; `DebugInfoRef` references are resolved against the
-    /// owning unit so that cross-CU references are followed.
+    /// owning unit (in the same file as `unit_index`); `DebugInfoRefSup`
+    /// references (`DW_FORM_GNU_ref_alt`, emitted by DWZ) are resolved against
+    /// the supplementary file's units.
     fn referenced_die(
         &self,
         unit_index: usize,
@@ -368,22 +435,64 @@ impl<R: Reader> DwarfUnitIndex<R> {
                 unit: unit_index,
                 offset,
             })),
-            AttributeValue::DebugInfoRef(offset) => Ok(self.debug_info_ref(offset)),
+            AttributeValue::DebugInfoRef(offset) => Ok(self.debug_info_ref(unit_index, offset)),
+            AttributeValue::DebugInfoRefSup(offset) => Ok(self.sup_debug_info_ref(offset)),
             _ => Ok(None),
         }
     }
 
-    fn debug_info_ref(&self, offset: DebugInfoOffset<R::Offset>) -> Option<DieRef<R::Offset>> {
+    /// Resolves a `.debug_info` offset within the same file as `from_unit` (main
+    /// for main units, supplementary for supplementary units).
+    fn debug_info_ref(
+        &self,
+        from_unit: usize,
+        offset: DebugInfoOffset<R::Offset>,
+    ) -> Option<DieRef<R::Offset>> {
+        let offsets = if self.is_sup(from_unit) {
+            &self.sup_unit_offsets
+        } else {
+            &self.unit_offsets
+        };
+        self.resolve_in(offsets, offset)
+    }
+
+    /// Resolves a `DW_FORM_GNU_ref_alt` offset against the supplementary file's
+    /// `.debug_info`. Resolves to `None` when no supplementary file is loaded.
+    fn sup_debug_info_ref(&self, offset: DebugInfoOffset<R::Offset>) -> Option<DieRef<R::Offset>> {
+        self.resolve_in(&self.sup_unit_offsets, offset)
+    }
+
+    fn resolve_in(
+        &self,
+        offsets: &[(R::Offset, usize)],
+        offset: DebugInfoOffset<R::Offset>,
+    ) -> Option<DieRef<R::Offset>> {
         // Find the unit whose start offset is the greatest that is <= the target,
         // then confirm the target actually lands inside that unit's range. A
         // target in a gap (e.g. a skipped unit) or past the last unit fails the
         // confirmation and resolves to None, matching the prior silent-miss.
-        let unit_index = owning_unit_index(&self.unit_offsets, offset.0)?;
+        let unit_index = owning_unit_index(offsets, offset.0)?;
         let unit = &self.units[unit_index];
         offset.to_unit_offset(&unit.header).map(|offset| DieRef {
             unit: unit_index,
             offset,
         })
+    }
+}
+
+/// Selects the `Dwarf` that owns `unit_index`'s strings and section data: the
+/// main file for main units, the supplementary (DWZ) file for supplementary
+/// units. For modules with no supplementary file this always returns `dwarf`,
+/// so same-file behavior is unchanged.
+fn dwarf_for<'a, R: Reader>(
+    dwarf: &'a Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
+) -> &'a Dwarf<R> {
+    if index.is_sup(unit_index) {
+        dwarf.sup().unwrap_or(dwarf)
+    } else {
+        dwarf
     }
 }
 
@@ -403,7 +512,7 @@ fn function_pcs<R: Reader>(
     wanted: &[&str],
 ) -> Result<BTreeMap<String, u64>> {
     let mut result = BTreeMap::new();
-    for unit_index in 0..index.len() {
+    for unit_index in 0..index.main_len() {
         let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
@@ -429,7 +538,7 @@ fn function_var_fields<R: Reader>(
     wanted: &[&str],
 ) -> Result<BTreeMap<String, FunctionVarFields>> {
     let mut result = BTreeMap::new();
-    for unit_index in 0..index.len() {
+    for unit_index in 0..index.main_len() {
         let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
         let root = tree.root()?;
@@ -540,8 +649,13 @@ fn probe_function_var_fields<R: Reader>(
         };
         let variable_unit = index.unit(variable.unit);
         let variable_entry = variable_unit.entry(variable.offset)?;
-        let Some(location) =
-            variable_location(dwarf, variable_unit, function, &variable_entry, pc)?
+        let Some(location) = variable_location(
+            dwarf_for(dwarf, index, variable.unit),
+            variable_unit,
+            function,
+            &variable_entry,
+            pc,
+        )?
         else {
             debug!(
                 function = function_name,
@@ -688,18 +802,27 @@ fn add_referenced_function_names<R: Reader>(
     };
     let referenced_unit = index.unit(referenced.unit);
     let referenced_entry = referenced_unit.entry(referenced.offset)?;
+    // A DWZ `DW_FORM_GNU_ref_alt` origin/specification lands in the
+    // supplementary file, whose strings live in its own `.debug_str`.
+    let referenced_dwarf = dwarf_for(dwarf, index, referenced.unit);
     let before = names.len();
-    add_entry_function_names(dwarf, referenced_unit, &referenced_entry, &[], names)?;
+    add_entry_function_names(
+        referenced_dwarf,
+        referenced_unit,
+        &referenced_entry,
+        &[],
+        names,
+    )?;
 
     let already_qualified = names[before..]
         .iter()
         .any(|name| PROBE_FUNCTIONS.contains(&name.as_str()));
     if !already_qualified {
-        if let Some(name) = die_name(dwarf, referenced_unit, &referenced_entry)? {
+        if let Some(name) = die_name(referenced_dwarf, referenced_unit, &referenced_entry)? {
             if PROBE_FUNCTION_LEAF_NAMES.contains(&name.as_str()) {
                 let referenced_scopes = entry_scopes(dwarf, index, referenced)?.unwrap_or_default();
                 add_entry_function_names(
-                    dwarf,
+                    referenced_dwarf,
                     referenced_unit,
                     &referenced_entry,
                     &referenced_scopes,
@@ -749,6 +872,7 @@ fn entry_scopes<R: Reader>(
     index: &DwarfUnitIndex<R>,
     die: DieRef<R::Offset>,
 ) -> Result<Option<Vec<String>>> {
+    let dwarf = dwarf_for(dwarf, index, die.unit);
     let unit = index.unit(die.unit);
     let mut tree = unit.entries_tree(None)?;
     let root = tree.root()?;
@@ -871,7 +995,7 @@ fn translate_declared_type_field_path<R: Reader>(
     if !entry_flag(&entry, gimli::DW_AT_declaration)? {
         return Ok(None);
     }
-    let Some(type_name) = die_name(dwarf, unit, &entry)? else {
+    let Some(type_name) = die_name(dwarf_for(dwarf, index, typedie.unit), unit, &entry)? else {
         return Ok(None);
     };
     if resolving.contains(&type_name) {
@@ -940,7 +1064,8 @@ fn find_named_type_field_path<R: Reader>(
     if matches!(
         entry.tag(),
         gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
-    ) && die_name(dwarf, unit, entry)?.as_deref() == Some(search.type_name)
+    ) && die_name(dwarf_for(dwarf, index, unit_index), unit, entry)?.as_deref()
+        == Some(search.type_name)
         && !entry_flag(entry, gimli::DW_AT_declaration)?
     {
         let typedie = DieRef {
@@ -1097,6 +1222,10 @@ fn find_member_entry<R: Reader>(
     let mut queue = vec![typedie];
     while let Some(parent) = queue.pop() {
         let unit = index.unit(parent.unit);
+        // A member's owning struct may live in the DWZ supplementary file
+        // (reached via `DW_FORM_GNU_ref_alt` on `DW_AT_type`); its member names
+        // then resolve against the supplementary `.debug_str`.
+        let parent_dwarf = dwarf_for(dwarf, index, parent.unit);
         let mut tree = unit.entries_tree(Some(parent.offset))?;
         let root = tree.root()?;
         let mut children = root.children();
@@ -1108,7 +1237,7 @@ fn find_member_entry<R: Reader>(
             };
             match entry.tag() {
                 gimli::DW_TAG_member => {
-                    if die_name(dwarf, unit, entry)?.as_deref() == Some(member_name) {
+                    if die_name(parent_dwarf, unit, entry)?.as_deref() == Some(member_name) {
                         return Ok(Some(child_ref));
                     }
                 }
@@ -1229,7 +1358,14 @@ fn child_variable_name_matches<R: Reader>(
     entry: &DebuggingInformationEntry<R>,
     name: &str,
 ) -> Result<bool> {
-    if die_name(dwarf, index.unit(unit_index), entry)?.as_deref() == Some(name) {
+    if die_name(
+        dwarf_for(dwarf, index, unit_index),
+        index.unit(unit_index),
+        entry,
+    )?
+    .as_deref()
+        == Some(name)
+    {
         return Ok(true);
     }
     for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
@@ -1238,7 +1374,14 @@ fn child_variable_name_matches<R: Reader>(
         };
         let origin_unit = index.unit(origin.unit);
         let origin_entry = origin_unit.entry(origin.offset)?;
-        if die_name(dwarf, origin_unit, &origin_entry)?.as_deref() == Some(name) {
+        if die_name(
+            dwarf_for(dwarf, index, origin.unit),
+            origin_unit,
+            &origin_entry,
+        )?
+        .as_deref()
+            == Some(name)
+        {
             return Ok(true);
         }
     }
@@ -1457,34 +1600,140 @@ fn load_section<'data>(
         .with_context(|| format!("failed to read {}", section.name().unwrap_or("<unknown>")))
 }
 
+/// Returns the DWARF-bearing object bytes and the on-disk path they came from.
+/// The path is the debug file itself (the main binary when debug info is
+/// embedded, otherwise the separate `.debug`/build-id file); DWZ supplementary
+/// lookup keys off that file's directory.
 fn debug_data<'data>(
     path: &Path,
     file: &object::File<'data>,
     data: &'data [u8],
     build_id: Option<&str>,
-) -> Result<Cow<'data, [u8]>> {
+) -> Result<(Cow<'data, [u8]>, PathBuf)> {
     if file.has_debug_symbols() {
-        return Ok(Cow::Borrowed(data));
+        return Ok((Cow::Borrowed(data), path.to_path_buf()));
     }
 
     if let Some(debug_path) = debuglink_file(path, file)? {
-        return fs::read(&debug_path)
-            .map(Cow::Owned)
-            .with_context(|| format!("failed to read debuglink file {}", debug_path.display()));
+        let bytes = fs::read(&debug_path)
+            .with_context(|| format!("failed to read debuglink file {}", debug_path.display()))?;
+        return Ok((Cow::Owned(bytes), debug_path));
     }
 
     if let Some(build_id) = build_id {
         if let Some(debug_path) = build_id_debug_file(path, build_id) {
-            return fs::read(&debug_path).map(Cow::Owned).with_context(|| {
+            let bytes = fs::read(&debug_path).with_context(|| {
                 format!(
                     "failed to read build-id debug file {}",
                     debug_path.display()
                 )
-            });
+            })?;
+            return Ok((Cow::Owned(bytes), debug_path));
         }
     }
 
-    Ok(Cow::Borrowed(data))
+    Ok((Cow::Borrowed(data), path.to_path_buf()))
+}
+
+/// Best-effort location and validation of the DWZ supplementary object named by
+/// the debug file's `.gnu_debugaltlink`. Returns the supplementary object's raw
+/// bytes when the file is found and its build-id matches the link; otherwise
+/// warns and returns `None` so extraction continues with whatever resolves
+/// without it (consistent with tolerating missing supplementary string refs).
+fn load_sup_object_bytes(debug_file: &object::File<'_>, debug_file_path: &Path) -> Option<Vec<u8>> {
+    let section = debug_file.section_by_name(".gnu_debugaltlink")?;
+    let data = match section.data() {
+        Ok(data) => data,
+        Err(err) => {
+            warn!(error = %err, "failed to read .gnu_debugaltlink section; ignoring supplementary DWARF");
+            return None;
+        }
+    };
+    let Some((alt_path, alt_build_id)) = parse_debugaltlink(data) else {
+        warn!("malformed .gnu_debugaltlink section; ignoring supplementary DWARF");
+        return None;
+    };
+    let Some(sup_path) = first_existing(debugaltlink_candidates(debug_file_path, alt_path)) else {
+        warn!(
+            alt_path = %alt_path.display(),
+            "DWZ supplementary file from .gnu_debugaltlink not found; \
+             names and types resolved through it will be unavailable"
+        );
+        return None;
+    };
+    let bytes = match fs::read(&sup_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(path = %sup_path.display(), error = %err, "failed to read DWZ supplementary file; ignoring it");
+            return None;
+        }
+    };
+    let sup = match object::File::parse(bytes.as_slice()) {
+        Ok(sup) => sup,
+        Err(err) => {
+            warn!(path = %sup_path.display(), error = %err, "DWZ supplementary file is not a supported object; ignoring it");
+            return None;
+        }
+    };
+    let actual_build_id = sup.build_id().ok().flatten();
+    if sup_build_id_matches(alt_build_id, actual_build_id) {
+        Some(bytes)
+    } else {
+        warn!(
+            path = %sup_path.display(),
+            "DWZ supplementary build-id does not match .gnu_debugaltlink; ignoring it"
+        );
+        None
+    }
+}
+
+/// Parse a `.gnu_debugaltlink` section body: a NUL-terminated path to the DWZ
+/// supplementary file, followed by that file's build-id bytes.
+fn parse_debugaltlink(data: &[u8]) -> Option<(&Path, &[u8])> {
+    let nul = data.iter().position(|&byte| byte == 0)?;
+    let path_bytes = &data[..nul];
+    let build_id = &data[nul + 1..];
+    if path_bytes.is_empty() || build_id.is_empty() {
+        return None;
+    }
+    let path = std::str::from_utf8(path_bytes).ok()?;
+    Some((Path::new(path), build_id))
+}
+
+/// True when the supplementary object's build-id equals the id embedded in
+/// `.gnu_debugaltlink`. A missing build-id never matches.
+fn sup_build_id_matches(expected: &[u8], actual: Option<&[u8]>) -> bool {
+    actual == Some(expected)
+}
+
+/// Candidate on-disk locations for the DWZ supplementary file. The
+/// `.gnu_debugaltlink` path is encoded relative to the debug file's directory;
+/// also try the conventional `/usr/lib/debug/.dwz/` tree, rooted under the debug
+/// file's ancestors so a `/proc/<pid>/root/...` debug file finds the
+/// namespace-local copy.
+fn debugaltlink_candidates(debug_file: &Path, alt_path: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if alt_path.is_absolute() {
+        push_unique(&mut candidates, alt_path.to_path_buf());
+    }
+    if let Some(parent) = debug_file.parent() {
+        push_unique(&mut candidates, parent.join(alt_path));
+    }
+    if let Some(basename) = alt_path.file_name() {
+        if let Some(parent) = debug_file.parent() {
+            for ancestor in parent.ancestors() {
+                push_unique(
+                    &mut candidates,
+                    ancestor.join("usr/lib/debug/.dwz").join(basename),
+                );
+            }
+        }
+        push_unique(
+            &mut candidates,
+            Path::new("/usr/lib/debug/.dwz").join(basename),
+        );
+    }
+    candidates
 }
 
 fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf>> {
@@ -1665,6 +1914,82 @@ mod tests {
         assert!(candidates.contains(&PathBuf::from(
             "/tmp/root/usr/lib/debug/.build-id/ab/cdef.debug"
         )));
+    }
+
+    #[test]
+    fn parses_gnu_debugaltlink_path_and_build_id() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"../../.dwz/ceph-debugsource-18.2.8-0.el9.x86_64");
+        data.push(0);
+        let build_id = [0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+        data.extend_from_slice(&build_id);
+
+        let (path, parsed_build_id) =
+            parse_debugaltlink(&data).expect("well-formed .gnu_debugaltlink parses");
+        assert_eq!(
+            path,
+            Path::new("../../.dwz/ceph-debugsource-18.2.8-0.el9.x86_64")
+        );
+        assert_eq!(parsed_build_id, build_id);
+    }
+
+    #[test]
+    fn rejects_malformed_gnu_debugaltlink() {
+        // No NUL terminator at all.
+        assert!(parse_debugaltlink(b"no-nul-terminator").is_none());
+        // Path present but no build-id bytes follow the NUL.
+        assert!(parse_debugaltlink(b"path\0").is_none());
+        // Empty section.
+        assert!(parse_debugaltlink(b"").is_none());
+        // Empty path (leading NUL) is not a usable link.
+        assert!(parse_debugaltlink(b"\0\x01\x02").is_none());
+    }
+
+    #[test]
+    fn supplementary_build_id_mismatch_is_rejected() {
+        let expected = [0x01u8, 0x02, 0x03, 0x04];
+        assert!(sup_build_id_matches(&expected, Some(&expected)));
+        // A different id, a truncated id, and a missing id are all rejected so a
+        // stale/wrong .dwz file is never silently trusted.
+        assert!(!sup_build_id_matches(
+            &expected,
+            Some(&[0x01, 0x02, 0x03, 0x05])
+        ));
+        assert!(!sup_build_id_matches(&expected, Some(&[0x01, 0x02])));
+        assert!(!sup_build_id_matches(&expected, None));
+    }
+
+    #[test]
+    fn debugaltlink_candidates_cover_relative_and_dwz_trees() {
+        let candidates = debugaltlink_candidates(
+            Path::new("/proc/9/root/usr/lib/debug/usr/lib64/librados.so.2.0.0.debug"),
+            Path::new("../../../.dwz/ceph-debugsource-18.2.8-0.el9.x86_64"),
+        );
+
+        // Resolved relative to the debug file's own directory (the encoding).
+        assert!(candidates.contains(&PathBuf::from(
+            "/proc/9/root/usr/lib/debug/usr/lib64/../../../.dwz/ceph-debugsource-18.2.8-0.el9.x86_64"
+        )));
+        // Conventional host /usr/lib/debug/.dwz tree.
+        assert!(candidates.contains(&PathBuf::from(
+            "/usr/lib/debug/.dwz/ceph-debugsource-18.2.8-0.el9.x86_64"
+        )));
+        // Same tree rooted under the debug file's mount-namespace root, so a
+        // /proc/<pid>/root/... debug file finds the namespace-local copy.
+        assert!(candidates.contains(&PathBuf::from(
+            "/proc/9/root/usr/lib/debug/.dwz/ceph-debugsource-18.2.8-0.el9.x86_64"
+        )));
+    }
+
+    #[test]
+    fn missing_supplementary_file_degrades_gracefully() {
+        // When no candidate exists on disk the lookup returns None rather than
+        // erroring, so extraction continues with whatever resolves locally.
+        let candidates = debugaltlink_candidates(
+            Path::new("/nonexistent/dir/foo.debug"),
+            Path::new("bar.dwz"),
+        );
+        assert!(first_existing(candidates).is_none());
     }
 
     #[test]
@@ -2341,10 +2666,7 @@ mod tests {
         )
     }
 
-    fn compile_objecter_fixture() -> Option<std::path::PathBuf> {
-        compile_cpp_source(
-            "objecter-fixture",
-            r#"
+    const OBJECTER_FIXTURE_SOURCE: &str = r#"
             struct DataPtr {
               char* _M_p;
             };
@@ -2432,8 +2754,219 @@ mod tests {
               objecter._finish_op(&op);
               return 0;
             }
-            "#,
+            "#;
+
+    fn compile_objecter_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_source("objecter-fixture", OBJECTER_FIXTURE_SOURCE)
+    }
+
+    /// Whether the `dwz` DWZ-compression tool is available, gating the
+    /// supplementary-file end-to-end test (skip-if-absent, like the objcopy and
+    /// LTO fixtures).
+    fn dwz_available() -> bool {
+        std::process::Command::new("dwz")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Compiles the Objecter fixture into two identical binaries in a shared
+    /// directory and runs `dwz -m` over them. DWZ moves the duplicated type DIEs
+    /// into the supplementary multifile and rewrites each binary with a
+    /// `.gnu_debugaltlink` pointing at it, so resolving the probe's field paths
+    /// then genuinely requires following `DW_FORM_GNU_ref_alt`/`GNU_strp_alt`
+    /// into the supplementary file. Returns the first binary's path.
+    fn compile_dwz_pair() -> Option<std::path::PathBuf> {
+        let compiler = std::env::var_os("CXX").unwrap_or_else(|| "c++".into());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rgwtrace-dwz-{}-{suffix}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+
+        let source = dir.join("objecter.cc");
+        std::fs::write(&source, OBJECTER_FIXTURE_SOURCE).ok()?;
+
+        // Relative output names so the .gnu_debugaltlink dwz writes is relative
+        // to (and resolvable from) the binary's own directory. `-O1` (not `-O0`)
+        // so parameters get register-resident locations `variable_location` can
+        // decode; at `-O0` this toolchain emits `DW_OP_fbreg`+`DW_OP_call_frame_cfa`,
+        // which the decoder rejects (unrelated to DWZ -- the same-file objecter
+        // fixture skips for the same reason at `-O0`).
+        for name in ["objecter-a", "objecter-b"] {
+            let ok = std::process::Command::new(&compiler)
+                .current_dir(&dir)
+                .args(["-g", "-O1", "-fno-inline", "objecter.cc", "-o", name])
+                .status()
+                .ok()?
+                .success();
+            if !ok {
+                return None;
+            }
+        }
+
+        let ok = std::process::Command::new("dwz")
+            .current_dir(&dir)
+            .args(["-m", "objecter.dwz", "objecter-a", "objecter-b"])
+            .status()
+            .ok()?
+            .success();
+        if !ok {
+            return None;
+        }
+
+        Some(dir.join("objecter-a"))
+    }
+
+    /// Same fixture compiled at `-O1 -fno-inline` (the level the DWZ pair uses)
+    /// but WITHOUT dwz. Serves as the oracle for the end-to-end test: resolving
+    /// through the supplementary file must match same-file resolution exactly.
+    fn compile_objecter_at_o1() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "objecter-o1",
+            &[("objecter", OBJECTER_FIXTURE_SOURCE)],
+            &["-g", "-O1", "-fno-inline"],
         )
+    }
+
+    /// Whether the DWZ'd binary's main `.debug_info` actually references the
+    /// supplementary file via `DW_FORM_GNU_ref_alt` (`DebugInfoRefSup`). Shape
+    /// guard so the end-to-end test never passes vacuously when dwz found
+    /// nothing worth moving into the supplementary file.
+    fn dwz_binary_uses_sup_refs(binary: &Path) -> bool {
+        let data = std::fs::read(binary).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        let build_id = file.build_id().unwrap().map(hex_string);
+        let (debug_data, debug_file_path) =
+            debug_data(binary, &file, data.as_slice(), build_id.as_deref()).unwrap();
+        let debug_file = object::File::parse(debug_data.as_ref()).unwrap();
+        let endian = if debug_file.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+        let sup_file = sup_data
+            .as_ref()
+            .map(|bytes| object::File::parse(bytes.as_slice()).unwrap());
+        let mut dwarf_owned =
+            Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))
+                .unwrap();
+        if let Some(sup_file) = &sup_file {
+            dwarf_owned
+                .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))
+                .unwrap();
+        }
+        #[allow(deprecated)]
+        let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
+        if dwarf.sup().is_none() {
+            return false;
+        }
+        let index = DwarfUnitIndex::load(&dwarf).unwrap();
+        for unit_index in 0..index.main_len() {
+            let unit = index.unit(unit_index);
+            let mut entries = unit.entries();
+            while let Some((_, entry)) = entries.next_dfs().unwrap() {
+                let mut attrs = entry.attrs();
+                while let Some(attr) = attrs.next().unwrap() {
+                    if matches!(attr.value(), AttributeValue::DebugInfoRefSup(_)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn extracts_objecter_var_fields_through_dwz_supplementary_file() {
+        if !dwz_available() {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 dwz tool not installed"
+            );
+            return;
+        }
+        let Some(binary) = compile_dwz_pair() else {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 could not build/dwz the fixture pair"
+            );
+            return;
+        };
+
+        // Shape guard 1: dwz actually emitted a supplementary link.
+        let data = std::fs::read(&binary).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        if file.section_by_name(".gnu_debugaltlink").is_none() {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 dwz did not emit a .gnu_debugaltlink"
+            );
+            return;
+        }
+        // Shape guard 2: the main file genuinely references DIEs in the
+        // supplementary file via DW_FORM_GNU_ref_alt, so the extraction below
+        // truly exercises DebugInfoRefSup/strp_alt rather than resolving
+        // everything locally. Never a vacuous pass.
+        if !dwz_binary_uses_sup_refs(&binary) {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 dwz did not move DIEs into the supplementary file"
+            );
+            return;
+        }
+
+        // Oracle: a pristine (non-dwz) build at the same optimization level. If
+        // this toolchain cannot decode the parameter locations even without dwz
+        // (e.g. only fbreg/CFA locations), skip -- that gap is unrelated to DWZ.
+        let Some(pristine) = compile_objecter_at_o1() else {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 could not compile the -O1 oracle"
+            );
+            return;
+        };
+        let pinfo = from_paths(&[pristine.as_path()]).unwrap();
+        let pmodule = pinfo.modules.values().next().unwrap();
+        let Some(pfields) = pmodule.func2vf.get("Objecter::_send_op") else {
+            eprintln!(
+                "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
+                 toolchain did not emit decodable var fields even without dwz"
+            );
+            return;
+        };
+
+        // Full public chain over the DWZ'd binary: function PC, variable
+        // location, AND every nested field path (member offsets) -- all
+        // resolving through the supplementary file -- must match same-file
+        // resolution byte for byte. `func2vf` was empty here before the sup file
+        // was loaded.
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+
+        assert!(module.func2pc.contains_key("Objecter::_send_op"));
+        let fields = module.func2vf.get("Objecter::_send_op").expect(
+            "Objecter::_send_op var fields must resolve through the DWZ supplementary file",
+        );
+        assert_eq!(fields.var_fields.len(), 12);
+        // Nested paths whose member/type DIEs live in the supplementary file
+        // (e.g. op->target.base_oid.name._M_dataplus._M_p, this->monc.global_id).
+        assert_eq!(fields.var_fields[0].fields.len(), 2);
+        assert_eq!(fields.var_fields[1].fields.len(), 3);
+        assert_eq!(fields.var_fields[3].fields.len(), 5);
+        assert_eq!(fields.var_fields[4].fields.len(), 6);
+        assert!(fields
+            .var_fields
+            .iter()
+            .all(|field| field.location.reg >= 0));
+        assert!(
+            same_var_fields(pfields, fields),
+            "DWZ sup-resolved var fields must equal same-file (non-dwz) resolution"
+        );
     }
 
     fn compile_declared_type_fixture() -> Option<std::path::PathBuf> {
@@ -2612,7 +3145,7 @@ mod tests {
                 let mut attrs = entry.attrs();
                 while let Some(attr) = attrs.next()? {
                     if let AttributeValue::DebugInfoRef(offset) = attr.value() {
-                        if let Some(target) = index.debug_info_ref(offset) {
+                        if let Some(target) = index.debug_info_ref(unit_index, offset) {
                             if target.unit != unit_index {
                                 return Ok(true);
                             }
