@@ -5,3 +5,4 @@ trace-data/
 *.o
 *.skel.rs
 *.tmp.bpf.o
+.claude/
