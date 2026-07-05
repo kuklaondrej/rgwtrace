@@ -47,6 +47,18 @@ pub struct Cli {
     #[arg(long)]
     pub correlate_inferred: bool,
 
+    /// Opt in to the fail-closed cross-thread RGW->RADOS correlation bridge
+    /// (default off). It re-seeds request context on the request execute thread
+    /// at `rgw_process_authenticated`, so RADOS ops submitted *synchronously* on
+    /// that thread inherit the request's `trans_id`. On async-dispatch RGW builds
+    /// only ~20-25% of ops submit on the execute thread (measured ceiling); the
+    /// rest stay `background`/`inferred`. The design is fail-closed and
+    /// zero-mis-correlation: a foreign/stale context lingering on a thread is
+    /// cleared rather than mis-attributed. With the flag off the re-seed probe is
+    /// never attached and behavior is identical to not having this feature.
+    #[arg(long)]
+    pub correlate_cross_thread: bool,
+
     #[arg(long, default_value = "1", value_parser = parse_duration_secs)]
     pub inference_window: Duration,
 

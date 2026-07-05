@@ -2,6 +2,7 @@ const RGWTRACE_BPF: &str = include_str!("../bpf/rgwtrace.bpf.c");
 const RGWTRACE_EVENTS: &str = include_str!("../bpf/rgwtrace_events.h");
 const BPF_UTILS: &str = include_str!("../bpf/bpf_utils.h");
 const DWARF_NATIVE: &str = include_str!("../src/dwarf_native.rs");
+const LIVE_LINUX: &str = include_str!("../src/live/linux.rs");
 
 #[test]
 fn object_name_read_uses_verifier_bounded_length() {
@@ -103,6 +104,53 @@ fn fetch_param_ptr_is_register_only_and_fails_closed_on_stack() {
     assert!(BPF_UTILS.contains("fetch_param_ptr"));
     assert!(BPF_UTILS.contains("if (vf == 0 || vf->varloc.stack)\n    return 0;"));
     assert!(BPF_UTILS.contains("return fetch_register(ctx, vf->varloc.reg);"));
+}
+
+#[test]
+fn reseed_probe_reads_raw_pointer_and_bridges_context() {
+    // Stage 3 consumer: the rgw_process_authenticated uprobe fetches the
+    // req_state* raw-pointer descriptor (varid 40, register-only via
+    // fetch_param_ptr) and re-seeds rgw_requests on a bridge hit.
+    assert!(RGWTRACE_BPF.contains("int uprobe_rgw_process_authenticated(struct pt_regs *ctx)"));
+    assert!(RGWTRACE_BPF.contains("int varid = 40;"));
+    assert!(RGWTRACE_BPF.contains("__u64 rsp = fetch_param_ptr(ctx, vf);"));
+    assert!(RGWTRACE_BPF.contains("bpf_map_lookup_elem(&rgw_ctx_by_reqstate, &rkey)"));
+    assert!(RGWTRACE_BPF.contains("bpf_map_update_elem(&rgw_requests, &tid, &ctx_copy, BPF_ANY)"));
+}
+
+#[test]
+fn reseed_probe_fails_closed_on_miss_with_identity_check() {
+    // On a bridge miss the probe clears a FOREIGN lingering context
+    // (mismatched req_state* OR mismatched tgid) so _send_op cannot stamp a
+    // stale trans_id, while keeping this request's own context.
+    assert!(RGWTRACE_BPF.contains("cur != 0 && (cur->req_state_ptr != rsp || cur->pid != tgid)"));
+    assert!(RGWTRACE_BPF.contains("bpf_map_delete_elem(&rgw_requests, &tid)"));
+}
+
+#[test]
+fn reseed_probe_wires_coverage_counters() {
+    assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED)"));
+    assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_RESEED_HITS)"));
+    assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_RESEED_MISSES)"));
+    // The hit path counts an update failure as a request-context drop, exactly
+    // like the other rgw_requests writers.
+    assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS)"));
+    // ABI mirror: the three new counters are declared and the total bumped.
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RESEED_HITS = 7,"));
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RESEED_MISSES = 8,"));
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED = 9,"));
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_COUNTERS = 10,"));
+}
+
+#[test]
+fn reseed_probe_attach_is_gated_behind_the_opt_in_flag() {
+    // The re-seed probe attaches only when --correlate-cross-thread is set AND
+    // the varid-40 descriptor resolved, so the flag-off path is byte-for-byte
+    // identical (probe present but never attached).
+    assert!(LIVE_LINUX.contains(
+        "if correlate_cross_thread && reseed_var_field_present(dwarf, &targets.radosgw)"
+    ));
+    assert!(LIVE_LINUX.contains("&skel.progs.uprobe_rgw_process_authenticated"));
 }
 
 #[test]

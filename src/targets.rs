@@ -286,6 +286,7 @@ mod tests {
             otlp_flush_interval: std::time::Duration::from_secs(30),
             correlation_ttl: std::time::Duration::from_secs(120),
             correlate_inferred: false,
+            correlate_cross_thread: false,
             inference_window: std::time::Duration::from_secs(1),
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),

@@ -46,6 +46,9 @@ const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
 const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
 const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
 const BPF_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
+const BPF_DIAG_RESEED_HITS: u32 = 7;
+const BPF_DIAG_RESEED_MISSES: u32 = 8;
+const BPF_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -73,7 +76,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let mut skel = open.load()?;
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
-    let _links = attach_probes(&mut skel, dwarf, &targets, pid)?;
+    let _links = attach_probes(&mut skel, dwarf, &targets, pid, cli.correlate_cross_thread)?;
     let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
     let collector = Arc::new(Mutex::new(if cli.correlate_inferred {
@@ -219,6 +222,9 @@ fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
         request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
         probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
         reqstate_map_drops: read_bpf_counter(map, BPF_DIAG_REQSTATE_MAP_DROPS)?,
+        reseed_hits: read_bpf_counter(map, BPF_DIAG_RESEED_HITS)?,
+        reseed_misses: read_bpf_counter(map, BPF_DIAG_RESEED_MISSES)?,
+        reseed_base_unresolved: read_bpf_counter(map, BPF_DIAG_RESEED_BASE_UNRESOLVED)?,
     })
 }
 
@@ -420,6 +426,7 @@ fn attach_probes(
     dwarf: &DwarfInfo,
     targets: &targets::ProbeTargets,
     pid: i32,
+    correlate_cross_thread: bool,
 ) -> Result<Vec<Link>> {
     let mut links = Vec::new();
 
@@ -454,11 +461,39 @@ fn attach_probes(
         "RGWREST::get_handler",
     )?;
 
+    // Cross-thread re-seed bridge (Stage 3): opt-in via --correlate-cross-thread
+    // and only when the varid-40 raw-pointer var_field actually resolved for the
+    // radosgw binary. With the flag off (or the descriptor absent) the probe is
+    // never attached, so the dormant BPF program cannot change any behavior --
+    // baseline is byte-for-byte identical.
+    if correlate_cross_thread && reseed_var_field_present(dwarf, &targets.radosgw) {
+        attach_if_present(
+            &mut links,
+            &skel.progs.uprobe_rgw_process_authenticated,
+            false,
+            pid,
+            &targets.radosgw,
+            dwarf,
+            "rgw_process_authenticated",
+        )?;
+    }
+
     if links.is_empty() {
         bail!("no uprobes were attached; check DWARF JSON and target paths")
     }
 
     Ok(links)
+}
+
+/// Whether the radosgw DWARF carries the varid-40 raw-pointer var_field for
+/// `rgw_process_authenticated`. When the descriptor is missing (e.g. the
+/// req_state* was stack-located at entry and native extraction dropped it) the
+/// re-seed probe has nothing to read, so it is left unattached and the tracer
+/// falls back to main's same-thread behavior.
+fn reseed_var_field_present(dwarf: &DwarfInfo, radosgw: &Path) -> bool {
+    basename(radosgw)
+        .and_then(|module| dwarf.function_var_field_count(module, "rgw_process_authenticated"))
+        .is_some_and(|count| count >= 1)
 }
 
 fn attach_if_present(

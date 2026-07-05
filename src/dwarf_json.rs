@@ -81,6 +81,7 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("Objecter::_send_op", 0),
     ("Objecter::_finish_op", 20),
     ("RGWREST::get_handler", 30),
+    ("rgw_process_authenticated", 40),
 ];
 
 /// Number of slots in the kernel `hprobes` map. Mirrors `max_entries, 8192` on
@@ -471,10 +472,12 @@ mod tests {
         assert_eq!(function_slot_capacity("Objecter::_send_op"), Some(20));
         // _finish_op base 20 -> get_handler base 30 => 10 slots.
         assert_eq!(function_slot_capacity("Objecter::_finish_op"), Some(10));
-        // Highest base extends to the map capacity.
+        // get_handler base 30 -> rgw_process_authenticated base 40 => 10 slots.
+        assert_eq!(function_slot_capacity("RGWREST::get_handler"), Some(10));
+        // Highest base (rgw_process_authenticated, 40) extends to the map capacity.
         assert_eq!(
-            function_slot_capacity("RGWREST::get_handler"),
-            Some((HPROBES_MAP_CAPACITY - 30) as usize)
+            function_slot_capacity("rgw_process_authenticated"),
+            Some((HPROBES_MAP_CAPACITY - 40) as usize)
         );
         assert_eq!(function_slot_capacity("Unknown::function"), None);
     }

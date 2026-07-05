@@ -226,6 +226,78 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   return 0;
 }
 
+/*
+ * Cross-thread re-seed bridge (design-cross-thread-correlation.md Stage 3).
+ * Gated behind --correlate-cross-thread: the userspace attach code only wires
+ * this probe up (to radosgw, at rgw_process_authenticated) when the flag is
+ * set AND the varid-40 var_field is present, so with the flag off this program
+ * is compiled but never attached and stays fully dormant.
+ *
+ * rgw_process_authenticated runs on the request execute thread T_e, whose
+ * req_state* is pointer-identical to the one get_handler stored in
+ * rgw_ctx_by_reqstate. On a hit we re-seed rgw_requests[T_e] with that
+ * authoritative context so any RADOS op submitted synchronously on T_e inherits
+ * the request's trans_id. On a miss we FAIL CLOSED: a foreign/stale context
+ * lingering on this TID is deleted so _send_op stamps nothing rather than
+ * mis-correlating; this request's own fresh context (same req_state*, same
+ * tgid) is kept so a same-thread submit stays correlated. _send_op is
+ * unchanged.
+ */
+SEC("uprobe")
+int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
+  int varid = 40;
+  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  if (vf == 0)
+    return 0;
+
+  /*
+   * Raw-pointer descriptor: the req_state* parameter's own value, register-only
+   * at entry. A stack-located (unresolvable) descriptor yields 0, so we fail
+   * closed and fall back to main's same-thread behavior.
+   */
+  __u64 rsp = fetch_param_ptr(ctx, vf);
+  if (rsp == 0) {
+    count_diag(RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED);
+    return 0;
+  }
+
+  __u32 tgid = get_pid();
+  __u32 tid = get_tid();
+
+  struct reqstate_key rkey = {};
+  rkey.req_state_ptr = rsp;
+  rkey.tgid = tgid;
+
+  struct rgw_request_ctx *bridged =
+      bpf_map_lookup_elem(&rgw_ctx_by_reqstate, &rkey);
+  if (bridged != 0) {
+    /*
+     * Hit: re-seed this execute thread with the authoritative context. Copy
+     * the map value onto the stack first so the update reads a verifier-known
+     * source (a direct map-value pointer as the update source is not a safe
+     * pattern here).
+     */
+    struct rgw_request_ctx ctx_copy = {};
+    __builtin_memcpy(&ctx_copy, bridged, sizeof(ctx_copy));
+    count_diag(RGWTRACE_DIAG_RESEED_HITS);
+    if (bpf_map_update_elem(&rgw_requests, &tid, &ctx_copy, BPF_ANY) != 0)
+      count_diag(RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS);
+    return 0;
+  }
+
+  /*
+   * Miss: fail closed. If this thread still carries some OTHER request's
+   * context (a different req_state* or a different process), clear it so
+   * _send_op cannot stamp a stale/foreign trans_id. A context that is this
+   * request's own is left in place so a same-thread submit stays correlated.
+   */
+  struct rgw_request_ctx *cur = bpf_map_lookup_elem(&rgw_requests, &tid);
+  if (cur != 0 && (cur->req_state_ptr != rsp || cur->pid != tgid))
+    bpf_map_delete_elem(&rgw_requests, &tid);
+  count_diag(RGWTRACE_DIAG_RESEED_MISSES);
+  return 0;
+}
+
 SEC("uprobe")
 int uprobe_send_op(struct pt_regs *ctx) {
   int varid = 0;

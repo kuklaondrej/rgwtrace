@@ -29,7 +29,7 @@ fn dry_run_with_imported_dwarf_emits_empty_trace_document() {
     assert_eq!(json["dwarf"]["version"], "19.2.3-test");
     assert_eq!(json["dwarf"]["arch"], "amd64");
     assert_eq!(json["dwarf"]["module_count"], 2);
-    assert_eq!(json["dwarf"]["hprobe_entries"], 3);
+    assert_eq!(json["dwarf"]["hprobe_entries"], 4);
     assert_eq!(json["trace"]["service_name"], "rgwtrace-test");
     assert_eq!(json["trace"]["spans"].as_array().unwrap().len(), 0);
     assert_eq!(json["trace"]["diagnostics"]["events_decoded"], 0);
