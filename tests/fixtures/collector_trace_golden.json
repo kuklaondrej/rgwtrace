@@ -226,6 +226,7 @@
     "correlated_rados_ops": 1,
     "background_rados_ops": 1,
     "same_thread_correlations": 1,
+    "cross_thread_correlations": 0,
     "inferred_correlations": 0,
     "inference_no_candidate_rados_ops": 0,
     "inference_ambiguous_rados_ops": 0,

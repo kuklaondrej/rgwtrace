@@ -22,6 +22,10 @@ VALID_RADOS_ROLES = {
     "config",
     "unknown",
 }
+# Correlated rados.op child spans carry one of these rgw.correlation values.
+# "cross_thread" is the late-derived, opt-in re-seed-bridge correlation
+# (best-effort, build-dependent) added in the cross-thread stage.
+VALID_CHILD_CORRELATIONS = {"same_thread", "cross_thread", "inferred"}
 VALID_BACKGROUND_REASONS = {
     "missing_trans_id",
     "classified_background_role",
@@ -400,8 +404,26 @@ def verify_document(args, document, workload, manifest=None):
         fail(errors, f"correlated_rados_ops={diagnostics.get('correlated_rados_ops')} but JSON has {len(rados_spans)} rados.op spans")
     if diagnostics.get("background_rados_ops") != len(background_spans):
         fail(errors, f"background_rados_ops={diagnostics.get('background_rados_ops')} but JSON has {len(background_spans)} background spans")
-    if diagnostics.get("same_thread_correlations", 0) + diagnostics.get("inferred_correlations", 0) != diagnostics.get("correlated_rados_ops"):
-        fail(errors, "same_thread_correlations + inferred_correlations must equal correlated_rados_ops")
+    # Counter equation (cross-thread stage): every correlated op is exactly one
+    # of same_thread, cross_thread, or inferred. same_thread/cross_thread are
+    # derived late when spans are built, so the equation ties the render-time
+    # tallies back to the ingest-time correlated total.
+    if (
+        diagnostics.get("same_thread_correlations", 0)
+        + diagnostics.get("cross_thread_correlations", 0)
+        + diagnostics.get("inferred_correlations", 0)
+        != diagnostics.get("correlated_rados_ops")
+    ):
+        fail(errors, "same_thread_correlations + cross_thread_correlations + inferred_correlations must equal correlated_rados_ops")
+    # Tie each counter to the rendered child spans it derives from.
+    child_correlations = count_by([attr_map(span).get("rgw.correlation") for span in rados_spans])
+    for counter, correlation in (
+        ("same_thread_correlations", "same_thread"),
+        ("cross_thread_correlations", "cross_thread"),
+        ("inferred_correlations", "inferred"),
+    ):
+        if diagnostics.get(counter, 0) != child_correlations.get(correlation, 0):
+            fail(errors, f"{counter}={diagnostics.get(counter, 0)} but JSON has {child_correlations.get(correlation, 0)} {correlation} rados.op spans")
     if diagnostics.get("missing_trans_id_background_ops") != diagnostics.get("background_rados_ops"):
         fail(errors, "missing_trans_id_background_ops must equal background_rados_ops")
     for key in BPF_FAILURE_DIAGNOSTICS:
@@ -450,10 +472,16 @@ def verify_document(args, document, workload, manifest=None):
                 fail(errors, f"rados.op span {span.get('span_id')} trace_id does not match parent request")
             if span.get("start_ns", 0) < parent_span.get("start_ns", 0) or span.get("end_ns", 0) > parent_span.get("end_ns", 0):
                 fail(errors, f"rados.op span {span.get('span_id')} is outside parent request bounds")
-        if attrs.get("rgw.correlation") not in {"same_thread", "inferred"}:
+        if attrs.get("rgw.correlation") not in VALID_CHILD_CORRELATIONS:
             fail(errors, f"rados.op span {span.get('span_id')} has invalid rgw.correlation={attrs.get('rgw.correlation')!r}")
         if attrs.get("rgw.correlation") == "same_thread" and attrs.get("rgw.correlation_reason") is not None:
             fail(errors, f"rados.op span {span.get('span_id')} has unexpected rgw.correlation_reason")
+        # cross_thread is the late-derived, bridge-inherited correlation
+        # (--correlate-cross-thread): best-effort, opt-in, build-dependent. It
+        # carries a fixed reason so consumers can distinguish it from a native
+        # same-thread correlation.
+        if attrs.get("rgw.correlation") == "cross_thread" and attrs.get("rgw.correlation_reason") != "reseed_bridge":
+            fail(errors, f"rados.op span {span.get('span_id')} has invalid cross_thread correlation reason")
         if attrs.get("rgw.correlation") == "inferred" and attrs.get("rgw.correlation_reason") != "pid_time_window":
             fail(errors, f"rados.op span {span.get('span_id')} has invalid inferred correlation reason")
 
@@ -688,6 +716,52 @@ def valid_self_test_document():
             "spans_produced": 3,
         },
     }
+
+
+def cross_thread_self_test_document():
+    """valid_self_test_document plus a second child correlated cross_thread.
+
+    Exercises the late-derived cross_thread label (opt-in re-seed bridge): a
+    same_thread child and a cross_thread child under the same request, with the
+    counter equation correlated == same_thread + cross_thread + inferred holding.
+    """
+    document = valid_self_test_document()
+    cross_attrs = [
+        attr("ceph.rados.duration_ns", 40),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2b"),
+        attr("ceph.rados.pg_seed", 43),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/selftest-object-shadow"),
+        attr("ceph.rados.ops", "writefull"),
+        attr("ceph.rados.rw", "write"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 4096),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "cross_thread"),
+        attr("rgw.correlation_reason", "reseed_bridge"),
+    ]
+    document["spans"].insert(
+        2,
+        {
+            "trace_id": "1" * 32,
+            "span_id": "6" * 16,
+            "parent_span_id": "1" * 16,
+            "name": "rados.op",
+            "start_ns": 200,
+            "end_ns": 240,
+            "attributes": cross_attrs,
+            "events": [],
+        },
+    )
+    diagnostics = document["diagnostics"]
+    diagnostics["events_decoded"] = 4
+    diagnostics["rados_ops"] = 3
+    diagnostics["correlated_rados_ops"] = 2
+    diagnostics["cross_thread_correlations"] = 1
+    diagnostics["spans_produced"] = 4
+    return document
 
 
 def valid_self_test_workload():
@@ -981,7 +1055,26 @@ def run_self_test():
             print(f"SELF-TEST ERROR: valid document failed: {error}", file=sys.stderr)
         return 1
 
+    # A document carrying a late-derived cross_thread child must validate, and
+    # its cross_thread_correlations counter must satisfy the counter equation.
+    _, errors = verify_document(args, cross_thread_self_test_document(), workload)
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: valid cross_thread document failed: {error}", file=sys.stderr)
+        return 1
+
     cases = [
+        (
+            "cross_thread reason",
+            # Relabel the same_thread child as cross_thread with no valid reason.
+            lambda document: document["spans"][1]["attributes"][-1].update({"value": "cross_thread"}),
+            "invalid cross_thread correlation reason",
+        ),
+        (
+            "counter equation",
+            lambda document: document["diagnostics"].update({"inferred_correlations": 1}),
+            "must equal correlated_rados_ops",
+        ),
         (
             "bpf diagnostics",
             lambda document: document["diagnostics"].update({"bpf_probe_read_failures": 1}),

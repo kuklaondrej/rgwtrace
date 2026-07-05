@@ -122,7 +122,7 @@ When `--correlate-inferred` is enabled, `--inference-window` controls the conser
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
 
 OTLP mode logs the same trace counters plus export batches, attempts, and failures when internal logging is enabled.
 
@@ -251,7 +251,7 @@ rgw.background.rados_op
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
 
-RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`.
+RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread` when the RADOS op ran on the request's own execute thread; children recovered by the opt-in cross-thread re-seed bridge (`--correlate-cross-thread`) use `cross_thread` with `rgw.correlation_reason = "reseed_bridge"`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`. The `same_thread`/`cross_thread` split is derived late, when spans are built, from whether the op's send thread matches the request marker's thread, so `correlated_rados_ops == same_thread_correlations + cross_thread_correlations + inferred_correlations`. `cross_thread` is best-effort, opt-in, and build-dependent: on async-dispatch RGW builds most data-path ops submit off the execute thread and stay `background`/`inferred`, with a measured ~20–25% ceiling on the recoverable synchronous subset (see `docs/design-cross-thread-correlation.md`).
 
 Request spans include `rgw.duration_quality`, which has exactly two values. Requests observed via the single safe RGW probe use `marker` (the probe observes a request marker rather than full lifecycle latency; the span still envelopes any correlated RADOS child bounds). Request groups built only from RADOS timestamps use `rados_bounds`. There is no `request_lifecycle` value: measuring a true request lifecycle would require a request-completion probe RGW cannot safely expose (a `process_request` return probe crashes RGW).
 
