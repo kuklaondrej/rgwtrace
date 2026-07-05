@@ -45,6 +45,7 @@ const BPF_DIAG_RADOS_MAP_DROPS: u32 = 2;
 const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
 const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
 const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
+const BPF_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -217,6 +218,7 @@ fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
         rados_finish_misses: read_bpf_counter(map, BPF_DIAG_RADOS_FINISH_MISSES)?,
         request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
         probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
+        reqstate_map_drops: read_bpf_counter(map, BPF_DIAG_REQSTATE_MAP_DROPS)?,
     })
 }
 

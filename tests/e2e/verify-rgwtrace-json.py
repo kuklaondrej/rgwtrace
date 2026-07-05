@@ -34,6 +34,7 @@ BPF_FAILURE_DIAGNOSTICS = [
     "bpf_rados_map_drops",
     "bpf_request_context_drops",
     "bpf_probe_read_failures",
+    "bpf_reqstate_map_drops",
 ]
 RADOS_ATTRIBUTE_KEYS = [
     "ceph.rados.duration_ns",

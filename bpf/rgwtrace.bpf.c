@@ -54,6 +54,13 @@ struct rgw_request_ctx {
   __u32 tid;
   __u32 flags;
   char trans_id[MAX_TRANS_ID];
+  /*
+   * BPF-internal only: the request's req_state* captured at get_handler, used
+   * to key the cross-thread rgw_ctx_by_reqstate bridge. Not a wire field --
+   * emit_request_event copies only the on-wire members, so rgwtrace_events.h /
+   * events.rs are unaffected.
+   */
+  __u64 req_state_ptr;
 };
 
 static struct rados_op_state zero_rados_op = {};
@@ -71,6 +78,26 @@ struct {
   __type(value, struct rgw_request_ctx);
   __uint(max_entries, 8192);
 } rgw_requests SEC(".maps");
+
+/*
+ * Cross-thread context bridge (design-cross-thread-correlation.md Stage 1).
+ * Keyed by (req_state*, tgid) because req_state pointers can collide across
+ * address spaces while --pid is optional. PID-scoped; the u32 pad is explicit
+ * and zeroed on every key so hashing is deterministic. Stage 1 only populates
+ * this map; nothing reads it yet, so behavior is unchanged.
+ */
+struct reqstate_key {
+  __u64 req_state_ptr;
+  __u32 tgid;
+  __u32 _pad;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __type(key, struct reqstate_key);
+  __type(value, struct rgw_request_ctx);
+  __uint(max_entries, 8192);
+} rgw_ctx_by_reqstate SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
@@ -143,6 +170,14 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
     return 0;
 
   __u64 v = fetch_register(ctx, vf->varloc.reg);
+  /*
+   * Reuse the exact slot-30 base register value (and its stack disposition)
+   * for the cross-thread reqstate bridge below. Register-only by design: a
+   * stack-located descriptor cannot encode the req_state* here, so the bridge
+   * is skipped and we fall back to main's same-thread behavior.
+   */
+  bool req_state_is_reg = !vf->varloc.stack;
+  __u64 req_state_base = v;
   __u64 len_addr = fetch_var_member_addr(v, vf);
   rgwtrace_probe_read_user(&trans_id_len, sizeof(trans_id_len), (void *)len_addr);
 
@@ -170,6 +205,22 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
      */
     emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
                        bpf_ktime_get_boot_ns());
+  }
+
+  /*
+   * Stage 1: populate the (req_state*, tgid)-keyed context bridge. Placed after
+   * the trans_id read + marker emission so those are byte-for-byte unaffected.
+   * Only when the slot-30 req_state* came from a register (register-only by
+   * design) and is non-null. Overwrite-on-reuse (BPF_ANY) is the aliasing cure.
+   * Nothing reads this map yet, so live behavior is unchanged.
+   */
+  if (req_state_is_reg && req_state_base > 0) {
+    request->req_state_ptr = req_state_base;
+    struct reqstate_key rkey = {};
+    rkey.req_state_ptr = req_state_base;
+    rkey.tgid = get_pid();
+    if (bpf_map_update_elem(&rgw_ctx_by_reqstate, &rkey, request, BPF_ANY) != 0)
+      count_diag(RGWTRACE_DIAG_REQSTATE_MAP_DROPS);
   }
 
   return 0;
