@@ -202,12 +202,51 @@ impl DwarfInfo {
                         );
                     }
 
+                    // F-B: the per-offset bound above is not cumulative. In
+                    // `fetch_var_member_addr` (bpf/bpf_utils.h) a run of NON-pointer
+                    // fields accumulates displacement onto `cur_addr`
+                    // (`cur_addr += fields[i].offset`), while a `pointer:true` field
+                    // derefs and RESETS `cur_addr` to a freshly read pointer value
+                    // (`cur_addr = tmpaddr + fields[i].offset`). So N non-pointer
+                    // fields each at the per-field limit walk N*MAX_OFFSET from the
+                    // base before any deref -- a drift the independent per-field
+                    // check never catches. Track the cumulative displacement between
+                    // derefs and reject if it exceeds a single MAX_OFFSET. The
+                    // location offset seeds the running sum because BPF applies it to
+                    // the register-relative base (`cur_addr += varloc.offset`) before
+                    // the first deref; seeding it unconditionally is a safe (stricter)
+                    // over-approximation of the `if (varloc.stack)` guard. Every
+                    // `pointer:true` field resets the accumulator because BPF rereads
+                    // `cur_addr` from process memory there.
+                    let mut running = loc_offset as i64;
                     for (fidx, field) in var_field.fields.iter().enumerate() {
+                        // Individual-offset bound (preserved from prior behavior): a
+                        // single field may never exceed MAX_OFFSET on its own.
                         if !(-MAX_OFFSET..=MAX_OFFSET).contains(&field.offset) {
                             bail!(
                                 "module {module_name} function {function} var_field {idx} field {fidx}: \
                                  offset {} is outside the sane range +/-{MAX_OFFSET}",
                                 field.offset
+                            );
+                        }
+
+                        if field.pointer {
+                            // The deref reads at the accumulated `running` displacement
+                            // (already bounded by the previous iteration's check), then
+                            // `cur_addr` resets to the read pointer plus this field's
+                            // offset -- so a new accumulation run starts here.
+                            running = field.offset as i64;
+                        } else {
+                            running += field.offset as i64;
+                        }
+
+                        if !(-(MAX_OFFSET as i64)..=MAX_OFFSET as i64).contains(&running) {
+                            bail!(
+                                "module {module_name} function {function} var_field {idx} field {fidx}: \
+                                 cumulative non-pointer displacement {running} exceeds the sane range \
+                                 +/-{MAX_OFFSET} between pointer derefs (fetch_var_member_addr in \
+                                 bpf/bpf_utils.h walks non-pointer fields additively before a deref \
+                                 resets the address)"
                             );
                         }
                     }
@@ -411,6 +450,21 @@ mod tests {
         )
     }
 
+    /// Builds a var_field with `location.offset == loc_offset` and an explicit
+    /// `fields` chain given as `(offset, pointer)` pairs. Unlike `var_field_json`,
+    /// this exposes per-field `pointer` so cumulative-displacement resets can be
+    /// exercised.
+    fn var_field_with_chain(loc_offset: i32, chain: &[(i32, bool)]) -> String {
+        let fields: Vec<String> = chain
+            .iter()
+            .map(|(offset, pointer)| format!(r#"{{"offset": {offset}, "pointer": {pointer}}}"#))
+            .collect();
+        format!(
+            r#"{{"location": {{"reg": 4, "offset": {loc_offset}, "stack": false}}, "fields": [{}]}}"#,
+            fields.join(",")
+        )
+    }
+
     #[test]
     fn slot_capacities_match_base_id_gaps() {
         // _send_op base 0 -> _finish_op base 20 => 20 slots.
@@ -535,6 +589,48 @@ mod tests {
         let err = DwarfInfo::from_str(&json).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("field 0"), "message: {msg}");
+    }
+
+    #[test]
+    fn cumulative_non_pointer_displacement_over_limit_fails() {
+        // F-B: 9 non-pointer fields, each individually AT the per-field limit
+        // (so every per-field check passes), accumulate ~9*MAX_OFFSET onto the
+        // base before any deref. Without the cumulative check this walks ~144
+        // MiB from the register base yet slips past the independent bounds.
+        let chain: Vec<(i32, bool)> = (0..9).map(|_| (MAX_OFFSET, false)).collect();
+        let vf = var_field_with_chain(0, &chain);
+        let json = json_with_single_var_field("amd64", "Objecter::_send_op", &vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cumulative"), "message: {msg}");
+        assert!(msg.contains("Objecter::_send_op"), "message: {msg}");
+    }
+
+    #[test]
+    fn cumulative_displacement_reset_by_pointer_derefs_passes() {
+        // Same-magnitude per-field offsets as the failing case, but each is
+        // separated by a `pointer:true` deref that resets `cur_addr`, so no
+        // single between-deref run exceeds MAX_OFFSET. This must still pass.
+        let mut chain: Vec<(i32, bool)> = Vec::new();
+        for _ in 0..5 {
+            chain.push((MAX_OFFSET, false)); // run reaches exactly the limit
+            chain.push((0, true)); // deref resets the accumulator to 0
+        }
+        let vf = var_field_with_chain(0, &chain);
+        let json = json_with_single_var_field("amd64", "Objecter::_send_op", &vf);
+        DwarfInfo::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn single_field_over_limit_still_fails() {
+        // Existing per-field behavior is preserved: one oversized field is
+        // rejected on its own, independent of the cumulative check.
+        let vf = var_field_with_chain(0, &[(MAX_OFFSET + 1, false)]);
+        let json = json_with_single_var_field("amd64", "Objecter::_send_op", &vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("field 0"), "message: {msg}");
+        assert!(msg.contains("sane range"), "message: {msg}");
     }
 
     #[test]
