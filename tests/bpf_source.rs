@@ -75,6 +75,49 @@ fn state_maps_use_lru_hash_to_bound_entry_leaks() {
 }
 
 #[test]
+fn reqstate_bridge_map_is_declared_lru_hash() {
+    // Stage 1 of the cross-thread correlation bridge: a PID-scoped
+    // (req_state*, tgid)-keyed LRU_HASH context map. Populated only; nothing
+    // reads it yet, so there is no behavior change.
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "struct reqstate_key {\n",
+        "  __u64 req_state_ptr;\n",
+        "  __u32 tgid;\n",
+        "  __u32 _pad;\n",
+        "};"
+    )));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, struct reqstate_key);\n",
+        "  __type(value, struct rgw_request_ctx);\n",
+        "  __uint(max_entries, 8192);\n",
+        "} rgw_ctx_by_reqstate SEC(\".maps\");"
+    )));
+}
+
+#[test]
+fn fetch_param_ptr_is_register_only_and_fails_closed_on_stack() {
+    // Register-only raw-pointer descriptor helper: returns 0 for a
+    // stack-located varloc so callers fail closed, and never composes a varloc
+    // via fetch_var_member_addr.
+    assert!(BPF_UTILS.contains("fetch_param_ptr"));
+    assert!(BPF_UTILS.contains("if (vf == 0 || vf->varloc.stack)\n    return 0;"));
+    assert!(BPF_UTILS.contains("return fetch_register(ctx, vf->varloc.reg);"));
+}
+
+#[test]
+fn get_handler_populates_reqstate_bridge() {
+    // The get_handler probe writes the reqstate bridge, reusing the slot-30
+    // base register value (register-only), and counts update failures.
+    assert!(
+        RGWTRACE_BPF.contains("bpf_map_update_elem(&rgw_ctx_by_reqstate, &rkey, request, BPF_ANY)")
+    );
+    assert!(RGWTRACE_BPF.contains("request->req_state_ptr = req_state_base;"));
+    assert!(RGWTRACE_BPF.contains("if (req_state_is_reg && req_state_base > 0)"));
+    assert!(RGWTRACE_BPF.contains("count_diag(RGWTRACE_DIAG_REQSTATE_MAP_DROPS)"));
+}
+
+#[test]
 fn cls_and_method_reads_use_verifier_bounded_lengths() {
     assert!(RGWTRACE_BPF.contains("__u32 cls_read_len = cls_len;"));
     assert!(RGWTRACE_BPF.contains("cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;"));

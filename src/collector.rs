@@ -74,6 +74,7 @@ pub struct BpfDiagnostics {
     pub rados_finish_misses: u64,
     pub request_context_drops: u64,
     pub probe_read_failures: u64,
+    pub reqstate_map_drops: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -108,6 +109,7 @@ pub struct TraceDiagnostics {
     pub bpf_rados_finish_misses: u64,
     pub bpf_request_context_drops: u64,
     pub bpf_probe_read_failures: u64,
+    pub bpf_reqstate_map_drops: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -324,6 +326,7 @@ impl Collector {
         self.diagnostics.bpf_rados_finish_misses = diagnostics.rados_finish_misses;
         self.diagnostics.bpf_request_context_drops = diagnostics.request_context_drops;
         self.diagnostics.bpf_probe_read_failures = diagnostics.probe_read_failures;
+        self.diagnostics.bpf_reqstate_map_drops = diagnostics.reqstate_map_drops;
     }
 
     pub fn drain_expired(
@@ -1317,6 +1320,7 @@ mod tests {
             rados_finish_misses: 4,
             request_context_drops: 5,
             probe_read_failures: 6,
+            reqstate_map_drops: 7,
         });
 
         let document = collector.into_trace_document("rgwtrace");
@@ -1326,6 +1330,7 @@ mod tests {
         assert_eq!(document.diagnostics.bpf_rados_finish_misses, 4);
         assert_eq!(document.diagnostics.bpf_request_context_drops, 5);
         assert_eq!(document.diagnostics.bpf_probe_read_failures, 6);
+        assert_eq!(document.diagnostics.bpf_reqstate_map_drops, 7);
     }
 
     #[test]

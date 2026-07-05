@@ -100,4 +100,18 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   return cur_addr;
 }
 
+/*
+ * Raw-pointer parameter fetch for register-at-entry descriptors: return the
+ * value of the parameter's ABI register, or 0 when the descriptor is
+ * stack-located (post-prologue spill). Register-only by design -- it never
+ * composes a varloc via fetch_var_member_addr, so there is no double-varloc
+ * risk. Callers treat 0 as "unresolved" and fail closed.
+ */
+static __always_inline __u64 fetch_param_ptr(const struct pt_regs *const ctx,
+                                             struct VarField *vf) {
+  if (vf == 0 || vf->varloc.stack)
+    return 0;
+  return fetch_register(ctx, vf->varloc.reg);
+}
+
 #endif
