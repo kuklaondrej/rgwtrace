@@ -285,6 +285,51 @@ resolve_function() {
     return 0
 }
 
+# --- el9 / embedded-Objecter pre-warning -----------------------------------
+#
+# When _send_op resolves in libceph-common, a HIDDEN private copy of Objecter
+# embedded in librados.so may be the one that actually executes, so the uprobe
+# would attach to dead code and report 0 _send_op calls with no hint why. If a
+# librados.so mapped into the same process embeds Objecter (its source path
+# 'osdc/Objecter.cc' shows up in the string table), warn at resolution time so
+# the operator is not surprised by a silent zero. Best-effort and never fatal.
+warn_if_embedded_objecter() {
+    local send_bin="$1"
+    # Only relevant when we attached to libceph-common's copy.
+    [[ "${send_bin}" == "${LIBCEPH_COMMON_PATH}" ]] || return 0
+    command -v strings >/dev/null 2>&1 || return 0
+
+    local librados=""
+    if [[ -n "${RGW_PID:-}" && "${RGW_PID}" != "0" ]]; then
+        local mapped
+        mapped="$(grep -oE '/[^ ]*librados\.so[^ ]*' "/proc/${RGW_PID}/maps" 2>/dev/null | sort -u | head -n1 || true)"
+        if [[ -n "${mapped}" ]]; then
+            if [[ -r "/proc/${RGW_PID}/root${mapped}" ]]; then
+                librados="/proc/${RGW_PID}/root${mapped}"
+            elif [[ -r "${mapped}" ]]; then
+                librados="${mapped}"
+            fi
+        fi
+    fi
+    if [[ -z "${librados}" ]]; then
+        local cand
+        for cand in \
+            "$(dirname "${LIBCEPH_COMMON_PATH}")"/librados.so.* \
+            /usr/lib64/librados.so.* \
+            /usr/lib/*/librados.so.*; do
+            [[ -r "${cand}" ]] && { librados="${cand}"; break; }
+        done
+    fi
+    [[ -n "${librados}" && -r "${librados}" ]] || return 0
+
+    if strings -- "${librados}" 2>/dev/null | grep -qm1 'osdc/Objecter.cc'; then
+        warn "resolved Objecter::_send_op in libceph-common, but ${librados} appears to embed a PRIVATE copy of Objecter (found 'osdc/Objecter.cc' in its strings)."
+        warn "  On el9 Ceph builds that hidden Objecter is the one that actually executes; the libceph-common export can be dead code, so this uprobe may report 0 _send_op calls."
+        warn "  If the summary shows 0 _send_op with nonzero process_authenticated, re-run with the executing copy:"
+        warn "    LIBCEPH_COMMON_PATH=/proc/<pid>/root/usr/lib64/librados.so.2.0.0 (unstripped/debuginfo symtab; merge one with eu-unstrip if needed)."
+    fi
+}
+
 # --- argument-index derivation ---------------------------------------------
 #
 # Parse a demangled signature, find which source parameter's type contains
@@ -501,6 +546,28 @@ END
     printf("_send_op calls                 : %d\n", @send_total);
     printf("\n");
 
+    /*
+     * Dead-probe hazard: 0 _send_op while process_authenticated fired means the
+     * _send_op uprobe is very likely attached to a NON-EXECUTING copy of
+     * Objecter. On el9 Ceph builds librados.so embeds a HIDDEN private Objecter
+     * (the one that actually runs) while libceph-common.so ALSO exports
+     * Objecter::_send_op as dead code -- resolving there attaches successfully
+     * yet observes nothing. Say so explicitly instead of reporting a silent 0.
+     */
+    if (@send_total == 0 && @pa_calls > 0) {
+        printf("[stage0][WARNING] 0 _send_op but %d process_authenticated calls.\n", @pa_calls);
+        printf("    The _send_op uprobe may be attached to a NON-EXECUTING copy of Objecter\n");
+        printf("    (multiple DSOs can define Objecter::_send_op). On el9, librados.so embeds a\n");
+        printf("    hidden private Objecter that actually runs, while libceph-common.so exports\n");
+        printf("    _send_op as dead code.\n");
+        printf("    Diagnose : strings <librados.so> | grep -m1 'osdc/Objecter.cc'\n");
+        printf("               (a hit means librados carries its own Objecter).\n");
+        printf("    Override : LIBCEPH_COMMON_PATH=/proc/<pid>/root/usr/lib64/librados.so.2.0.0\n");
+        printf("               (needs an unstripped/debuginfo symtab; merge one with eu-unstrip).\n");
+        printf("    See the 'el9 / embedded-Objecter' caveat in docs/stage0-runbook.md.\n");
+        printf("\n");
+    }
+
     /* (a) coverage ceiling: _send_op on a TID seeded within 1s. */
     if (@send_total > 0) {
         printf("(a) coverage ceiling      : %d%% seeded<=1s (%d/%d)  [gate >=${STAGE0_COVERAGE_GATE}%% single-stream, 80%% concurrent]\n",
@@ -648,6 +715,9 @@ main() {
         SEND_BIN="${LIBCEPH_COMMON_PATH}"
     fi
     local send_sym="${RESOLVED_SYM}"
+
+    # el9 dead-probe hazard: warn now if librados.so embeds its own Objecter.
+    warn_if_embedded_objecter "${SEND_BIN}"
 
     # Derive & validate arg indices from the demangled signatures.
     derive_arg "${GH_DEMANGLED_NAME}" "${gh_sig}" "${GH_THIS_OFFSET}" "${GH_EXPECTED_ARG}" "${RGW_GET_HANDLER_ARG:-}"
