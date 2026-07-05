@@ -19,7 +19,7 @@
         },
         {
           "key": "rgw.duration_quality",
-          "value": "request_lifecycle"
+          "value": "marker"
         }
       ],
       "events": []
@@ -219,9 +219,9 @@
     }
   ],
   "diagnostics": {
-    "events_decoded": 4,
+    "events_decoded": 3,
     "decode_errors": 0,
-    "request_markers": 2,
+    "request_markers": 1,
     "rados_ops": 2,
     "correlated_rados_ops": 1,
     "background_rados_ops": 1,

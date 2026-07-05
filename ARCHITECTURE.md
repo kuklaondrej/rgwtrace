@@ -26,12 +26,14 @@ The BPF program attaches RADOS probes to `Objecter::_send_op` and `Objecter::_fi
 
 It also attaches `RGWREST::get_handler` to read the RGW `trans_id` and seed request context.
 
-The older `process_request` probe path is intentionally not present because live testing showed it could crash RGW on return-probe attach.
+`RGWREST::get_handler` is the earliest entry probe at which the request identity (`trans_id`) is known, and it is the only safe request probe. This is a single-marker model: RGW exposes no request-completion probe (a `process_request` return probe crashed RGW in live testing, and there is no return probe anywhere in the BPF program), so exactly one request marker is emitted -- a `REQUEST_END` event that carries both the seeded start timestamp and the probe-time end timestamp. No `REQUEST_START` is emitted; it would be informationally redundant because the `REQUEST_END` already carries the seeded start timestamp. The `RGWTRACE_EVENT_REQUEST_START` type stays reserved in the ABI but is never produced.
 
-Captured request data:
+The older `process_request` probe path is intentionally not present because live testing showed it could crash RGW on return-probe attach. There is no return probe anywhere in the BPF program.
 
-- Start timestamp.
-- End or marker timestamp.
+Captured request data (all from the single `REQUEST_END` marker):
+
+- Seeded start timestamp.
+- Probe-time end/marker timestamp.
 - Process ID and thread ID.
 - RGW `trans_id`.
 
@@ -69,7 +71,7 @@ The BPF layer stores RGW request context by Linux thread ID when it reads a `tra
 
 `Objecter::_send_op` copies that `trans_id` into the RADOS event when the same thread context is available.
 
-The Rust collector groups request and RADOS events by `trans_id`.
+The Rust collector groups request and RADOS events by `trans_id`. Each `REQUEST_END` marker is the sole request event for a `trans_id`; there is no start to stage or match. A request seen via its marker yields `rgw.duration_quality = "marker"`; a request reconstructed only from correlated RADOS child bounds (no marker at all) yields `"rados_bounds"`. There is no `"request_lifecycle"` value -- a true request lifecycle would require a completion probe RGW cannot safely provide.
 
 RADOS events without `trans_id` become background spans instead of being attached to a request.
 

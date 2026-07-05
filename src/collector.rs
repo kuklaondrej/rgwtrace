@@ -11,7 +11,6 @@ use crate::{
 
 #[derive(Debug, Default)]
 pub struct Collector {
-    starts_by_tid: BTreeMap<u32, RequestEvent>,
     requests: BTreeMap<String, RequestBuilder>,
     pending_inference: Vec<RadosEvent>,
     background: Vec<BackgroundRados>,
@@ -25,7 +24,6 @@ struct RequestBuilder {
     request: Option<RequestEvent>,
     rados: Vec<CorrelatedRados>,
     last_seen_ns: u64,
-    saw_request_start: bool,
 }
 
 #[derive(Debug)]
@@ -156,26 +154,16 @@ impl Collector {
     pub fn push(&mut self, event: TraceEvent) {
         self.diagnostics.events_decoded += 1;
         match event {
-            TraceEvent::RequestStart(request) => {
+            TraceEvent::RequestEnd(request) => {
+                // Single-marker model: the get_handler entry probe emits one
+                // request marker (END) that already carries the seeded start_ns
+                // and the probe-time end_ns. There is no START to correlate.
                 self.diagnostics.request_markers += 1;
                 record_truncation(&mut self.diagnostics, request.truncation);
-                self.starts_by_tid.insert(request.tid, request);
-            }
-            TraceEvent::RequestEnd(mut request) => {
-                self.diagnostics.request_markers += 1;
-                record_truncation(&mut self.diagnostics, request.truncation);
-                let saw_request_start = if let Some(start) = self.starts_by_tid.remove(&request.tid)
-                {
-                    request.start_ns = start.start_ns;
-                    true
-                } else {
-                    false
-                };
                 let key = request_key(&request);
                 let last_seen_ns = request.end_ns.max(request.start_ns);
                 let builder = self.requests.entry(key).or_default();
                 builder.last_seen_ns = builder.last_seen_ns.max(last_seen_ns);
-                builder.saw_request_start |= saw_request_start;
                 builder.request = Some(request);
                 self.retry_pending_inference();
             }
@@ -451,7 +439,11 @@ fn request_spans(key: String, builder: RequestBuilder) -> Vec<SpanDocument> {
         .into_iter()
         .chain(rados_end_ns)
         .max()
-        .unwrap_or(start_ns);
+        .unwrap_or(start_ns)
+        // Normalize against out-of-order stamps (e.g. a marker whose end_ns
+        // precedes its start_ns): a span must never end before it starts, which
+        // the JSON validator also enforces. Raw values are kept on the event.
+        .max(start_ns);
     let trans_id = builder
         .request
         .as_ref()
@@ -724,10 +716,12 @@ fn request_class_name(class: RequestClass) -> &'static str {
 }
 
 fn request_duration_quality(builder: &RequestBuilder) -> &'static str {
+    // Only two honest values exist in the single-marker model: a request seen
+    // via its END marker is a "marker"; a request reconstructed purely from
+    // correlated RADOS child bounds (no marker) is "rados_bounds". There is no
+    // request_lifecycle -- RGW exposes no safe completion probe.
     if builder.request.is_none() {
         "rados_bounds"
-    } else if builder.saw_request_start {
-        "request_lifecycle"
     } else {
         "marker"
     }
@@ -1029,18 +1023,58 @@ mod tests {
     }
 
     #[test]
-    fn marks_request_lifecycle_duration_when_start_was_seen() {
+    fn request_end_marker_produces_marker_quality_span() {
+        // Single-marker production stream: the get_handler probe emits one END
+        // event carrying both the seeded start_ns and the probe-time end_ns.
+        // The resulting request span is always "marker" quality.
         let mut collector = Collector::default();
-        collector.push(TraceEvent::RequestStart(request("", 1, 0)));
         collector.push(TraceEvent::RequestEnd(request("tx1", 10, 30)));
 
         let document = collector.into_trace_document("rgwtrace");
 
-        assert_eq!(document.spans[0].start_ns, 1);
+        assert_eq!(document.spans.len(), 1);
+        assert_eq!(document.spans[0].name, "rgw.request");
+        assert_eq!(document.spans[0].start_ns, 10);
+        assert_eq!(document.spans[0].end_ns, 30);
         assert_eq!(
             string_attribute(&document.spans[0], "rgw.duration_quality"),
-            Some("request_lifecycle")
+            Some("marker")
         );
+        assert_eq!(document.diagnostics.request_markers, 1);
+    }
+
+    #[test]
+    fn request_end_marker_with_zero_duration_is_a_zero_duration_span() {
+        // A marker whose seeded start_ns equals its probe-time end_ns yields a
+        // zero-duration span rather than being dropped.
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx1", 100, 100)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 1);
+        assert_eq!(document.spans[0].start_ns, 100);
+        assert_eq!(document.spans[0].end_ns, 100);
+        assert_eq!(
+            string_attribute(&document.spans[0], "rgw.duration_quality"),
+            Some("marker")
+        );
+    }
+
+    #[test]
+    fn request_end_marker_with_reversed_timestamps_is_normalized() {
+        // Defensive: an END whose end_ns precedes its start_ns (e.g. a clock
+        // offset artifact) must still produce a span without panicking, and the
+        // span's end_ns is clamped up to start_ns so it is never before the
+        // start -- the JSON validator rejects start_ns > end_ns.
+        let mut collector = Collector::default();
+        collector.push(TraceEvent::RequestEnd(request("tx1", 100, 50)));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        assert_eq!(document.spans.len(), 1);
+        assert_eq!(document.spans[0].start_ns, 100);
+        assert_eq!(document.spans[0].end_ns, 100);
     }
 
     #[test]
@@ -1252,8 +1286,11 @@ mod tests {
 
     #[test]
     fn collector_trace_matches_golden_fixture() {
+        // Mirror the real production event stream: the get_handler entry probe
+        // emits a single END marker for the trans_id, and the request's RADOS
+        // children arrive afterwards from the send/finish probes.
         let mut collector = Collector::default();
-        collector.push(TraceEvent::RequestStart(request("", 100, 0)));
+        collector.push(TraceEvent::RequestEnd(request("tx-golden", 100, 250)));
 
         let mut child = rados("bucket-object", "tx-golden");
         child.sent_ns = 120;
@@ -1278,7 +1315,6 @@ mod tests {
             },
         ];
         collector.push(TraceEvent::RadosOp(child));
-        collector.push(TraceEvent::RequestEnd(request("tx-golden", 150, 250)));
 
         let mut background = rados("notify.0", "");
         background.sent_ns = 300;
