@@ -59,14 +59,14 @@ struct rgw_request_ctx {
 static struct rados_op_state zero_rados_op = {};
 
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __type(key, struct client_op_key);
   __type(value, struct rados_op_state);
   __uint(max_entries, 8192);
 } rados_ops SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __type(key, __u32);
   __type(value, struct rgw_request_ctx);
   __uint(max_entries, 8192);
