@@ -7,6 +7,9 @@ pub const MAX_TRANS_ID: usize = 128;
 pub const MAX_OBJECT_NAME: usize = 128;
 pub const MAX_RADOS_OPS: usize = 3;
 
+// Reserved in the ABI (mirrored in bpf/rgwtrace_events.h) but never emitted:
+// the single-marker model uses only REQUEST_END. Kept for byte-for-byte ABI
+// stability; there is deliberately no TraceEvent::RequestStart variant.
 pub const RGWTRACE_EVENT_REQUEST_START: u32 = 1;
 pub const RGWTRACE_EVENT_REQUEST_END: u32 = 2;
 pub const RGWTRACE_EVENT_RADOS_OP: u32 = 3;
@@ -63,7 +66,6 @@ pub struct RawRadosEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
-    RequestStart(RequestEvent),
     RequestEnd(RequestEvent),
     RadosOp(RadosEvent),
 }
@@ -77,7 +79,7 @@ impl TraceEvent {
         }
 
         match self {
-            TraceEvent::RequestStart(request) | TraceEvent::RequestEnd(request) => {
+            TraceEvent::RequestEnd(request) => {
                 add_offset(&mut request.start_ns, offset_ns);
                 add_offset(&mut request.end_ns, offset_ns);
             }
@@ -276,7 +278,7 @@ mod tests {
 
     #[test]
     fn timestamp_offset_keeps_zero_end_timestamp() {
-        let mut event = TraceEvent::RequestStart(RequestEvent {
+        let mut event = TraceEvent::RequestEnd(RequestEvent {
             start_ns: 10,
             end_ns: 0,
             pid: 1,
@@ -287,8 +289,8 @@ mod tests {
 
         event.add_timestamp_offset(1000);
 
-        let TraceEvent::RequestStart(request) = event else {
-            panic!("expected request start event");
+        let TraceEvent::RequestEnd(request) = event else {
+            panic!("expected request end event");
         };
         assert_eq!(request.start_ns, 1010);
         assert_eq!(request.end_ns, 0);

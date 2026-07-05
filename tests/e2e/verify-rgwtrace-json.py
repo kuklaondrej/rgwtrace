@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 
 SPAN_NAMES = {"rgw.request", "rados.op", "rgw.background.rados_op"}
-VALID_DURATION_QUALITIES = {"marker", "request_lifecycle", "rados_bounds"}
+# Single-marker model: request_lifecycle is unattainable by contract (RGW has
+# no safe request-completion probe), so only "marker" and "rados_bounds" occur.
+VALID_DURATION_QUALITIES = {"marker", "rados_bounds"}
 VALID_RADOS_ROLES = {
     "data",
     "bucket_index",

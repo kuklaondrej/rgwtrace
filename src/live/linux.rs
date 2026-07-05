@@ -25,7 +25,7 @@ use crate::{
     dwarf_json::{basename, DwarfInfo, VarFieldKernel},
     events::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
-        RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
+        RGWTRACE_EVENT_REQUEST_END,
     },
     otel, preflight, targets,
 };
@@ -438,15 +438,16 @@ fn decode_event(data: &[u8]) -> Result<TraceEvent> {
     let event_type = u32::from_ne_bytes(data[..4].try_into()?);
     let payload = &data[EVENT_DATA_OFFSET..];
     match event_type {
-        RGWTRACE_EVENT_REQUEST_START => Ok(TraceEvent::RequestStart(
-            read_payload::<RawRequestEvent>(payload)?.into(),
-        )),
         RGWTRACE_EVENT_REQUEST_END => Ok(TraceEvent::RequestEnd(
             read_payload::<RawRequestEvent>(payload)?.into(),
         )),
         RGWTRACE_EVENT_RADOS_OP => Ok(TraceEvent::RadosOp(
             read_payload::<RawRadosEvent>(payload)?.into(),
         )),
+        // RGWTRACE_EVENT_REQUEST_START is reserved in the ABI but never emitted
+        // in the single-marker model. Any such event flows through the same
+        // unknown-event path (counted as a decode error) rather than
+        // fabricating a request span.
         other => bail!("unknown event type {other}"),
     }
 }
@@ -516,7 +517,32 @@ mod tests {
     use crate::events::{RawClsOp, MAX_ACTING, MAX_RADOS_OPS};
 
     #[test]
-    fn decodes_request_start_event() {
+    fn decodes_request_end_event() {
+        let raw = RawRequestEvent {
+            start_ns: 10,
+            end_ns: 30,
+            pid: 42,
+            tid: 7,
+            flags: 0,
+            trans_id: bytes("tx0001"),
+        };
+
+        let event = decode_event(&event_data(RGWTRACE_EVENT_REQUEST_END, &raw)).unwrap();
+
+        let TraceEvent::RequestEnd(request) = event else {
+            panic!("expected request end event");
+        };
+        assert_eq!(request.start_ns, 10);
+        assert_eq!(request.end_ns, 30);
+        assert_eq!(request.pid, 42);
+        assert_eq!(request.trans_id, "tx0001");
+    }
+
+    #[test]
+    fn reserved_request_start_event_flows_through_unknown_path() {
+        // REQUEST_START is ABI-reserved but never emitted; if one ever arrives
+        // it is treated as an unknown event (decode error) rather than decoded
+        // into a request span.
         let raw = RawRequestEvent {
             start_ns: 10,
             end_ns: 0,
@@ -526,14 +552,13 @@ mod tests {
             trans_id: bytes("tx0001"),
         };
 
-        let event = decode_event(&event_data(RGWTRACE_EVENT_REQUEST_START, &raw)).unwrap();
+        let err = decode_event(&event_data(
+            crate::events::RGWTRACE_EVENT_REQUEST_START,
+            &raw,
+        ))
+        .unwrap_err();
 
-        let TraceEvent::RequestStart(request) = event else {
-            panic!("expected request start event");
-        };
-        assert_eq!(request.start_ns, 10);
-        assert_eq!(request.pid, 42);
-        assert_eq!(request.trans_id, "tx0001");
+        assert!(err.to_string().contains("unknown event type 1"));
     }
 
     #[test]

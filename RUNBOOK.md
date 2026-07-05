@@ -139,11 +139,12 @@ Do not assume background spans are errors. A rising background ratio is useful s
 
 ## Capture Quality
 
-Request spans include `rgw.duration_quality`.
+Request spans include `rgw.duration_quality`, which has exactly two values.
 
-- `marker`: current live probe path observed a request marker, not full lifecycle latency. The request span still envelopes correlated RADOS child bounds.
-- `request_lifecycle`: both request start and end markers were observed.
+- `marker`: the single safe RGW probe observed a request marker, not full lifecycle latency. The request span still envelopes correlated RADOS child bounds.
 - `rados_bounds`: the request group was built from RADOS timestamps only.
+
+There is no `request_lifecycle` value. Measuring a true request lifecycle would require a request-completion probe RGW cannot safely expose (a `process_request` return probe crashes RGW), so only the single-marker and RADOS-bounds qualities occur.
 
 RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names.
 

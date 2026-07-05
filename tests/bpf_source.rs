@@ -27,6 +27,24 @@ fn bpf_records_drop_and_probe_read_diagnostics() {
 }
 
 #[test]
+fn bpf_emits_only_request_end_marker() {
+    // Single-marker contract: the get_handler entry probe is the only safe
+    // request probe and emits exactly one request marker (END), which carries
+    // both the seeded start_ns and the probe-time end_ns. REQUEST_START is
+    // deliberately NOT emitted -- it would be informationally redundant (the
+    // END already carries start_ns), double ring-buffer volume, and a matched
+    // start/end lifecycle is unattainable without a request-completion probe.
+    assert!(RGWTRACE_BPF.contains("emit_request_event(RGWTRACE_EVENT_REQUEST_END"));
+    assert!(!RGWTRACE_BPF.contains("RGWTRACE_EVENT_REQUEST_START"));
+    // AGENTS.md hard rule: no return probe anywhere (a process_request return
+    // probe was observed to crash RGW live). Guard against any uretprobe or a
+    // probe handler attached to process_request being reintroduced.
+    assert!(!RGWTRACE_BPF.contains("uretprobe"));
+    assert!(!RGWTRACE_BPF.contains("uprobe_process_request"));
+    assert!(!RGWTRACE_BPF.contains("int uprobe_ret_"));
+}
+
+#[test]
 fn bpf_records_rados_sender_thread_id() {
     assert!(RGWTRACE_EVENTS.contains("__u32 send_tid;"));
     assert!(RGWTRACE_BPF.contains("__u32 thread_id = get_tid();"));

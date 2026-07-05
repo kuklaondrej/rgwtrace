@@ -161,6 +161,13 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
       request->flags |= RGWTRACE_TRUNC_TRANS_ID;
     rgwtrace_probe_read_user_str(request->trans_id, sizeof(request->trans_id),
                                  (void *)trans_id_base);
+    /*
+     * Single-marker model: RGWREST::get_handler is the only safe request probe.
+     * RGW offers no request-completion probe (a process_request return probe was
+     * observed to crash RGW live), so exactly one marker is emitted -- the END
+     * event carries both the seeded start_ns and the probe-time end_ns. No
+     * REQUEST_START is emitted; it would be informationally redundant.
+     */
     emit_request_event(RGWTRACE_EVENT_REQUEST_END, request,
                        bpf_ktime_get_boot_ns());
   }
