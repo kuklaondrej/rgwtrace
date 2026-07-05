@@ -68,7 +68,33 @@ def parse_args():
         help="comma-separated role alternatives; at least one must be present",
     )
     parser.add_argument("--time-slack-ms", type=int, default=2000)
+    parser.add_argument(
+        "--workload-manifest",
+        default=None,
+        help="s3-workload.py --manifest file; enables the object->request cross-check "
+        "(always-on zero-mis-correlation) and the coverage-rate gates below",
+    )
+    parser.add_argument(
+        "--require-get-read-correlation",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help="fail if the fraction of manifest GET data ops with a correctly correlated "
+        "read RADOS span is below RATE (requires --workload-manifest)",
+    )
+    parser.add_argument(
+        "--require-put-write-correlation",
+        type=float,
+        default=None,
+        metavar="RATE",
+        help="fail if the fraction of manifest PUT data ops with a correctly correlated "
+        "write RADOS span is below RATE (requires --workload-manifest)",
+    )
     args = parser.parse_args()
+    if (args.require_get_read_correlation is not None or args.require_put_write_correlation is not None) and not (
+        args.workload_manifest or args.self_test
+    ):
+        parser.error("--require-*-correlation requires --workload-manifest")
     if not args.self_test and (not args.trace or not args.workload):
         parser.error("--trace and --workload are required unless --self-test is used")
     return args
@@ -87,6 +113,48 @@ def load_workload(path):
             if line:
                 records.append(json.loads(line))
     return records
+
+
+def load_manifest(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, list):
+        return list(data)
+    if isinstance(data, dict):
+        return list(data.get("operations", []))
+    return []
+
+
+def manifest_data_ops(manifest):
+    """Successful data-path (GET/PUT) operations with a key and request id."""
+    ops = []
+    for record in manifest or []:
+        if record.get("status", "ok") != "ok":
+            continue
+        if not record.get("key") or not record.get("x_amz_request_id"):
+            continue
+        if record.get("op") not in {"GET", "PUT"}:
+            continue
+        ops.append(record)
+    return ops
+
+
+def manifest_record_matches_span(record, span, span_attrs, slack_ns, match_rw=True):
+    object_name = str(span_attrs.get("ceph.rados.object", ""))
+    if record["key"] not in object_name:
+        return False
+    if not span_overlaps(span, record["start_ns"], record["end_ns"], slack_ns):
+        return False
+    if match_rw and record.get("rw") and span_attrs.get("ceph.rados.rw") != record.get("rw"):
+        return False
+    return True
+
+
+def span_parent_trans_id(span, request_by_id):
+    parent = request_by_id.get(span.get("parent_span_id"))
+    if parent is None:
+        return None
+    return attr_map(parent).get("rgw.trans_id")
 
 
 def attr_map(span):
@@ -188,7 +256,84 @@ def validate_background_event(errors, span, span_attrs):
             fail(errors, f"background span {span_id} event attribute {key} does not match span attribute")
 
 
-def verify_document(args, document, workload):
+def check_object_request_correlation(args, errors, manifest, rados_spans, background_spans, request_by_id, slack_ns):
+    """Object<->request cross-check against the workload manifest.
+
+    Returns a coverage summary. Two independent findings:
+      * MIS-CORRELATION (always fails): a correlated rados.op child span for a
+        workload object is attached to the WRONG request. This is the
+        zero-mis-correlation gate that must hold even on current baseline.
+      * COVERAGE MISS (reported as a rate; only fails when a --require-* flag
+        demands it): a workload data op has no correctly correlated child span
+        (its data ops landed as background/inferred, or on a wrong request).
+    """
+    data_ops = manifest_data_ops(manifest)
+
+    # Always-on zero-mis-correlation check. Only decide when the workload object
+    # maps to exactly one data op (key substring + rw + time window); ambiguous
+    # matches are skipped rather than guessed.
+    for span in rados_spans:
+        span_attrs = attr_map(span)
+        matches = [
+            record
+            for record in data_ops
+            if manifest_record_matches_span(record, span, span_attrs, slack_ns)
+        ]
+        if len(matches) != 1:
+            continue
+        expected = matches[0]["x_amz_request_id"]
+        actual = span_parent_trans_id(span, request_by_id)
+        if actual != expected:
+            fail(
+                errors,
+                f"MIS-CORRELATION: rados.op span {span.get('span_id')} for object "
+                f"{span_attrs.get('ceph.rados.object')!r} (workload key {matches[0]['key']!r}) "
+                f"attached to request {actual!r}; expected {expected!r}",
+            )
+
+    def op_correctly_correlated(record, rw):
+        for span in rados_spans:
+            span_attrs = attr_map(span)
+            if span_attrs.get("ceph.rados.rw") != rw:
+                continue
+            if not manifest_record_matches_span(record, span, span_attrs, slack_ns):
+                continue
+            if span_parent_trans_id(span, request_by_id) == record["x_amz_request_id"]:
+                return True
+        return False
+
+    def coverage(op, rw):
+        records = [record for record in data_ops if record.get("op") == op]
+        hits = [record for record in records if op_correctly_correlated(record, rw)]
+        return len(hits), len(records)
+
+    get_hits, get_total = coverage("GET", "read")
+    put_hits, put_total = coverage("PUT", "write")
+
+    def enforce_rate(flag_value, hits, total, label):
+        if flag_value is None:
+            return
+        if total == 0:
+            if flag_value > 0:
+                fail(errors, f"{label}: manifest has no successful data operations to evaluate")
+            return
+        rate = hits / total
+        if rate < flag_value - 1e-9:
+            fail(
+                errors,
+                f"{label}: correlation rate {rate:.3f} ({hits}/{total}) is below required {flag_value:.3f}",
+            )
+
+    enforce_rate(args.require_get_read_correlation, get_hits, get_total, "require-get-read-correlation")
+    enforce_rate(args.require_put_write_correlation, put_hits, put_total, "require-put-write-correlation")
+
+    return {
+        "get_read": {"correlated": get_hits, "total": get_total},
+        "put_write": {"correlated": put_hits, "total": put_total},
+    }
+
+
+def verify_document(args, document, workload, manifest=None):
     errors = []
 
     trace = document.get("trace", document)
@@ -395,6 +540,13 @@ def verify_document(args, document, workload):
         if unexpected_trace_ids:
             fail(errors, f"trace rgw.trans_id values without matching workload x-amz-request-id: {unexpected_trace_ids}")
 
+    manifest_coverage = None
+    if manifest is not None:
+        slack_ns = args.time_slack_ms * 1_000_000
+        manifest_coverage = check_object_request_correlation(
+            args, errors, manifest, rados_spans, background_spans, request_by_id, slack_ns
+        )
+
     summary = {
         "spans": len(spans),
         "request_spans": len(request_spans),
@@ -405,16 +557,25 @@ def verify_document(args, document, workload):
         "roles": sorted(role for role in roles if role),
         "diagnostics": diagnostics,
     }
+    if manifest_coverage is not None:
+        summary["manifest_coverage"] = manifest_coverage
     return summary, errors
 
 
-def self_test_args():
+def self_test_args(
+    require_get_read_correlation=None,
+    require_put_write_correlation=None,
+    expect_role=("data",),
+):
     return SimpleNamespace(
         min_request_spans=1,
         min_rados_spans=1,
-        expect_role=["data"],
+        expect_role=list(expect_role),
         expect_any_role=[],
         time_slack_ms=2000,
+        workload_manifest=None,
+        require_get_read_correlation=require_get_read_correlation,
+        require_put_write_correlation=require_put_write_correlation,
     )
 
 
@@ -529,6 +690,274 @@ def valid_self_test_workload():
     ]
 
 
+def manifest_self_test_document():
+    """A two-request document (GET->read, PUT->write) plus one background op.
+
+    Both data ops carry a distinct object key so the manifest object->request
+    mapping is unambiguous, mirroring s3-workload.py --unique-keys output.
+    """
+    get_request_attrs = [
+        attr("rgw.trans_id", "tx-get"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    read_rados_attrs = [
+        attr("ceph.rados.duration_ns", 60),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2a"),
+        attr("ceph.rados.pg_seed", 42),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/get-key-aaa"),
+        attr("ceph.rados.ops", "read"),
+        attr("ceph.rados.rw", "read"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 0),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "same_thread"),
+    ]
+    put_request_attrs = [
+        attr("rgw.trans_id", "tx-put"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+    ]
+    write_rados_attrs = [
+        attr("ceph.rados.duration_ns", 80),
+        attr("ceph.rados.pool", 1),
+        attr("ceph.rados.pg", "1.2b"),
+        attr("ceph.rados.pg_seed", 43),
+        attr("ceph.rados.target_osd", 0),
+        attr("ceph.rados.acting", "[0,1,2]"),
+        attr("ceph.rados.object", "bucket/put-key-bbb__shadow_0"),
+        attr("ceph.rados.ops", "writefull"),
+        attr("ceph.rados.rw", "write"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 4096),
+        attr("rgw.rados_role", "data"),
+        attr("rgw.correlation", "same_thread"),
+    ]
+    background_attrs = [
+        attr("ceph.rados.duration_ns", 20),
+        attr("ceph.rados.pool", 2),
+        attr("ceph.rados.pg", "2.7"),
+        attr("ceph.rados.pg_seed", 7),
+        attr("ceph.rados.target_osd", 1),
+        attr("ceph.rados.acting", "[1,2,3]"),
+        attr("ceph.rados.object", "notify.0"),
+        attr("ceph.rados.ops", "read"),
+        attr("ceph.rados.rw", "read"),
+        attr("ceph.rados.offset", 0),
+        attr("ceph.rados.length", 0),
+        attr("rgw.rados_role", "notify"),
+        attr("rgw.correlation", "none"),
+        attr("rgw.correlation_reason", "classified_background_role"),
+    ]
+    return {
+        "service_name": "rgwtrace-e2e",
+        "spans": [
+            {
+                "trace_id": "1" * 32,
+                "span_id": "1" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 100,
+                "end_ns": 300,
+                "attributes": get_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "1" * 32,
+                "span_id": "2" * 16,
+                "parent_span_id": "1" * 16,
+                "name": "rados.op",
+                "start_ns": 120,
+                "end_ns": 180,
+                "attributes": read_rados_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "4" * 32,
+                "span_id": "4" * 16,
+                "parent_span_id": None,
+                "name": "rgw.request",
+                "start_ns": 400,
+                "end_ns": 600,
+                "attributes": put_request_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "4" * 32,
+                "span_id": "5" * 16,
+                "parent_span_id": "4" * 16,
+                "name": "rados.op",
+                "start_ns": 420,
+                "end_ns": 500,
+                "attributes": write_rados_attrs,
+                "events": [],
+            },
+            {
+                "trace_id": "3" * 32,
+                "span_id": "3" * 16,
+                "parent_span_id": None,
+                "name": "rgw.background.rados_op",
+                "start_ns": 700,
+                "end_ns": 720,
+                "attributes": background_attrs,
+                "events": [
+                    {
+                        "name": "rados.op",
+                        "time_ns": 720,
+                        "attributes": deepcopy(background_attrs),
+                    }
+                ],
+            },
+        ],
+        "diagnostics": {
+            "events_decoded": 5,
+            "decode_errors": 0,
+            "request_markers": 2,
+            "rados_ops": 3,
+            "correlated_rados_ops": 2,
+            "background_rados_ops": 1,
+            "same_thread_correlations": 2,
+            "inferred_correlations": 0,
+            "missing_trans_id_background_ops": 1,
+            "background_rados_by_role": {"notify": 1},
+            "background_rados_by_reason": {"classified_background_role": 1},
+            "spans_produced": 5,
+        },
+    }
+
+
+def manifest_self_test_workload():
+    return [
+        {
+            "name": "get_object",
+            "status": "ok",
+            "start_ns": 110,
+            "end_ns": 290,
+            "key": "get-key-aaa",
+            "x_amz_request_id": "tx-get",
+        },
+        {
+            "name": "put_object",
+            "status": "ok",
+            "start_ns": 410,
+            "end_ns": 590,
+            "key": "put-key-bbb",
+            "x_amz_request_id": "tx-put",
+        },
+    ]
+
+
+def manifest_self_test_manifest():
+    return [
+        {
+            "name": "get_object",
+            "op": "GET",
+            "rw": "read",
+            "status": "ok",
+            "start_ns": 110,
+            "end_ns": 290,
+            "key": "get-key-aaa",
+            "x_amz_request_id": "tx-get",
+        },
+        {
+            "name": "put_object",
+            "op": "PUT",
+            "rw": "write",
+            "status": "ok",
+            "start_ns": 410,
+            "end_ns": 590,
+            "key": "put-key-bbb",
+            "x_amz_request_id": "tx-put",
+        },
+    ]
+
+
+def set_span_object(document, span_id, value):
+    for span in document["spans"]:
+        if span.get("span_id") == span_id:
+            for attribute in span["attributes"]:
+                if attribute["key"] == "ceph.rados.object":
+                    attribute["value"] = value
+    return document
+
+
+def set_manifest_request_id(manifest, op, request_id):
+    for record in manifest:
+        if record.get("op") == op:
+            record["x_amz_request_id"] = request_id
+    return manifest
+
+
+def run_manifest_self_test():
+    workload = manifest_self_test_workload()
+
+    # 1. Correct correlation passes even under strict (100%) rate gates.
+    strict_args = self_test_args(require_get_read_correlation=1.0, require_put_write_correlation=1.0)
+    _, errors = verify_document(strict_args, manifest_self_test_document(), workload, manifest_self_test_manifest())
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: valid manifest document failed: {error}", file=sys.stderr)
+        return 1
+
+    # 2. Manifest absent => behavior unchanged (gate inert, strict flags ignored).
+    _, errors = verify_document(strict_args, manifest_self_test_document(), workload, None)
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: manifest-absent path regressed: {error}", file=sys.stderr)
+        return 1
+
+    # 3. A coverage miss (data op with no correctly correlated span) must NOT
+    #    fail when no --require-* flag is set.
+    doc = set_span_object(manifest_self_test_document(), "2" * 16, "bucket/unrelated-read-object")
+    _, errors = verify_document(self_test_args(), doc, workload, manifest_self_test_manifest())
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: coverage miss failed without a --require flag: {error}", file=sys.stderr)
+        return 1
+
+    cases = [
+        (
+            "mis-correlation wrong request",
+            self_test_args(),
+            lambda doc, man: (doc, set_manifest_request_id(man, "GET", "tx-put")),
+            "MIS-CORRELATION",
+        ),
+        (
+            "get coverage gate",
+            self_test_args(require_get_read_correlation=1.0),
+            lambda doc, man: (set_span_object(doc, "2" * 16, "bucket/unrelated-read-object"), man),
+            "require-get-read-correlation",
+        ),
+        (
+            "put coverage gate",
+            self_test_args(require_put_write_correlation=1.0),
+            lambda doc, man: (set_span_object(doc, "5" * 16, "bucket/unrelated-write-object"), man),
+            "require-put-write-correlation",
+        ),
+        (
+            "get coverage gate needs data ops",
+            self_test_args(require_get_read_correlation=0.5),
+            lambda doc, man: (doc, [record for record in man if record.get("op") != "GET"]),
+            "no successful data operations",
+        ),
+    ]
+
+    for name, case_args, mutate, expected_error in cases:
+        document = manifest_self_test_document()
+        manifest = manifest_self_test_manifest()
+        document, manifest = mutate(document, manifest)
+        _, errors = verify_document(case_args, document, workload, manifest)
+        if not any(expected_error in error for error in errors):
+            print(f"SELF-TEST ERROR: manifest {name!r} case did not fail with {expected_error!r}", file=sys.stderr)
+            print(json.dumps(errors, indent=2, sort_keys=True), file=sys.stderr)
+            return 1
+
+    return 0
+
+
 def run_self_test():
     args = self_test_args()
     workload = valid_self_test_workload()
@@ -583,6 +1012,9 @@ def run_self_test():
             print(json.dumps(errors, indent=2, sort_keys=True), file=sys.stderr)
             return 1
 
+    if run_manifest_self_test() != 0:
+        return 1
+
     print("verify-rgwtrace-json self-test passed")
     return 0
 
@@ -594,7 +1026,8 @@ def main():
 
     document = load_json(args.trace)
     workload = load_workload(args.workload)
-    summary, errors = verify_document(args, document, workload)
+    manifest = load_manifest(args.workload_manifest) if args.workload_manifest else None
+    summary, errors = verify_document(args, document, workload, manifest)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
     if errors:

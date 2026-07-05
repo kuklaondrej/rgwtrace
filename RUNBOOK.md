@@ -175,3 +175,37 @@ Run dependency audit checks when dependency or toolchain inputs change:
 ```sh
 VERIFY_AUDIT=1 ./scripts/verify.sh
 ```
+
+---
+
+## End-to-end object↔request correlation gate
+
+`tests/e2e/functional-test-microceph-rgw.sh` drives `s3-workload.py` and checks
+the trace with `verify-rgwtrace-json.py`. Two artifacts feed the verifier: the
+per-op workload log (`--output` / `--workload`) and a machine-readable manifest
+(`--manifest` / `--workload-manifest`).
+
+The manifest records, per operation, its op class (`GET`/`PUT`/`OTHER`), `rw`
+(`read`/`write`), S3 key, timestamp window, and `x_amz_request_id`. When the
+verifier is given `--workload-manifest`, it maps each RADOS child span to a
+workload object by matching the S3 key as a substring of `ceph.rados.object`
+(RGW embeds the key in shadow/multipart RADOS names), constrained by `rw` and the
+op's time window. This drives two checks:
+
+- **Zero mis-correlation (always on with a manifest):** a correlated `rados.op`
+  child span for a workload object attached to the wrong request fails the run.
+- **Coverage rate (opt-in):** `--require-get-read-correlation RATE` and
+  `--require-put-write-correlation RATE` fail when the fraction of GET-read /
+  PUT-write data ops that carry a correctly correlated child span drops below
+  `RATE`. A workload object landing as `background`/`inferred` is a coverage
+  miss, not a mis-correlation.
+
+On the current baseline (no cross-thread bridge), cross-thread data ops are not
+correlated, so the coverage gates run at `0` — the functional test's
+`REQUIRE_GET_READ_CORRELATION` / `REQUIRE_PUT_WRITE_CORRELATION` env vars default
+to `0`, and the zero-mis-correlation check still holds. Raise those thresholds
+(0.90, and 0.80 with `WORKLOAD_CONCURRENT_REQUESTS`) once Stage 3's
+`--correlate-cross-thread` bridge is enabled. Use `--unique-keys` (already set by
+the functional test) so the object→request mapping stays unambiguous.
+
+Without `--workload-manifest`, the verifier behaves exactly as before.
