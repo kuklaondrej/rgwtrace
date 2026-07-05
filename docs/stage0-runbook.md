@@ -101,18 +101,22 @@ for i in 1 2 3 4 5; do
 done
 ```
 
-**Concurrent (the coverage-≥80% case).** The current `s3-workload.py` is
-single-threaded, so drive concurrency by running **4 instances in parallel**,
-each on its own bucket (the script auto-generates a unique bucket per run):
+**Concurrent (the coverage-≥80% case).** `s3-workload.py` supports concurrent
+request streams natively via `--concurrent-requests` (added with the Stage 2
+e2e gate):
 
 ```sh
-for i in 1 2 3 4; do
-  python3 tests/e2e/s3-workload.py \
-    --endpoint "$ENDPOINT" --access-key "$AK" --secret-key "$SK" \
-    --output "/tmp/stage0-workload-concurrent-$i.jsonl" &
-done
-wait
+python3 tests/e2e/s3-workload.py \
+  --endpoint "$ENDPOINT" --access-key "$AK" --secret-key "$SK" \
+  --concurrent-requests 4 --unique-keys \
+  --output "/tmp/stage0-workload-concurrent.jsonl" \
+  --manifest "/tmp/stage0-manifest-concurrent.json"
 ```
+
+(`--unique-keys` and `--manifest` are not needed for the Stage 0 metrics
+themselves, but capturing the manifest lets you reuse the same run for the
+Stage 2 object↔request cross-check via
+`verify-rgwtrace-json.py --workload-manifest`.)
 
 Run the single-stream and concurrent passes as **separate probe runs** (restart
 Terminal 1 for each) so metric (a) is attributable to one load shape. For the
