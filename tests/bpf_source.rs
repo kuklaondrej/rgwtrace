@@ -52,6 +52,29 @@ fn bpf_records_rados_sender_thread_id() {
 }
 
 #[test]
+fn state_maps_use_lru_hash_to_bound_entry_leaks() {
+    // rados_ops and rgw_requests accumulate entries that are only removed on a
+    // clean finish/exit path. Entries for cancelled ops, linger/watch ops, or
+    // exited worker threads never get deleted, so a plain HASH would fill up and
+    // start hard-failing (E2BIG) on new inserts, silently killing correlation.
+    // LRU_HASH evicts stale entries under pressure instead.
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, struct client_op_key);\n",
+        "  __type(value, struct rados_op_state);\n",
+        "  __uint(max_entries, 8192);\n",
+        "} rados_ops SEC(\".maps\");"
+    )));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, __u32);\n",
+        "  __type(value, struct rgw_request_ctx);\n",
+        "  __uint(max_entries, 8192);\n",
+        "} rgw_requests SEC(\".maps\");"
+    )));
+}
+
+#[test]
 fn cls_and_method_reads_use_verifier_bounded_lengths() {
     assert!(RGWTRACE_BPF.contains("__u32 cls_read_len = cls_len;"));
     assert!(RGWTRACE_BPF.contains("cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;"));
