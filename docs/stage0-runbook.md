@@ -209,6 +209,65 @@ sudo RGW_PROC_AUTH_ARG=4 RGW_GET_HANDLER_ARG=2 ./scripts/stage0-crossthread-prob
 
 ---
 
+## el9 / embedded-Objecter caveat (silent `0 _send_op`)
+
+**Symptom.** The summary shows `_send_op calls: 0` while
+`process_authenticated calls` is nonzero (and a workload was running). The
+harness now prints an explicit `[stage0][WARNING]` for exactly this shape
+instead of a silent zero.
+
+**Diagnosis.** On el9 Ceph builds the `Objecter::_send_op` symbol is defined in
+**more than one DSO**. `librados.so.2.0.0` statically embeds a **hidden** copy
+of Objecter — the one that actually executes inside `radosgw` — while
+`libceph-common.so.2` **also exports** `_ZN8Objecter8_send_opEPNS_2OpE` as dead
+code. The harness resolves `_send_op` in `libceph-common` (its default search
+order), attaches successfully, and observes **nothing**, because the executing
+code lives in librados' private copy. Confirm which DSO carries a real Objecter:
+
+```sh
+# A hit means this librados carries its own (executing) Objecter.
+strings /proc/<pid>/root/usr/lib64/librados.so.2.0.0 | grep -m1 'osdc/Objecter.cc'
+```
+
+The harness also **pre-warns at symbol-resolution time**: when it resolves
+`_send_op` in `libceph-common` and finds `osdc/Objecter.cc` in a mapped
+`librados.so`, it prints a WARNING before the run (best-effort; needs
+`strings`).
+
+**Fix — probe the executing copy.** Point `_send_op` resolution at librados via
+the override:
+
+```sh
+sudo LIBCEPH_COMMON_PATH=/proc/<pid>/root/usr/lib64/librados.so.2.0.0 \
+  ./scripts/stage0-crossthread-probe.sh
+```
+
+`librados.so.2.0.0` is usually **stripped**, so its `.symtab` may not contain
+`_send_op`. Merge the matching debuginfo's symbol table first:
+
+1. Install / fetch the matching **debuginfo RPM** (e.g.
+   `ceph-debuginfo-<version>.el9.x86_64.rpm` from `download.ceph.com`, matching
+   the exact `ceph version` string the harness prints).
+2. **Verify the build-id matches** before trusting it:
+   ```sh
+   readelf -n /proc/<pid>/root/usr/lib64/librados.so.2.0.0 | grep -i 'build id'
+   # compare against the debuginfo file under /usr/lib/debug/.build-id/<xx>/<rest>.debug
+   ```
+3. Merge the debuginfo symbols back onto the stripped library:
+   ```sh
+   eu-unstrip -o merged-librados.so \
+     /proc/<pid>/root/usr/lib64/librados.so.2.0.0 \
+     /usr/lib/debug/.build-id/<xx>/<rest>.debug
+   sudo LIBCEPH_COMMON_PATH=$PWD/merged-librados.so \
+     ./scripts/stage0-crossthread-probe.sh
+   ```
+
+If both copies are genuinely present, prefer probing librados' copy — that is
+the one on the data path, so it is what the coverage/residual metrics must
+measure.
+
+---
+
 ## Overrides (env vars)
 
 | Var | Purpose |
