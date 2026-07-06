@@ -84,6 +84,35 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     (RGW_PROCESS_AUTHENTICATED, 40),
 ];
 
+/// Probe functions whose var_fields MUST resolve for an artifact to be usable
+/// for live tracing. Without them the `hprobes` map stays empty, the RGW/RADOS
+/// uprobes (e.g. `uprobe_rgw_get_handler`) return before emitting, and the
+/// tracer captures nothing while looking healthy. Mirrors the required set
+/// preflight enforces (`Objecter::_send_op`/`Objecter::_finish_op` in a RADOS
+/// module, `RGWREST::get_handler` in radosgw). `rgw_process_authenticated` is
+/// intentionally excluded: it only powers the optional
+/// `--correlate-cross-thread` bridge, whose absence merely degrades to
+/// same-thread correlation.
+pub const REQUIRED_HPROBE_FUNCTIONS: &[&str] = &[
+    "Objecter::_send_op",
+    "Objecter::_finish_op",
+    "RGWREST::get_handler",
+];
+
+/// Required functions with zero total var_fields, i.e. functions the artifact
+/// cannot probe at all. `totals` maps each required function to its var_field
+/// count SUMMED across every module, so a function that one module leaves empty
+/// but another module supplies (the Ubuntu librados-vs-libceph-common split) is
+/// NOT reported -- only a function empty in every module is returned. A non-empty
+/// result means the artifact/import is silently unusable for live tracing.
+pub fn required_functions_missing_var_fields(totals: &BTreeMap<&str, usize>) -> Vec<&'static str> {
+    REQUIRED_HPROBE_FUNCTIONS
+        .iter()
+        .copied()
+        .filter(|function| totals.get(function).copied().unwrap_or(0) == 0)
+        .collect()
+}
+
 /// The one function whose hprobe slot carries a raw-pointer descriptor rather
 /// than a member-deref chain. Its var_field is read register-only by the BPF
 /// cross-thread re-seed handler (`fetch_param_ptr` in bpf/rgwtrace.bpf.c), which
@@ -334,6 +363,47 @@ impl DwarfInfo {
             .get(module_basename)
             .and_then(|module| module.func2vf.get(function))
             .map(|vars| vars.var_fields.len())
+    }
+
+    /// Total var_fields for `function` summed across every module. Summing is
+    /// what lets a function one module leaves empty count as covered when
+    /// another module supplies it.
+    fn total_var_field_count(&self, function: &str) -> usize {
+        self.modules
+            .values()
+            .filter_map(|module| module.func2vf.get(function))
+            .map(|vars| vars.var_fields.len())
+            .sum()
+    }
+
+    /// Required probe functions that resolved no var_fields in ANY module. A
+    /// non-empty result means the artifact is unusable for live tracing: those
+    /// functions' hprobes never populate and their uprobes emit nothing. See
+    /// [`required_functions_missing_var_fields`].
+    pub fn required_functions_without_var_fields(&self) -> Vec<&'static str> {
+        let totals = REQUIRED_HPROBE_FUNCTIONS
+            .iter()
+            .map(|function| (*function, self.total_var_field_count(function)))
+            .collect();
+        required_functions_missing_var_fields(&totals)
+    }
+
+    /// Modules that expose a `func2pc` address for `function` but no var_fields
+    /// for it -- the silent empty-extraction signature (`func2vf: {}` while
+    /// `func2pc` is populated). Used to name the offending modules in the export
+    /// warning.
+    pub fn modules_with_addr_but_empty_var_fields(&self, function: &str) -> Vec<&str> {
+        self.modules
+            .iter()
+            .filter(|(_, module)| {
+                module.func2pc.contains_key(function)
+                    && module
+                        .func2vf
+                        .get(function)
+                        .is_none_or(|vars| vars.var_fields.is_empty())
+            })
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 
     /// Whether `function` in `module_basename` carries a single valid raw-pointer
@@ -794,5 +864,148 @@ mod tests {
         ))
         .unwrap();
         DwarfInfo::from_str(&json).unwrap();
+    }
+
+    fn sample_var_field() -> VarFieldJson {
+        VarFieldJson {
+            location: VarLocationJson {
+                reg: 4,
+                offset: 0,
+                stack: false,
+            },
+            fields: vec![FieldJson {
+                offset: 0,
+                pointer: false,
+            }],
+        }
+    }
+
+    /// Builds a module with the given func2pc addresses and func2vf var_field
+    /// counts. A function present in `func2pc` but not `func2vf` is the silent
+    /// empty-extraction case.
+    fn module_with(func2pc: &[(&str, u64)], func2vf: &[(&str, usize)]) -> DwarfModule {
+        DwarfModule {
+            build_id: Some("bid".to_string()),
+            func2pc: func2pc
+                .iter()
+                .map(|(function, addr)| (function.to_string(), *addr))
+                .collect(),
+            func2vf: func2vf
+                .iter()
+                .map(|(function, count)| {
+                    (
+                        function.to_string(),
+                        FunctionVarFields {
+                            var_fields: vec![sample_var_field(); *count],
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    // --- exporter/import empty-var-field warn logic (pure helper) ---
+
+    #[test]
+    fn required_function_empty_in_every_module_warns() {
+        // Cross-module totals: get_handler is 0 everywhere -> reported so the
+        // caller warns. The other two are covered, so only get_handler comes back.
+        let totals = BTreeMap::from([
+            ("Objecter::_send_op", 12),
+            ("Objecter::_finish_op", 3),
+            ("RGWREST::get_handler", 0),
+        ]);
+        assert_eq!(
+            required_functions_missing_var_fields(&totals),
+            vec!["RGWREST::get_handler"]
+        );
+    }
+
+    #[test]
+    fn redundant_module_empty_does_not_warn() {
+        // Every required function has a nonzero cross-module total (one module
+        // left _send_op empty but another supplied it), so nothing is reported.
+        let totals = BTreeMap::from([
+            ("Objecter::_send_op", 12),
+            ("Objecter::_finish_op", 3),
+            ("RGWREST::get_handler", 2),
+        ]);
+        assert!(required_functions_missing_var_fields(&totals).is_empty());
+    }
+
+    #[test]
+    fn missing_required_function_key_is_treated_as_empty() {
+        // A required function absent from the totals map counts as 0 var_fields.
+        let totals = BTreeMap::from([("Objecter::_send_op", 12)]);
+        assert_eq!(
+            required_functions_missing_var_fields(&totals),
+            vec!["Objecter::_finish_op", "RGWREST::get_handler"]
+        );
+    }
+
+    // --- import-side equivalent (DwarfInfo over real module structure) ---
+
+    #[test]
+    fn dwarf_with_redundant_module_coverage_is_usable() {
+        // Ubuntu split: librados carries the addresses, libceph-common carries the
+        // var_fields, radosgw carries get_handler. No required function is empty
+        // everywhere, so the artifact is usable.
+        let info = DwarfInfo {
+            version: Some("v".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::from([
+                (
+                    "librados.so.2".to_string(),
+                    module_with(
+                        &[("Objecter::_send_op", 1), ("Objecter::_finish_op", 1)],
+                        &[],
+                    ),
+                ),
+                (
+                    "libceph-common.so.2".to_string(),
+                    module_with(
+                        &[],
+                        &[("Objecter::_send_op", 12), ("Objecter::_finish_op", 3)],
+                    ),
+                ),
+                (
+                    "radosgw".to_string(),
+                    module_with(&[], &[("RGWREST::get_handler", 2)]),
+                ),
+            ]),
+        };
+        assert!(info.required_functions_without_var_fields().is_empty());
+    }
+
+    #[test]
+    fn dwarf_missing_required_var_fields_everywhere_is_flagged_and_names_modules() {
+        // librados has a func2pc address for _send_op but empty func2vf (the silent
+        // empty-extraction signature), and no other module covers it.
+        let info = DwarfInfo {
+            version: Some("v".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::from([
+                (
+                    "librados.so.2".to_string(),
+                    module_with(&[("Objecter::_send_op", 1)], &[]),
+                ),
+                (
+                    "libceph-common.so.2".to_string(),
+                    module_with(&[], &[("Objecter::_finish_op", 3)]),
+                ),
+                (
+                    "radosgw".to_string(),
+                    module_with(&[], &[("RGWREST::get_handler", 2)]),
+                ),
+            ]),
+        };
+        assert_eq!(
+            info.required_functions_without_var_fields(),
+            vec!["Objecter::_send_op"]
+        );
+        assert_eq!(
+            info.modules_with_addr_but_empty_var_fields("Objecter::_send_op"),
+            vec!["librados.so.2"]
+        );
     }
 }

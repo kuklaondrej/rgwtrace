@@ -13,13 +13,14 @@ mod targets;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
     cli::{Cli, OutputMode},
     collector::{Collector, TraceDocument},
     dwarf_input::DwarfInput,
+    dwarf_json::DwarfInfo,
 };
 
 fn main() -> Result<()> {
@@ -46,6 +47,7 @@ fn main() -> Result<()> {
     info!(source = %dwarf_input.description(), "loading DWARF probe data");
     let dwarf = dwarf_input.load()?;
     if cli.export_dwarf_json {
+        warn_if_export_unusable(&dwarf);
         println!(
             "{}",
             serde_json::to_string_pretty(&export_dwarf_json(&dwarf))?
@@ -62,6 +64,7 @@ fn main() -> Result<()> {
     let trace = if cli.dry_run {
         Collector::default().into_trace_document(cli.service_name.clone())
     } else {
+        warn_if_import_unusable(&dwarf);
         live::run(&cli, &dwarf)?
     };
 
@@ -161,6 +164,41 @@ fn finish_otlp_export(
                 .context("failed to dump the un-exported trace to stdout")?;
             Err(err.context("OTLP export failed; the collected trace was dumped to stdout as JSON"))
         }
+    }
+}
+
+/// After `--export-dwarf-json` extraction, loudly warn (to stderr; stdout
+/// carries the JSON) if any REQUIRED probe function resolved no var_fields in any
+/// module. Such an artifact is silently unusable for live tracing: its `hprobes`
+/// map stays empty and the uprobes return before emitting, so the tracer looks
+/// healthy but captures nothing. Per-module empties are fine when another module
+/// covers the function (the Ubuntu librados-vs-libceph-common split), so this
+/// checks the cross-module total and only fires for a function empty everywhere,
+/// naming the modules that produced a func2pc address but an empty func2vf.
+fn warn_if_export_unusable(dwarf: &DwarfInfo) {
+    for function in dwarf.required_functions_without_var_fields() {
+        let modules = dwarf.modules_with_addr_but_empty_var_fields(function);
+        warn!(
+            function,
+            ?modules,
+            "exported DWARF artifact has NO variable fields for a required probe function; it is \
+             UNUSABLE for live tracing (hprobes would be empty and the uprobe emits nothing) -- \
+             re-run extraction against binaries with matching debuginfo"
+        );
+    }
+}
+
+/// At live start, warn (never hard-fail -- DWARF preflight stays advisory) if the
+/// loaded/imported DWARF resolved no var_fields for a required probe function.
+/// Fires before attach so the operator sees the dead-probe cause immediately;
+/// complements the end-of-run `should_warn_no_request_markers` warning.
+fn warn_if_import_unusable(dwarf: &DwarfInfo) {
+    for function in dwarf.required_functions_without_var_fields() {
+        warn!(
+            function,
+            "loaded DWARF has NO variable fields for a required probe function; its hprobe will \
+             never populate and the uprobe will capture nothing -- the trace may be silently empty"
+        );
     }
 }
 
