@@ -61,12 +61,14 @@ pub fn export_otlp_http(
         .context("failed to build OTLP HTTP client")?;
 
     let max_attempts = config.retries.saturating_add(1);
+    let batch_count = batches.len();
     let mut diagnostics = ExportDiagnostics {
-        batches: batches.len() as u64,
+        batches: batch_count as u64,
         ..ExportDiagnostics::default()
     };
-    for (batch_idx, batch) in batches.iter().enumerate() {
-        let protobuf_body = to_otlp_protobuf(batch)?;
+    for (batch_idx, batch) in batches.into_iter().enumerate() {
+        let span_count = batch.len();
+        let protobuf_body = spans_to_otlp_protobuf(&document.service_name, batch);
         let body = encode_body(protobuf_body, config.compression)?;
         let headers = otlp_headers(config.headers, body.content_encoding)?;
         for attempt in 1..=max_attempts {
@@ -75,10 +77,10 @@ pub fn export_otlp_http(
                 attempt,
                 max_attempts,
                 batch = batch_idx + 1,
-                batches = batches.len(),
+                batches = batch_count,
                 endpoint = config.endpoint,
                 timeout_ms = config.timeout.as_millis(),
-                spans = batch.spans.len(),
+                spans = span_count,
                 body_bytes = body.bytes.len(),
                 uncompressed_body_bytes = body.uncompressed_len,
                 compression = ?config.compression,
@@ -92,9 +94,9 @@ pub fn export_otlp_http(
             ) {
                 Ok(()) => {
                     info!(
-                        spans = batch.spans.len(),
+                        spans = span_count,
                         batch = batch_idx + 1,
-                        batches = batches.len(),
+                        batches = batch_count,
                         attempt,
                         "exported OTLP traces"
                     );
@@ -122,11 +124,14 @@ pub fn export_otlp_http(
     Ok(diagnostics)
 }
 
-pub fn to_otlp_protobuf(document: &TraceDocument) -> Result<Vec<u8>> {
+/// Encode the OTLP request envelope around already-built protobuf `spans`. The
+/// batching path builds each span's protobuf object once and moves it in here,
+/// so a batch is assembled without re-converting or cloning any span.
+fn spans_to_otlp_protobuf(service_name: &str, spans: Vec<Span>) -> Vec<u8> {
     let request = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
             resource: Some(Resource {
-                attributes: vec![string_key_value("service.name", &document.service_name)],
+                attributes: vec![string_key_value("service.name", service_name)],
                 dropped_attributes_count: 0,
                 entity_refs: Vec::new(),
             }),
@@ -137,18 +142,14 @@ pub fn to_otlp_protobuf(document: &TraceDocument) -> Result<Vec<u8>> {
                     attributes: Vec::new(),
                     dropped_attributes_count: 0,
                 }),
-                spans: document
-                    .spans
-                    .iter()
-                    .map(span_to_otlp)
-                    .collect::<Result<_>>()?,
+                spans,
                 schema_url: String::new(),
             }],
             schema_url: String::new(),
         }],
     };
 
-    Ok(request.encode_to_vec())
+    request.encode_to_vec()
 }
 
 fn send_once(
@@ -296,45 +297,69 @@ fn encode_body(bytes: Vec<u8>, compression: OtlpCompression) -> Result<EncodedBo
     }
 }
 
+/// A span's OTLP protobuf object paired with the marginal byte cost of adding it
+/// to a batch. The protobuf object is built exactly once (here) and then moved
+/// into a batch, so neither the size arithmetic nor the final assembly re-builds
+/// or clones it.
+struct SizedSpan {
+    span: Span,
+    marginal_len: usize,
+}
+
+/// Convert every document span to its OTLP protobuf object once, recording the
+/// marginal batch cost alongside each. A conversion failure surfaces here as the
+/// same `Err` the export path would previously have produced.
+fn build_sized_spans(document: &TraceDocument) -> Result<Vec<SizedSpan>> {
+    document
+        .spans
+        .iter()
+        .map(|span| {
+            let span = span_to_otlp(span)?;
+            let marginal_len = span_marginal_len(span.encoded_len());
+            Ok(SizedSpan { span, marginal_len })
+        })
+        .collect()
+}
+
 fn otlp_batches(
     document: &TraceDocument,
     max_spans_per_batch: usize,
     max_bytes_per_batch: usize,
-) -> Result<Vec<TraceDocument>> {
-    if document.spans.is_empty() {
+) -> Result<Vec<Vec<Span>>> {
+    let sized_spans = build_sized_spans(document)?;
+    if sized_spans.is_empty() {
         return Ok(Vec::new());
     }
 
     // Fixed cost of a batch carrying the resource/scope envelope but no spans.
     // Cloning the accumulated span vec and re-encoding the whole candidate
     // batch for every appended span is O(n^2) on large drains; instead we
-    // encode each span's marginal size once and keep a running total. See
+    // sum each span's precomputed marginal size and keep a running total. See
     // `batch_size_estimate` for why the running total is a safe upper bound on
     // the real encoded batch size, so a batch flushed under
     // `max_bytes_per_batch` still respects the limit once actually encoded.
-    let base_len = to_otlp_protobuf(&trace_batch(document, Vec::new()))?.len();
+    let base_len = spans_to_otlp_protobuf(&document.service_name, Vec::new()).len();
 
     let mut batches = Vec::new();
-    let mut spans = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
     let mut running_span_bytes = 0usize;
-    for span in &document.spans {
-        let span_bytes = span_marginal_len(span)?;
-
+    for SizedSpan { span, marginal_len } in sized_spans {
         let over_count = !spans.is_empty() && spans.len() >= max_spans_per_batch;
         let over_bytes = max_bytes_per_batch > 0
             && !spans.is_empty()
-            && batch_size_estimate(base_len, running_span_bytes + span_bytes) > max_bytes_per_batch;
+            && batch_size_estimate(base_len, running_span_bytes + marginal_len)
+                > max_bytes_per_batch;
 
         if over_count || over_bytes {
-            batches.push(trace_batch(document, std::mem::take(&mut spans)));
+            batches.push(std::mem::take(&mut spans));
             running_span_bytes = 0;
         }
 
-        running_span_bytes += span_bytes;
-        spans.push(span.clone());
+        running_span_bytes += marginal_len;
+        spans.push(span);
     }
     if !spans.is_empty() {
-        batches.push(trace_batch(document, spans));
+        batches.push(spans);
     }
     Ok(batches)
 }
@@ -349,12 +374,11 @@ const OTLP_BATCH_FRAMING_SLACK: usize = 20;
 /// tag is a single byte; 2 leaves headroom against future field renumbering.
 const OTLP_SPAN_TAG_MAX: usize = 2;
 
-/// Marginal encoded cost of appending `span` to a batch: its own encoded
-/// length plus the framing (field tag + length varint) it contributes to the
-/// repeated `spans` field. Each span is encoded exactly once here.
-fn span_marginal_len(span: &SpanDocument) -> Result<usize> {
-    let encoded = span_to_otlp(span)?.encoded_len();
-    Ok(OTLP_SPAN_TAG_MAX + varint_len(encoded) + encoded)
+/// Marginal encoded cost of appending a span to a batch, given its own encoded
+/// length: that length plus the framing (field tag + length varint) it
+/// contributes to the repeated `spans` field.
+fn span_marginal_len(encoded_len: usize) -> usize {
+    OTLP_SPAN_TAG_MAX + varint_len(encoded_len) + encoded_len
 }
 
 /// Upper bound on the fully encoded batch size given the empty-envelope size
@@ -374,14 +398,6 @@ fn varint_len(value: usize) -> usize {
         remaining >>= 7;
     }
     len
-}
-
-fn trace_batch(document: &TraceDocument, spans: Vec<SpanDocument>) -> TraceDocument {
-    TraceDocument {
-        service_name: document.service_name.clone(),
-        spans,
-        diagnostics: document.diagnostics.clone(),
-    }
 }
 
 struct EncodedBody {
@@ -477,6 +493,18 @@ mod tests {
 
     use crate::collector::{AttributeValue, SpanDocument, TraceDiagnostics, TraceDocument};
 
+    /// Full document -> encoded OTLP bytes, mirroring the production encode path
+    /// (per-span conversion followed by envelope encoding). Lets the encoding
+    /// tests assert against a whole `TraceDocument` in one step.
+    fn to_otlp_protobuf(document: &TraceDocument) -> Result<Vec<u8>> {
+        let spans = document
+            .spans
+            .iter()
+            .map(span_to_otlp)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(spans_to_otlp_protobuf(&document.service_name, spans))
+    }
+
     #[test]
     fn encodes_otlp_protobuf() {
         let document = trace_document(1);
@@ -549,10 +577,10 @@ mod tests {
         let batches = otlp_batches(&document, 2, 0).unwrap();
 
         assert_eq!(batches.len(), 3);
-        assert_eq!(batches[0].spans.len(), 2);
-        assert_eq!(batches[1].spans.len(), 2);
-        assert_eq!(batches[2].spans.len(), 1);
-        assert_eq!(all_span_ids(&batches), all_span_ids(&[document]));
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 2);
+        assert_eq!(batches[2].len(), 1);
+        assert_eq!(batched_span_ids(&batches), document_span_ids(&document));
     }
 
     #[test]
@@ -564,8 +592,8 @@ mod tests {
         let batches = otlp_batches(&document, 512, max_bytes).unwrap();
 
         assert_eq!(batches.len(), 3);
-        assert!(batches.iter().all(|batch| batch.spans.len() == 1));
-        assert_eq!(all_span_ids(&batches), all_span_ids(&[document]));
+        assert!(batches.iter().all(|batch| batch.len() == 1));
+        assert_eq!(batched_span_ids(&batches), document_span_ids(&document));
     }
 
     #[test]
@@ -655,24 +683,21 @@ mod tests {
         // Vary span sizes so encoded lengths differ and the running estimate is
         // exercised across several batch boundaries.
         let document = trace_document_with_varied_sizes(40);
-        let one_span_size = to_otlp_protobuf(&trace_batch(&document, Vec::new()))
-            .unwrap()
-            .len()
-            + 128;
-        let max_bytes = one_span_size * 3;
+        let base_len = spans_to_otlp_protobuf(&document.service_name, Vec::new()).len();
+        let max_bytes = (base_len + 128) * 3;
 
         let batches = otlp_batches(&document, 512, max_bytes).unwrap();
 
         assert!(batches.len() > 1, "test should exercise multiple batches");
-        assert_eq!(all_span_ids(&batches), all_span_ids(&[document]));
+        assert_eq!(batched_span_ids(&batches), document_span_ids(&document));
         for batch in &batches {
-            let encoded = to_otlp_protobuf(batch).unwrap().len();
+            let span_count = batch.len();
+            // Encode the batch exactly as the export path would and compare the
+            // real wire size against the estimate-derived flush threshold.
+            let encoded = spans_to_otlp_protobuf(&document.service_name, batch.clone()).len();
             assert!(
-                batch.spans.len() == 1 || encoded <= max_bytes,
-                "flushed batch of {} spans encoded to {} bytes, exceeding max {}",
-                batch.spans.len(),
-                encoded,
-                max_bytes
+                span_count == 1 || encoded <= max_bytes,
+                "flushed batch of {span_count} spans encoded to {encoded} bytes, exceeding max {max_bytes}"
             );
         }
     }
@@ -838,10 +863,21 @@ mod tests {
         }
     }
 
-    fn all_span_ids(documents: &[TraceDocument]) -> Vec<String> {
-        documents
+    /// Span ids, in order, of the built protobuf spans across all batches.
+    fn batched_span_ids(batches: &[Vec<Span>]) -> Vec<Vec<u8>> {
+        batches
             .iter()
-            .flat_map(|document| document.spans.iter().map(|span| span.span_id.clone()))
+            .flat_map(|batch| batch.iter().map(|span| span.span_id.clone()))
+            .collect()
+    }
+
+    /// Span ids, in order, of a source document decoded to their wire bytes, so
+    /// they can be compared directly against `batched_span_ids`.
+    fn document_span_ids(document: &TraceDocument) -> Vec<Vec<u8>> {
+        document
+            .spans
+            .iter()
+            .map(|span| decode_hex_id(&span.span_id, 8, "span_id").unwrap())
             .collect()
     }
 }
