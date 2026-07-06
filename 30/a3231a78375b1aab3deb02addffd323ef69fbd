@@ -1,0 +1,22 @@
+.github/workflows/dwarf-artifact.yml
+  s_d616d8c6030bfd::t_3474021744891b 1-67
+scripts/export-upstream-ceph-dwarf.sh
+  s_d616d8c6030bfd::t_3474021744891b 1-62,64-69,71-305
+  s_d616d8c6030bfd::t_5276b05600325e 63,70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "30a3231a78375b1aab3deb02addffd323ef69fbd",
+  "prompts": {},
+  "sessions": {
+    "s_d616d8c6030bfd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f1203-e854-7d71-979b-94f8f64f735c",
+        "model": "gpt-5.5"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
