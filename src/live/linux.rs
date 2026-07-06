@@ -200,7 +200,22 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
             "merged OTLP spans stranded by a disconnected exporter into the end-of-run trace"
         );
     }
-    info!(spans = trace.spans.len(), "finished live tracing");
+    info!(
+        spans = trace.spans.len(),
+        otlp_queue_dropped_traces = trace.diagnostics.otlp_queue_dropped_traces,
+        otlp_queue_dropped_spans = trace.diagnostics.otlp_queue_dropped_spans,
+        "finished live tracing"
+    );
+    // Operator UX: OTLP export backpressure silently dropped batches during the
+    // run. Surface it as a warning so a partial export is not mistaken for a
+    // complete one; the counters above give the exact magnitude.
+    if should_warn_otlp_queue_drops(trace.diagnostics.otlp_queue_dropped_spans) {
+        warn!(
+            otlp_queue_dropped_traces = trace.diagnostics.otlp_queue_dropped_traces,
+            otlp_queue_dropped_spans = trace.diagnostics.otlp_queue_dropped_spans,
+            "dropped OTLP spans under export backpressure -- the exported trace is incomplete"
+        );
+    }
     // Operator UX: RADOS ops were seen but not a single RGW request marker. The
     // most common cause is a workload started before the trace window opened
     // (native DWARF extraction is slow), so nothing correlates. Surface it as a
@@ -222,6 +237,13 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 /// typical cause is a workload started before the (slow-to-open) trace window.
 fn should_warn_no_request_markers(request_markers: u64, rados_ops: u64) -> bool {
     request_markers == 0 && rados_ops > 0
+}
+
+/// Whether to emit the "OTLP spans dropped" end-of-run warning: the export
+/// queue was full at least once, so backpressure dropped whole batches and the
+/// exported trace is missing those spans.
+fn should_warn_otlp_queue_drops(otlp_queue_dropped_spans: u64) -> bool {
+    otlp_queue_dropped_spans > 0
 }
 
 fn merge_bpf_diagnostics(map: &impl MapCore, collector: &Arc<Mutex<Collector>>) -> Result<()> {
@@ -384,6 +406,12 @@ fn dispatch_expired_otlp(
             None
         }
         Err(TrySendError::Full(trace)) => {
+            // Asymmetry with `Disconnected` below is deliberate. `Full` is
+            // transient backpressure: retaining every full-dropped batch would
+            // grow `retained_otlp` without bound under sustained backpressure,
+            // so we drop the batch (counted via `record_otlp_queue_drop`) to
+            // keep memory bounded. `Disconnected` is a permanent condition that
+            // affects exactly one batch, so retaining that single batch is safe.
             collector
                 .lock()
                 .expect("collector lock poisoned")
@@ -687,6 +715,15 @@ mod tests {
         assert!(!should_warn_no_request_markers(0, 0));
         // Markers but no RADOS ops -> a different situation, no warning.
         assert!(!should_warn_no_request_markers(2, 0));
+    }
+
+    #[test]
+    fn warns_only_when_otlp_spans_were_dropped() {
+        // No backpressure drops -> the export is complete, stay silent.
+        assert!(!should_warn_otlp_queue_drops(0));
+        // Any dropped spans -> the exported trace is incomplete, warn.
+        assert!(should_warn_otlp_queue_drops(1));
+        assert!(should_warn_otlp_queue_drops(42));
     }
 
     #[test]
