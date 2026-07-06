@@ -71,6 +71,14 @@ via `pgrep -f 'radosgw --name'`), workload `tests/e2e/s3-workload.py` (single
 config; (b) whether the ~20–25% seeded submits are the GET/PUT data ops or
 incidental synchronous metadata ops (role cross-check via rgwtrace output).
 
+**Live bridge validation (this rig, Stages 3+4 built, `--correlate-cross-thread`
+ON) [MEASURED]:** `reseed_hits` 43/43 requests (0 misses, 0 base_unresolved);
+82 correlated ops, counter equation holds; e2e manifest cross-check EXIT=0 with
+zero mis-correlations; per-role coverage decomposes as **GET-read 2/2 (100%)
+vs PUT-write 0/4 (0%)** — reads submit synchronously on the execute thread
+(bridgeable), writes dispatch to the async worker pool (the de-scoped gap).
+The ~20–25% aggregate ceiling is therefore read-dominated on this build.
+
 **Mechanistic conclusion (measured):** `execute()` dispatches object I/O
 asynchronously (`aio_operate` + `AioCompletion` overloads are present and are
 the data path; `aio_operate` is itself off-execute-thread 75%). The chain
