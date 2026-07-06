@@ -65,15 +65,31 @@ struct rgw_request_ctx {
 
 static struct rados_op_state zero_rados_op = {};
 
+/*
+ * Deliberately plain HASH, NOT LRU_HASH. Both maps have explicit lifecycle
+ * deletes on their finish/exit paths, so under normal operation they self-drain.
+ * LRU_HASH is actively harmful here: its per-CPU freelists reserve ~128 nodes
+ * per logical CPU, so on many-core hosts (>=64 CPUs) 128*cores approaches
+ * max_entries and the allocator evicts LIVE, in-flight entries once more than
+ * ~128 ops are outstanding -- an evicted rados_ops entry makes _finish_op's
+ * lookup miss and the op event is never emitted. Plain HASH never evicts live
+ * entries; when genuinely full (e.g. leaked entries) it only rejects NEW inserts
+ * with E2BIG, which is counted via the existing drop counters. Rejecting new
+ * inserts is strictly less harmful than silently killing op emission.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct client_op_key);
   __type(value, struct rados_op_state);
   __uint(max_entries, 8192);
 } rados_ops SEC(".maps");
 
+/* Plain HASH for the same reason as rados_ops (see above): LRU per-CPU
+ * freelists evict live in-flight entries on many-core hosts; plain HASH only
+ * rejects new inserts when full, and rgw_requests has explicit lifecycle
+ * deletes. */
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, __u32);
   __type(value, struct rgw_request_ctx);
   __uint(max_entries, 8192);
@@ -85,6 +101,13 @@ struct {
  * address spaces while --pid is optional. PID-scoped; the u32 pad is explicit
  * and zeroed on every key so hashing is deterministic. Stage 1 only populates
  * this map; nothing reads it yet, so behavior is unchanged.
+ *
+ * Unlike rados_ops / rgw_requests above, this map is deliberately LRU_HASH: it
+ * is insert-only (there is NO lifecycle delete), so it needs eviction to bound
+ * growth, and its consumers fail closed on stale entries (they re-check the
+ * req_state pointer and tgid identity). Eviction of a stale entry here is
+ * harmless, so LRU
+ * is correct precisely where it is wrong for the two lifecycle-managed maps.
  */
 struct reqstate_key {
   __u64 req_state_ptr;

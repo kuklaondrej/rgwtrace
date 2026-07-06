@@ -53,25 +53,49 @@ fn bpf_records_rados_sender_thread_id() {
 }
 
 #[test]
-fn state_maps_use_lru_hash_to_bound_entry_leaks() {
-    // rados_ops and rgw_requests accumulate entries that are only removed on a
-    // clean finish/exit path. Entries for cancelled ops, linger/watch ops, or
-    // exited worker threads never get deleted, so a plain HASH would fill up and
-    // start hard-failing (E2BIG) on new inserts, silently killing correlation.
-    // LRU_HASH evicts stale entries under pressure instead.
+fn lifecycle_state_maps_use_plain_hash_not_lru() {
+    // rados_ops and rgw_requests MUST stay plain HASH, never LRU_HASH. Do not
+    // "fix" this back to LRU to bound leaks: BPF LRU_HASH reserves ~128 free
+    // nodes per logical CPU, so on many-core hosts (>=64 CPUs) 128*cores
+    // approaches max_entries and the allocator evicts LIVE, in-flight entries
+    // once >~128 ops are outstanding. An evicted rados_ops entry makes
+    // _finish_op's lookup miss and the op event is NEVER emitted -- production
+    // traces showed request markers with zero rados children. Both maps have
+    // explicit lifecycle deletes; plain HASH only rejects new inserts when full
+    // (counted via the existing drop counters), which is strictly less harmful.
     assert!(RGWTRACE_BPF.contains(concat!(
-        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __uint(type, BPF_MAP_TYPE_HASH);\n",
         "  __type(key, struct client_op_key);\n",
         "  __type(value, struct rados_op_state);\n",
         "  __uint(max_entries, 8192);\n",
         "} rados_ops SEC(\".maps\");"
     )));
     assert!(RGWTRACE_BPF.contains(concat!(
-        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __uint(type, BPF_MAP_TYPE_HASH);\n",
         "  __type(key, __u32);\n",
         "  __type(value, struct rgw_request_ctx);\n",
         "  __uint(max_entries, 8192);\n",
         "} rgw_requests SEC(\".maps\");"
+    )));
+    // Neither map may be declared LRU_HASH.
+    assert!(!RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, struct client_op_key);\n",
+        "  __type(value, struct rados_op_state);\n",
+    )));
+    assert!(!RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, __u32);\n",
+        "  __type(value, struct rgw_request_ctx);\n",
+    )));
+    // The insert-only cross-thread bridge, by contrast, STAYS LRU_HASH because
+    // it has no lifecycle delete and its consumers fail closed on stale entries.
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
+        "  __type(key, struct reqstate_key);\n",
+        "  __type(value, struct rgw_request_ctx);\n",
+        "  __uint(max_entries, 8192);\n",
+        "} rgw_ctx_by_reqstate SEC(\".maps\");"
     )));
 }
 
