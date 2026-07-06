@@ -94,16 +94,17 @@ fn lifecycle_state_maps_use_plain_hash_not_lru() {
         "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
         "  __type(key, struct reqstate_key);\n",
         "  __type(value, struct rgw_request_ctx);\n",
-        "  __uint(max_entries, 8192);\n",
+        "  __uint(max_entries, 65536);\n",
         "} rgw_ctx_by_reqstate SEC(\".maps\");"
     )));
 }
 
 #[test]
 fn reqstate_bridge_map_is_declared_lru_hash() {
-    // Stage 1 of the cross-thread correlation bridge: a PID-scoped
-    // (req_state*, tgid)-keyed LRU_HASH context map. Populated only; nothing
-    // reads it yet, so there is no behavior change.
+    // Cross-thread correlation bridge: a PID-scoped (req_state*, tgid)-keyed
+    // LRU_HASH context map. Sized to 65536 so the ~128-free-nodes-per-CPU LRU
+    // reservation stays well under capacity on many-core hosts (an 8192-entry
+    // LRU map is fully consumed by per-CPU freelists at 64 CPUs).
     assert!(RGWTRACE_BPF.contains(concat!(
         "struct reqstate_key {\n",
         "  __u64 req_state_ptr;\n",
@@ -115,7 +116,7 @@ fn reqstate_bridge_map_is_declared_lru_hash() {
         "  __uint(type, BPF_MAP_TYPE_LRU_HASH);\n",
         "  __type(key, struct reqstate_key);\n",
         "  __type(value, struct rgw_request_ctx);\n",
-        "  __uint(max_entries, 8192);\n",
+        "  __uint(max_entries, 65536);\n",
         "} rgw_ctx_by_reqstate SEC(\".maps\");"
     )));
 }

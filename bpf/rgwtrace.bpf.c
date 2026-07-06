@@ -96,18 +96,26 @@ struct {
 } rgw_requests SEC(".maps");
 
 /*
- * Cross-thread context bridge (design-cross-thread-correlation.md Stage 1).
+ * Cross-thread context bridge (design-cross-thread-correlation.md). Populated at
+ * get_handler, read at rgw_process_authenticated under --correlate-cross-thread.
  * Keyed by (req_state*, tgid) because req_state pointers can collide across
  * address spaces while --pid is optional. PID-scoped; the u32 pad is explicit
- * and zeroed on every key so hashing is deterministic. Stage 1 only populates
- * this map; nothing reads it yet, so behavior is unchanged.
+ * and zeroed on every key so hashing is deterministic.
  *
  * Unlike rados_ops / rgw_requests above, this map is deliberately LRU_HASH: it
  * is insert-only (there is NO lifecycle delete), so it needs eviction to bound
  * growth, and its consumers fail closed on stale entries (they re-check the
  * req_state pointer and tgid identity). Eviction of a stale entry here is
- * harmless, so LRU
- * is correct precisely where it is wrong for the two lifecycle-managed maps.
+ * harmless, so LRU is correct precisely where it is wrong for the two
+ * lifecycle-managed maps.
+ *
+ * max_entries is sized well above the two lifecycle maps because LRU_HASH
+ * reserves ~128 free nodes per CPU that touches it: on a 64-CPU host an
+ * 8192-entry LRU map is entirely consumed by per-CPU freelists and evicts live
+ * entries continuously (the regression that forced rados_ops/rgw_requests back
+ * to plain HASH). Here eviction only degrades bridge hit rate rather than
+ * dropping ops, but 65536 keeps 128*cores well under capacity so correlation
+ * stays useful on the many-core hosts that exposed the freelist behavior.
  */
 struct reqstate_key {
   __u64 req_state_ptr;
@@ -119,7 +127,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __type(key, struct reqstate_key);
   __type(value, struct rgw_request_ctx);
-  __uint(max_entries, 8192);
+  __uint(max_entries, 65536);
 } rgw_ctx_by_reqstate SEC(".maps");
 
 struct {
