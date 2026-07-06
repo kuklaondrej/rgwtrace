@@ -275,45 +275,54 @@ def check_object_request_correlation(args, errors, manifest, workload, rados_spa
     Returns a coverage summary. Two independent findings:
       * MIS-CORRELATION (always fails): a correlated rados.op child span for a
         workload object is attached to the WRONG request -- but only when that
-        is *provable*. It is provable only when the request the span is attached
-        to is ITSELF a manifest-recorded request (GET/PUT) for a different key:
-        then both the expected and the actual request are known, so their keys
-        demonstrably conflict. If the span is attached to a request the manifest
-        does not record (HEAD/DELETE/COPY on the same object key -- the manifest
-        only records GET/PUT), we cannot prove a conflict, so it is counted
-        informationally and does NOT fail. The workload log (which records ALL
-        request ids) further classifies such attachments into a real-but-
-        unrecorded workload request vs a completely foreign trans_id.
+        is *provable*. The manifest records EVERY workload operation (GET, PUT,
+        and OTHER ops -- HEAD/COPY/DELETE/multipart -- each with a key and a
+        request id), so the request a span is attached to can be looked up. A
+        mis-correlation is provable only when that request is a GET/PUT (which by
+        S3 semantics touches exactly one object, its own key) whose key does NOT
+        match the span's object. Attachment to a request whose recorded key DOES
+        match the object (e.g. a head_object/delete_object on the same key a
+        GET/PUT also touched), or to an OTHER op whose key does not match (a
+        copy_object legitimately reads its SOURCE object while its recorded key
+        is the DESTINATION, and multipart touches part objects), cannot be proven
+        wrong from the manifest key alone and is counted informationally. Spans
+        attached to a request absent from the manifest fall back to the workload
+        log to distinguish a real-but-unrecorded request from a foreign trans_id.
       * COVERAGE MISS (reported as a rate; only fails when a --require-* flag
         demands it): a workload data op has no correctly correlated child span
         (its data ops landed as background/inferred, or on a wrong request).
     """
     data_ops = manifest_data_ops(manifest)
 
-    # Requests the manifest itself records (GET/PUT only). A mis-correlation is
-    # provable only when a span is attached to one of these known requests.
-    manifest_request_ids = {
-        record.get("x_amz_request_id")
+    # The manifest records every operation (incl. OTHER ops with keys), so index
+    # ALL records by request id to look up whatever operation a span was actually
+    # attached to and judge whether that attachment is manifest-consistent.
+    record_by_request_id = {
+        record.get("x_amz_request_id"): record
         for record in (manifest or [])
         if record.get("x_amz_request_id")
     }
-    # Every request id the workload issued, INCLUDING HEAD/DELETE/COPY which the
-    # manifest omits. Used only to classify informational non-manifest
-    # attachments: a real-but-unrecorded workload request vs a foreign trans_id.
+    # Every request id the workload issued, used only to classify attachments to
+    # requests the manifest does not record: real workload request vs foreign id.
     workload_request_ids = {
         record.get("x_amz_request_id")
         for record in (workload or [])
         if record.get("x_amz_request_id")
     }
 
-    attributed_to_unrecorded_request = 0
-    attributed_to_foreign_request = 0
+    counters = {
+        "attributed_to_same_key_other_op": 0,
+        "attributed_to_cross_key_other_op": 0,
+        "attributed_to_unrecorded_request": 0,
+        "attributed_to_foreign_request": 0,
+    }
 
     # Always-on zero-mis-correlation check. Only decide when the workload object
     # maps to exactly one data op (key substring + rw + time window); ambiguous
     # matches are skipped rather than guessed.
     for span in rados_spans:
         span_attrs = attr_map(span)
+        object_name = str(span_attrs.get("ceph.rados.object", ""))
         matches = [
             record
             for record in data_ops
@@ -333,23 +342,40 @@ def check_object_request_correlation(args, errors, manifest, workload, rados_spa
         actual = span_parent_trans_id(span, request_by_id)
         if actual == expected:
             continue
-        if actual in manifest_request_ids:
-            # Both the expected and the actual request are manifest-recorded (for
-            # different keys): a provable mis-correlation.
-            fail(
-                errors,
-                f"MIS-CORRELATION: rados.op span {span.get('span_id')} for object "
-                f"{span_attrs.get('ceph.rados.object')!r} (workload key {matches[0]['key']!r}) "
-                f"attached to request {actual!r}; expected {expected!r}",
-            )
+
+        actual_record = record_by_request_id.get(actual)
+        if actual_record is not None:
+            actual_key = actual_record.get("key")
+            if actual_key and actual_key in object_name:
+                # The span is attached to a DIFFERENT manifest request, but that
+                # request operates on the SAME object key (e.g. head_object or
+                # delete_object on a key a GET/PUT also touched). Consistent with
+                # the manifest -- not a mis-correlation.
+                counters["attributed_to_same_key_other_op"] += 1
+            elif actual_record.get("op") in {"GET", "PUT"}:
+                # A GET/PUT touches exactly one object (its own key). Attached to
+                # one whose key does not match the span's object -> provable
+                # mis-correlation.
+                fail(
+                    errors,
+                    f"MIS-CORRELATION: rados.op span {span.get('span_id')} for object "
+                    f"{object_name!r} (workload key {matches[0]['key']!r}) attached to "
+                    f"{actual_record.get('op')} request {actual!r} for a different key "
+                    f"{actual_key!r}; expected {expected!r}",
+                )
+            else:
+                # A multi/related-object OTHER op (copy_object reads its SOURCE
+                # while its recorded key is the DESTINATION; multipart touches
+                # part objects) whose recorded key does not match this object.
+                # Cannot be proven wrong from the manifest key alone.
+                counters["attributed_to_cross_key_other_op"] += 1
         elif actual in workload_request_ids:
-            # Attached to a real workload request the manifest does not record
-            # (HEAD/DELETE/COPY on the same key): not a conflict, informational.
-            attributed_to_unrecorded_request += 1
+            # Attached to a real workload request the manifest does not record.
+            counters["attributed_to_unrecorded_request"] += 1
         else:
             # trans_id belongs to no workload request at all: still not a provable
             # manifest conflict, but surfaced separately for operator attention.
-            attributed_to_foreign_request += 1
+            counters["attributed_to_foreign_request"] += 1
 
     def op_correctly_correlated(record, rw):
         for span in rados_spans:
@@ -390,8 +416,7 @@ def check_object_request_correlation(args, errors, manifest, workload, rados_spa
     return {
         "get_read": {"correlated": get_hits, "total": get_total},
         "put_write": {"correlated": put_hits, "total": put_total},
-        "attributed_to_unrecorded_request": attributed_to_unrecorded_request,
-        "attributed_to_foreign_request": attributed_to_foreign_request,
+        **counters,
     }
 
 
@@ -409,6 +434,7 @@ def verify_document(args, document, workload, manifest=None):
     request_ids = set(request_by_id)
     workload_request_id_count = 0
     trace_request_id_count = 0
+    trace_only_request_id_count = 0
 
     span_ids = set()
     for span in spans:
@@ -625,10 +651,17 @@ def verify_document(args, document, workload, manifest=None):
         trace_request_id_set = set(trace_request_ids)
         missing_trace_ids = sorted(workload_request_id_set - trace_request_id_set)
         unexpected_trace_ids = sorted(trace_request_id_set - workload_request_id_set)
+        # Coverage guarantee (still a failure): every workload request the tool
+        # issued must show up in the trace window.
         if missing_trace_ids:
             fail(errors, f"workload x-amz-request-id values missing from trace rgw.trans_id: {missing_trace_ids}")
-        if unexpected_trace_ids:
-            fail(errors, f"trace rgw.trans_id values without matching workload x-amz-request-id: {unexpected_trace_ids}")
+        # The reverse direction is NOT a failure: a live trace window legitimately
+        # captures every request RGW served, which can exceed a single --workload
+        # file (concurrent clients, retries, background/health requests). Flagging
+        # those extra trace requests was a false positive -- e.g. a concurrent
+        # workload phase running alongside the sequential one. Surface the count
+        # informationally instead.
+        trace_only_request_id_count = len(unexpected_trace_ids)
 
     manifest_coverage = None
     if manifest is not None:
@@ -644,6 +677,7 @@ def verify_document(args, document, workload, manifest=None):
         "background_spans": len(background_spans),
         "workload_request_ids": workload_request_id_count,
         "trace_request_ids_in_window": trace_request_id_count,
+        "trace_only_request_ids": trace_only_request_id_count,
         "roles": sorted(role for role in roles if role),
         "diagnostics": diagnostics,
     }
@@ -1070,20 +1104,56 @@ def run_manifest_self_test():
             print(f"SELF-TEST ERROR: coverage miss failed without a --require flag: {error}", file=sys.stderr)
         return 1
 
-    # Positive regressions: these must produce NO errors (F2 false-positive fixes).
+    # Positive regressions: these must produce NO errors (F2 false-positive
+    # fixes). The manifest records EVERY workload operation, including OTHER ops
+    # (HEAD/COPY/DELETE) that carry a key and a request id, so these cases encode
+    # that true shape rather than an absent record.
     positive_cases = [
         (
-            # (i) The read span for get-key-aaa is attached to tx-get, but the
-            # manifest maps that key to a request the trace never issued as GET
-            # (simulating a HEAD/DELETE/COPY on the same key -- absent from the
-            # manifest, which records only GET/PUT). The old verifier declared a
-            # mis-correlation; now tx-get is not a manifest-recorded request, so
-            # the attachment is informational, not a conflict.
-            "non-manifest attachment is not a mis-correlation",
+            # (i) Same-key OTHER op: the read span for get-key-aaa is attached to
+            # tx-get, which the manifest records as a delete_object (op OTHER) on
+            # the SAME key get-key-aaa, while get-key-aaa's GET is tx-get-read.
+            # The attachment is consistent with the manifest (a delete on the key
+            # a GET also touched), so it is informational, not a mis-correlation.
+            "same-key OTHER-op attachment is consistent",
+            lambda doc, man: (
+                doc,
+                add_manifest_record(
+                    set_manifest_request_id(man, "GET", "tx-get-read"),
+                    "OTHER",
+                    None,
+                    "get-key-aaa",
+                    "tx-get",
+                ),
+            ),
+        ),
+        (
+            # (ii) Cross-key OTHER op (copy source): the read span for get-key-aaa
+            # is attached to tx-get, recorded as a copy_object (op OTHER) whose key
+            # is the DESTINATION copy-get-key-aaa -- which does NOT match the
+            # SOURCE object the span read. A copy legitimately reads its source, so
+            # the key mismatch on an OTHER op is not provable and does not fail.
+            "cross-key OTHER-op (copy source) attachment does not fail",
+            lambda doc, man: (
+                doc,
+                add_manifest_record(
+                    set_manifest_request_id(man, "GET", "tx-get-read"),
+                    "OTHER",
+                    None,
+                    "copy-get-key-aaa",
+                    "tx-get",
+                ),
+            ),
+        ),
+        (
+            # (iii) Absent from the manifest entirely: tx-get is not a manifest
+            # request at all but is a real workload request. Falls back to the
+            # workload log -> informational, not a mis-correlation.
+            "attachment to a request absent from the manifest does not fail",
             lambda doc, man: (doc, set_manifest_request_id(man, "GET", "tx-head-external")),
         ),
         (
-            # (ii) The object contains two manifest keys, one a substring of the
+            # (iv) The object contains two manifest keys, one a substring of the
             # other ("key-aaa" inside "get-key-aaa"). Only the longest, most
             # specific key sets the expectation; its request equals the span's
             # actual parent, so there is no false flag. Using the shorter generic
@@ -1107,12 +1177,12 @@ def run_manifest_self_test():
 
     cases = [
         (
-            # (iii) Genuine, provable conflict: the read span for get-key-aaa is
+            # (v) Genuine, provable conflict: the read span for get-key-aaa is
             # attached to tx-get, but the manifest records tx-get as the PUT of
-            # put-key-bbb and get-key-aaa's GET as tx-other. Both the expected
-            # and the actual request are manifest-recorded for different keys, so
-            # this still FAILS.
-            "genuine conflict between two manifest requests",
+            # put-key-bbb (a single-object op) and get-key-aaa's GET as tx-other.
+            # A GET/PUT touches exactly one object, so an attachment to a PUT
+            # whose key does not match the span's object still FAILS.
+            "genuine conflict with a GET/PUT for a different key",
             self_test_args(),
             lambda doc, man: (
                 doc,
