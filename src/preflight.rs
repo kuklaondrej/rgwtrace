@@ -202,9 +202,7 @@ fn reseed_probe_check(dwarf: &DwarfInfo, radosgw: &str) -> PreflightCheck {
     let present = dwarf
         .function_addr(radosgw, RGW_PROCESS_AUTHENTICATED)
         .is_some()
-        && dwarf
-            .function_var_field_count(radosgw, RGW_PROCESS_AUTHENTICATED)
-            .is_some_and(|count| count >= 1);
+        && dwarf.function_has_raw_pointer_descriptor(radosgw, RGW_PROCESS_AUTHENTICATED);
     if present {
         PreflightCheck {
             name: "cross_thread_reseed_probe".to_string(),

@@ -81,8 +81,29 @@ const FUNCTION_BASE_IDS: &[(&str, i32)] = &[
     ("Objecter::_send_op", 0),
     ("Objecter::_finish_op", 20),
     ("RGWREST::get_handler", 30),
-    ("rgw_process_authenticated", 40),
+    (RGW_PROCESS_AUTHENTICATED, 40),
 ];
+
+/// The one function whose hprobe slot carries a raw-pointer descriptor rather
+/// than a member-deref chain. Its var_field is read register-only by the BPF
+/// cross-thread re-seed handler (`fetch_param_ptr` in bpf/rgwtrace.bpf.c), which
+/// consumes `location.reg` and ignores `fields`. Any other var_field shape here
+/// would make the handler read a wrong parameter, so we pin the shape at import.
+pub const RGW_PROCESS_AUTHENTICATED: &str = "rgw_process_authenticated";
+
+/// Whether `var_field` is the exact raw-pointer sentinel that native extraction
+/// emits for `rgw_process_authenticated` (see `probe_function_var_fields` in
+/// `src/dwarf_native.rs`): register-located (`!stack`) with a single
+/// `{offset: 0, pointer: false}` field. The BPF re-seed handler reads only
+/// `location.reg`; anything else (stack-located, extra fields, a nonzero offset,
+/// or a `pointer: true` deref) means the descriptor was hand-edited or produced
+/// by a different toolchain and cannot be trusted to name the req_state pointer.
+pub fn is_raw_pointer_descriptor(var_field: &VarFieldJson) -> bool {
+    !var_field.location.stack
+        && var_field.fields.len() == 1
+        && var_field.fields[0].offset == 0
+        && !var_field.fields[0].pointer
+}
 
 /// Number of slots in the kernel `hprobes` map. Mirrors `max_entries, 8192` on
 /// the `hprobes` BPF_MAP_TYPE_HASH in `bpf/rgwtrace.bpf.c`. hprobe keys are
@@ -175,6 +196,29 @@ impl DwarfInfo {
                 }
 
                 for (idx, var_field) in vars.var_fields.iter().enumerate() {
+                    // F1: rgw_process_authenticated's slot is read register-only by
+                    // the BPF cross-thread re-seed handler (it consumes
+                    // `location.reg` and ignores `fields`). A stale or hand-edited
+                    // JSON with any other shape -- a stack location, extra fields, a
+                    // nonzero offset, or a `pointer:true` deref -- would silently
+                    // name a wrong parameter and, on a bridge match, re-seed request
+                    // context from the wrong entry. Fail closed at import: this slot
+                    // only ever carries the raw-pointer sentinel.
+                    if function == RGW_PROCESS_AUTHENTICATED
+                        && !is_raw_pointer_descriptor(var_field)
+                    {
+                        bail!(
+                            "module {module_name} function {function} var_field {idx}: expected the \
+                             raw-pointer descriptor (register-located, exactly one \
+                             {{offset:0, pointer:false}} field) that the BPF re-seed handler reads \
+                             register-only, but got location {:?} with {} field(s) {:?}; refusing a \
+                             descriptor that could read a wrong parameter",
+                            var_field.location,
+                            var_field.fields.len(),
+                            var_field.fields
+                        );
+                    }
+
                     // F7: nested chain must fit the fixed kernel array; refuse to
                     // truncate because a dropped deref reads garbage.
                     if var_field.fields.len() > MAX_VAR_FIELD_CHAIN {
@@ -290,6 +334,25 @@ impl DwarfInfo {
             .get(module_basename)
             .and_then(|module| module.func2vf.get(function))
             .map(|vars| vars.var_fields.len())
+    }
+
+    /// Whether `function` in `module_basename` carries a single valid raw-pointer
+    /// descriptor (see [`is_raw_pointer_descriptor`]). The attach gate and the
+    /// `cross_thread_reseed_probe` preflight check use this instead of a mere
+    /// presence test so that only a descriptor the BPF re-seed handler can read
+    /// register-only (`fetch_param_ptr`) enables the bridge -- keeping the path
+    /// fail-closed even if `validate` is ever bypassed.
+    pub fn function_has_raw_pointer_descriptor(
+        &self,
+        module_basename: &str,
+        function: &str,
+    ) -> bool {
+        self.modules
+            .get(module_basename)
+            .and_then(|module| module.func2vf.get(function))
+            .is_some_and(|vars| {
+                vars.var_fields.len() == 1 && is_raw_pointer_descriptor(&vars.var_fields[0])
+            })
     }
 
     pub fn module_build_id(&self, module_basename: &str) -> Option<&str> {
@@ -634,6 +697,69 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("field 0"), "message: {msg}");
         assert!(msg.contains("sane range"), "message: {msg}");
+    }
+
+    #[test]
+    fn rgw_process_authenticated_valid_sentinel_passes() {
+        // The exact raw-pointer descriptor native extraction emits: register-
+        // located, single {offset:0, pointer:false} field.
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let info = DwarfInfo::from_str(&json).unwrap();
+        assert!(info
+            .function_has_raw_pointer_descriptor("libceph-common.so.2", RGW_PROCESS_AUTHENTICATED));
+    }
+
+    #[test]
+    fn rgw_process_authenticated_stack_located_rejected() {
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": true}, "fields": [{"offset": 0, "pointer": false}]}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(RGW_PROCESS_AUTHENTICATED), "message: {msg}");
+        assert!(msg.contains("raw-pointer descriptor"), "message: {msg}");
+    }
+
+    #[test]
+    fn rgw_process_authenticated_multi_field_rejected() {
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}, {"offset": 8, "pointer": true}]}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        assert!(format!("{err:#}").contains("raw-pointer descriptor"));
+    }
+
+    #[test]
+    fn rgw_process_authenticated_nonzero_offset_rejected() {
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": false}, "fields": [{"offset": 8, "pointer": false}]}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        assert!(format!("{err:#}").contains("raw-pointer descriptor"));
+    }
+
+    #[test]
+    fn rgw_process_authenticated_pointer_true_rejected() {
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": true}]}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        assert!(format!("{err:#}").contains("raw-pointer descriptor"));
+    }
+
+    #[test]
+    fn rgw_process_authenticated_empty_fields_rejected() {
+        // The preflight test helper's `fields:[]` shape must not qualify.
+        let vf = r#"{"location": {"reg": 4, "offset": 0, "stack": false}, "fields": []}"#;
+        let json = json_with_single_var_field("amd64", RGW_PROCESS_AUTHENTICATED, vf);
+        let err = DwarfInfo::from_str(&json).unwrap_err();
+        assert!(format!("{err:#}").contains("raw-pointer descriptor"));
+    }
+
+    #[test]
+    fn has_raw_pointer_descriptor_false_when_absent() {
+        let vf = var_field_json(4, 0, 1);
+        let json = json_with_single_var_field("amd64", "Objecter::_send_op", &vf);
+        let info = DwarfInfo::from_str(&json).unwrap();
+        assert!(!info
+            .function_has_raw_pointer_descriptor("libceph-common.so.2", RGW_PROCESS_AUTHENTICATED));
     }
 
     #[test]

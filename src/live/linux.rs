@@ -485,15 +485,17 @@ fn attach_probes(
     Ok(links)
 }
 
-/// Whether the radosgw DWARF carries the varid-40 raw-pointer var_field for
-/// `rgw_process_authenticated`. When the descriptor is missing (e.g. the
-/// req_state* was stack-located at entry and native extraction dropped it) the
-/// re-seed probe has nothing to read, so it is left unattached and the tracer
-/// falls back to main's same-thread behavior.
+/// Whether the radosgw DWARF carries a valid varid-40 raw-pointer descriptor for
+/// `rgw_process_authenticated`. The BPF re-seed handler reads only `location.reg`
+/// (`fetch_param_ptr`), so we require the exact raw-pointer shape, not mere
+/// presence: a stale/hand-edited JSON with a wrong register or a member-deref
+/// chain here could make the bridge re-seed request context from a wrong entry.
+/// When the descriptor is missing or malformed the re-seed probe is left
+/// unattached and the tracer falls back to main's same-thread behavior.
 fn reseed_var_field_present(dwarf: &DwarfInfo, radosgw: &Path) -> bool {
-    basename(radosgw)
-        .and_then(|module| dwarf.function_var_field_count(module, "rgw_process_authenticated"))
-        .is_some_and(|count| count >= 1)
+    basename(radosgw).is_some_and(|module| {
+        dwarf.function_has_raw_pointer_descriptor(module, "rgw_process_authenticated")
+    })
 }
 
 fn attach_if_present(
