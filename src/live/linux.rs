@@ -201,7 +201,27 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         );
     }
     info!(spans = trace.spans.len(), "finished live tracing");
+    // Operator UX: RADOS ops were seen but not a single RGW request marker. The
+    // most common cause is a workload started before the trace window opened
+    // (native DWARF extraction is slow), so nothing correlates. Surface it as a
+    // warning rather than leaving the operator to infer a dead probe.
+    if should_warn_no_request_markers(
+        trace.diagnostics.request_markers,
+        trace.diagnostics.rados_ops,
+    ) {
+        warn!(
+            rados_ops = trace.diagnostics.rados_ops,
+            "no RGW request markers captured -- did the workload run after 'starting live tracing'?"
+        );
+    }
     Ok(trace)
+}
+
+/// Whether to emit the "no RGW request markers" end-of-run warning: RADOS ops
+/// were captured but no request marker fired, so nothing could correlate. The
+/// typical cause is a workload started before the (slow-to-open) trace window.
+fn should_warn_no_request_markers(request_markers: u64, rados_ops: u64) -> bool {
+    request_markers == 0 && rados_ops > 0
 }
 
 fn merge_bpf_diagnostics(map: &impl MapCore, collector: &Arc<Mutex<Collector>>) -> Result<()> {
@@ -655,6 +675,18 @@ mod tests {
                 .collect(),
             diagnostics: TraceDiagnostics::default(),
         }
+    }
+
+    #[test]
+    fn warns_only_when_rados_ops_seen_without_request_markers() {
+        // The empty-window operator hazard: RADOS ops but no request markers.
+        assert!(should_warn_no_request_markers(0, 5));
+        // Markers present -> correlation is possible, no warning.
+        assert!(!should_warn_no_request_markers(3, 5));
+        // Nothing captured at all (e.g. idle target) -> not this diagnosis.
+        assert!(!should_warn_no_request_markers(0, 0));
+        // Markers but no RADOS ops -> a different situation, no warning.
+        assert!(!should_warn_no_request_markers(2, 0));
     }
 
     #[test]

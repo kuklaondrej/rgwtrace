@@ -65,7 +65,12 @@ pub struct Cli {
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
 
-    #[arg(long, default_value = "warn")]
+    // Default to `info` (not `warn`): native DWARF extraction can take ~30s+ on
+    // real targets, and the "starting live tracing" / "finished live tracing"
+    // readiness lines are `info!`. At `warn` an operator saw an empty stderr log
+    // and started their workload before the trace window opened, mis-diagnosing
+    // it as a probe that never fired. Logs go to stderr, so stdout stays clean.
+    #[arg(long, default_value = "info")]
     pub log_level: String,
 
     #[arg(short = 'p', long)]

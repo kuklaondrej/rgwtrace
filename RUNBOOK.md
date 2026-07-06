@@ -88,7 +88,7 @@ sudo rgwtrace \
   --correlation-ttl 120
 ```
 
-Use `--log-level info` or `RUST_LOG=rgwtrace=debug` to see export queue summaries, export attempts, and retry details.
+Logging defaults to `info` so the `starting live tracing` / `finished live tracing` readiness lines are visible: native DWARF extraction can take ~30s+, and starting a workload before `starting live tracing` prints yields an empty trace that looks like a dead probe. Logs go to stderr, so stdout stays clean for JSON. If RADOS ops are captured but no RGW request markers, the run ends with a `no RGW request markers captured` warning pointing at exactly that timing mistake. Pass `--log-level warn` for quieter output or `RUST_LOG=rgwtrace=debug` to also see export queue summaries, export attempts, and retry details.
 
 Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobuf payloads. The byte limit is checked before gzip compression; `0` disables byte-based splitting.
 
