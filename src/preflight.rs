@@ -6,14 +6,13 @@ use serde::Serialize;
 
 use crate::{
     cli::Cli,
-    dwarf_json::{basename, DwarfInfo, DwarfSummary},
+    dwarf_json::{basename, DwarfInfo, DwarfSummary, RGW_PROCESS_AUTHENTICATED},
     targets::{self, ProbeTargets},
 };
 
 const SEND_OP: &str = "Objecter::_send_op";
 const FINISH_OP: &str = "Objecter::_finish_op";
 const GET_HANDLER: &str = "RGWREST::get_handler";
-const RGW_PROCESS_AUTHENTICATED: &str = "rgw_process_authenticated";
 
 const SEND_OP_FIELDS: usize = 12;
 const FINISH_OP_FIELDS: usize = 3;
