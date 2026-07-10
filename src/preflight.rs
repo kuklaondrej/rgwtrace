@@ -1,12 +1,14 @@
-use std::{fs, path::Path};
+use std::fs;
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use object::Object;
 use serde::Serialize;
+use tracing::warn;
 
 use crate::{
     cli::Cli,
-    dwarf_json::{basename, DwarfInfo, DwarfSummary, RGW_PROCESS_AUTHENTICATED},
+    dwarf_json::{module_key_for_path, DwarfInfo, DwarfSummary, RGW_PROCESS_AUTHENTICATED},
     targets::{self, ProbeTargets},
 };
 
@@ -112,10 +114,8 @@ fn validate_file_path(label: &str, path: &Path) -> Result<()> {
 }
 
 fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<()> {
-    let rados_modules = targets
-        .rados_libraries()
+    let rados_modules = rados_module_keys(targets)
         .into_iter()
-        .filter_map(basename)
         .filter(|module| module_supports_rados(dwarf, module))
         .collect::<Vec<_>>();
     if rados_modules.is_empty() {
@@ -124,9 +124,51 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
         );
     }
 
+    warn_on_silent_rados_skip(dwarf, targets);
+
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
-    require_function(dwarf, radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
+    require_function(dwarf, &radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
     Ok(())
+}
+
+/// Canonicalized artifact module keys for the discovered rados libraries, in the
+/// same order as [`ProbeTargets::rados_libraries`]. Routing every rados-library
+/// basename through [`module_key_for_path`] keeps this in agreement with attach
+/// (`attach_if_present`) and the build-id check about each module's key.
+fn rados_module_keys(targets: &ProbeTargets) -> Vec<String> {
+    targets
+        .rados_libraries()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect()
+}
+
+/// Advisory warning for the exact silent-skip that hid the versioned-soname bug:
+/// a discovered rados library whose module key resolves to NO artifact module,
+/// even though the artifact carries a `Objecter::_send_op` `func2pc` in some
+/// module. That combination means the librados uprobes would be skipped at
+/// attach (request markers, but `rados_ops = 0`). It is advisory only -- if the
+/// artifact genuinely lacks `_send_op` anywhere the required-module check above
+/// already fails -- so this is a `warn!`, not a hard error.
+fn warn_on_silent_rados_skip(dwarf: &DwarfInfo, targets: &ProbeTargets) {
+    if !dwarf.any_module_has_func2pc(SEND_OP) {
+        return;
+    }
+    for (path, module) in targets
+        .rados_libraries()
+        .into_iter()
+        .zip(rados_module_keys(targets))
+    {
+        if !dwarf.has_module(&module) {
+            warn!(
+                module = %module,
+                path = %path.display(),
+                "discovered rados library resolves to no artifact module even though the \
+                 artifact has a {SEND_OP} address; its uprobes will be silently skipped \
+                 (check for a versioned/soname basename mismatch)"
+            );
+        }
+    }
 }
 
 fn module_supports_rados(dwarf: &DwarfInfo, module: &str) -> bool {
@@ -155,13 +197,11 @@ fn require_function(
 }
 
 fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
-    let rados_modules = targets
-        .rados_libraries()
+    let rados_modules = rados_module_keys(targets)
         .into_iter()
-        .filter_map(basename)
         .filter(|module| module_supports_rados(dwarf, module))
         .collect::<Vec<_>>();
-    let radosgw = basename(&targets.radosgw).unwrap_or("<invalid>");
+    let radosgw = module_key_for_path(&targets.radosgw).unwrap_or_else(|| "<invalid>".to_string());
 
     vec![
         PreflightCheck {
@@ -188,7 +228,7 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
             status: "ok",
             detail: format!("{GET_HANDLER} available in {radosgw}"),
         },
-        reseed_probe_check(dwarf, radosgw),
+        reseed_probe_check(dwarf, &radosgw),
     ]
 }
 
@@ -267,7 +307,7 @@ fn build_id_checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<Vec<Buil
 }
 
 fn build_id_check(dwarf: &DwarfInfo, path: &Path) -> Result<BuildIdCheck> {
-    let module = target_basename(path, "target")?.to_string();
+    let module = target_basename(path, "target")?;
     let dwarf_build_id = dwarf.module_build_id(&module).map(ToOwned::to_owned);
     let target_build_id = elf_build_id(path)
         .with_context(|| format!("failed to read build ID from {}", path.display()))?;
@@ -311,8 +351,9 @@ fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn target_basename<'a>(path: &'a Path, label: &str) -> Result<&'a str> {
-    basename(path).with_context(|| format!("{label} {} has no file name", path.display()))
+fn target_basename(path: &Path, label: &str) -> Result<String> {
+    module_key_for_path(path)
+        .with_context(|| format!("{label} {} has no file name", path.display()))
 }
 
 #[cfg(test)]
@@ -322,6 +363,22 @@ mod tests {
     #[test]
     fn validates_required_dwarf_targets() {
         let dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "radosgw")).unwrap();
+        let targets = ProbeTargets {
+            librados: "/tmp/librados.so.2".into(),
+            librbd: None,
+            libceph_common: "/tmp/libceph-common.so.2".into(),
+            radosgw: "/tmp/radosgw".into(),
+        };
+
+        validate_dwarf_targets(&dwarf, &targets).unwrap();
+    }
+
+    #[test]
+    fn soname_target_matches_versioned_artifact_module() {
+        // The production bug: artifact keys the RADOS module by the versioned
+        // real name, but the discovered/explicit target is the soname symlink.
+        // With soname-aware resolution the symlink basename must still validate.
+        let dwarf = DwarfInfo::from_str(&dwarf_json("librados.so.2.0.0", "radosgw")).unwrap();
         let targets = ProbeTargets {
             librados: "/tmp/librados.so.2".into(),
             librbd: None,

@@ -350,17 +350,54 @@ impl DwarfInfo {
         entries
     }
 
+    /// Resolve a module-key lookup with an exact match first, then a
+    /// soname-aware fallback. Ubuntu ships DWARF-bearing real files under
+    /// versioned names (`librados.so.2.0.0`) reached through soname symlinks
+    /// (`librados.so.2`); auto-discovery and explicit `--*-path` flags may yield
+    /// either form, while the artifact keys modules by whichever name was seen at
+    /// export time. Matching only on exact basename silently skips the librados
+    /// `_send_op`/`_finish_op` uprobes (and hard-fails the librbd build-id check).
+    /// The fallback matches any module whose key shares the same
+    /// `lib<name>.so.<major>` soname stem, so `librados.so.2` resolves to
+    /// `librados.so.2.0.0` and vice-versa. Exact match always wins; the fallback
+    /// never crosses major versions (`librados.so.2` never matches
+    /// `librados.so.3`) because the stem includes the major.
+    pub fn resolve_module(&self, module_key: &str) -> Option<&DwarfModule> {
+        if let Some(module) = self.modules.get(module_key) {
+            return Some(module);
+        }
+        let stem = soname_stem(module_key);
+        self.modules
+            .iter()
+            .find_map(|(name, module)| (soname_stem(name) == stem).then_some(module))
+    }
+
+    /// Whether any artifact module resolves for `module_key` (exact or
+    /// soname-fallback). Used by preflight to detect the silent-skip signature: a
+    /// discovered rados library that maps to no artifact module.
+    pub fn has_module(&self, module_key: &str) -> bool {
+        self.resolve_module(module_key).is_some()
+    }
+
+    /// Whether any module in the artifact exposes a `func2pc` address for
+    /// `function`. Used to distinguish "the artifact simply lacks this probe"
+    /// from "the artifact has it but the discovered library did not resolve to
+    /// the module that carries it" (the silent-skip preflight warning).
+    pub fn any_module_has_func2pc(&self, function: &str) -> bool {
+        self.modules
+            .values()
+            .any(|module| module.func2pc.contains_key(function))
+    }
+
     #[allow(dead_code)]
     pub fn function_addr(&self, module_basename: &str, function: &str) -> Option<u64> {
-        self.modules
-            .get(module_basename)
+        self.resolve_module(module_basename)
             .and_then(|module| module.func2pc.get(function).copied())
             .filter(|addr| *addr != 0)
     }
 
     pub fn function_var_field_count(&self, module_basename: &str, function: &str) -> Option<usize> {
-        self.modules
-            .get(module_basename)
+        self.resolve_module(module_basename)
             .and_then(|module| module.func2vf.get(function))
             .map(|vars| vars.var_fields.len())
     }
@@ -417,8 +454,7 @@ impl DwarfInfo {
         module_basename: &str,
         function: &str,
     ) -> bool {
-        self.modules
-            .get(module_basename)
+        self.resolve_module(module_basename)
             .and_then(|module| module.func2vf.get(function))
             .is_some_and(|vars| {
                 vars.var_fields.len() == 1 && is_raw_pointer_descriptor(&vars.var_fields[0])
@@ -426,8 +462,7 @@ impl DwarfInfo {
     }
 
     pub fn module_build_id(&self, module_basename: &str) -> Option<&str> {
-        self.modules
-            .get(module_basename)
+        self.resolve_module(module_basename)
             .and_then(|module| module.build_id.as_deref())
             .filter(|build_id| !build_id.is_empty())
     }
@@ -446,6 +481,45 @@ impl DwarfInfo {
 #[allow(dead_code)]
 pub fn basename(path: &Path) -> Option<&str> {
     path.file_name().and_then(|name| name.to_str())
+}
+
+/// The single "path -> artifact module key" mapping used everywhere a basename
+/// is matched against the DWARF module map (attach, preflight, build-id).
+///
+/// Canonicalizes the path first so a soname symlink (`/usr/lib/librados.so.2`)
+/// resolves to the versioned real file (`librados.so.2.0.0`) the artifact keys
+/// modules by -- the same versioned name `--pid`/maps discovery already yields
+/// from the mmap'd path. If canonicalization fails (e.g. a `/proc/<pid>/root`
+/// path, or a nonexistent path in unit tests) it falls back to the path as
+/// given, so callers never panic and preflight/attach still agree via the
+/// soname-fallback in [`DwarfInfo::resolve_module`]. Routing every lookup
+/// through this one helper keeps attach, preflight, and the build-id check from
+/// disagreeing about a module's key.
+pub fn module_key_for_path(path: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+}
+
+/// The `lib<name>.so.<major>` soname stem of a module key, used for
+/// soname-aware fallback matching. Truncates a versioned real filename after the
+/// major version, so `librados.so.2.0.0`, `librados.so.2`, and a hypothetical
+/// `librados.so.2.99` all share the stem `librados.so.2`, while `librados.so.3`
+/// does not (different major). Names without a `.so.<n>` shape (e.g. `radosgw`,
+/// or `libceph-common.so.2` which carries no minor suffix) are returned
+/// unchanged, so they only ever match themselves.
+fn soname_stem(name: &str) -> &str {
+    let Some(after) = name.find(".so.").map(|idx| idx + ".so.".len()) else {
+        return name;
+    };
+    // `after` points at the major version component; keep everything up to (and
+    // including) it, dropping any `.minor.patch` suffix.
+    match name[after..].find('.') {
+        Some(dot) => &name[..after + dot],
+        None => name,
+    }
 }
 
 impl VarFieldJson {
@@ -1007,5 +1081,134 @@ mod tests {
             info.modules_with_addr_but_empty_var_fields("Objecter::_send_op"),
             vec!["librados.so.2"]
         );
+    }
+
+    // --- soname-aware module resolution + path -> module key ---
+
+    /// Builds a DwarfInfo whose only module is `module_key`, exposing a
+    /// `_send_op` func2pc address and a build id so both lookups can be exercised.
+    fn info_with_module(module_key: &str) -> DwarfInfo {
+        DwarfInfo {
+            version: Some("v".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::from([(
+                module_key.to_string(),
+                module_with(&[("Objecter::_send_op", 42)], &[("Objecter::_send_op", 1)]),
+            )]),
+        }
+    }
+
+    #[test]
+    fn soname_stem_truncates_after_major() {
+        assert_eq!(soname_stem("librados.so.2.0.0"), "librados.so.2");
+        assert_eq!(soname_stem("librados.so.2"), "librados.so.2");
+        assert_eq!(soname_stem("librbd.so.1.18.0"), "librbd.so.1");
+        assert_eq!(soname_stem("librbd.so.1"), "librbd.so.1");
+        // No minor suffix and no `.so.` past the major -> unchanged.
+        assert_eq!(soname_stem("libceph-common.so.2"), "libceph-common.so.2");
+        // No `.so.` at all -> returned verbatim.
+        assert_eq!(soname_stem("radosgw"), "radosgw");
+    }
+
+    #[test]
+    fn soname_fallback_resolves_versioned_and_symlink_forms() {
+        // Artifact keyed by the versioned real name; a symlink-style lookup key
+        // resolves to it via the shared soname stem, and vice-versa.
+        let versioned = info_with_module("librados.so.2.0.0");
+        assert_eq!(
+            versioned.function_addr("librados.so.2", "Objecter::_send_op"),
+            Some(42)
+        );
+
+        let symlinked = info_with_module("librados.so.2");
+        assert_eq!(
+            symlinked.function_addr("librados.so.2.0.0", "Objecter::_send_op"),
+            Some(42)
+        );
+
+        // librbd major-1 versioned <-> soname, both directions.
+        let rbd = info_with_module("librbd.so.1.18.0");
+        assert_eq!(
+            rbd.function_addr("librbd.so.1", "Objecter::_send_op"),
+            Some(42)
+        );
+        assert!(rbd.module_build_id("librbd.so.1").is_some());
+    }
+
+    #[test]
+    fn soname_fallback_never_crosses_major() {
+        let info = info_with_module("librados.so.2.0.0");
+        // A different major must NOT resolve to the major-2 module.
+        assert_eq!(
+            info.function_addr("librados.so.3", "Objecter::_send_op"),
+            None
+        );
+        assert!(info.module_build_id("librados.so.3").is_none());
+        assert!(!info.has_module("librados.so.3"));
+        assert!(info.has_module("librados.so.2"));
+    }
+
+    #[test]
+    fn exact_match_takes_precedence_over_soname_fallback() {
+        // Two modules sharing a soname stem: an exact key must return the exact
+        // module, not the first soname-stem match.
+        let info = DwarfInfo {
+            version: Some("v".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::from([
+                (
+                    "librados.so.2".to_string(),
+                    module_with(&[("Objecter::_send_op", 1)], &[]),
+                ),
+                (
+                    "librados.so.2.0.0".to_string(),
+                    module_with(&[("Objecter::_send_op", 2)], &[]),
+                ),
+            ]),
+        };
+        assert_eq!(
+            info.function_addr("librados.so.2.0.0", "Objecter::_send_op"),
+            Some(2)
+        );
+        assert_eq!(
+            info.function_addr("librados.so.2", "Objecter::_send_op"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn libceph_common_without_version_suffix_still_matches() {
+        let info = info_with_module("libceph-common.so.2");
+        assert_eq!(
+            info.function_addr("libceph-common.so.2", "Objecter::_send_op"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn module_key_for_path_canonicalizes_symlink_to_versioned() {
+        let dir = std::env::temp_dir().join(format!("rgwtrace-mkfp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("librados.so.2.0.0");
+        fs::write(&real, b"\x7fELF").unwrap();
+        let link = dir.join("librados.so.2");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The symlink path resolves to the versioned real basename.
+        assert_eq!(
+            module_key_for_path(&link).as_deref(),
+            Some("librados.so.2.0.0")
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn module_key_for_path_falls_back_when_canonicalize_fails() {
+        // A nonexistent path cannot be canonicalized; the helper falls back to
+        // the path's own file name rather than panicking or returning None.
+        let path = Path::new("/nonexistent/dir/librados.so.2");
+        assert_eq!(module_key_for_path(path).as_deref(), Some("librados.so.2"));
     }
 }

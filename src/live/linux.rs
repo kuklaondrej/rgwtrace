@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use crate::{
     cli::{Cli, OutputMode},
     collector::{BpfDiagnostics, Collector, TraceDocument},
-    dwarf_json::{basename, DwarfInfo, VarFieldKernel},
+    dwarf_json::{module_key_for_path, DwarfInfo, VarFieldKernel},
     events::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
         RGWTRACE_EVENT_REQUEST_END,
@@ -541,8 +541,8 @@ fn attach_probes(
 /// When the descriptor is missing or malformed the re-seed probe is left
 /// unattached and the tracer falls back to main's same-thread behavior.
 fn reseed_var_field_present(dwarf: &DwarfInfo, radosgw: &Path) -> bool {
-    basename(radosgw).is_some_and(|module| {
-        dwarf.function_has_raw_pointer_descriptor(module, "rgw_process_authenticated")
+    module_key_for_path(radosgw).is_some_and(|module| {
+        dwarf.function_has_raw_pointer_descriptor(&module, "rgw_process_authenticated")
     })
 }
 
@@ -555,12 +555,29 @@ fn attach_if_present(
     dwarf: &DwarfInfo,
     function: &str,
 ) -> Result<()> {
-    let Some(module) = basename(path) else {
+    // Derive the artifact module key from the CANONICALIZED path so a soname
+    // symlink (`librados.so.2`) resolves to the versioned module the artifact
+    // keys by (`librados.so.2.0.0`). The uprobe still attaches to `path`, whose
+    // canonical form is the same inode, so the attach target is unchanged.
+    let Some(module) = module_key_for_path(path) else {
         return Ok(());
     };
-    let Some(addr) = dwarf.function_addr(module, function) else {
+    let Some(addr) = dwarf.function_addr(&module, function) else {
+        debug!(
+            module = %module,
+            function,
+            path = %path.display(),
+            "no artifact module resolved a func2pc address; uprobe skipped"
+        );
         return Ok(());
     };
+    debug!(
+        module = %module,
+        function,
+        addr,
+        path = %path.display(),
+        "resolved func2pc; attaching uprobe"
+    );
 
     let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
         .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
