@@ -46,6 +46,17 @@ pub struct FieldJson {
     pub pointer: bool,
 }
 
+/// Outcome of resolving a path-derived module key against the artifact's
+/// modules. `Unique` covers both an exact key hit and a single soname-stem
+/// fallback; `Ambiguous` names every candidate when two or more share the stem
+/// so the caller never has to pick arbitrarily.
+#[derive(Debug)]
+pub enum ModuleMatch<'a> {
+    None,
+    Unique(&'a DwarfModule),
+    Ambiguous(Vec<String>),
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct HprobeEntry {
     pub module: String,
@@ -350,31 +361,70 @@ impl DwarfInfo {
         entries
     }
 
-    /// Resolve a module-key lookup with an exact match first, then a
-    /// soname-aware fallback. Ubuntu ships DWARF-bearing real files under
-    /// versioned names (`librados.so.2.0.0`) reached through soname symlinks
-    /// (`librados.so.2`); auto-discovery and explicit `--*-path` flags may yield
-    /// either form, while the artifact keys modules by whichever name was seen at
-    /// export time. Matching only on exact basename silently skips the librados
+    /// Classify a module-key lookup: exact match first, then a soname-aware
+    /// fallback. Ubuntu ships DWARF-bearing real files under versioned names
+    /// (`librados.so.2.0.0`) reached through soname symlinks (`librados.so.2`);
+    /// auto-discovery and explicit `--*-path` flags may yield either form, while
+    /// the artifact keys modules by whichever name was seen at export time.
+    /// Matching only on exact basename silently skips the librados
     /// `_send_op`/`_finish_op` uprobes (and hard-fails the librbd build-id check).
+    ///
     /// The fallback matches any module whose key shares the same
     /// `lib<name>.so.<major>` soname stem, so `librados.so.2` resolves to
     /// `librados.so.2.0.0` and vice-versa. Exact match always wins; the fallback
     /// never crosses major versions (`librados.so.2` never matches
     /// `librados.so.3`) because the stem includes the major.
-    pub fn resolve_module(&self, module_key: &str) -> Option<&DwarfModule> {
+    ///
+    /// When two or more modules share the key's stem (e.g. both
+    /// `librados.so.2.0.0` and `librados.so.2.1.0` present) the fallback refuses
+    /// to guess: an arbitrary pick could pair one module's function address with
+    /// another module's field descriptors (hprobe entries are keyed by a GLOBAL
+    /// function id and populated for every module). It returns
+    /// [`ModuleMatch::Ambiguous`] naming the candidates so the caller can surface
+    /// an explicit error, and is treated as unresolved everywhere a lookup is a
+    /// plain `Option`.
+    pub fn match_module(&self, module_key: &str) -> ModuleMatch<'_> {
         if let Some(module) = self.modules.get(module_key) {
-            return Some(module);
+            return ModuleMatch::Unique(module);
         }
-        let stem = soname_stem(module_key);
-        self.modules
+        let Some(stem) = soname_stem(module_key) else {
+            return ModuleMatch::None;
+        };
+        let mut matches = self
+            .modules
             .iter()
-            .find_map(|(name, module)| (soname_stem(name) == stem).then_some(module))
+            .filter(|(name, _)| soname_stem(name) == Some(stem));
+        let Some((_, first)) = matches.next() else {
+            return ModuleMatch::None;
+        };
+        if matches.next().is_none() {
+            return ModuleMatch::Unique(first);
+        }
+        // Two or more share the stem: name every candidate and refuse to pick.
+        let keys = self
+            .modules
+            .keys()
+            .filter(|name| soname_stem(name) == Some(stem))
+            .cloned()
+            .collect();
+        ModuleMatch::Ambiguous(keys)
     }
 
-    /// Whether any artifact module resolves for `module_key` (exact or
-    /// soname-fallback). Used by preflight to detect the silent-skip signature: a
-    /// discovered rados library that maps to no artifact module.
+    /// The single module for `module_key`, or `None` when nothing matches OR the
+    /// soname fallback is ambiguous. An ambiguous multi-match is deliberately
+    /// treated as unresolved rather than an arbitrary pick; preflight surfaces
+    /// it as an explicit named error via [`Self::match_module`].
+    pub fn resolve_module(&self, module_key: &str) -> Option<&DwarfModule> {
+        match self.match_module(module_key) {
+            ModuleMatch::Unique(module) => Some(module),
+            ModuleMatch::None | ModuleMatch::Ambiguous(_) => None,
+        }
+    }
+
+    /// Whether exactly one artifact module resolves for `module_key` (exact or a
+    /// unique soname-fallback). An ambiguous multi-match counts as unresolved, so
+    /// the preflight silent-skip warning fires rather than being suppressed by a
+    /// would-be arbitrary pick.
     pub fn has_module(&self, module_key: &str) -> bool {
         self.resolve_module(module_key).is_some()
     }
@@ -503,23 +553,35 @@ pub fn module_key_for_path(path: &Path) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// The `lib<name>.so.<major>` soname stem of a module key, used for
-/// soname-aware fallback matching. Truncates a versioned real filename after the
-/// major version, so `librados.so.2.0.0`, `librados.so.2`, and a hypothetical
-/// `librados.so.2.99` all share the stem `librados.so.2`, while `librados.so.3`
-/// does not (different major). Names without a `.so.<n>` shape (e.g. `radosgw`,
-/// or `libceph-common.so.2` which carries no minor suffix) are returned
-/// unchanged, so they only ever match themselves.
-fn soname_stem(name: &str) -> &str {
-    let Some(after) = name.find(".so.").map(|idx| idx + ".so.".len()) else {
-        return name;
-    };
-    // `after` points at the major version component; keep everything up to (and
-    // including) it, dropping any `.minor.patch` suffix.
-    match name[after..].find('.') {
-        Some(dot) => &name[..after + dot],
-        None => name,
+/// The `lib<name>.so.<major>` soname stem of a WELL-FORMED numeric soname, used
+/// for soname-aware fallback matching. Returns `Some("librados.so.2")` for
+/// `librados.so.2.0.0`, `librados.so.2`, and `librados.so.2.99` (all major 2),
+/// but `Some("librados.so.3")` for `librados.so.3` (different major, no cross).
+///
+/// Returns `None` for anything that is not a numeric soname, so malformed or
+/// "backup" names stay exact-only and never participate in the fallback:
+/// - no `.so.` marker (`radosgw`)                        -> None
+/// - a non-numeric major (`foo.so.debug.anything`, `libx.so.2x`) -> None
+/// - an empty component (`libfoo.so..junk`)              -> None
+/// - a non-numeric minor/patch (`libfoo.so.2.backup`)    -> None
+///
+/// The version after `.so.` must be a dot-separated run of non-empty ASCII-digit
+/// components (`major[.minor[.patch...]]`); the stem keeps only the major.
+fn soname_stem(name: &str) -> Option<&str> {
+    const MARKER: &str = ".so.";
+    let idx = name.find(MARKER)?;
+    let version_start = idx + MARKER.len();
+    let mut components = name[version_start..].split('.');
+    let major = components.next()?;
+    if major.is_empty() || !major.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    for component in components {
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(&name[..version_start + major.len()])
 }
 
 impl VarFieldJson {
@@ -1100,14 +1162,71 @@ mod tests {
 
     #[test]
     fn soname_stem_truncates_after_major() {
-        assert_eq!(soname_stem("librados.so.2.0.0"), "librados.so.2");
-        assert_eq!(soname_stem("librados.so.2"), "librados.so.2");
-        assert_eq!(soname_stem("librbd.so.1.18.0"), "librbd.so.1");
-        assert_eq!(soname_stem("librbd.so.1"), "librbd.so.1");
-        // No minor suffix and no `.so.` past the major -> unchanged.
-        assert_eq!(soname_stem("libceph-common.so.2"), "libceph-common.so.2");
-        // No `.so.` at all -> returned verbatim.
-        assert_eq!(soname_stem("radosgw"), "radosgw");
+        assert_eq!(soname_stem("librados.so.2.0.0"), Some("librados.so.2"));
+        assert_eq!(soname_stem("librados.so.2"), Some("librados.so.2"));
+        assert_eq!(soname_stem("librbd.so.1.18.0"), Some("librbd.so.1"));
+        assert_eq!(soname_stem("librbd.so.1"), Some("librbd.so.1"));
+        // No minor suffix -> stem is the whole name (major only).
+        assert_eq!(
+            soname_stem("libceph-common.so.2"),
+            Some("libceph-common.so.2")
+        );
+    }
+
+    #[test]
+    fn soname_stem_rejects_malformed_and_non_numeric() {
+        // No `.so.` marker at all -> exact-only.
+        assert_eq!(soname_stem("radosgw"), None);
+        // Non-numeric major.
+        assert_eq!(soname_stem("foo.so.debug.anything"), None);
+        assert_eq!(soname_stem("libx.so.2x"), None);
+        // Empty component right after `.so.`.
+        assert_eq!(soname_stem("libfoo.so..junk"), None);
+        // Numeric major but a non-numeric ("backup") minor.
+        assert_eq!(soname_stem("libfoo.so.2.backup"), None);
+        // Trailing dot leaves an empty final component.
+        assert_eq!(soname_stem("libfoo.so.2."), None);
+    }
+
+    #[test]
+    fn ambiguous_soname_fallback_is_rejected_not_guessed() {
+        // Two patch-level modules share the same major stem. A symlink-style key
+        // must NOT resolve to an arbitrary one -- it is reported ambiguous and
+        // treated as unresolved by the Option-returning lookups.
+        let info = DwarfInfo {
+            version: Some("v".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: BTreeMap::from([
+                (
+                    "librados.so.2.0.0".to_string(),
+                    module_with(&[("Objecter::_send_op", 1)], &[]),
+                ),
+                (
+                    "librados.so.2.1.0".to_string(),
+                    module_with(&[("Objecter::_send_op", 2)], &[]),
+                ),
+            ]),
+        };
+
+        match info.match_module("librados.so.2") {
+            ModuleMatch::Ambiguous(mut keys) => {
+                keys.sort();
+                assert_eq!(keys, vec!["librados.so.2.0.0", "librados.so.2.1.0"]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        // Every Option-returning lookup treats ambiguity as unresolved (no pick).
+        assert!(info.resolve_module("librados.so.2").is_none());
+        assert!(!info.has_module("librados.so.2"));
+        assert_eq!(
+            info.function_addr("librados.so.2", "Objecter::_send_op"),
+            None
+        );
+        // An EXACT key still resolves that specific module (exact wins).
+        assert_eq!(
+            info.function_addr("librados.so.2.1.0", "Objecter::_send_op"),
+            Some(2)
+        );
     }
 
     #[test]

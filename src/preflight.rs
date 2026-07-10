@@ -8,7 +8,9 @@ use tracing::warn;
 
 use crate::{
     cli::Cli,
-    dwarf_json::{module_key_for_path, DwarfInfo, DwarfSummary, RGW_PROCESS_AUTHENTICATED},
+    dwarf_json::{
+        module_key_for_path, DwarfInfo, DwarfSummary, ModuleMatch, RGW_PROCESS_AUTHENTICATED,
+    },
     targets::{self, ProbeTargets},
 };
 
@@ -114,6 +116,8 @@ fn validate_file_path(label: &str, path: &Path) -> Result<()> {
 }
 
 fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<()> {
+    reject_ambiguous_modules(dwarf, targets)?;
+
     let rados_modules = rados_module_keys(targets)
         .into_iter()
         .filter(|module| module_supports_rados(dwarf, module))
@@ -128,6 +132,30 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
 
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
     require_function(dwarf, &radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
+    Ok(())
+}
+
+/// Fail preflight when a discovered target's module key resolves ambiguously --
+/// two or more artifact modules share its `lib<name>.so.<major>` soname stem
+/// (e.g. both `librados.so.2.0.0` and `librados.so.2.1.0` present). The
+/// soname-fallback deliberately refuses to guess in that case, so rather than
+/// silently skipping the probe we surface an explicit, named error naming the
+/// ambiguous keys and the offending target path.
+fn reject_ambiguous_modules(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<()> {
+    for path in targets.all_paths() {
+        let Some(key) = module_key_for_path(path) else {
+            continue;
+        };
+        if let ModuleMatch::Ambiguous(candidates) = dwarf.match_module(&key) {
+            bail!(
+                "target {} (module key {key}) matches multiple DWARF modules sharing its soname \
+                 stem: {}; refusing to pick one -- pass an explicit --*-path to the versioned \
+                 real file or prune the duplicate module from the artifact",
+                path.display(),
+                candidates.join(", ")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -387,6 +415,54 @@ mod tests {
         };
 
         validate_dwarf_targets(&dwarf, &targets).unwrap();
+    }
+
+    #[test]
+    fn rejects_ambiguous_soname_module_match() {
+        // Two patch-level librados modules share the `librados.so.2` stem. A
+        // symlink-basename target (/tmp/librados.so.2 -> canonicalize fails ->
+        // key `librados.so.2`) must NOT be resolved to an arbitrary one; preflight
+        // fails with an explicit error naming both candidates.
+        let json = format!(
+            r#"{{
+              "version": "18.2.8-1jammy",
+              "arch": "amd64",
+              "librados.so.2.0.0": {{
+                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2}},
+                "func2vf": {{
+                  "{SEND_OP}": {{"var_fields": {send}}},
+                  "{FINISH_OP}": {{"var_fields": {finish}}}
+                }}
+              }},
+              "librados.so.2.1.0": {{
+                "func2pc": {{"{SEND_OP}": 3, "{FINISH_OP}": 4}},
+                "func2vf": {{
+                  "{SEND_OP}": {{"var_fields": {send}}},
+                  "{FINISH_OP}": {{"var_fields": {finish}}}
+                }}
+              }},
+              "radosgw": {{
+                "func2pc": {{"{GET_HANDLER}": 5}},
+                "func2vf": {{"{GET_HANDLER}": {{"var_fields": {handler}}}}}
+              }}
+            }}"#,
+            send = var_fields(SEND_OP_FIELDS),
+            finish = var_fields(FINISH_OP_FIELDS),
+            handler = var_fields(GET_HANDLER_FIELDS),
+        );
+        let dwarf = DwarfInfo::from_str(&json).unwrap();
+        let targets = ProbeTargets {
+            librados: "/tmp/librados.so.2".into(),
+            librbd: None,
+            libceph_common: "/tmp/libceph-common.so.2".into(),
+            radosgw: "/tmp/radosgw".into(),
+        };
+
+        let err = validate_dwarf_targets(&dwarf, &targets).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("multiple DWARF modules"), "message: {msg}");
+        assert!(msg.contains("librados.so.2.0.0"), "message: {msg}");
+        assert!(msg.contains("librados.so.2.1.0"), "message: {msg}");
     }
 
     #[test]
