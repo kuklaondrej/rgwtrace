@@ -14,24 +14,83 @@ use gimli::{
 use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::{debug, warn};
 
+#[cfg(test)]
+use crate::dwarf_json::dtor_variant_rank;
 use crate::dwarf_json::{
-    basename, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
+    basename, provenance_rank, DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson,
+    VarLocationJson, REQ_STATE_DTOR, RGWREST_GET_HANDLER, RGW_PROCESS_AUTHENTICATED,
+    RGW_RADOS_OPERATE, RGW_RADOS_OPERATE_OVERLOADS, RGW_RADOS_OPERATE_READ,
+    RGW_RADOS_OPERATE_WRITE, VARIANT_PROVENANCE_FUNCTIONS,
 };
 
 const PROBE_FUNCTIONS: &[&str] = &[
     "Objecter::_send_op",
     "Objecter::_finish_op",
-    "RGWREST::get_handler",
-    "rgw_process_authenticated",
+    RGWREST_GET_HANDLER,
+    RGW_PROCESS_AUTHENTICATED,
+    REQ_STATE_DTOR,
+    RGW_RADOS_OPERATE_READ,
+    RGW_RADOS_OPERATE_WRITE,
 ];
 const OBJECTER_PROBE_FUNCTIONS: &[&str] = &["Objecter::_send_op", "Objecter::_finish_op"];
-const RGW_PROBE_FUNCTIONS: &[&str] = &["RGWREST::get_handler", "rgw_process_authenticated"];
+const RGW_PROBE_FUNCTIONS: &[&str] = &[
+    RGWREST_GET_HANDLER,
+    RGW_PROCESS_AUTHENTICATED,
+    REQ_STATE_DTOR,
+    RGW_RADOS_OPERATE_READ,
+    RGW_RADOS_OPERATE_WRITE,
+];
 const PROBE_FUNCTION_LEAF_NAMES: &[&str] = &[
     "_send_op",
     "_finish_op",
     "get_handler",
-    "rgw_process_authenticated",
+    RGW_PROCESS_AUTHENTICATED,
+    "~req_state",
+    RGW_RADOS_OPERATE,
 ];
+
+/// The probe KEYS a definition whose demangled name is `demangled` could be a
+/// definition of, restricted to the `wanted` set.
+///
+/// For every function but one the demangled name IS the key, so this is just an
+/// equality filter and the previous `wanted.contains(&fullname)` behavior is
+/// preserved exactly. The exception is `rgw_rados_operate`: its two overloads are
+/// distinct out-of-line functions at distinct addresses that collapse onto ONE
+/// demangled name (the argument list, the only thing that distinguishes them, is
+/// stripped by `demangle_function_name`). Such a definition is therefore a
+/// candidate for BOTH synthetic overload keys, and [`definition_ranking`] -- which
+/// consults the MANGLED linkage name -- accepts it for exactly one of them and
+/// rejects it for the other. That is what makes the binding deterministic instead
+/// of "whichever overload the symbol table lists first".
+fn probe_keys<'w>(demangled: &str, wanted: &[&'w str]) -> Vec<&'w str> {
+    if demangled == RGW_RADOS_OPERATE {
+        return wanted
+            .iter()
+            .copied()
+            .filter(|key| RGW_RADOS_OPERATE_OVERLOADS.contains(key))
+            .collect();
+    }
+    wanted
+        .iter()
+        .copied()
+        // The SYNTHETIC overload keys are reachable ONLY through the branch above.
+        // They are not C++ names and can never equal a demangled one (in practice
+        // `demangle_function_name` truncates at `(`, so it cannot even produce a
+        // string of this shape) -- but a definition must never be able to claim one
+        // of them by name alone, bypassing the mangled-signature gate that is the
+        // entire point of splitting the overloads.
+        .filter(|key| !RGW_RADOS_OPERATE_OVERLOADS.contains(key))
+        .filter(|key| *key == demangled)
+        .collect()
+}
+
+/// Whether `name` is a DEMANGLED name that could belong to a probe function.
+/// Distinct from `PROBE_FUNCTIONS.contains(..)`, which since Phase B also holds
+/// the two SYNTHETIC `rgw_rados_operate` overload keys -- names that never appear
+/// in a binary and can never equal a demangled name.
+fn is_probe_demangled_name(name: &str) -> bool {
+    PROBE_FUNCTIONS.contains(&name) || name == RGW_RADOS_OPERATE
+}
 const OBJECTER_FINISH_OP_FIELDS: &[&[&str]] = &[
     &["op", "tid"],
     &["this", "monc", "global_id"],
@@ -55,12 +114,93 @@ const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
     &["s", "trans_id", "_M_string_length"],
     &["s", "trans_id", "_M_dataplus", "_M_p"],
 ];
-/// Cross-thread re-seed bridge (design Stage 3). A single-element path names the
-/// `req_state* s` parameter's own pointer value with no member access -- the
-/// raw-pointer descriptor. It resolves to the parameter's entry-PC register
-/// location plus one sentinel field, and is dropped when the parameter is not
-/// register-resident at entry (see `probe_function_var_fields`).
-const RGW_PROCESS_AUTHENTICATED_FIELDS: &[&[&str]] = &[&["s"]];
+/// Cross-thread re-seed bridge (design Stage 3) AND the multi-key bridge's second
+/// key.
+///
+/// * `s`  -- the `req_state* s` parameter's own pointer value with no member
+///   access (the raw-pointer descriptor): the request's CANONICAL bridge key.
+/// * `op` -- the `RGWOp*& op` parameter: the ALTERNATE bridge key. RGW threads a
+///   `const DoutPrefixProvider*` down its data path, and inside an op's
+///   `execute()` that pointer is usually the RGWOp (`this`), not the req_state,
+///   so without this key the per-submit re-seed misses the whole op data path.
+///
+/// `op` is a REFERENCE to a pointer, so its descriptor is the reference-to-pointer
+/// shape (one `{offset:0, pointer:true}` field): the register holds an `RGWOp**`
+/// and the BPF handler reads the pointee exactly once. It is emitted ONLY when
+/// DWARF PROVES both halves of that claim -- the parameter really is
+/// `reference -> pointer -> RGWOp`, and `RGWOp` really does inherit
+/// `DoutPrefixProvider` at offset 0 -- and it is OPTIONAL: a build where the proof
+/// fails keeps the `s` descriptor and simply loses the alternate key (see
+/// `optional_trailing_var_field`).
+const RGW_PROCESS_AUTHENTICATED_FIELDS: &[&[&str]] = &[&["s"], &["op"]];
+/// Request-END probe. `req_state::~req_state`'s only parameter is the implicit
+/// `this` (a `req_state*`), named by the same single-element raw-pointer path:
+/// the pointer's own value, register-only, no dereference. The register itself
+/// comes from DWARF -- nothing here assumes the x86-64 `rdi`/DWARF-reg-5 ABI.
+const REQ_STATE_DTOR_FIELDS: &[&[&str]] = &[&["this"]];
+/// PHASE B. Both `rgw_rados_operate` overloads take the request's
+/// `const DoutPrefixProvider *dpp` as their FIRST parameter, and that pointer --
+/// used purely as an opaque identity token, never dereferenced -- is all the BPF
+/// handler needs. Same single-element raw-pointer path shape as the two above.
+///
+/// The name here is documentation only: these two functions resolve the parameter
+/// POSITIONALLY (see [`FIRST_PARAM_PROBE_FUNCTIONS`]), so an upstream rename of
+/// `dpp` cannot silently disable the feature.
+const RGW_RADOS_OPERATE_FIELDS: &[&[&str]] = &[&["dpp"]];
+
+/// The C++ types the cross-thread bridge's KEY IDENTITY depends on.
+///
+/// The whole design rests on one claim: the `const DoutPrefixProvider* dpp` RGW
+/// passes to `rgw_rados_operate` for a request is NUMERICALLY EQUAL to a pointer
+/// we captured elsewhere (its `req_state*`, or the `RGWOp*` executing it). That is
+/// only true if the `DoutPrefixProvider` base subobject sits at offset 0 of both
+/// types. On every Ceph build seen so far it does (both use single inheritance
+/// with `DoutPrefixProvider` as the first and only base) -- but "seen so far" is
+/// not a proof, and a nonzero base offset would silently key the bridge on a
+/// pointer that is not the dpp. So it is VERIFIED in DWARF, per build, and the
+/// features that depend on it are disabled (loudly) when the verification fails.
+const REQ_STATE_TYPE: &str = "req_state";
+const RGW_OP_TYPE: &str = "RGWOp";
+const DOUT_PREFIX_PROVIDER_TYPE: &str = "DoutPrefixProvider";
+
+/// The `DoutPrefixProvider` base offsets proven from this module's DWARF, gathered
+/// while the probe parameters are resolved (each is reached through a parameter we
+/// already have to walk, so no extra scan of the type tree is needed).
+///
+/// `None` means "not proven", which is treated exactly like "proven nonzero":
+/// fail closed.
+#[derive(Clone, Copy, Debug, Default)]
+struct DppFacts {
+    /// From `req_state* s` (get_handler / rgw_process_authenticated) or the
+    /// destructor's `this`. Gates the per-submit re-seed probes entirely: without
+    /// it, a `dpp` cannot be assumed to be a `req_state*`.
+    req_state_base: Option<i64>,
+    /// From the `RGWOp*& op` parameter of rgw_process_authenticated. Gates only
+    /// the ALTERNATE bridge key.
+    rgw_op_base: Option<i64>,
+}
+
+impl DppFacts {
+    /// Is a request's `dpp` provably its `req_state*`?
+    fn req_state_dpp_identity_holds(&self) -> bool {
+        self.req_state_base == Some(0)
+    }
+}
+
+/// Probe functions whose single raw-pointer parameter is resolved POSITIONALLY --
+/// the subprogram's FIRST `DW_TAG_formal_parameter` -- rather than by name.
+///
+/// Only the `rgw_rados_operate` overloads, and only because their mangled
+/// signature has ALREADY been checked (`rados_operate_overload` requires arg0 to
+/// be `const DoutPrefixProvider*` before the definition is accepted at all). Given
+/// that proof, position 0 IS the dpp, so we do not additionally have to trust that
+/// upstream keeps spelling the parameter `dpp` -- nor risk a name lookup matching
+/// a same-named local `DW_TAG_variable` inside an optimized body.
+///
+/// Every other probe function keeps name-based lookup: a member function's first
+/// formal parameter is the implicit `this`, and `RGWREST::get_handler` wants its
+/// third parameter, so position 0 means nothing there.
+const FIRST_PARAM_PROBE_FUNCTIONS: &[&str] = &[RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE];
 
 #[allow(dead_code)]
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
@@ -261,25 +401,120 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     #[allow(deprecated)]
     let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
-    let mut func2pc = symbol_function_pcs(&debug_file, wanted);
-    for (function, pc) in symbol_function_pcs(&file, wanted) {
-        func2pc.entry(function).or_insert(pc);
+    let mut resolved = symbol_function_pcs(&debug_file, wanted);
+    for (function, ranked) in symbol_function_pcs(&file, wanted) {
+        resolved.entry(function).or_insert(ranked);
     }
     // Load every compilation unit once and share it across both extraction
     // passes; cross-CU reference resolution needs all units resident anyway.
     let index = DwarfUnitIndex::load(&dwarf)?;
-    if !has_all_functions(&func2pc, wanted) {
-        for (function, pc) in function_pcs(&dwarf, &index, wanted)? {
-            func2pc.entry(function).or_insert(pc);
+    if !has_all_functions(&resolved, wanted) {
+        for (function, ranked) in function_pcs(&dwarf, &index, wanted)? {
+            resolved.entry(function).or_insert(ranked);
         }
     }
-    let func2vf = function_var_fields(&dwarf, &index, wanted)?;
+    let (mut func2vf, dpp) = function_var_fields(&dwarf, &index, wanted)?;
+    // Refuse any function whose name resolved to two equally valid definitions at
+    // different addresses -- there is nothing left to choose between them, so we
+    // must not pick. Drop the descriptors with the address: an hprobe slot filled
+    // for a probe that cannot attach is only a trap for the next reader.
+    for function in drop_ambiguous_definitions(&mut resolved) {
+        func2vf.remove(&function);
+    }
+    apply_dpp_identity_gates(module_name, &dpp, &mut resolved, &mut func2vf);
+    // Split the resolved definitions into the address map and the PROVENANCE map.
+    // The latter records the mangled linkage name the address came from, which is
+    // the only evidence an importer of this artifact has that a
+    // `req_state::~req_state` address is the complete/base destructor (D1/D2) and
+    // not the deleting one (D0), and that an `rgw_rados_operate` address is the
+    // overload it is filed under rather than the other one. Written for every
+    // function whose demangled name is ambiguous; see
+    // `VARIANT_PROVENANCE_FUNCTIONS`.
+    let func2linkage = provenance_linkage_names(&resolved);
+    let func2pc = ranked_pcs_into_pcs(resolved);
 
     Ok(DwarfModule {
         build_id,
         func2pc,
         func2vf,
+        func2linkage,
     })
+}
+
+/// Drop every probe whose soundness depends on a `DoutPrefixProvider` identity
+/// this build's DWARF did NOT prove, and say so.
+///
+/// The per-submit re-seed reads `rgw_rados_operate`'s `dpp` and looks its VALUE up
+/// in the (pointer, tgid) bridge. That is only meaningful if a request's dpp is
+/// numerically its `req_state*` -- i.e. if `req_state`'s `DoutPrefixProvider` base
+/// is at offset 0. If we cannot prove that from this binary's DWARF, the probes
+/// are not attached at all: a bridge keyed on the wrong pointer would not merely
+/// miss, it could (astronomically unlikely, but the whole tool's value is that it
+/// does not gamble) collide with another live request's key. Refuse instead.
+///
+/// The alternate `RGWOp*` key is gated the same way, but independently: losing it
+/// only costs coverage (ops submitted under an RGWOp dpp go uncorrelated), so the
+/// re-seed itself stays attached.
+fn apply_dpp_identity_gates(
+    module_name: &str,
+    dpp: &DppFacts,
+    resolved: &mut BTreeMap<String, RankedPc>,
+    func2vf: &mut BTreeMap<String, FunctionVarFields>,
+) {
+    if !dpp.req_state_dpp_identity_holds() {
+        let had_operate = RGW_RADOS_OPERATE_OVERLOADS
+            .iter()
+            .any(|function| resolved.contains_key(*function) || func2vf.contains_key(*function));
+        for function in RGW_RADOS_OPERATE_OVERLOADS {
+            resolved.remove(*function);
+            func2vf.remove(*function);
+        }
+        if had_operate {
+            warn!(
+                module = module_name,
+                req_state_dpp_base = ?dpp.req_state_base,
+                "could not prove that {REQ_STATE_TYPE} inherits {DOUT_PREFIX_PROVIDER_TYPE} at \
+                 offset 0 in this build's DWARF, so a request's `dpp` cannot be assumed to be its \
+                 req_state*. The per-submit cross-thread re-seed ({RGW_RADOS_OPERATE}) is DISABLED \
+                 for this artifact: RADOS ops submitted after a coroutine migration will not be \
+                 correlated"
+            );
+        }
+    }
+
+    // The `op` descriptor is emitted only when the RGWOp identity is proven, so a
+    // single var_field here means the proof failed (or the parameter was not
+    // register-resident). Either way the operator must hear about it: it is the
+    // difference between correlating the op data path and not.
+    if func2vf
+        .get(RGW_PROCESS_AUTHENTICATED)
+        .is_some_and(|vars| vars.var_fields.len() < RGW_PROCESS_AUTHENTICATED_FIELDS.len())
+    {
+        warn!(
+            module = module_name,
+            rgw_op_dpp_base = ?dpp.rgw_op_base,
+            "no usable `{RGW_OP_TYPE}*&` descriptor for {RGW_PROCESS_AUTHENTICATED} (parameter not \
+             register-resident at entry, or {RGW_OP_TYPE}'s {DOUT_PREFIX_PROVIDER_TYPE} base not \
+             provably at offset 0). The cross-thread bridge will key requests by their req_state* \
+             ONLY, so RADOS ops submitted under an RGWOp dpp -- most of an op's data path -- stay \
+             uncorrelated"
+        );
+    }
+}
+
+/// The mangled linkage names to export alongside `func2pc`, for the functions
+/// whose demangled name cannot identify a single definition.
+fn provenance_linkage_names(resolved: &BTreeMap<String, RankedPc>) -> BTreeMap<String, String> {
+    resolved
+        .iter()
+        .filter(|(function, _)| VARIANT_PROVENANCE_FUNCTIONS.contains(&function.as_str()))
+        .filter_map(|(function, ranked)| {
+            ranked
+                .linkage
+                .as_ref()
+                .map(|linkage| (function.clone(), linkage.clone()))
+        })
+        .collect()
 }
 
 fn probe_functions_for_module(module_name: &str) -> &'static [&'static str] {
@@ -522,8 +757,8 @@ fn function_pcs<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     wanted: &[&str],
-) -> Result<BTreeMap<String, u64>> {
-    let mut result = BTreeMap::new();
+) -> Result<BTreeMap<String, RankedPc>> {
+    let mut result: BTreeMap<String, RankedPc> = BTreeMap::new();
     for unit_index in 0..index.main_len() {
         let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
@@ -548,8 +783,9 @@ fn function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     wanted: &[&str],
-) -> Result<BTreeMap<String, FunctionVarFields>> {
+) -> Result<(BTreeMap<String, FunctionVarFields>, DppFacts)> {
     let mut result = BTreeMap::new();
+    let mut facts = DppFacts::default();
     for unit_index in 0..index.main_len() {
         let unit = index.unit(unit_index);
         let mut tree = unit.entries_tree(None)?;
@@ -562,14 +798,16 @@ fn function_var_fields<R: Reader>(
             &mut Vec::new(),
             &mut result,
             wanted,
+            &mut facts,
         )?;
         if has_all_functions(&result, wanted) {
             break;
         }
     }
-    Ok(result)
+    Ok((result, facts))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
@@ -578,6 +816,7 @@ fn collect_function_var_fields<R: Reader>(
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
     wanted: &[&str],
+    facts: &mut DppFacts,
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
@@ -592,14 +831,27 @@ fn collect_function_var_fields<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, index, unit_index, entry, scopes)? {
-            if !wanted.contains(&fullname.as_str()) {
-                continue;
-            }
-            if let Some(paths) = probe_field_paths(&fullname) {
-                if let Some(fields) =
-                    probe_function_var_fields(dwarf, index, unit_index, entry, &fullname, paths)?
-                {
-                    result.entry(fullname).or_insert(fields);
+            // One DIE can be a candidate for several probe keys (the two
+            // `rgw_rados_operate` overloads share a demangled name); the
+            // linkage-name gate below accepts it for exactly one of them.
+            for key in probe_keys(&fullname, wanted) {
+                // Same acceptance gate as `collect_function_pcs`: a rejected
+                // definition (the D0 destructor, or the OTHER rgw_rados_operate
+                // overload) must not supply this key's var_fields either. Its
+                // register would often happen to agree, but the descriptors and
+                // the probed address must come from the same definition --
+                // otherwise a descriptor would silently describe a different
+                // function body.
+                let linkage_names = entry_linkage_names(dwarf, index, unit_index, entry)?;
+                if definition_rank(key, &linkage_names).is_none() {
+                    continue;
+                }
+                if let Some(paths) = probe_field_paths(key) {
+                    if let Some(fields) = probe_function_var_fields(
+                        dwarf, index, unit_index, entry, key, paths, facts,
+                    )? {
+                        result.entry(key.to_string()).or_insert(fields);
+                    }
                 }
             }
         }
@@ -611,7 +863,9 @@ fn collect_function_var_fields<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_var_fields(dwarf, index, unit_index, child, scopes, result, wanted)?;
+        collect_function_var_fields(
+            dwarf, index, unit_index, child, scopes, result, wanted, facts,
+        )?;
         if has_all_functions(result, wanted) {
             break;
         }
@@ -623,6 +877,24 @@ fn collect_function_var_fields<R: Reader>(
     Ok(())
 }
 
+/// Is var_field `idx` of `function` OPTIONAL, i.e. may extraction drop it and keep
+/// the descriptors before it?
+///
+/// Exactly one descriptor is: `rgw_process_authenticated`'s `RGWOp*& op` (slot 41,
+/// the ALTERNATE bridge key). Every other descriptor is all-or-nothing, because a
+/// missing one would shift no slot but would leave its BPF reader with a zeroed
+/// VarField and no way to tell. The `op` slot is different by construction: its
+/// BPF reader looks the slot up separately and treats an absent one as "this build
+/// has no alternate key", which is a supported, counted, warned-about degradation
+/// (`RGWTRACE_DIAG_RGWOP_KEY_UNRESOLVED`).
+///
+/// Optional descriptors must be TRAILING (an optional slot in the middle would
+/// shift every later slot's key), which `debug_assert` below pins.
+fn optional_trailing_var_field(function: &str, idx: usize) -> bool {
+    function == RGW_PROCESS_AUTHENTICATED && idx == 1
+}
+
+#[allow(clippy::too_many_arguments)]
 fn probe_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
@@ -630,6 +902,7 @@ fn probe_function_var_fields<R: Reader>(
     function: &DebuggingInformationEntry<R>,
     function_name: &str,
     paths: &[&[&str]],
+    facts: &mut DppFacts,
 ) -> Result<Option<FunctionVarFields>> {
     let unit = index.unit(unit_index);
     let Some(pc) = entry_pc(dwarf, unit, function)? else {
@@ -641,24 +914,48 @@ fn probe_function_var_fields<R: Reader>(
     };
     let mut var_fields = Vec::new();
 
-    for path in paths {
+    for (idx, path) in paths.iter().enumerate() {
+        debug_assert!(
+            !optional_trailing_var_field(function_name, idx) || idx + 1 == paths.len(),
+            "an optional var_field must be trailing, or it would shift later hprobe slot keys"
+        );
+        // A descriptor that cannot be resolved (or, for `op`, cannot be PROVEN)
+        // either drops the whole function -- the all-or-nothing rule -- or, for an
+        // optional trailing slot, drops just itself and everything after it.
+        macro_rules! reject {
+            ($($reason:tt)*) => {{
+                debug!(function = function_name, idx, $($reason)*);
+                if optional_trailing_var_field(function_name, idx) {
+                    break;
+                }
+                return Ok(None);
+            }};
+        }
+
         let Some(variable_name) = path.first() else {
-            debug!(
-                function = function_name,
-                "native DWARF probe rejected: empty field path"
-            );
-            return Ok(None);
+            reject!("native DWARF probe rejected: empty field path");
         };
-        let Some(variable) =
+        // The `rgw_rados_operate` overloads resolve their `dpp` by POSITION (first
+        // formal parameter), which their already-verified mangled signature proves
+        // is the `const DoutPrefixProvider*`. Every other probe resolves by name.
+        let variable = if FIRST_PARAM_PROBE_FUNCTIONS.contains(&function_name) {
+            find_first_formal_parameter(index, unit_index, function)?
+        } else {
             find_function_variable(dwarf, index, unit_index, function, variable_name)?
-        else {
-            debug!(
-                function = function_name,
+        };
+        let Some(variable) = variable else {
+            reject!(
                 variable = *variable_name,
                 "native DWARF probe rejected: missing variable"
             );
-            return Ok(None);
         };
+
+        // Record the DoutPrefixProvider base offsets the cross-thread bridge's key
+        // identity depends on, from the parameter we just resolved. Done here
+        // because every type we need is reachable from a parameter we already have
+        // to walk -- no separate scan of the type tree.
+        record_dpp_facts(dwarf, index, function_name, variable_name, variable, facts)?;
+
         let variable_unit = index.unit(variable.unit);
         let variable_entry = variable_unit.entry(variable.offset)?;
         let Some(location) = variable_location(
@@ -669,44 +966,50 @@ fn probe_function_var_fields<R: Reader>(
             pc,
         )?
         else {
-            debug!(
-                function = function_name,
+            reject!(
                 variable = *variable_name,
                 "native DWARF probe rejected: missing variable location"
             );
-            return Ok(None);
         };
-        // Raw-pointer descriptor (design Stage 3): a single-element path names
-        // the parameter's own pointer value with no member access. The BPF
-        // fetch_param_ptr reads it register-only, so a stack-located descriptor
-        // cannot encode it -- drop the whole function's var_fields
-        // (all-or-nothing, like every other probe) and fall back to baseline.
-        // The emitted field is the sentinel {offset:0, pointer:false}.
+        // Single-element path => a POINTER-VALUED descriptor, not a member-deref
+        // chain: the parameter's own value (raw pointer), or -- for the `RGWOp*& op`
+        // reference -- the value it refers to. Both are read from the ABI register at
+        // entry, so a stack-located descriptor cannot encode either.
         if path.len() == 1 {
             if location.stack {
-                debug!(
-                    function = function_name,
+                reject!(
                     variable = *variable_name,
-                    "native DWARF probe rejected: raw-pointer parameter is stack-located at entry"
+                    "native DWARF probe rejected: pointer parameter is stack-located at entry"
                 );
-                return Ok(None);
+            }
+            // The `RGWOp*& op` reference: emitted only once DWARF proves the type
+            // chain (reference -> pointer -> RGWOp) AND that RGWOp's
+            // DoutPrefixProvider base is at offset 0, i.e. that the pointer we are
+            // about to key the bridge on is the very pointer RGW passes as the dpp.
+            // Anything else and we key nothing rather than key a guess.
+            let pointer_ref = function_name == RGW_PROCESS_AUTHENTICATED && *variable_name == "op";
+            if pointer_ref && facts.rgw_op_base != Some(0) {
+                reject!(
+                    variable = *variable_name,
+                    rgw_op_dpp_base = ?facts.rgw_op_base,
+                    "native DWARF probe rejected: cannot prove the parameter is an RGWOp*& whose \
+                     DoutPrefixProvider base is at offset 0"
+                );
             }
             var_fields.push(VarFieldJson {
                 location,
                 fields: vec![FieldJson {
                     offset: 0,
-                    pointer: false,
+                    pointer: pointer_ref,
                 }],
             });
             continue;
         }
         let Some(fields) = translate_field_path(dwarf, index, variable, path)? else {
-            debug!(
-                function = function_name,
+            reject!(
                 path = path.join("."),
                 "native DWARF probe rejected: field path translation failed"
             );
-            return Ok(None);
         };
         var_fields.push(VarFieldJson { location, fields });
     }
@@ -714,18 +1017,483 @@ fn probe_function_var_fields<R: Reader>(
     Ok(Some(FunctionVarFields { var_fields }))
 }
 
+/// Record whichever `DoutPrefixProvider` base offset this probe parameter can
+/// prove. Each fact is recorded once, from the first parameter that reaches its
+/// type; every path here is a parameter the extractor already resolves for its own
+/// descriptor, so nothing extra is walked.
+fn record_dpp_facts<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    function_name: &str,
+    variable_name: &str,
+    variable: DieRef<R::Offset>,
+    facts: &mut DppFacts,
+) -> Result<()> {
+    match (function_name, variable_name) {
+        // `req_state* s` (get_handler, rgw_process_authenticated) and the
+        // destructor's implicit `this` are all `req_state*`.
+        (RGWREST_GET_HANDLER, "s")
+        | (RGW_PROCESS_AUTHENTICATED, "s")
+        | (REQ_STATE_DTOR, "this")
+            if facts.req_state_base.is_none() =>
+        {
+            facts.req_state_base = pointee_dpp_base_offset(dwarf, index, variable, REQ_STATE_TYPE)?;
+        }
+        (RGW_PROCESS_AUTHENTICATED, "op") if facts.rgw_op_base.is_none() => {
+            facts.rgw_op_base = rgw_op_reference_dpp_base_offset(dwarf, index, variable)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The `DoutPrefixProvider` base offset of the class a `T*` parameter points at,
+/// requiring that class to be named `expected`. `None` if any link of the chain is
+/// not what we require -- fail closed, never assume.
+fn pointee_dpp_base_offset<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    variable: DieRef<R::Offset>,
+    expected: &str,
+) -> Result<Option<i64>> {
+    let Some(pointer) = die_type(index, variable)? else {
+        return Ok(None);
+    };
+    let pointer = peel_type_qualifiers(index, pointer)?;
+    if index.entry(pointer)?.tag() != gimli::DW_TAG_pointer_type {
+        return Ok(None);
+    }
+    let Some(class) = die_type(index, pointer)? else {
+        return Ok(None);
+    };
+    named_class_dpp_base_offset(dwarf, index, class, expected)
+}
+
+/// The `DoutPrefixProvider` base offset of `RGWOp`, reached through the
+/// `RGWOp*& op` parameter -- i.e. a REFERENCE to a POINTER to `RGWOp`.
+///
+/// Proving this chain is what makes the single `bpf_probe_read_user` the BPF
+/// handler performs on that register safe and meaningful: the register holds an
+/// `RGWOp**`, so exactly one read yields the `RGWOp*`, and offset 0 means that
+/// pointer is numerically the `dpp` RGW passes for this op.
+fn rgw_op_reference_dpp_base_offset<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    variable: DieRef<R::Offset>,
+) -> Result<Option<i64>> {
+    let Some(reference) = die_type(index, variable)? else {
+        return Ok(None);
+    };
+    let reference = peel_type_qualifiers(index, reference)?;
+    if index.entry(reference)?.tag() != gimli::DW_TAG_reference_type {
+        return Ok(None);
+    }
+    let Some(pointer) = die_type(index, reference)? else {
+        return Ok(None);
+    };
+    let pointer = peel_type_qualifiers(index, pointer)?;
+    if index.entry(pointer)?.tag() != gimli::DW_TAG_pointer_type {
+        return Ok(None);
+    }
+    let Some(class) = die_type(index, pointer)? else {
+        return Ok(None);
+    };
+    named_class_dpp_base_offset(dwarf, index, class, RGW_OP_TYPE)
+}
+
+/// The offset of `class`'s DIRECT `DoutPrefixProvider` base, if `class` IS the
+/// type `expected` -- where "is" means its FULLY-QUALIFIED DWARF path matches, not
+/// merely its unqualified name.
+///
+/// WHY QUALIFIED, NOT UNQUALIFIED. This function produces the PROOF that a
+/// `req_state*`/`RGWOp*` and the `DoutPrefixProvider*` RGW passes for it are the
+/// same pointer value -- the proof the entire cross-thread bridge key rests on.
+/// Matching on an unqualified name would let `namespace x { struct RGWOp; }` --
+/// an unrelated type that merely shares a name -- supply that proof, and a proof
+/// that can be satisfied by the wrong type is not a proof. The probe targets are
+/// global-scope Ceph types (`::req_state`, `::RGWOp`, `::DoutPrefixProvider`), so
+/// `expected` is a global-scope path and anything nested in a namespace or another
+/// class is REJECTED.
+///
+/// Only a DIRECT base counts. An indirect one would need its offsets summed
+/// through the whole inheritance chain, and a virtual base is not a compile-time
+/// constant offset at all -- so anything other than "names DoutPrefixProvider as
+/// its own base" returns `None` and the dependent feature is disabled rather than
+/// keyed on an offset we inferred.
+fn named_class_dpp_base_offset<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    class: DieRef<R::Offset>,
+    expected: &str,
+) -> Result<Option<i64>> {
+    let class = peel_type_qualifiers(index, class)?;
+    if !is_global_type_named(dwarf, index, class, expected)? {
+        return Ok(None);
+    }
+    // The DIE we reached may be a DECLARATION (`DW_AT_declaration`, no children) in
+    // this CU; the base list lives on the DEFINITION, which may be in another unit.
+    let Some(definition) = type_definition_die(dwarf, index, class)? else {
+        return Ok(None);
+    };
+    dpp_base_offset(dwarf, index, definition)
+}
+
+/// Offset of the `DoutPrefixProvider` base of the (fully defined) class `typedie`,
+/// or `None` when it does not inherit it directly.
+///
+/// The base's identity is checked the same way as the derived class's: by
+/// FULLY-QUALIFIED path. A `namespace x { class DoutPrefixProvider {...}; }` base
+/// would otherwise be accepted as the real one and hand us an offset for the wrong
+/// inheritance edge.
+fn dpp_base_offset<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
+) -> Result<Option<i64>> {
+    let unit = index.unit(typedie.unit);
+    let mut tree = unit.entries_tree(Some(typedie.offset))?;
+    let root = tree.root()?;
+    let mut children = root.children();
+    while let Some(child) = children.next()? {
+        let entry = child.entry();
+        if entry.tag() != gimli::DW_TAG_inheritance {
+            continue;
+        }
+        let base_ref = DieRef {
+            unit: typedie.unit,
+            offset: entry.offset(),
+        };
+        let Some(base) = die_type(index, base_ref)? else {
+            continue;
+        };
+        let base = peel_type_qualifiers(index, base)?;
+        if !is_global_type_named(dwarf, index, base, DOUT_PREFIX_PROVIDER_TYPE)? {
+            continue;
+        }
+        // DWARF 5 5.7.3: a member (here, a base class) whose location coincides with
+        // the start of the containing entity may omit DW_AT_data_member_location, so
+        // an absent attribute means offset 0. A virtual base encodes its location as
+        // an expression rather than a constant; `member_offset` yields None for those
+        // shapes too, and we must not read that as "0" -- so distinguish explicitly.
+        let Some(attr) = entry.attr(gimli::DW_AT_data_member_location)? else {
+            return Ok(Some(0));
+        };
+        return Ok(attr_offset(unit, attr.value())?.map(i64::from));
+    }
+    Ok(None)
+}
+
+/// Is `typedie` the GLOBAL-SCOPE class/struct named `name` -- i.e. is its
+/// fully-qualified DWARF path exactly `[name]`?
+///
+/// Fails closed on everything else: a different tag, an unnamed DIE, or a type
+/// nested in any namespace or class (`x::RGWOp` is NOT `::RGWOp`).
+fn is_global_type_named<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
+    name: &str,
+) -> Result<bool> {
+    let entry = index.entry(typedie)?;
+    if !matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+    ) {
+        return Ok(false);
+    }
+    drop(entry);
+    Ok(qualified_type_path(dwarf, index, typedie)?.as_deref() == Some(&[name.to_string()]))
+}
+
+/// The FULLY-QUALIFIED DWARF path of a type DIE: the names of every enclosing
+/// namespace/class scope, outermost first, then its own name.
+///
+/// `None` when the DIE has no `DW_AT_name`, or when it cannot be located in its own
+/// unit. An identity that cannot be stated is one we refuse to claim.
+///
+/// The scope stack is built exactly the way the function-name walker builds one
+/// (`scope_name` -- namespaces and classes only), so `::RGWOp` and
+/// `namespace x { struct RGWOp; }` produce DIFFERENT paths and can never be
+/// confused for one another.
+fn qualified_type_path<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
+) -> Result<Option<Vec<String>>> {
+    let unit = index.unit(typedie.unit);
+    let dwarf = dwarf_for(dwarf, index, typedie.unit);
+
+    // DFS with a depth-tracked scope stack: a scope pushed at depth d encloses
+    // every DIE deeper than d, and is popped as soon as the walk returns to d.
+    let mut scopes: Vec<(isize, String)> = Vec::new();
+    let mut depth = 0isize;
+    let mut entries = unit.entries();
+    while let Some((delta, entry)) = entries.next_dfs()? {
+        depth += delta;
+        scopes.retain(|(scope_depth, _)| *scope_depth < depth);
+
+        if entry.offset() == typedie.offset {
+            let Some(name) = die_name(dwarf, unit, entry)? else {
+                return Ok(None);
+            };
+            let mut path: Vec<String> = scopes.into_iter().map(|(_, name)| name).collect();
+            path.push(name);
+            return Ok(Some(path));
+        }
+
+        if let Some(scope) = scope_name(dwarf, unit, entry)? {
+            scopes.push((depth, scope));
+        }
+    }
+    Ok(None)
+}
+
+/// The DEFINITION DIE of `typedie`: itself when it is not a mere declaration, or
+/// the non-declaration DIE in any unit whose FULLY-QUALIFIED PATH is identical.
+///
+/// THE WHOLE POINT IS THE QUALIFIED PATH. This used to accept the first
+/// non-declaration class/struct with a matching UNQUALIFIED name in any unit, which
+/// meant a `namespace x { struct RGWOp { ... }; }` anywhere in the binary could
+/// supply the `DoutPrefixProvider`-at-offset-0 "proof" for the real `::RGWOp` --
+/// binding the bridge key to a type identity that was never actually established.
+/// Matching the full path makes the definition the SAME TYPE as the declaration
+/// (the one-definition rule then guarantees there is only one such definition), and
+/// a declaration whose definition is nowhere to be found yields `None`, which
+/// disables the dependent probe rather than probing on an unproven identity.
+///
+/// A definition that lives only in a `.debug_types` type unit (a `DW_AT_signature`
+/// declaration) is not in the CU index and therefore is not found: that too fails
+/// closed.
+fn type_definition_die<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    typedie: DieRef<R::Offset>,
+) -> Result<Option<DieRef<R::Offset>>> {
+    let unit = index.unit(typedie.unit);
+    let entry = unit.entry(typedie.offset)?;
+    if !entry_flag(&entry, gimli::DW_AT_declaration)? {
+        return Ok(Some(typedie));
+    }
+    drop(entry);
+
+    let Some(path) = qualified_type_path(dwarf, index, typedie)? else {
+        return Ok(None);
+    };
+    for unit_index in 0..index.len() {
+        let unit = index.unit(unit_index);
+        let mut tree = unit.entries_tree(None)?;
+        let root = tree.root()?;
+        let mut scopes = Vec::new();
+        if let Some(found) =
+            find_type_definition(dwarf, index, unit_index, root, &path, &mut scopes)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
+/// Find the non-declaration class/struct DIE whose enclosing scopes plus own name
+/// equal `path`, anywhere under `node`.
+fn find_type_definition<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
+    node: EntriesTreeNode<R>,
+    path: &[String],
+    scopes: &mut Vec<String>,
+) -> Result<Option<DieRef<R::Offset>>> {
+    let unit = index.unit(unit_index);
+    let dwarf = dwarf_for(dwarf, index, unit_index);
+    let entry = node.entry();
+    let is_definition = matches!(
+        entry.tag(),
+        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+    ) && !entry_flag(entry, gimli::DW_AT_declaration)?;
+    let name = die_name(dwarf, unit, entry)?;
+
+    if is_definition {
+        if let Some(name) = &name {
+            // The candidate's identity is its scope stack plus its own name. Only an
+            // exact match on the WHOLE path is the same type.
+            if path.len() == scopes.len() + 1
+                && path[..scopes.len()] == scopes[..]
+                && path[scopes.len()] == *name
+            {
+                return Ok(Some(DieRef {
+                    unit: unit_index,
+                    offset: entry.offset(),
+                }));
+            }
+        }
+    }
+
+    let scope = scope_name(dwarf, unit, entry)?;
+    if let Some(scope) = &scope {
+        scopes.push(scope.clone());
+    }
+    let mut children = node.children();
+    while let Some(child) = children.next()? {
+        if let Some(found) = find_type_definition(dwarf, index, unit_index, child, path, scopes)? {
+            if scope.is_some() {
+                scopes.pop();
+            }
+            return Ok(Some(found));
+        }
+    }
+    if scope.is_some() {
+        scopes.pop();
+    }
+    Ok(None)
+}
+
 fn probe_field_paths(function: &str) -> Option<&'static [&'static [&'static str]]> {
     match function {
         "Objecter::_send_op" => Some(OBJECTER_SEND_OP_FIELDS),
         "Objecter::_finish_op" => Some(OBJECTER_FINISH_OP_FIELDS),
-        "RGWREST::get_handler" => Some(RGWREST_GET_HANDLER_FIELDS),
-        "rgw_process_authenticated" => Some(RGW_PROCESS_AUTHENTICATED_FIELDS),
+        RGWREST_GET_HANDLER => Some(RGWREST_GET_HANDLER_FIELDS),
+        RGW_PROCESS_AUTHENTICATED => Some(RGW_PROCESS_AUTHENTICATED_FIELDS),
+        REQ_STATE_DTOR => Some(REQ_STATE_DTOR_FIELDS),
+        RGW_RADOS_OPERATE_READ | RGW_RADOS_OPERATE_WRITE => Some(RGW_RADOS_OPERATE_FIELDS),
         _ => None,
     }
 }
 
-fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<String, u64> {
-    let mut result = BTreeMap::new();
+/// Rank of a candidate definition (an ELF symbol or a DWARF subprogram DIE) as
+/// THE definition to probe for `function`, given every mangled linkage name
+/// reachable from it. Lower ranks win; `None` rejects the candidate outright.
+///
+/// This exists because two of our probe targets have a demangled name that does
+/// NOT identify a single function:
+///
+/// * C++ destructors. The Itanium ABI emits up to three and ALL THREE DEMANGLE TO
+///   THE SAME NAME (`req_state::~req_state`), so a plain demangled-name match
+///   binds the probe to whichever variant the symbol table or DWARF lists first --
+///   which, on the g++ output we checked, is the WRONG one (D0 precedes D1/D2 both
+///   in `.symtab` order and in DIE order).
+/// * The two `rgw_rados_operate` overloads (Phase B). `demangle_function_name`
+///   strips the argument list, i.e. exactly the thing that distinguishes them, so
+///   both definitions present themselves as `rgw_rados_operate` and a first-match
+///   bind would attach one probe to an arbitrary one of them and never see the
+///   other -- silently losing either every RADOS read or every RADOS write.
+///
+/// Both are resolved the same way: by the MANGLED linkage name, via
+/// [`provenance_rank`]. Every other probe function has a single definition, so it
+/// ranks 0 and the existing first-one-wins behavior is preserved exactly.
+fn definition_rank(function: &str, linkage_names: &[String]) -> Option<u8> {
+    definition_ranking(function, linkage_names).map(|(rank, _)| rank)
+}
+
+/// The accepted rank of this candidate definition together with the MANGLED
+/// linkage name that earned it, for functions whose provenance must be exported
+/// ([`VARIANT_PROVENANCE_FUNCTIONS`]). The name is `None` for every other
+/// function: their demangled name identifies a single definition, so there is
+/// nothing to prove and nothing to record.
+fn definition_ranking(function: &str, linkage_names: &[String]) -> Option<(u8, Option<String>)> {
+    if !VARIANT_PROVENANCE_FUNCTIONS.contains(&function) {
+        return Some((0, None));
+    }
+    linkage_names
+        .iter()
+        .filter_map(|name| provenance_rank(function, name).map(|rank| (rank, name)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(rank, name)| (rank, Some(name.clone())))
+}
+
+/// Insert `pc` for `function` keeping the best-ranked candidate seen so far.
+/// Equal ranks keep the FIRST candidate, which preserves the previous
+/// `or_insert` behavior for every single-definition probe function.
+///
+/// The rank is a tie-break between ACCEPTED destructor variants, never a
+/// correctness gate (rejection is): D1 and D2 differ only for classes with
+/// virtual bases, and `req_state`'s only base (`DoutPrefixProvider`) is
+/// non-virtual at offset 0, so the two are emitted as aliases of one address on
+/// both verified Ceph builds. Settling on D2 (e.g. when the DWARF scan short
+/// circuits before an aliased D1 DIE) therefore probes the same instruction.
+///
+/// AMBIGUITY. For the provenance functions (and only for them -- every other probe
+/// has one definition by construction) an equal-rank candidate at a DIFFERENT
+/// address is a genuine ambiguity: two definitions the mangled-name rule considers
+/// equally valid, at two addresses, so nothing distinguishes them and any pick
+/// would be a coin flip. That is precisely the "silently grabbed the wrong
+/// overload" failure this whole mechanism exists to prevent, so instead of
+/// preferring one we MARK the entry and drop it entirely (loudly) at the end of
+/// extraction. Fail closed: no address, no probe, an explicit warning.
+fn insert_ranked_pc(
+    result: &mut BTreeMap<String, RankedPc>,
+    function: String,
+    rank: u8,
+    pc: u64,
+    linkage: Option<String>,
+) {
+    match result.get_mut(&function) {
+        Some(existing) if existing.rank < rank => {}
+        Some(existing) if existing.rank == rank => {
+            if existing.pc != pc && VARIANT_PROVENANCE_FUNCTIONS.contains(&function.as_str()) {
+                existing.ambiguous = true;
+            }
+        }
+        _ => {
+            result.insert(
+                function,
+                RankedPc {
+                    rank,
+                    pc,
+                    linkage,
+                    ambiguous: false,
+                },
+            );
+        }
+    }
+}
+
+/// A resolved function PC, the rank of the definition it came from (see
+/// [`definition_rank`]), and -- for the functions whose demangled name is
+/// ambiguous -- the MANGLED linkage name that proves which definition it is.
+/// Ranks are dropped once resolution finishes; the linkage name is exported as
+/// `func2linkage` so an importer can re-verify the definition.
+#[derive(Clone)]
+struct RankedPc {
+    rank: u8,
+    pc: u64,
+    linkage: Option<String>,
+    /// Two equally-ranked definitions at different addresses were seen for this
+    /// function. Nothing can choose between them, so the entry is DISCARDED rather
+    /// than resolved to an arbitrary one. See [`insert_ranked_pc`].
+    ambiguous: bool,
+}
+
+/// Drop every function whose definition could not be resolved unambiguously, and
+/// say so. Returns the discarded keys so the caller can drop their var_fields too:
+/// a descriptor without a proven address is dead weight at best, and at worst
+/// would populate an hprobe slot for a probe that must not attach.
+fn drop_ambiguous_definitions(resolved: &mut BTreeMap<String, RankedPc>) -> Vec<String> {
+    let ambiguous: Vec<String> = resolved
+        .iter()
+        .filter(|(_, ranked)| ranked.ambiguous)
+        .map(|(function, _)| function.clone())
+        .collect();
+    for function in &ambiguous {
+        resolved.remove(function);
+        warn!(
+            function = %function,
+            "refusing to resolve an address: two equally valid definitions with different \
+             addresses share this name, and nothing can prove which one to probe; the probe will \
+             not attach (fail closed)"
+        );
+    }
+    ambiguous
+}
+
+fn ranked_pcs_into_pcs(ranked: BTreeMap<String, RankedPc>) -> BTreeMap<String, u64> {
+    ranked
+        .into_iter()
+        .map(|(function, ranked)| (function, ranked.pc))
+        .collect()
+}
+
+fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<String, RankedPc> {
+    let mut result: BTreeMap<String, RankedPc> = BTreeMap::new();
     for symbol in file.symbols().chain(file.dynamic_symbols()) {
         if !symbol.is_definition()
             || !symbol.is_global()
@@ -740,8 +1508,23 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
         let Some(function) = demangle_function_name(name) else {
             continue;
         };
-        if wanted.contains(&function.as_str()) {
-            result.entry(function).or_insert(symbol.address());
+        for key in probe_keys(&function, wanted) {
+            // The symbol's own MANGLED name is the only evidence of WHICH
+            // definition this address belongs to -- the demangled name is identical
+            // for every destructor variant, and for both `rgw_rados_operate`
+            // overloads. A rejected definition contributes NO address, so it can
+            // never be probed by accident, and the accepted one's mangled name is
+            // carried along as the address's provenance.
+            let Some((rank, linkage)) = definition_ranking(key, &[name.to_string()]) else {
+                continue;
+            };
+            insert_ranked_pc(
+                &mut result,
+                key.to_string(),
+                rank,
+                symbol.address(),
+                linkage,
+            );
         }
     }
     result
@@ -753,7 +1536,7 @@ fn collect_function_pcs<R: Reader>(
     unit_index: usize,
     node: EntriesTreeNode<R>,
     scopes: &mut Vec<String>,
-    result: &mut BTreeMap<String, u64>,
+    result: &mut BTreeMap<String, RankedPc>,
     wanted: &[&str],
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
@@ -769,9 +1552,19 @@ fn collect_function_pcs<R: Reader>(
 
     if entry.tag() == gimli::DW_TAG_subprogram {
         for fullname in function_names(dwarf, index, unit_index, entry, scopes)? {
-            if wanted.contains(&fullname.as_str()) {
+            for key in probe_keys(&fullname, wanted) {
+                // Rank this DIE as a definition of `key`. For a destructor and for
+                // the two `rgw_rados_operate` overloads the rank comes from the
+                // MANGLED linkage names reachable from the DIE, so neither the
+                // deleting dtor (D0, which g++ emits BEFORE D1/D2 in both DIE and
+                // symbol order) nor the wrong overload can win by position. The
+                // winning mangled name travels with the address as its provenance.
+                let linkage_names = entry_linkage_names(dwarf, index, unit_index, entry)?;
+                let Some((rank, linkage)) = definition_ranking(key, &linkage_names) else {
+                    continue;
+                };
                 if let Some(pc) = entry_pc(dwarf, unit, entry)? {
-                    result.entry(fullname).or_insert(pc);
+                    insert_ranked_pc(result, key.to_string(), rank, pc, linkage);
                 }
             }
         }
@@ -793,6 +1586,56 @@ fn collect_function_pcs<R: Reader>(
         scopes.pop();
     }
     Ok(())
+}
+
+/// Every mangled `DW_AT_linkage_name` reachable from `entry`: its own, plus the
+/// ones on its `DW_AT_abstract_origin` / `DW_AT_specification` targets (an
+/// optimized concrete subprogram carries its own linkage name and inherits the
+/// declaration's through the origin chain).
+fn entry_linkage_names<R: Reader>(
+    dwarf: &Dwarf<R>,
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
+    entry: &DebuggingInformationEntry<R>,
+) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    if let Some(name) = linkage_name(
+        dwarf_for(dwarf, index, unit_index),
+        index.unit(unit_index),
+        entry,
+    )? {
+        names.push(name);
+    }
+    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+        let Some(origin) = index.referenced_die(unit_index, entry, attr)? else {
+            continue;
+        };
+        let origin_unit = index.unit(origin.unit);
+        let origin_entry = origin_unit.entry(origin.offset)?;
+        if let Some(name) = linkage_name(
+            dwarf_for(dwarf, index, origin.unit),
+            origin_unit,
+            &origin_entry,
+        )? {
+            names.push(name);
+        }
+        // A concrete instance points at an abstract instance, which in turn
+        // points at the class-scope declaration that carries the linkage name.
+        if let Some(specification) =
+            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
+        {
+            let spec_unit = index.unit(specification.unit);
+            let spec_entry = spec_unit.entry(specification.offset)?;
+            if let Some(name) = linkage_name(
+                dwarf_for(dwarf, index, specification.unit),
+                spec_unit,
+                &spec_entry,
+            )? {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
 }
 
 fn function_names<R: Reader>(
@@ -853,7 +1696,7 @@ fn add_referenced_function_names<R: Reader>(
 
     let already_qualified = names[before..]
         .iter()
-        .any(|name| PROBE_FUNCTIONS.contains(&name.as_str()));
+        .any(|name| is_probe_demangled_name(name));
     if !already_qualified {
         if let Some(name) = die_name(referenced_dwarf, referenced_unit, &referenced_entry)? {
             if PROBE_FUNCTION_LEAF_NAMES.contains(&name.as_str()) {
@@ -1307,6 +2150,63 @@ fn find_child_entry_by_name<'unit, R: Reader>(
             return Ok(Some(unit.entry(entry.offset())?));
         }
     }
+    Ok(None)
+}
+
+/// The subprogram's FIRST `DW_TAG_formal_parameter`, in DIE order (which is
+/// declaration order, per DWARF 5 §3.3.4). Used only by
+/// [`FIRST_PARAM_PROBE_FUNCTIONS`], where the mangled signature has already proven
+/// what parameter 0 is, so the position -- not the name -- is the identity.
+///
+/// Follows the same `DW_AT_abstract_origin` / `DW_AT_specification` chain as
+/// [`find_function_variable`]: an optimized concrete subprogram frequently carries
+/// no parameter DIEs of its own and inherits them from the abstract instance.
+/// Deliberately ignores `DW_TAG_variable` (a local, never a parameter) and
+/// `DW_TAG_unspecified_parameters` (the `...` of a variadic).
+fn find_first_formal_parameter<R: Reader>(
+    index: &DwarfUnitIndex<R>,
+    unit_index: usize,
+    function: &DebuggingInformationEntry<R>,
+) -> Result<Option<DieRef<R::Offset>>> {
+    let mut candidates = vec![DieRef {
+        unit: unit_index,
+        offset: function.offset(),
+    }];
+
+    if let Some(origin) =
+        index.referenced_die(unit_index, function, gimli::DW_AT_abstract_origin)?
+    {
+        candidates.push(origin);
+        let origin_unit = index.unit(origin.unit);
+        let origin_entry = origin_unit.entry(origin.offset)?;
+        if let Some(specification) =
+            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
+        {
+            candidates.push(specification);
+        }
+    }
+    if let Some(specification) =
+        index.referenced_die(unit_index, function, gimli::DW_AT_specification)?
+    {
+        candidates.push(specification);
+    }
+
+    for parent in candidates {
+        let unit = index.unit(parent.unit);
+        let mut tree = unit.entries_tree(Some(parent.offset))?;
+        let root = tree.root()?;
+        let mut children = root.children();
+        while let Some(child) = children.next()? {
+            let entry = child.entry();
+            if entry.tag() == gimli::DW_TAG_formal_parameter {
+                return Ok(Some(DieRef {
+                    unit: parent.unit,
+                    offset: entry.offset(),
+                }));
+            }
+        }
+    }
+
     Ok(None)
 }
 
@@ -2339,43 +3239,77 @@ mod tests {
         Ok(false)
     }
 
-    /// Free function taking `req_state* s` as its 4th parameter -- the Stage 3
-    /// re-seed site. Built at `-O1 -fno-inline` (not `-O0`) so the parameter is
-    /// register-resident at entry and `variable_location` can decode it; at
-    /// `-O0` this toolchain emits `DW_OP_fbreg`/CFA locations the decoder
-    /// rejects, matching the other optimized fixtures.
+    /// The Stage-3 re-seed site, with RGW's real parameter shapes: `req_state* s`
+    /// (the CANONICAL bridge key) and `RGWOp*& op` -- a REFERENCE to a pointer,
+    /// which is the ALTERNATE bridge key and the identity RGW actually passes as
+    /// the `dpp` at most call sites in an op's data path.
+    ///
+    /// Both `req_state` and `RGWOp` derive from `DoutPrefixProvider` (first and
+    /// only base, so the base subobject is at offset 0) exactly as they do in Ceph.
+    /// That property is the whole premise of the bridge, and extraction verifies it
+    /// here rather than assuming it.
+    ///
+    /// Built at `-O1 -fno-inline` (not `-O0`) so the parameters are
+    /// register-resident at entry and `variable_location` can decode them; at `-O0`
+    /// this toolchain emits `DW_OP_fbreg`/CFA locations the decoder rejects,
+    /// matching the other optimized fixtures.
     fn compile_rgw_process_authenticated_fixture() -> Option<std::path::PathBuf> {
-        compile_cpp_sources_flags_only(
+        compile_rgw_process_authenticated_source(
             "rgw-process-authenticated-fixture",
-            &[(
-                "rgw-process-authenticated-fixture",
-                r#"
-                struct req_state { unsigned long id; };
-                struct RGWHandler_REST { int x; };
-                struct RGWOp { int y; };
-                struct RGWRequest { int z; };
+            "class RGWOp : public DoutPrefixProvider { public: int y; };",
+        )
+    }
+
+    /// The same site, but with an `RGWOp` whose `DoutPrefixProvider` base is NOT at
+    /// offset 0 (another non-empty base comes first). A build like this breaks the
+    /// premise "the RGWOp* we read IS the dpp RGW passes", so the alternate key
+    /// must be refused rather than keyed on a pointer that is off by a constant.
+    fn compile_rgw_process_authenticated_offset_base_fixture() -> Option<std::path::PathBuf> {
+        compile_rgw_process_authenticated_source(
+            "rgw-process-authenticated-offset-base-fixture",
+            "struct FirstBase { virtual ~FirstBase() {} long pad; };\n\
+             class RGWOp : public FirstBase, public DoutPrefixProvider { public: int y; };",
+        )
+    }
+
+    fn compile_rgw_process_authenticated_source(
+        name: &str,
+        rgw_op_decl: &str,
+    ) -> Option<std::path::PathBuf> {
+        let source = format!(
+            r#"
+                struct DoutPrefixProvider {{
+                  virtual ~DoutPrefixProvider() {{}}
+                  virtual int get_id() const {{ return 0; }}
+                }};
+                struct req_state : public DoutPrefixProvider {{
+                  unsigned long id;
+                  int get_id() const override {{ return (int)id; }}
+                }};
+                {rgw_op_decl}
+                struct RGWHandler_REST {{ int x; }};
+                struct RGWRequest {{ int z; }};
                 static volatile unsigned long sink;
                 __attribute__((noinline)) void rgw_process_authenticated(
-                    RGWHandler_REST* handler, RGWOp** op, RGWRequest* req,
-                    req_state* s) {
+                    RGWHandler_REST* handler, RGWOp*& op, RGWRequest* req,
+                    req_state* s) {{
                   sink += handler->x;
-                  sink += (*op)->y;
+                  sink += op->y;
                   sink += req->z;
                   sink += s->id;
-                }
-                int main() {
-                  RGWHandler_REST h{1};
-                  RGWOp o{2};
+                }}
+                int main() {{
+                  RGWHandler_REST h{{1}};
+                  RGWOp o; o.y = 2;
                   RGWOp* op = &o;
-                  RGWRequest r{3};
-                  req_state s{4};
-                  rgw_process_authenticated(&h, &op, &r, &s);
+                  RGWRequest r{{3}};
+                  req_state s; s.id = 4;
+                  rgw_process_authenticated(&h, op, &r, &s);
                   return 0;
-                }
-                "#,
-            )],
-            &["-g", "-O1", "-fno-inline"],
-        )
+                }}
+                "#
+        );
+        compile_cpp_sources_flags_only(name, &[(name, &source)], &["-g", "-O1", "-fno-inline"])
     }
 
     #[test]
@@ -2387,9 +3321,9 @@ mod tests {
         let info = from_paths(&[binary.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
         // Function PC must resolve (proves the free-function name is matched).
-        assert!(module.func2pc.contains_key("rgw_process_authenticated"));
+        assert!(module.func2pc.contains_key(RGW_PROCESS_AUTHENTICATED));
 
-        let Some(fields) = module.func2vf.get("rgw_process_authenticated") else {
+        let Some(fields) = module.func2vf.get(RGW_PROCESS_AUTHENTICATED) else {
             // Toolchain did not emit a decodable register location for `s` at
             // entry; the all-or-nothing raw-pointer path then drops the
             // var_fields. Announce loudly so this does not look like a pass.
@@ -2400,10 +3334,437 @@ mod tests {
             return;
         };
 
-        // Exactly one var_field: the raw-pointer descriptor. Its location is a
-        // register (never stack), and its single field is the sentinel
-        // {offset:0, pointer:false} -- the parameter's own value, no member
-        // access.
+        // Slot 40: the raw-pointer descriptor for `req_state* s`. Register-located
+        // (never stack), one sentinel field {offset:0, pointer:false} -- the
+        // parameter's own value, no member access, no read.
+        let raw = &fields.var_fields[0];
+        assert!(raw.location.reg >= 0, "descriptor must be register-located");
+        assert!(!raw.location.stack, "descriptor must not be stack-located");
+        assert_eq!(raw.fields.len(), 1);
+        assert_eq!(raw.fields[0].offset, 0);
+        assert!(!raw.fields[0].pointer);
+    }
+
+    #[test]
+    fn extracts_the_rgw_op_reference_descriptor_that_carries_the_alternate_bridge_key() {
+        // THE key that makes Phase B recover anything. RGW passes the executing
+        // RGWOp -- not the req_state -- as the `dpp` at most call sites in an op's
+        // data path, so the request must ALSO be keyed by its RGWOp*. That pointer
+        // is only reachable through the `RGWOp*& op` parameter: a REFERENCE to a
+        // pointer, so the register holds an RGWOp** and the BPF handler must read
+        // the pointee exactly once.
+        //
+        // The descriptor therefore carries {offset:0, pointer:true} -- distinct from
+        // the raw-pointer shape, because keying the bridge on the ADDRESS OF the
+        // caller's pointer variable instead of the RGWOp would silently correlate
+        // nothing.
+        let Some(binary) = compile_rgw_process_authenticated_fixture() else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get(RGW_PROCESS_AUTHENTICATED) else {
+            eprintln!(
+                "SKIPPED extracts_the_rgw_op_reference_descriptor_that_carries_the_alternate_bridge_key: \
+                 toolchain did not emit a decodable register location"
+            );
+            return;
+        };
+
+        assert_eq!(
+            fields.var_fields.len(),
+            2,
+            "both bridge keys must be extractable: the req_state* and the RGWOp*&"
+        );
+        let op = &fields.var_fields[1];
+        assert!(op.location.reg >= 0, "descriptor must be register-located");
+        assert!(!op.location.stack);
+        assert_eq!(op.fields.len(), 1);
+        assert_eq!(op.fields[0].offset, 0);
+        assert!(
+            op.fields[0].pointer,
+            "the reference must be marked as needing exactly one deref to reach the RGWOp*"
+        );
+        // The two descriptors name DIFFERENT parameters (different registers), so
+        // the alternate key is not just the req_state* under another name.
+        assert_ne!(fields.var_fields[0].location.reg, op.location.reg);
+    }
+
+    #[test]
+    fn refuses_the_rgw_op_key_when_its_dpp_base_is_not_at_offset_zero() {
+        // FAIL CLOSED ON AN UNPROVEN IDENTITY. The alternate key is only sound
+        // because `(DoutPrefixProvider*)op == (void*)op`, i.e. because RGWOp's
+        // DoutPrefixProvider base sits at offset 0. On a build where it does not,
+        // the pointer we can read is NOT the dpp RGW passes -- so we must not key
+        // the bridge on it. (A wrong key would mostly just miss; but "mostly" is not
+        // a property this tool is allowed to rely on, and a pointer that is off by a
+        // constant is exactly the kind of thing that collides with something real.)
+        //
+        // The req_state descriptor SURVIVES: losing the alternate key costs coverage
+        // (ops submitted under an RGWOp dpp), not correctness.
+        let Some(binary) = compile_rgw_process_authenticated_offset_base_fixture() else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get(RGW_PROCESS_AUTHENTICATED) else {
+            eprintln!(
+                "SKIPPED refuses_the_rgw_op_key_when_its_dpp_base_is_not_at_offset_zero: \
+                 toolchain did not emit a decodable register location"
+            );
+            return;
+        };
+
+        assert_eq!(
+            fields.var_fields.len(),
+            1,
+            "an RGWOp whose DoutPrefixProvider base is not at offset 0 must yield NO alternate-key \
+             descriptor, and must not break the req_state one"
+        );
+        assert!(
+            !fields.var_fields[0].fields[0].pointer,
+            "slot 40 stays the raw pointer"
+        );
+    }
+
+    /// A two-TU fixture that puts a DECOY type -- `namespace decoy { struct RGWOp; }`
+    /// -- in the very CU that contains `rgw_process_authenticated`, while the REAL
+    /// `::RGWOp` is only DECLARED there and DEFINED in the other TU.
+    ///
+    /// This is the shape that makes the offset-0 proof falsifiable. A parameter whose
+    /// type is an incomplete `::RGWOp` reaches a DECLARATION DIE, so the extractor has
+    /// to go looking for the definition in another unit -- and that search is where
+    /// binding by UNQUALIFIED name goes wrong: `decoy::RGWOp` is a definition, it is
+    /// named `RGWOp`, and it appears FIRST (it is in the same CU as the function).
+    ///
+    /// `real_rgw_op_bases` decides what the REAL `::RGWOp` inherits, which is the only
+    /// difference between the two tests below.
+    ///
+    /// The binary is named `radosgw` because the module key (and hence the RGW probe
+    /// function set) is derived from the binary's basename.
+    fn compile_namespaced_decoy_rgw_op_fixture(
+        real_rgw_op_bases: &str,
+    ) -> Option<std::path::PathBuf> {
+        let dpp = "struct DoutPrefixProvider {\n\
+                     virtual ~DoutPrefixProvider() {}\n\
+                     virtual int get_id() const { return 0; }\n\
+                   };";
+        // The CU with the probe function: the decoy is DEFINED here (with its
+        // DoutPrefixProvider base at offset 0 -- i.e. it would satisfy the proof),
+        // and the real ::RGWOp is only declared.
+        let radosgw = format!(
+            r#"
+                {dpp}
+                struct req_state : public DoutPrefixProvider {{
+                  unsigned long id;
+                  int get_id() const override {{ return (int)id; }}
+                }};
+                namespace decoy {{
+                  struct RGWOp : public DoutPrefixProvider {{ int y; }};
+                }}
+                struct RGWOp;
+                struct RGWHandler_REST {{ int x; }};
+                struct RGWRequest {{ int z; }};
+                static volatile unsigned long sink;
+                __attribute__((noinline)) void rgw_process_authenticated(
+                    RGWHandler_REST* handler, RGWOp*& op, RGWRequest* req,
+                    req_state* s) {{
+                  sink += handler->x;
+                  sink += (unsigned long)(void*)op;
+                  sink += req->z;
+                  sink += s->id;
+                }}
+                int touch_real_rgw_op();
+                int main() {{
+                  RGWHandler_REST h{{1}};
+                  RGWRequest r{{3}};
+                  req_state s; s.id = 4;
+                  RGWOp* op = 0;
+                  decoy::RGWOp d; d.y = 7;
+                  sink += d.get_id();
+                  rgw_process_authenticated(&h, op, &r, &s);
+                  return touch_real_rgw_op();
+                }}
+                "#
+        );
+        // The other CU: the real ::RGWOp's DEFINITION.
+        let other = format!(
+            r#"
+                {dpp}
+                struct FirstBase {{ virtual ~FirstBase() {{}} long pad; }};
+                struct RGWOp {real_rgw_op_bases} {{ int y; }};
+                static volatile int real_sink;
+                int touch_real_rgw_op() {{
+                  RGWOp o; o.y = 1;
+                  real_sink += o.y;
+                  return o.get_id();
+                }}
+                "#
+        );
+        compile_cpp_sources_flags_only(
+            "radosgw",
+            &[("probe_unit", &radosgw), ("other_unit", &other)],
+            &["-g", "-O1", "-fno-inline"],
+        )
+    }
+
+    #[test]
+    fn a_namespaced_same_named_type_cannot_supply_the_offset_zero_proof() {
+        // THE UNSOUND PROOF. The `RGWOp*` bridge key is only legitimate because
+        // `(DoutPrefixProvider*)op == (void*)op` -- i.e. because ::RGWOp inherits
+        // DoutPrefixProvider at offset 0. That proof used to be obtained by resolving
+        // the declaration DIE to "the first non-declaration class/struct with a
+        // matching UNQUALIFIED name in any unit", which means a completely unrelated
+        // `namespace decoy { struct RGWOp : DoutPrefixProvider {}; }` could supply it.
+        // A proof that the wrong type can satisfy is not a proof.
+        //
+        // Here the REAL ::RGWOp puts DoutPrefixProvider at a NON-ZERO offset, while
+        // the decoy puts it at 0. Binding by unqualified name reads the decoy's 0 and
+        // EMITS the key -- keying the bridge on a pointer that is not the dpp. Binding
+        // by fully-qualified DIE path reads the real type's nonzero offset and
+        // REFUSES the key.
+        let Some(binary) = compile_namespaced_decoy_rgw_op_fixture(
+            ": public FirstBase, public DoutPrefixProvider",
+        ) else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.get("radosgw").expect("radosgw module");
+        let Some(fields) = module.func2vf.get(RGW_PROCESS_AUTHENTICATED) else {
+            eprintln!(
+                "SKIPPED a_namespaced_same_named_type_cannot_supply_the_offset_zero_proof: \
+                 toolchain did not emit a decodable register location"
+            );
+            return;
+        };
+
+        assert_eq!(
+            fields.var_fields.len(),
+            1,
+            "a namespaced type that merely SHARES the name `RGWOp` must not satisfy the \
+             DoutPrefixProvider-at-offset-0 proof for ::RGWOp -- the alternate bridge key must be \
+             refused, leaving only the req_state* descriptor"
+        );
+        assert!(!fields.var_fields[0].fields[0].pointer);
+    }
+
+    #[test]
+    fn the_real_global_type_is_still_found_through_a_cross_unit_declaration() {
+        // The CONTROL for the test above, and the reason it proves something. Same
+        // decoy, same cross-TU declaration, same everything -- except the REAL ::RGWOp
+        // does inherit DoutPrefixProvider at offset 0. The key must now be EMITTED.
+        //
+        // Without this, the test above could pass for a boring reason (extraction
+        // failing to resolve any definition through a cross-unit declaration, so the
+        // key is refused no matter what the types say). Together, the pair shows the
+        // resolver finds the RIGHT type: it follows the declaration across units, and
+        // it refuses to be satisfied by a same-named type in a namespace.
+        let Some(binary) = compile_namespaced_decoy_rgw_op_fixture(": public DoutPrefixProvider")
+        else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.get("radosgw").expect("radosgw module");
+        let Some(fields) = module.func2vf.get(RGW_PROCESS_AUTHENTICATED) else {
+            eprintln!(
+                "SKIPPED the_real_global_type_is_still_found_through_a_cross_unit_declaration: \
+                 toolchain did not emit a decodable register location"
+            );
+            return;
+        };
+
+        assert_eq!(
+            fields.var_fields.len(),
+            2,
+            "the real ::RGWOp's definition must be resolvable through its cross-unit DECLARATION, \
+             or the qualified-path binding would just be a way of never proving anything"
+        );
+        assert!(
+            fields.var_fields[1].fields[0].pointer,
+            "the alternate key is the RGWOp*& reference descriptor"
+        );
+    }
+
+    /// A `req_state` shaped like RGW's: a polymorphic `DoutPrefixProvider` base
+    /// and an out-of-line destructor, destroyed BOTH as a stack-allocated
+    /// complete object (like `process_request` does) and through a base pointer
+    /// via `delete` (which is what forces g++ to emit the deleting dtor, D0).
+    /// The result is the exact hazard this probe has to survive: three symbols
+    /// (`D0`, `D1`, `D2`) that all demangle to `req_state::~req_state`, with D0
+    /// listed FIRST in both the symbol table and the DWARF DIE order.
+    ///
+    /// Built at `-O1 -fno-inline` for the same reason as the other raw-pointer
+    /// fixture: at `-O0` this toolchain emits `DW_OP_fbreg`/CFA locations the
+    /// decoder rejects, so `this` would not be register-resident at entry.
+    fn compile_req_state_dtor_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "req-state-dtor-fixture",
+            &[(
+                "req-state-dtor-fixture",
+                r#"
+                struct DoutPrefixProvider {
+                  virtual ~DoutPrefixProvider() {}
+                  virtual int get_id() const { return 0; }
+                };
+                struct req_state : public DoutPrefixProvider {
+                  unsigned long id;
+                  char* buf;
+                  req_state(unsigned long i);
+                  ~req_state();
+                  int get_id() const override { return (int)id; }
+                };
+                static volatile unsigned long sink;
+                req_state::req_state(unsigned long i) : id(i), buf(new char[16]) {}
+                __attribute__((noinline)) req_state::~req_state() {
+                  sink += id;
+                  delete[] buf;
+                }
+                __attribute__((noinline)) void process_request(unsigned long i) {
+                  req_state s(i);
+                  sink += s.get_id();
+                }
+                __attribute__((noinline)) void destroy(DoutPrefixProvider* p) { delete p; }
+                int main() {
+                  process_request(3);
+                  destroy(new req_state(4));
+                  return 0;
+                }
+                "#,
+            )],
+            &["-g", "-O1", "-fno-inline"],
+        )
+    }
+
+    /// Addresses of the mangled destructor symbols in `binary`, by variant.
+    fn dtor_symbol_addresses(binary: &Path) -> BTreeMap<String, u64> {
+        let data = std::fs::read(binary).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        let mut result = BTreeMap::new();
+        for symbol in file.symbols() {
+            let Ok(name) = symbol.name() else { continue };
+            if name.starts_with("_ZN9req_stateD") {
+                result.insert(name.to_string(), symbol.address());
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn binds_req_state_dtor_to_the_complete_object_destructor_not_the_deleting_one() {
+        let Some(binary) = compile_req_state_dtor_fixture() else {
+            return;
+        };
+        let symbols = dtor_symbol_addresses(&binary);
+        let (Some(&deleting), Some(&complete)) = (
+            symbols.get("_ZN9req_stateD0Ev"),
+            symbols
+                .get("_ZN9req_stateD1Ev")
+                .or_else(|| symbols.get("_ZN9req_stateD2Ev")),
+        ) else {
+            eprintln!(
+                "SKIPPED binds_req_state_dtor_to_the_complete_object_destructor_not_the_deleting_one: \
+                 toolchain did not emit both destructor variants ({symbols:?})"
+            );
+            return;
+        };
+        assert_ne!(
+            deleting, complete,
+            "fixture must actually distinguish D0 from D1/D2"
+        );
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let addr = module
+            .func2pc
+            .get(REQ_STATE_DTOR)
+            .copied()
+            .expect("req_state::~req_state must resolve");
+
+        // THE invariant: the probe binds to the complete/base object destructor
+        // that `process_request` calls, never to the deleting destructor (which
+        // only runs for heap `delete` and would fire on the wrong path). All
+        // three variants demangle identically, so a name-only match would have
+        // taken D0 here -- it is listed first.
+        assert_eq!(addr, complete);
+        assert_ne!(addr, deleting);
+    }
+
+    #[test]
+    fn binds_req_state_dtor_from_dwarf_dies_when_the_symbol_table_is_gone() {
+        // The symbol table is the FIRST resolution source, so the test above only
+        // exercises symbol ranking. Strip the destructor SYMBOLS (keeping the
+        // DWARF, and every section address, untouched) to force resolution
+        // through the DIE walk -- where g++ also emits the deleting destructor's
+        // subprogram DIE BEFORE the complete/base one, so a first-DIE-wins match
+        // would again take D0.
+        let Some(binary) = compile_req_state_dtor_fixture() else {
+            return;
+        };
+        let symbols = dtor_symbol_addresses(&binary);
+        let (Some(&deleting), Some(&complete)) = (
+            symbols.get("_ZN9req_stateD0Ev"),
+            symbols
+                .get("_ZN9req_stateD1Ev")
+                .or_else(|| symbols.get("_ZN9req_stateD2Ev")),
+        ) else {
+            return;
+        };
+
+        let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
+        let stripped = binary.with_file_name("req-state-dtor-fixture-nodtorsyms");
+        if !std::process::Command::new(&objcopy)
+            .args([
+                "--strip-symbol=_ZN9req_stateD0Ev",
+                "--strip-symbol=_ZN9req_stateD1Ev",
+                "--strip-symbol=_ZN9req_stateD2Ev",
+            ])
+            .arg(&binary)
+            .arg(&stripped)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!(
+                "SKIPPED binds_req_state_dtor_from_dwarf_dies_when_the_symbol_table_is_gone: \
+                 objcopy unavailable"
+            );
+            return;
+        }
+        assert!(
+            dtor_symbol_addresses(&stripped).is_empty(),
+            "the stripped fixture must have no destructor symbols left"
+        );
+
+        let info = from_paths(&[stripped.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let addr = module
+            .func2pc
+            .get(REQ_STATE_DTOR)
+            .copied()
+            .expect("req_state::~req_state must resolve from DWARF alone");
+
+        assert_eq!(addr, complete);
+        assert_ne!(addr, deleting);
+    }
+
+    #[test]
+    fn extracts_req_state_dtor_this_raw_pointer_descriptor_from_cpp_fixture() {
+        let Some(binary) = compile_req_state_dtor_fixture() else {
+            return;
+        };
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let Some(fields) = module.func2vf.get(REQ_STATE_DTOR) else {
+            eprintln!(
+                "SKIPPED extracts_req_state_dtor_this_raw_pointer_descriptor_from_cpp_fixture: \
+                 toolchain did not emit a decodable register location for `this`"
+            );
+            return;
+        };
+
+        // Exactly one var_field: the register-only raw-pointer descriptor for
+        // `this`, with the sentinel field (no member access, no deref). The BPF
+        // end handler reads `location.reg` and nothing else.
         assert_eq!(fields.var_fields.len(), 1);
         let raw = &fields.var_fields[0];
         assert!(raw.location.reg >= 0, "descriptor must be register-located");
@@ -2411,6 +3772,416 @@ mod tests {
         assert_eq!(raw.fields.len(), 1);
         assert_eq!(raw.fields[0].offset, 0);
         assert!(!raw.fields[0].pointer);
+    }
+
+    #[test]
+    fn exports_the_variant_provenance_of_the_req_state_dtor_address() {
+        // The address alone cannot prove which destructor variant it is, so an
+        // artifact that carries only `func2pc` leaves an importer no way to tell
+        // a D1/D2 address from a D0 one. Native extraction therefore exports the
+        // MANGLED name of the definition it chose, and that name must (a) be one
+        // of the accepted variants and (b) actually correspond to the exported
+        // address -- i.e. it is the address's provenance, not decoration.
+        let Some(binary) = compile_req_state_dtor_fixture() else {
+            return;
+        };
+        let symbols = dtor_symbol_addresses(&binary);
+        if symbols.is_empty() {
+            eprintln!(
+                "SKIPPED exports_the_variant_provenance_of_the_req_state_dtor_address: \
+                 toolchain emitted no destructor symbols"
+            );
+            return;
+        }
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let (module_key, module) = info.modules.iter().next().unwrap();
+        let addr = module
+            .func2pc
+            .get(REQ_STATE_DTOR)
+            .copied()
+            .expect("req_state::~req_state must resolve");
+        let linkage = module
+            .func2linkage
+            .get(REQ_STATE_DTOR)
+            .expect("the destructor address must carry its variant provenance");
+
+        assert!(
+            dtor_variant_rank(linkage).is_some(),
+            "exported provenance {linkage} must be an ACCEPTED destructor variant (D1/D2)"
+        );
+        assert_eq!(
+            symbols.get(linkage.as_str()),
+            Some(&addr),
+            "the exported linkage name must be the name of the exported address"
+        );
+
+        // And the import-side gate accepts what native extraction produced: the
+        // native path must never emit an artifact its own importer refuses.
+        if module.func2vf.contains_key(REQ_STATE_DTOR) {
+            assert_eq!(
+                info.request_end_probe(module_key),
+                crate::dwarf_json::RequestEndProbe::Available {
+                    addr,
+                    linkage: linkage.clone(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dtor_variant_rank_accepts_complete_and_base_but_never_deleting() {
+        // D1 (complete object) is preferred over D2 (base object); the deleting
+        // destructor D0 and GCC's DWARF-only D4 placeholder are rejected
+        // outright, so they can never supply an address.
+        assert_eq!(dtor_variant_rank("_ZN9req_stateD1Ev"), Some(0));
+        assert_eq!(dtor_variant_rank("_ZN9req_stateD2Ev"), Some(1));
+        assert_eq!(dtor_variant_rank("_ZN9req_stateD0Ev"), None);
+        assert_eq!(dtor_variant_rank("_ZN9req_stateD4Ev"), None);
+        assert_eq!(dtor_variant_rank("_ZN9req_stateD5Ev"), None);
+        // Not a destructor mangling at all.
+        assert_eq!(dtor_variant_rank("_ZN9req_state6get_idEv"), None);
+        assert_eq!(dtor_variant_rank(""), None);
+        assert_eq!(dtor_variant_rank("Ev"), None);
+    }
+
+    #[test]
+    fn definition_rank_rejects_the_deleting_dtor_and_passes_other_functions_through() {
+        // Only the destructor is ranked; every other probe function keeps the
+        // previous first-definition-wins behavior (rank 0, never rejected).
+        assert_eq!(
+            definition_rank(REQ_STATE_DTOR, &["_ZN9req_stateD1Ev".to_string()]),
+            Some(0)
+        );
+        assert_eq!(
+            definition_rank(REQ_STATE_DTOR, &["_ZN9req_stateD2Ev".to_string()]),
+            Some(1)
+        );
+        // The deleting dtor's DIE also reaches the declaration's D4 placeholder
+        // through its abstract origin; neither is acceptable, so it is rejected.
+        assert_eq!(
+            definition_rank(
+                REQ_STATE_DTOR,
+                &[
+                    "_ZN9req_stateD0Ev".to_string(),
+                    "_ZN9req_stateD4Ev".to_string()
+                ]
+            ),
+            None
+        );
+        // A destructor definition with no reachable linkage name cannot be
+        // proven to be the right variant -- reject rather than coin-flip.
+        assert_eq!(definition_rank(REQ_STATE_DTOR, &[]), None);
+        // Non-destructor probe functions are unaffected.
+        assert_eq!(definition_rank("RGWREST::get_handler", &[]), Some(0));
+        assert_eq!(
+            definition_rank(
+                "Objecter::_send_op",
+                &["_ZN8Objecter8_send_opEv".to_string()]
+            ),
+            Some(0)
+        );
+    }
+
+    // --- PHASE B: rgw_rados_operate overload extraction ---------------------
+
+    /// A radosgw-shaped fixture carrying BOTH `rgw_rados_operate` overloads with
+    /// the real Ceph namespaces, so the mangled names it produces are the ones a
+    /// real radosgw exports. The write overload is DECLARED AND DEFINED FIRST on
+    /// purpose: a first-match binder would hand its address to whichever key it
+    /// looked up first, and this fixture is what catches that.
+    ///
+    /// It also carries `req_state : DoutPrefixProvider` (with the out-of-line
+    /// destructor) because the per-submit re-seed is only extracted once DWARF
+    /// PROVES that a `req_state*` and the `dpp` RGW passes for it are the same
+    /// pointer -- i.e. that the DoutPrefixProvider base sits at offset 0. A fixture
+    /// without that type models a build we would (correctly) refuse to probe.
+    const RGW_RADOS_OPERATE_FIXTURE_SOURCE: &str = r#"
+            class DoutPrefixProvider {
+              public:
+                virtual ~DoutPrefixProvider() {}
+                virtual int get_id() const { return 0; }
+            };
+            struct req_state : public DoutPrefixProvider {
+              unsigned long id;
+              req_state(unsigned long i);
+              ~req_state();
+              int get_id() const override { return (int)id; }
+            };
+            static volatile unsigned long sink;
+            req_state::req_state(unsigned long i) : id(i) {}
+            __attribute__((noinline)) req_state::~req_state() { sink += id; }
+
+            namespace librados { inline namespace v14_2_0 {
+              class IoCtx { public: int fd; };
+              class ObjectReadOperation { public: int r; };
+              class ObjectWriteOperation { public: int w; };
+            }}
+            namespace ceph { namespace buffer { inline namespace v15_2_0 {
+              class list { public: int len; };
+            }}}
+            class optional_yield { public: int y; };
+            class CephString { public: const char* p; };
+
+            int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx,
+                                  const CephString& oid, librados::ObjectWriteOperation *op,
+                                  optional_yield y, int flags) {
+              return dpp != 0 ? ioctx.fd + op->w + y.y + flags : (int)(unsigned long)oid.p;
+            }
+
+            int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx,
+                                  const CephString& oid, librados::ObjectReadOperation *op,
+                                  ceph::buffer::list* pbl, optional_yield y, int flags) {
+              return dpp != 0 ? ioctx.fd + op->r + pbl->len + y.y + flags : (int)(unsigned long)oid.p;
+            }
+
+            int main(int argc, char**) {
+              librados::IoCtx ioctx; CephString oid; optional_yield y;
+              librados::ObjectReadOperation rop; librados::ObjectWriteOperation wop;
+              ceph::buffer::list bl;
+              req_state s((unsigned long)argc);
+              const DoutPrefixProvider* dpp = &s;
+              return rgw_rados_operate(dpp, ioctx, oid, &rop, &bl, y, argc)
+                   + rgw_rados_operate(dpp, ioctx, oid, &wop, y, argc);
+            }
+        "#;
+
+    /// Builds the fixture as a module named `radosgw` (which is what routes it
+    /// through `RGW_PROBE_FUNCTIONS`). `-O1` because at `-O0` this toolchain gives
+    /// parameters `DW_OP_fbreg`+`DW_OP_call_frame_cfa` locations that
+    /// `variable_location` deliberately rejects -- the same reason the DWZ fixture
+    /// uses `-O1`.
+    fn compile_rgw_rados_operate_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "radosgw",
+            &[("radosgw", RGW_RADOS_OPERATE_FIXTURE_SOURCE)],
+            &["-g", "-O1", "-fno-inline"],
+        )
+    }
+
+    /// The ELF address of the symbol in `binary` whose MANGLED name classifies as
+    /// `overload`. This is the ground truth the extractor's binding is checked
+    /// against: it is read straight from the symbol table, independently of any of
+    /// the code under test except the classifier itself.
+    fn symbol_address_of_overload(
+        binary: &std::path::Path,
+        overload: crate::dwarf_json::RadosOperateOverload,
+    ) -> Option<u64> {
+        let data = fs::read(binary).ok()?;
+        let file = object::File::parse(data.as_slice()).ok()?;
+        file.symbols().find_map(|symbol| {
+            let name = symbol.name().ok()?;
+            (crate::dwarf_json::rados_operate_overload(name) == Some(overload))
+                .then(|| symbol.address())
+        })
+    }
+
+    #[test]
+    fn binds_each_rados_operate_overload_to_its_own_address() {
+        // THE end-to-end overload-binding proof, on a real compiled binary with real
+        // mangled names. Both overloads exist, at different addresses, under ONE
+        // demangled name -- and the fixture defines the WRITE one first, so a
+        // first-match binder would give the read key the write overload's address.
+        let Some(binary) = compile_rgw_rados_operate_fixture() else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.get("radosgw").expect("radosgw module");
+
+        let (Some(read_addr), Some(write_addr)) = (
+            module.func2pc.get(RGW_RADOS_OPERATE_READ).copied(),
+            module.func2pc.get(RGW_RADOS_OPERATE_WRITE).copied(),
+        ) else {
+            panic!(
+                "both overloads must resolve an address; got {:?}",
+                module.func2pc.keys().collect::<Vec<_>>()
+            );
+        };
+        assert_ne!(
+            read_addr, write_addr,
+            "the two overloads are distinct functions and must not share an address"
+        );
+
+        // Ground truth from the symbol table: each key must hold the address of the
+        // symbol whose own mangled signature says it is that overload.
+        assert_eq!(
+            Some(read_addr),
+            symbol_address_of_overload(&binary, crate::dwarf_json::RadosOperateOverload::Read),
+            "the read key must hold the READ overload's address"
+        );
+        assert_eq!(
+            Some(write_addr),
+            symbol_address_of_overload(&binary, crate::dwarf_json::RadosOperateOverload::Write),
+            "the write key must hold the WRITE overload's address"
+        );
+
+        // The exported provenance must name the mangled symbol each address came
+        // from, and it must classify back to the key it is filed under -- this is
+        // what an importer re-verifies (`DwarfInfo::rados_operate_probe`).
+        for (function, overload) in [
+            (
+                RGW_RADOS_OPERATE_READ,
+                crate::dwarf_json::RadosOperateOverload::Read,
+            ),
+            (
+                RGW_RADOS_OPERATE_WRITE,
+                crate::dwarf_json::RadosOperateOverload::Write,
+            ),
+        ] {
+            let linkage = module
+                .func2linkage
+                .get(function)
+                .unwrap_or_else(|| panic!("{function} must export its mangled linkage name"));
+            assert_eq!(
+                crate::dwarf_json::rados_operate_overload(linkage),
+                Some(overload),
+                "{function}: exported provenance {linkage} does not classify back to its own key"
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_a_register_only_dpp_descriptor_for_both_overloads() {
+        // The `dpp` descriptor must be the raw-pointer sentinel: register-located,
+        // exactly one {offset: 0, pointer: false} field. The BPF handler reads
+        // `location.reg` and NOTHING else -- it never dereferences the dpp -- so any
+        // other shape is refused at import (`is_raw_pointer_descriptor`).
+        let Some(binary) = compile_rgw_rados_operate_fixture() else {
+            return;
+        };
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.get("radosgw").expect("radosgw module");
+
+        for function in [RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE] {
+            let fields = module
+                .func2vf
+                .get(function)
+                .unwrap_or_else(|| panic!("{function} must resolve a dpp descriptor"));
+            assert_eq!(fields.var_fields.len(), 1, "{function}");
+
+            let dpp = &fields.var_fields[0];
+            assert!(
+                crate::dwarf_json::is_raw_pointer_descriptor(dpp),
+                "{function}: dpp descriptor must be the register-only raw-pointer sentinel: {dpp:?}"
+            );
+            assert!(!dpp.location.stack, "{function}");
+            assert_eq!(dpp.fields.len(), 1, "{function}");
+            assert_eq!(dpp.fields[0].offset, 0, "{function}");
+            assert!(!dpp.fields[0].pointer, "{function}");
+
+            // The register is DERIVED FROM DWARF, never hardcoded -- but on x86-64
+            // arg0 is rdi, which is DWARF register 5, so that is what a correct
+            // derivation must produce here. (Cross-check of the same rule the
+            // existing probes obey: get_handler's req_state* is arg2 => rdx => 1,
+            // rgw_process_authenticated's is arg3 => rcx => 2.)
+            if cfg!(target_arch = "x86_64") {
+                assert_eq!(
+                    dpp.location.reg, 5,
+                    "{function}: dpp is arg0 => rdi => DWARF reg 5 on x86-64"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_an_ambiguous_definition_rather_than_picking_one() {
+        // Two equally-valid definitions of the SAME key at DIFFERENT addresses (a
+        // third overload added upstream that also takes an ObjectWriteOperation, an
+        // ICF'd alias, a duplicated symbol). Nothing can choose between them, so the
+        // address is DROPPED, not guessed -- the probe simply does not attach.
+        let mut resolved = BTreeMap::new();
+        insert_ranked_pc(
+            &mut resolved,
+            RGW_RADOS_OPERATE_WRITE.to_string(),
+            0,
+            0x1000,
+            Some("_ZN4mangledA".to_string()),
+        );
+        insert_ranked_pc(
+            &mut resolved,
+            RGW_RADOS_OPERATE_WRITE.to_string(),
+            0,
+            0x2000, // a DIFFERENT address, equally ranked
+            Some("_ZN4mangledB".to_string()),
+        );
+
+        assert!(resolved[RGW_RADOS_OPERATE_WRITE].ambiguous);
+        let dropped = drop_ambiguous_definitions(&mut resolved);
+        assert_eq!(dropped, vec![RGW_RADOS_OPERATE_WRITE.to_string()]);
+        assert!(
+            !resolved.contains_key(RGW_RADOS_OPERATE_WRITE),
+            "an ambiguous definition must not be resolved to an arbitrary address"
+        );
+    }
+
+    #[test]
+    fn the_same_definition_seen_twice_is_not_ambiguous() {
+        // The symbol table and the dynamic symbol table both list the same symbol,
+        // and the DWARF scan may re-find it. Same address => same definition => not
+        // an ambiguity, or every binary would lose its probes.
+        let mut resolved = BTreeMap::new();
+        for _ in 0..3 {
+            insert_ranked_pc(
+                &mut resolved,
+                RGW_RADOS_OPERATE_READ.to_string(),
+                0,
+                0x1000,
+                Some("_ZN4same".to_string()),
+            );
+        }
+
+        assert!(!resolved[RGW_RADOS_OPERATE_READ].ambiguous);
+        assert!(drop_ambiguous_definitions(&mut resolved).is_empty());
+        assert_eq!(resolved[RGW_RADOS_OPERATE_READ].pc, 0x1000);
+    }
+
+    #[test]
+    fn probe_keys_expands_only_the_overload_set() {
+        // A definition demangling to `rgw_rados_operate` is a candidate for BOTH
+        // overload keys (the linkage-name gate then picks exactly one); every other
+        // demangled name maps to itself, preserving the previous behavior.
+        assert_eq!(
+            probe_keys(RGW_RADOS_OPERATE, RGW_PROBE_FUNCTIONS),
+            vec![RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE]
+        );
+        assert_eq!(
+            probe_keys("RGWREST::get_handler", RGW_PROBE_FUNCTIONS),
+            vec!["RGWREST::get_handler"]
+        );
+        // The synthetic keys are not demangled names and must never match a symbol.
+        assert!(probe_keys(RGW_RADOS_OPERATE_READ, RGW_PROBE_FUNCTIONS).is_empty());
+        assert!(probe_keys("Objecter::_send_op", RGW_PROBE_FUNCTIONS).is_empty());
+        // Restricted to `wanted`: a librados module never asks for the RGW probes.
+        assert!(probe_keys(RGW_RADOS_OPERATE, OBJECTER_PROBE_FUNCTIONS).is_empty());
+    }
+
+    #[test]
+    fn definition_rank_binds_each_overload_only_to_its_own_signature() {
+        // Symbol-table order cannot swap the overloads: each key ACCEPTS only its
+        // own mangled signature and REJECTS the other's, so whichever is seen first
+        // can still only claim its own slot.
+        let read = "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_19ObjectReadOperationEPN4ceph6buffer7v15_2_04listE14optional_yieldi";
+        let write = "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_20ObjectWriteOperationE14optional_yieldi";
+
+        assert_eq!(
+            definition_rank(RGW_RADOS_OPERATE_READ, &[read.to_string()]),
+            Some(0)
+        );
+        assert_eq!(
+            definition_rank(RGW_RADOS_OPERATE_READ, &[write.to_string()]),
+            None
+        );
+        assert_eq!(
+            definition_rank(RGW_RADOS_OPERATE_WRITE, &[write.to_string()]),
+            Some(0)
+        );
+        assert_eq!(
+            definition_rank(RGW_RADOS_OPERATE_WRITE, &[read.to_string()]),
+            None
+        );
+        // A definition with no reachable linkage name cannot be proven to be either
+        // overload -- reject rather than coin-flip.
+        assert_eq!(definition_rank(RGW_RADOS_OPERATE_READ, &[]), None);
     }
 
     #[test]
@@ -2638,6 +4409,7 @@ mod tests {
             build_id: Some("abc".to_string()),
             func2pc: BTreeMap::new(),
             func2vf: BTreeMap::new(),
+            func2linkage: BTreeMap::new(),
         };
         module.func2pc.insert(function.to_string(), pc);
         module
@@ -3304,7 +5076,7 @@ mod tests {
         let pc = pcs
             .get("Objecter::_finish_op")
             .expect("cross-unit DWARF reference should resolve the probe function name");
-        assert_ne!(*pc, 0);
+        assert_ne!(pc.pc, 0);
     }
 
     #[test]

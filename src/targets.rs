@@ -297,6 +297,7 @@ mod tests {
             correlation_ttl: std::time::Duration::from_secs(120),
             correlate_inferred: false,
             correlate_cross_thread: false,
+            disable_rgw_op_bridge_key: false,
             inference_window: std::time::Duration::from_secs(1),
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),

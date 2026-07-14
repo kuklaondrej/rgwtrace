@@ -7,9 +7,25 @@ from types import SimpleNamespace
 
 
 SPAN_NAMES = {"rgw.request", "rados.op", "rgw.background.rados_op"}
-# Single-marker model: request_lifecycle is unattainable by contract (RGW has
-# no safe request-completion probe), so only "marker" and "rados_bounds" occur.
-VALID_DURATION_QUALITIES = {"marker", "rados_bounds"}
+# Two-marker model. A consumer must be able to tell a REAL request duration from
+# a reconstructed one:
+#   measured           -- the req_state::~req_state END probe fired and BOTH span
+#                         bounds are the request's real ones (start == the
+#                         get_handler marker, end == the destructor).
+#   measured_extended  -- the END probe fired, but a span bound had to be
+#                         stretched off its measured value to envelope a child:
+#                         the end pushed out past a late child, or the START
+#                         pulled BACK to a child that began before the marker.
+#                         rgw.request.measured_{start,end}_ns keep the truth.
+#   marker             -- no END marker (probe not attached on this build); the
+#                         end is DERIVED from the RADOS child bounds. The start is
+#                         still measured (get_handler).
+#   rados_bounds       -- no request marker at all; whole span from RADOS bounds,
+#                         so NEITHER bound is measured.
+# There is still no request_lifecycle value: a return probe crashes RGW.
+MEASURED_DURATION_QUALITIES = {"measured", "measured_extended"}
+DERIVED_DURATION_QUALITIES = {"marker", "rados_bounds"}
+VALID_DURATION_QUALITIES = MEASURED_DURATION_QUALITIES | DERIVED_DURATION_QUALITIES
 VALID_RADOS_ROLES = {
     "data",
     "bucket_index",
@@ -31,6 +47,10 @@ VALID_BACKGROUND_REASONS = {
     "classified_background_role",
     "no_inference_candidate",
     "ambiguous_inference_candidates",
+    # A trans_id-carrying op whose request span had already been exported. It is
+    # kept as background rather than re-grouped, because re-grouping would emit a
+    # SECOND request span with the same span id.
+    "request_already_emitted",
 }
 BPF_FAILURE_DIAGNOSTICS = [
     "bpf_ringbuf_request_drops",
@@ -48,9 +68,70 @@ BPF_INFORMATIONAL_DIAGNOSTICS = [
     "bpf_reseed_hits",
     "bpf_reseed_misses",
     "bpf_reseed_base_unresolved",
+    # Request-END probe (req_state::~req_state) coverage. Hits are measured
+    # request ends; misses are requests whose get_handler was never seen (started
+    # before the trace window) and which therefore fall back to a derived end.
+    # Neither is a failure, so they are never asserted to be zero.
+    "bpf_request_end_hits",
+    "bpf_request_end_misses",
+    "bpf_request_end_base_unresolved",
+    # _send_op request-context liveness gate. `stale_ctx_drops` are ops NOT
+    # stamped because the context left on the submitting thread belonged to a
+    # request that already ended -- fail-closed drops (uncorrelated, never
+    # mis-correlated), expected to be nonzero whenever context is re-seeded across
+    # threads. `unverifiable_ctx` are ops stamped without a liveness proof, which
+    # is the whole population on a build with no END probe.
+    "bpf_sendop_stale_ctx_drops",
+    "bpf_sendop_unverifiable_ctx",
+    # PHASE B: the per-submit re-seed at rgw_rados_operate. `seed_hits` is the
+    # win condition -- RADOS submits that had their request's context
+    # re-established on the (possibly migrated) submitting thread. `seed_misses`
+    # are operates carrying a dpp that is NOT a traced request's req_state
+    # (bucket/zone/wrapper dpps, and every background GC/LC/quota thread). Misses
+    # are the EXPECTED fail-closed steady state on a busy gateway, not failures
+    # and not lost ops, so they are never asserted to be zero.
+    "bpf_operate_seed_hits",
+    "bpf_operate_seed_misses",
+    "bpf_operate_base_unresolved",
+    # WHICH KEY the per-submit seed hit on. This split is what decides whether the
+    # `RGWOp*` alternate key -- and the S3-website-retarget mis-correlation hazard
+    # it carries -- earns its place. `reqstate` healthy + `rgwop` ~0 means the key
+    # buys nothing and should be disabled (--disable-rgw-op-bridge-key).
+    "bpf_operate_seed_hits_reqstate",
+    "bpf_operate_seed_hits_rgwop",
+    # The fail-closed clears. `miss_ctx_cleared` is a resolved-but-foreign dpp;
+    # `unresolved_ctx_cleared` is a dpp we could not resolve at all (null argument,
+    # or a descriptor that is not register-resident). Both drop the thread's context
+    # rather than let it stamp an op it cannot be proven to own.
+    "bpf_operate_miss_ctx_cleared",
+    "bpf_operate_unresolved_ctx_cleared",
+    "bpf_sendop_unbridged_ctx_drops",
+    # MULTI-KEY bridge revocation accounting. The identity that must hold:
+    #   inserts == revokes + revoke_skipped + revoke_absent + in-flight requests
+    "bpf_rgw_op_key_inserts",
+    "bpf_rgw_op_key_revokes",
+    "bpf_rgw_op_key_revoke_skipped",
+    "bpf_rgw_op_key_revoke_absent",
+    "bpf_rgw_op_key_unresolved",
+    "bpf_rgw_op_key_disabled",
+]
+# Counters that are informational in general but MUST be zero on a healthy run
+# because a nonzero value invalidates something we rely on.
+BPF_INVARIANT_DIAGNOSTICS = [
+    # A seed hit must be attributable to exactly one of the request's own keys (the
+    # dpp is compared against the bridged value's own req_state_ptr/rgw_op_ptr).
+    # Nonzero means the reqstate-vs-rgwop split -- the number the RGWOp key's fate
+    # is decided on -- cannot be trusted.
+    "bpf_operate_seed_hits_unattributed",
+    # The alternate key's revocation record could not be created, so the key was
+    # refused. Fail-closed and never wrong, but it means rgw_op_keys is full.
+    "bpf_rgw_op_key_index_drops",
 ]
 RADOS_ATTRIBUTE_KEYS = [
     "ceph.rados.duration_ns",
+    # The submitting thread. Paired with the parent's rgw.request.tid this is the
+    # direct evidence of an asio coroutine migration (send_tid != request tid).
+    "ceph.rados.send_tid",
     "ceph.rados.pool",
     "ceph.rados.pg",
     "ceph.rados.pg_seed",
@@ -461,8 +542,12 @@ def verify_document(args, document, workload, manifest=None):
 
     if diagnostics.get("decode_errors", 0) != 0:
         fail(errors, f"decode_errors must be 0, got {diagnostics.get('decode_errors')}")
-    if diagnostics.get("events_decoded") != diagnostics.get("request_markers", 0) + diagnostics.get("rados_ops", 0):
-        fail(errors, "events_decoded must equal request_markers + rados_ops")
+    if diagnostics.get("events_decoded") != (
+        diagnostics.get("request_markers", 0)
+        + diagnostics.get("request_end_markers", 0)
+        + diagnostics.get("rados_ops", 0)
+    ):
+        fail(errors, "events_decoded must equal request_markers + request_end_markers + rados_ops")
     if diagnostics.get("request_markers", 0) <= 0:
         fail(errors, "expected request_markers > 0")
     if diagnostics.get("rados_ops", 0) <= 0:
@@ -508,12 +593,42 @@ def verify_document(args, document, workload, manifest=None):
         value = diagnostics.get(key, 0)
         if not isinstance(value, int) or value < 0:
             fail(errors, f"{key} must be a non-negative integer, got {value!r}")
+    for key in BPF_INVARIANT_DIAGNOSTICS:
+        if diagnostics.get(key, 0) != 0:
+            fail(errors, f"{key} must be 0, got {diagnostics.get(key)}")
+    # The multi-key bridge's revocation identity. Every alternate key that was
+    # inserted must have been revoked, skipped (already re-keyed by a newer request),
+    # found already absent (LRU-evicted), or still belong to a request in flight. A
+    # shortfall means keys are LEAKING, and a leaked key on a recycled RGWOp address
+    # is a mis-correlation source.
+    inserts = diagnostics.get("bpf_rgw_op_key_inserts", 0)
+    accounted = (
+        diagnostics.get("bpf_rgw_op_key_revokes", 0)
+        + diagnostics.get("bpf_rgw_op_key_revoke_skipped", 0)
+        + diagnostics.get("bpf_rgw_op_key_revoke_absent", 0)
+    )
+    if accounted > inserts:
+        fail(errors, f"bpf_rgw_op_key revocations ({accounted}) exceed inserts ({inserts})")
+    # In-flight requests at end of run bound the shortfall. Requests that were still
+    # open when tracing stopped keep their keys, which is expected -- but a shortfall
+    # larger than the requests we saw start-without-end cannot be explained that way.
+    open_requests = max(
+        0, diagnostics.get("request_markers", 0) - diagnostics.get("request_end_markers", 0)
+    )
+    if inserts - accounted > open_requests:
+        fail(
+            errors,
+            f"bpf_rgw_op_key_inserts={inserts} but only {accounted} were revoked/skipped/absent "
+            f"and at most {open_requests} requests were still in flight -- alternate keys leaked",
+        )
 
     if len(request_spans) < args.min_request_spans:
         fail(errors, f"expected at least {args.min_request_spans} rgw.request spans, got {len(request_spans)}")
     if len(rados_spans) < args.min_rados_spans:
         fail(errors, f"expected at least {args.min_rados_spans} rados.op spans, got {len(rados_spans)}")
 
+    measured_request_spans = 0
+    derived_request_spans = 0
     for span in request_spans:
         attrs = attr_map(span)
         if span.get("parent_span_id") is not None:
@@ -524,8 +639,47 @@ def verify_document(args, document, workload, manifest=None):
             fail(errors, f"request span {span.get('span_id')} has rgw.request_class={attrs.get('rgw.request_class')!r}")
         if not attrs.get("rgw.trans_id"):
             fail(errors, f"request span {span.get('span_id')} has empty rgw.trans_id")
-        if attrs.get("rgw.duration_quality") not in VALID_DURATION_QUALITIES:
-            fail(errors, f"request span {span.get('span_id')} has invalid rgw.duration_quality={attrs.get('rgw.duration_quality')!r}")
+        quality = attrs.get("rgw.duration_quality")
+        if quality not in VALID_DURATION_QUALITIES:
+            fail(errors, f"request span {span.get('span_id')} has invalid rgw.duration_quality={quality!r}")
+        # Both boundaries have provenance. The START is measured whenever a
+        # request marker exists (get_handler's own clock read); the END only when
+        # the destructor probe fired. `rados_bounds` has neither.
+        measured_start = attrs.get("rgw.request.measured_start_ns")
+        if quality == "rados_bounds":
+            if measured_start is not None:
+                fail(errors, f"request span {span.get('span_id')} has no marker but carries rgw.request.measured_start_ns={measured_start!r}")
+        elif not is_uint(measured_start):
+            fail(errors, f"request span {span.get('span_id')} is {quality} but has no rgw.request.measured_start_ns")
+        # A measured duration MUST be backed by the raw end from the END probe,
+        # and a derived one must NOT claim to have one. `measured` additionally
+        # means BOTH span bounds ARE the raw measured values (unextended,
+        # unclamped) -- a span whose start was pulled back to an early child is
+        # just as partly-fictional as one whose end was pushed out.
+        measured_end = attrs.get("rgw.request.measured_end_ns")
+        if quality in MEASURED_DURATION_QUALITIES:
+            measured_request_spans += 1
+            if not is_uint(measured_end):
+                fail(errors, f"request span {span.get('span_id')} is {quality} but has no rgw.request.measured_end_ns")
+            elif quality == "measured" and measured_end != span.get("end_ns"):
+                fail(errors, f"request span {span.get('span_id')} claims measured but end_ns {span.get('end_ns')} != measured_end_ns {measured_end}")
+            elif quality == "measured" and measured_start != span.get("start_ns"):
+                fail(errors, f"request span {span.get('span_id')} claims measured but start_ns {span.get('start_ns')} != measured_start_ns {measured_start}")
+            elif quality == "measured_extended" and measured_end == span.get("end_ns") and measured_start == span.get("start_ns"):
+                fail(errors, f"request span {span.get('span_id')} claims measured_extended but both bounds equal the measured interval")
+        else:
+            derived_request_spans += 1
+            if measured_end is not None:
+                fail(errors, f"request span {span.get('span_id')} is {quality} but carries rgw.request.measured_end_ns={measured_end!r}")
+
+    if diagnostics.get("measured_duration_requests", 0) != measured_request_spans:
+        fail(errors, f"measured_duration_requests={diagnostics.get('measured_duration_requests', 0)} but JSON has {measured_request_spans} measured request spans")
+    if diagnostics.get("derived_duration_requests", 0) != derived_request_spans:
+        fail(errors, f"derived_duration_requests={diagnostics.get('derived_duration_requests', 0)} but JSON has {derived_request_spans} derived request spans")
+    # Every request end marker must land on a request span, so measured spans can
+    # never exceed the END markers decoded.
+    if measured_request_spans > diagnostics.get("request_end_markers", 0):
+        fail(errors, f"{measured_request_spans} measured request spans but only {diagnostics.get('request_end_markers', 0)} request_end_markers")
 
     roles = set()
     rados_objects = []
@@ -708,13 +862,19 @@ def attr(key, value):
 
 
 def valid_self_test_document():
+    # The default shape is now the two-marker one: the END probe fired, so the
+    # request span carries a MEASURED end (span end_ns == measured_end_ns).
     request_attrs = [
         attr("rgw.trans_id", "tx-selftest"),
         attr("rgw.request_class", "s3_request"),
-        attr("rgw.duration_quality", "marker"),
+        attr("rgw.duration_quality", "measured"),
+        attr("rgw.request.tid", 7),
+        attr("rgw.request.measured_start_ns", 100),
+        attr("rgw.request.measured_end_ns", 300),
     ]
     rados_attrs = [
         attr("ceph.rados.duration_ns", 60),
+        attr("ceph.rados.send_tid", 7),
         attr("ceph.rados.pool", 1),
         attr("ceph.rados.pg", "1.2a"),
         attr("ceph.rados.pg_seed", 42),
@@ -730,6 +890,7 @@ def valid_self_test_document():
     ]
     background_attrs = [
         attr("ceph.rados.duration_ns", 20),
+        attr("ceph.rados.send_tid", 11),
         attr("ceph.rados.pool", 2),
         attr("ceph.rados.pg", "2.7"),
         attr("ceph.rados.pg_seed", 7),
@@ -785,9 +946,12 @@ def valid_self_test_document():
             },
         ],
         "diagnostics": {
-            "events_decoded": 3,
+            "events_decoded": 4,
             "decode_errors": 0,
             "request_markers": 1,
+            "request_end_markers": 1,
+            "measured_duration_requests": 1,
+            "derived_duration_requests": 0,
             "rados_ops": 2,
             "correlated_rados_ops": 1,
             "background_rados_ops": 1,
@@ -801,6 +965,32 @@ def valid_self_test_document():
     }
 
 
+def derived_duration_self_test_document():
+    """valid_self_test_document as produced on a build WITHOUT the end probe.
+
+    Only the get_handler START marker arrives, so the request's end is derived
+    from its RADOS child bounds: quality `marker`, no rgw.request.measured_end_ns,
+    and no request_end_markers. This is the backward-compatibility shape and it
+    must keep validating.
+    """
+    document = valid_self_test_document()
+    request = document["spans"][0]
+    request["attributes"] = [
+        attr("rgw.trans_id", "tx-selftest"),
+        attr("rgw.request_class", "s3_request"),
+        attr("rgw.duration_quality", "marker"),
+        attr("rgw.request.tid", 7),
+        # The START is still measured (get_handler); only the END is derived.
+        attr("rgw.request.measured_start_ns", 100),
+    ]
+    diagnostics = document["diagnostics"]
+    diagnostics["events_decoded"] = 3
+    diagnostics["request_end_markers"] = 0
+    diagnostics["measured_duration_requests"] = 0
+    diagnostics["derived_duration_requests"] = 1
+    return document
+
+
 def cross_thread_self_test_document():
     """valid_self_test_document plus a second child correlated cross_thread.
 
@@ -811,6 +1001,8 @@ def cross_thread_self_test_document():
     document = valid_self_test_document()
     cross_attrs = [
         attr("ceph.rados.duration_ns", 40),
+        # A bridged op: submitted on a different thread than the request marker.
+        attr("ceph.rados.send_tid", 4242),
         attr("ceph.rados.pool", 1),
         attr("ceph.rados.pg", "1.2b"),
         attr("ceph.rados.pg_seed", 43),
@@ -839,7 +1031,7 @@ def cross_thread_self_test_document():
         },
     )
     diagnostics = document["diagnostics"]
-    diagnostics["events_decoded"] = 4
+    diagnostics["events_decoded"] = 5
     diagnostics["rados_ops"] = 3
     diagnostics["correlated_rados_ops"] = 2
     diagnostics["cross_thread_correlations"] = 1
@@ -869,10 +1061,14 @@ def manifest_self_test_document():
     get_request_attrs = [
         attr("rgw.trans_id", "tx-get"),
         attr("rgw.request_class", "s3_request"),
-        attr("rgw.duration_quality", "marker"),
+        attr("rgw.duration_quality", "measured"),
+        attr("rgw.request.tid", 7),
+        attr("rgw.request.measured_start_ns", 100),
+        attr("rgw.request.measured_end_ns", 300),
     ]
     read_rados_attrs = [
         attr("ceph.rados.duration_ns", 60),
+        attr("ceph.rados.send_tid", 7),
         attr("ceph.rados.pool", 1),
         attr("ceph.rados.pg", "1.2a"),
         attr("ceph.rados.pg_seed", 42),
@@ -889,10 +1085,14 @@ def manifest_self_test_document():
     put_request_attrs = [
         attr("rgw.trans_id", "tx-put"),
         attr("rgw.request_class", "s3_request"),
-        attr("rgw.duration_quality", "marker"),
+        attr("rgw.duration_quality", "measured"),
+        attr("rgw.request.tid", 9),
+        attr("rgw.request.measured_start_ns", 400),
+        attr("rgw.request.measured_end_ns", 600),
     ]
     write_rados_attrs = [
         attr("ceph.rados.duration_ns", 80),
+        attr("ceph.rados.send_tid", 9),
         attr("ceph.rados.pool", 1),
         attr("ceph.rados.pg", "1.2b"),
         attr("ceph.rados.pg_seed", 43),
@@ -908,6 +1108,7 @@ def manifest_self_test_document():
     ]
     background_attrs = [
         attr("ceph.rados.duration_ns", 20),
+        attr("ceph.rados.send_tid", 11),
         attr("ceph.rados.pool", 2),
         attr("ceph.rados.pg", "2.7"),
         attr("ceph.rados.pg_seed", 7),
@@ -983,9 +1184,12 @@ def manifest_self_test_document():
             },
         ],
         "diagnostics": {
-            "events_decoded": 5,
+            "events_decoded": 7,
             "decode_errors": 0,
             "request_markers": 2,
+            "request_end_markers": 2,
+            "measured_duration_requests": 2,
+            "derived_duration_requests": 0,
             "rados_ops": 3,
             "correlated_rados_ops": 2,
             "background_rados_ops": 1,
@@ -1241,6 +1445,15 @@ def run_self_test():
             print(f"SELF-TEST ERROR: valid cross_thread document failed: {error}", file=sys.stderr)
         return 1
 
+    # BACKWARD COMPATIBILITY: a run on a build without the request-END probe
+    # produces derived (`marker`) request durations and no measured_end_ns. That
+    # document must keep validating -- the end probe is optional by contract.
+    _, errors = verify_document(args, derived_duration_self_test_document(), workload)
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: valid derived-duration document failed: {error}", file=sys.stderr)
+        return 1
+
     cases = [
         (
             "cross_thread reason",
@@ -1284,6 +1497,47 @@ def run_self_test():
             "workload request marker",
             lambda document: document["spans"][0]["attributes"][2].update({"value": "rados_bounds"}),
             "missing RGW request markers",
+        ),
+        (
+            # A span claiming a measured duration whose end_ns does not equal the
+            # measured end is a LIE about provenance: it must fail.
+            "measured end must match the span end",
+            lambda document: document["spans"][0]["attributes"][5].update({"value": 999}),
+            "claims measured but end_ns",
+        ),
+        (
+            # ...and so is one whose START was stretched off the measured start
+            # (the backward extension to an early child). Both boundaries carry
+            # provenance, so both must match for a span to claim `measured`.
+            "measured start must match the span start",
+            lambda document: document["spans"][0]["attributes"][4].update({"value": 999}),
+            "claims measured but start_ns",
+        ),
+        (
+            # Any span with a request marker must expose its measured start.
+            "marker-bearing span must carry a measured start",
+            lambda document: document["spans"][0]["attributes"].pop(4),
+            "has no rgw.request.measured_start_ns",
+        ),
+        (
+            # A derived (`marker`) span must not carry a measured end.
+            "derived span must not carry a measured end",
+            lambda document: document["spans"][0]["attributes"][2].update({"value": "marker"}),
+            "carries rgw.request.measured_end_ns",
+        ),
+        (
+            # The duration-provenance counters must match the rendered spans.
+            "measured duration counter",
+            lambda document: document["diagnostics"].update({"measured_duration_requests": 0}),
+            "measured_duration_requests=0",
+        ),
+        (
+            # A measured span with no END marker decoded is impossible.
+            "measured spans require end markers",
+            lambda document: document["diagnostics"].update(
+                {"request_end_markers": 0, "events_decoded": 3}
+            ),
+            "request_end_markers",
         ),
     ]
 

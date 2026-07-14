@@ -135,18 +135,97 @@ Do not assume background spans are errors. A rising background ratio is useful s
 
 `--correlate-inferred` can attach untagged RADOS ops to a request only when there is one conservative candidate in `--inference-window` and the role does not look like RGW background work. A unique matching RADOS send thread is preferred over same-PID/time-window candidates. Inferred spans use `rgw.correlation = "inferred"` and `rgw.correlation_reason = "pid_time_window"`. Ambiguous or out-of-window candidates remain background spans.
 
-`--correlate-cross-thread` (default off, opt-in) enables the fail-closed cross-thread bridge described in `docs/design-cross-thread-correlation.md`. It re-seeds request context on the request execute thread at `rgw_process_authenticated`, so RADOS ops submitted *synchronously* on that thread inherit the request's `trans_id` even though `get_handler` ran on a different thread. It is bounded and honest: on async-dispatch RGW builds (e.g. 18.2.8 beast) most data-path ops submit off the execute thread, so only the measured ~20–25% synchronous subset is recovered; the rest stay `background`/`inferred` by design. The bridge is fail-closed and zero-mis-correlation — a foreign or stale context lingering on a thread is cleared rather than mis-attributed. With the flag off the re-seed uprobe is never attached and behavior is byte-for-byte identical to not having the feature. Coverage/health is visible in the informational diagnostics `bpf_reseed_hits`, `bpf_reseed_misses`, and `bpf_reseed_base_unresolved` (never failure counters). `preflight` reports `cross_thread_reseed_probe` as an advisory `ok`/`warn` for whether the `rgw_process_authenticated` raw-pointer descriptor resolved.
+`--correlate-cross-thread` (default off, opt-in) enables the fail-closed cross-thread bridge described in `docs/design-cross-thread-correlation.md`.
+
+RGW runs each S3 request as an asio coroutine that migrates to a different `io_context` pool thread at every yield, so a RADOS op submitted after a migration lands on a thread that carries no request context and shows up as `rgw.background.rados_op` (reason `missing_trans_id`). This flag re-establishes the request's context on whatever thread is about to submit, **at every RADOS submit** (`rgw_rados_operate`, both the read and write overloads), plus once on the execute thread (`rgw_process_authenticated`). Recovered ops become `cross_thread` children of their request.
+
+It is fail-closed and zero-mis-correlation by construction: the request is identified by the pointer **value** of the `DoutPrefixProvider*` the submit carries (never dereferenced, never type-assumed). A request is registered in the bridge under **both** of the identities RGW may pass as that `dpp` -- its `req_state*` and the `RGWOp*` executing it (RGW passes the RGWOp, not the req_state, at most call sites inside `op->execute()`) -- and both are revoked when the request ends. Any other `dpp`, such as a stack `DoutPrefix`/`DoutPrefixPipe` wrapper or a GC/LC/quota background thread's, simply misses the bridge and correlates nothing.
+
+Two rules keep it honest, and both cost coverage on purpose:
+
+- **A miss clears the submitting thread's request context** (`bpf_operate_miss_ctx_cleared`). A request's context can be left on every pool thread it ever ran an operate on, and another request can resume on one of those threads and submit through a `dpp` we cannot key. The first request is still *alive*, so a liveness check alone would happily stamp its `trans_id` onto the second request's op. A miss therefore assumes nothing: the op comes out uncorrelated.
+- **`_send_op` re-validates every context** against its request's liveness before stamping it, and refuses a context that could never be bridged at all.
+
+**What it does not cover:** object-payload I/O dispatched through `rgw::Aio`/`aio_operate` does not pass through `rgw_rados_operate`, so multi-stripe GET/PUT body ops stay `background`/`inferred` by design. Nor does a submit whose `dpp` is a stack wrapper object, which is unkeyable by construction.
+
+**It requires the request-END probe.** The END probe is the only thing that revokes a request's bridge entries; without it, entries live forever, and a recycled `req_state` (stack) or `RGWOp` (heap) address could hit a dead request's entry and stamp its `trans_id` onto a live op. If the END probe did not attach, the per-submit re-seed is **not attached either** -- the run warns and degrades to seed-thread-only correlation.
+
+With the flag off no re-seed uprobe is attached and behavior is byte-for-byte identical to not having the feature. On an RGW build where the `rgw_rados_operate` symbols cannot be resolved, the run degrades (loudly, with the specific reason) to seed-thread-only correlation.
+
+Coverage/health is visible in the informational diagnostics `bpf_operate_seed_hits` (submits that had their request's context re-established -- the win condition), `bpf_operate_seed_misses` (unkeyable/background `dpp`s: **expected**, not failures), `bpf_operate_miss_ctx_cleared` (the ops the fail-closed rule above gives up on), `bpf_operate_unresolved_ctx_cleared` (the same fail-closed clear, for a `dpp` we could not resolve at all), `bpf_operate_base_unresolved`, the multi-key accounting `bpf_rgw_op_key_inserts` / `bpf_rgw_op_key_revokes` / `bpf_rgw_op_key_revoke_skipped` / `bpf_rgw_op_key_revoke_absent` / `bpf_rgw_op_key_unresolved` / `bpf_rgw_op_key_index_drops` / `bpf_rgw_op_key_disabled`, and the `bpf_reseed_*` counters (never failure counters). Every one of these is in the JSON `trace.diagnostics`, in the end-of-run log summary, **and** -- on an `--output otlp` run -- in the final OTLP batch, both on its Resource and on the `rgwtrace.run_summary` span, as `rgwtrace.diag.*` (see "Where to read the final counters" below), so an `--output otlp` run can be evaluated without the JSON document. `preflight` reports `cross_thread_operate_probe` and `cross_thread_reseed_probe` as advisory `ok`/`warn` checks for whether each probe's address, descriptor, mangled-name provenance, and `DoutPrefixProvider`-base proof resolved.
+
+### Decide the fate of the `RGWOp*` alternate key: read these two counters
+
+The `RGWOp*` alternate key exists **only as insurance**, in case RGW does not pass the `req_state` as the `dpp` at the `rgw_rados_operate` call sites. It is also the one part of this design with a residual mis-correlation hazard that no amount of pointer-identity logic can close: `RGWHandler_REST_S3Website::retarget` can free and replace an `RGWOp` **while its request is still alive**, so another `DoutPrefixProvider` heap object can be allocated at that address, be passed as a `dpp`, and be seeded as that request -- and the liveness gate *passes*, because the request genuinely is alive (`docs/design-cross-thread-correlation.md` §10.1).
+
+So the key's fate is a **measurement**, not an argument. Run with it ON (the default), then read:
+
+| `bpf_operate_seed_hits_reqstate` | `bpf_operate_seed_hits_rgwop` | What it means | What to do |
+| --- | --- | --- | --- |
+| healthy (tracks correlated ops) | **~0** | RGW passes the `req_state` as the `dpp` on the paths we probe. The alternate key fires never or almost never, so it buys nothing and only carries the retarget hazard. | **Pass `--disable-rgw-op-bridge-key`.** The hazard disappears with no loss of coverage. |
+| healthy | a large share of `bpf_operate_seed_hits` | RGW passes the executing `RGWOp` as the `dpp` on the op data path, exactly as the multi-key design assumed. The key is load-bearing. | **Keep it.** Accept the retarget hazard; it cannot be closed by pointer identity, only by dropping the key. |
+| **0** | 0, with `bpf_operate_seed_misses` large | The bridge is consulted but never matches. Not a key-choice problem -- see the `bpf_operate_seed_hits` is 0 entry below. | Fix the artifact first, then re-measure. |
+| any | any, with `bpf_rgw_op_key_disabled` > 0 | The key was **off** for this run. `..._rgwop` being 0 says nothing. | Re-run without `--disable-rgw-op-bridge-key` to take the measurement. |
+
+`bpf_operate_seed_hits_unattributed` **must be 0**: every hit is attributed by comparing the `dpp` against the bridged value's own `req_state_ptr`/`rgw_op_ptr`, exactly one of which can match. A nonzero value means the split above cannot be trusted and the decision must not be made on it.
+
+`--disable-rgw-op-bridge-key` takes effect without a rebuild (it is published to the BPF side as a global before the probe that writes the key is attached), and it does not touch anything else: `req_state`-keyed correlation, the liveness gate, and the END probe all keep working.
+
+#### Where to read the final counters
+
+The counters above are **run totals, read at the end of the run**. Three places carry the same numbers:
+
+1. **The log**, on either output mode: the `finished live tracing` and `rgwtrace shutdown summary` lines carry every counter in a `diagnostics=` field of `key=value` pairs. Logs go to stderr, so `2> run.log` keeps them even with `--output json` on stdout.
+2. **The JSON document**, under `trace.diagnostics` (`--output json`).
+3. **The final OTLP batch** (`--output otlp`), which is always sent -- even when the run's last drain left no spans, which is the normal ending, because the periodic drains have already exported everything by then while the final BPF counters are merged only after the poll loop exits. The batch carries the totals on its Resource as `rgwtrace.diag.*` attributes **and** on a synthetic zero-duration span named **`rgwtrace.run_summary`** with the same `rgwtrace.diag.*` attribute names.
+
+For a validation run, search the backend for the `rgwtrace.run_summary` span and read `rgwtrace.diag.bpf_operate_seed_hits_reqstate` and `rgwtrace.diag.bpf_operate_seed_hits_rgwop` off its attributes. Prefer the span over the Resource attributes: a batch with no spans carries nothing most trace backends will store, so on a run whose final drain was empty the Resource copy can reach the collector and be dropped there. If the endpoint is unreachable, the final export fails loudly and the whole trace (including `trace.diagnostics`) is dumped to stdout as JSON rather than lost.
+
+**`bpf_operate_seed_hits` is 0 while `bpf_operate_seed_misses` is large.** The bridge is being consulted but never matching. Check `preflight`'s `cross_thread_reseed_probe`: if it warns that the `RGWOp*&` descriptor is unavailable, requests are keyed by their `req_state*` only -- and if RGW passes the executing `RGWOp` as the `dpp` on most of an op's data path, virtually every lookup will miss. **Fix:** re-export the DWARF artifact with a current rgwtrace.
+
+**The alternate-key revocation identity.** Every alternate key that is inserted is accounted for at its request's end:
+
+```
+bpf_rgw_op_key_inserts == bpf_rgw_op_key_revokes        (deleted: still the request's own)
+                        + bpf_rgw_op_key_revoke_skipped (already re-keyed by a NEWER, live request)
+                        + bpf_rgw_op_key_revoke_absent  (already gone: LRU-evicted)
+                        + alternate keys of requests still in flight
+```
+
+This holds exactly, because a key is only inserted **after** its revocation record exists in `rgw_op_keys` -- a plain HASH that never evicts -- and the destructor consults that record unconditionally, including when the request's own canonical LRU entry has been evicted. A shortfall beyond the in-flight count means keys are LEAKING, and a leaked key on a recycled `RGWOp` address is a mis-correlation source: check `bpf_request_end_misses` and `bpf_request_end_base_unresolved` (the destructor is what revokes keys).
+
+**`bpf_rgw_op_key_index_drops` is nonzero.** The `rgw_op_keys` revocation map (16384 entries, i.e. ~16x Ceph's default `rgw_max_concurrent_requests`) is full, so the alternate key was **refused** rather than created unrevocable. Fail-closed: coverage degrades on the RGWOp-dpp path, nothing is mis-attributed. It implies an implausible in-flight request count; check for a request leak first.
+
+**`bpf_operate_unresolved_ctx_cleared` is nonzero.** A `rgw_rados_operate` call carried a `dpp` we could not resolve (a NULL argument, or a descriptor that is not register-resident at entry). The thread's request context is dropped, exactly as on a foreign-`dpp` miss and for the same reason: an unresolved `dpp` proves nothing about which coroutine is running on this pool thread, and the context sitting there may belong to another live request. A steady nonzero count means RGW passes null `dpp`s on this path; a large one alongside `bpf_operate_base_unresolved` means the descriptor is broken and correlation is dead (it is never silent).
+
+The request-END probe (`req_state::~req_state`) is ON by default and needs no flag. It is what makes `rgw.request` durations real rather than reconstructed from child RADOS bounds. It is also optional: if the destructor address, its **variant provenance**, or its `this` descriptor does not resolve on your RGW build, the probe is not attached, the run degrades to derived durations, and both the run (a `warn!` at attach time) and `preflight` (an advisory `request_end_probe` `warn`, never a failure) say so with the specific reason. Coverage is visible in the informational diagnostics `bpf_request_end_hits`, `bpf_request_end_misses`, and `bpf_request_end_base_unresolved`, and in `measured_duration_requests` / `derived_duration_requests`. See `docs/design-request-end-probe.md`.
+
+**"artifact has a `req_state::~req_state` address but no `func2linkage` entry".** Your imported DWARF JSON predates the variant-provenance field (or came from a third-party producer). The three C++ destructor variants all demangle to the same name and the deleting one (D0) is listed first, so an address with no mangled-name provenance cannot be proven safe to probe — rgwtrace refuses it rather than risk probing D0. **Fix:** re-export the artifact with a current rgwtrace (`--export-dwarf-json`). Until then the run works exactly as it did before the end probe existed, with `rgw.duration_quality = "marker"`.
+
+**`bpf_sendop_stale_ctx_drops` is nonzero.** These are RADOS ops that were *not* stamped with a `trans_id` because the request context left on the submitting thread belonged to a request that had already ended. They are left uncorrelated (they show up as `background`, or `inferred` with `--correlate-inferred`) instead of being attributed to the wrong request — fail-closed by design, and expected to be nonzero whenever request context is re-seeded across threads. A count that is *large* relative to `correlated_rados_ops` means live bridge entries are being evicted from `rgw_ctx_by_reqstate` (131072 entries, i.e. two keys for each of ~49k in-flight requests even on a 256-CPU host after the LRU's per-CPU freelist reservation): expect it only under extreme in-flight request counts. `bpf_sendop_unverifiable_ctx` counts ops stamped without a liveness proof, which is the whole population on a build where the END probe could not attach (nothing can revoke a context there).
+
+**`bpf_sendop_unbridged_ctx_drops` is nonzero.** No RADOS op is being correlated, and the reason is upstream of correlation: this build's `RGWREST::get_handler` does not hold the `req_state*` in a register at entry, so no request is ever entered into the bridge. Such a context can never be verified *or revoked*, so with the END probe attached `_send_op` refuses to stamp from it (a lingering one would otherwise let a long-dead request stamp later ops on a pooled thread). Attach warns about this explicitly. **Fix:** re-export the DWARF artifact with a current rgwtrace; if the build genuinely cannot expose it, the tracer still reports RADOS ops as background spans.
+
+**`expired_open_requests` is nonzero.** Requests whose END marker never arrived within 10x `--correlation-ttl` of the request's start, so they were force-expired with a derived end. This means END markers are being lost (ring-buffer drops — check `bpf_ringbuf_request_drops` — or destructor bridge misses, `bpf_request_end_misses`), not that requests are slow. `late_request_markers_dropped` counts markers that arrived for a request whose span had already been exported; they are dropped rather than emitting a second span with the same span id, and a nonzero count means the expiry bounds are too tight for the workload.
+
+**"the no-duplicate tombstone filter is past its design capacity".** Every exported request key is remembered for the life of the run so a straggler can never resurrect an already-exported group and emit a second span with the same span id. That memory is a fixed 8 MiB Bloom filter (`emitted_request_keys` counts the keys in it), which **never** produces a false negative — so the no-duplicate guarantee holds no matter how long the run — but past ~2M exported requests its false-**positive** rate starts to climb. A false positive can only cause a DROP: a late straggler discarded, or a fresh request whose key collides dropped (`late_request_markers_dropped`) with its ops demoted to background (`request_already_emitted`). It can never duplicate a span. **Fix:** restart the tracer, or run with `--timeout` for bounded windows.
 
 ---
 
 ## Capture Quality
 
-Request spans include `rgw.duration_quality`, which has exactly two values.
+Request spans include `rgw.duration_quality`, which says how the span's end was obtained.
 
-- `marker`: the single safe RGW probe observed a request marker, not full lifecycle latency. The request span still envelopes correlated RADOS child bounds.
-- `rados_bounds`: the request group was built from RADOS timestamps only.
+- `measured`: the request-END probe (`req_state::~req_state`) fired and BOTH span bounds ARE the request's real ones. This is a true request duration.
+- `measured_extended`: the END probe fired, but a correlated RADOS child fell outside the request's real interval -- it ended after the request did (a late `_finish_op`, or an inferred child), or it started before the request marker -- so the span was stretched to keep the child inside its parent. The real interval is preserved on the `rgw.request.measured_start_ns` / `rgw.request.measured_end_ns` attributes -- use those, not `start_ns`/`end_ns`, to compute the request's true duration.
+- `marker`: no END marker arrived, so the end was DERIVED from the correlated RADOS child bounds. Expect this when preflight's `request_end_probe` check warns (the destructor symbol or its `this` descriptor did not resolve on this build), or for a request that was still in flight when the trace window closed.
+- `rados_bounds`: the request group was built from RADOS timestamps only (no request marker at all).
 
-There is no `request_lifecycle` value. Measuring a true request lifecycle would require a request-completion probe RGW cannot safely expose (a `process_request` return probe crashes RGW), so only the single-marker and RADOS-bounds qualities occur.
+There is no `request_lifecycle` value, and no return probe anywhere: a `process_request` return probe crashes RGW.
+
+To check end-probe coverage on a run, compare `measured_duration_requests` against `derived_duration_requests` in the diagnostics (or the `bpf_request_end_hits` / `bpf_request_end_misses` counters, which count destructor firings that did and did not resolve a request). A high `bpf_request_end_misses` count is normal when tracing starts mid-workload: those requests began before the trace window, so their `get_handler` was never seen.
+
+RADOS child spans carry `ceph.rados.send_tid` and request spans carry `rgw.request.tid`. If they differ, the op was submitted on a different thread than the one that handled the request -- an asio coroutine migration.
 
 RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names.
 

@@ -76,25 +76,22 @@ fn main() -> Result<()> {
             );
         }
         OutputMode::Otlp => {
-            let export = if trace.spans.is_empty() {
-                Ok(otel::ExportDiagnostics::default())
-            } else {
-                otel::export_otlp_http(
-                    otel::ExportConfig {
-                        endpoint: &cli.otlp_endpoint,
-                        headers: &cli.otlp_header,
-                        compression: cli.otlp_compression,
-                        max_spans_per_batch: cli.otlp_max_spans_per_batch,
-                        max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
-                        timeout: cli.otlp_timeout,
-                        retries: cli.otlp_retries,
-                    },
-                    &trace,
-                )
-            };
             // Serialize once so a failed export can still preserve the trace.
             let document = trace_output_document(&dwarf, &trace)?;
-            finish_otlp_export(export, &document, &trace, &mut std::io::stdout())?;
+            export_trace_otlp(
+                otel::ExportConfig {
+                    endpoint: &cli.otlp_endpoint,
+                    headers: &cli.otlp_header,
+                    compression: cli.otlp_compression,
+                    max_spans_per_batch: cli.otlp_max_spans_per_batch,
+                    max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
+                    timeout: cli.otlp_timeout,
+                    retries: cli.otlp_retries,
+                },
+                &trace,
+                &document,
+                &mut std::io::stdout(),
+            )?;
         }
     }
 
@@ -113,6 +110,32 @@ fn trace_output_document(
     }))
 }
 
+/// The FINAL export of an `--output otlp` session: everything the live loop's
+/// periodic drains left behind, plus the run summary.
+///
+/// It is deliberately UNCONDITIONAL. It used to be skipped when the trace had no
+/// spans -- and an empty final trace is the NORMAL end to a live run, because the
+/// periodic drains have already taken every span by then. But the final BPF
+/// counters are merged only after the poll loop exits, so this document is the
+/// only one that carries the run's true totals; skipping its export left the
+/// backend holding an earlier, stale snapshot and the final numbers nowhere.
+/// `otel::export_final_otlp_http` therefore always puts a diagnostics-bearing
+/// batch on the wire, spans or no spans.
+///
+/// The consequence to accept: an `--output otlp` run that captured nothing now
+/// still contacts the endpoint, so an unreachable endpoint is reported as a
+/// failure instead of exiting silently. That is the correct trade -- "I asked for
+/// OTLP and nothing was delivered" must never be indistinguishable from success.
+fn export_trace_otlp(
+    config: otel::ExportConfig<'_>,
+    trace: &TraceDocument,
+    document: &serde_json::Value,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    let export = otel::export_final_otlp_http(config, trace);
+    finish_otlp_export(export, document, trace, out)
+}
+
 /// Finish an `OutputMode::Otlp` session given the outcome of the final
 /// synchronous export.
 ///
@@ -129,15 +152,16 @@ fn finish_otlp_export(
     trace: &TraceDocument,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
+    // Both arms render the COMPLETE diagnostics via `TraceDiagnostics::summary()`
+    // rather than a hand-picked list of fields. An `--output otlp` run never prints
+    // the JSON document, so this log line and the OTLP resource attributes are the
+    // only two channels a live run can be evaluated through -- and a curated list
+    // in either of them silently drops exactly the counters a new feature adds.
     match export {
         Ok(export) => {
             info!(
                 spans = trace.spans.len(),
-                events_decoded = trace.diagnostics.events_decoded,
-                decode_errors = trace.diagnostics.decode_errors,
-                rados_ops = trace.diagnostics.rados_ops,
-                correlated_rados_ops = trace.diagnostics.correlated_rados_ops,
-                background_rados_ops = trace.diagnostics.background_rados_ops,
+                diagnostics = %trace.diagnostics.summary(),
                 export_attempts = export.attempts,
                 export_failures = export.failures,
                 export_failed = false,
@@ -152,11 +176,7 @@ fn finish_otlp_export(
             );
             info!(
                 spans = trace.spans.len(),
-                events_decoded = trace.diagnostics.events_decoded,
-                decode_errors = trace.diagnostics.decode_errors,
-                rados_ops = trace.diagnostics.rados_ops,
-                correlated_rados_ops = trace.diagnostics.correlated_rados_ops,
-                background_rados_ops = trace.diagnostics.background_rados_ops,
+                diagnostics = %trace.diagnostics.summary(),
                 export_failed = true,
                 "rgwtrace shutdown summary"
             );
@@ -236,9 +256,139 @@ fn init_logging(default_filter: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn sample_trace() -> TraceDocument {
         Collector::default().into_trace_document("rgwtrace")
+    }
+
+    /// An end-of-run trace with NO spans (every span already left in a periodic
+    /// drain) but real final counters -- the exact shape that used to lose its
+    /// diagnostics.
+    fn empty_trace_with_final_counters() -> TraceDocument {
+        let mut trace = sample_trace();
+        trace.spans.clear();
+        trace.diagnostics.bpf_operate_seed_hits_reqstate = 41;
+        trace.diagnostics.bpf_operate_seed_hits_rgwop = 7;
+        trace
+    }
+
+    /// A `tracing` writer that captures the log into a buffer the test can read.
+    #[derive(Clone)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("log must be UTF-8")
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `body` with the log captured, and return what was logged.
+    fn capture_log(body: impl FnOnce()) -> String {
+        let log = CapturedLog::new();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        log.text()
+    }
+
+    /// THE SHUTDOWN LOG LINE, for the empty-final-trace case. The log is the other
+    /// channel an `--output otlp` run can be evaluated through (it never prints the
+    /// JSON document), so it must carry the FINAL counters even when the final
+    /// trace holds no spans. Asserts on the emitted log text, not on
+    /// `summary()`'s return value -- a summary that is built and never logged is
+    /// the same bug as a batch that is built and never sent.
+    #[test]
+    fn shutdown_summary_log_carries_the_final_counters_with_no_spans() {
+        let trace = empty_trace_with_final_counters();
+        let document = serde_json::json!({ "trace": &trace });
+
+        let logged = capture_log(|| {
+            finish_otlp_export(
+                Ok(otel::ExportDiagnostics::default()),
+                &document,
+                &trace,
+                &mut Vec::new(),
+            )
+            .unwrap();
+        });
+
+        assert!(
+            logged.contains("rgwtrace shutdown summary"),
+            "the shutdown summary must be logged even when the final trace has no spans: {logged}"
+        );
+        assert!(
+            logged.contains("bpf_operate_seed_hits_reqstate=41"),
+            "the shutdown summary must carry the FINAL counters: {logged}"
+        );
+        assert!(
+            logged.contains("bpf_operate_seed_hits_rgwop=7"),
+            "the shutdown summary must carry the FINAL counters: {logged}"
+        );
+    }
+
+    /// The same, on the export-failure path: the counters must survive a failed
+    /// export, which is when an operator needs them most.
+    #[test]
+    fn shutdown_summary_log_carries_the_final_counters_when_the_export_fails() {
+        let trace = empty_trace_with_final_counters();
+        let document = serde_json::json!({ "trace": &trace });
+
+        let logged = capture_log(|| {
+            let result = finish_otlp_export(
+                Err(anyhow::anyhow!("connection refused")),
+                &document,
+                &trace,
+                &mut Vec::new(),
+            );
+            assert!(result.is_err());
+        });
+
+        assert!(logged.contains("rgwtrace shutdown summary"));
+        assert!(
+            logged.contains("bpf_operate_seed_hits_reqstate=41"),
+            "a failed export must still log the final counters: {logged}"
+        );
+    }
+
+    /// THE JSON PATH, for the same empty-final-trace case. It has no equivalent
+    /// hole -- the document is printed unconditionally and serde carries every
+    /// counter -- and this pins that: no `spans.is_empty()` short-circuit may ever
+    /// be added to it.
+    #[test]
+    fn json_output_carries_the_final_counters_with_no_spans() {
+        let trace = empty_trace_with_final_counters();
+        let dwarf = DwarfInfo::default();
+
+        let document = trace_output_document(&dwarf, &trace).unwrap();
+
+        assert_eq!(document["trace"]["spans"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            document["trace"]["diagnostics"]["bpf_operate_seed_hits_reqstate"],
+            41
+        );
+        assert_eq!(
+            document["trace"]["diagnostics"]["bpf_operate_seed_hits_rgwop"],
+            7
+        );
     }
 
     #[test]

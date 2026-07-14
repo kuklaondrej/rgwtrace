@@ -9,14 +9,16 @@ use tracing::warn;
 use crate::{
     cli::Cli,
     dwarf_json::{
-        module_key_for_path, DwarfInfo, DwarfSummary, ModuleMatch, RGW_PROCESS_AUTHENTICATED,
+        module_key_for_path, DwarfInfo, DwarfSummary, ModuleMatch, RadosOperateProbe,
+        RequestEndProbe, REQ_STATE_DTOR, RGWREST_GET_HANDLER, RGW_PROCESS_AUTHENTICATED,
+        RGW_RADOS_OPERATE, RGW_RADOS_OPERATE_OVERLOADS,
     },
     targets::{self, ProbeTargets},
 };
 
 const SEND_OP: &str = "Objecter::_send_op";
 const FINISH_OP: &str = "Objecter::_finish_op";
-const GET_HANDLER: &str = "RGWREST::get_handler";
+const GET_HANDLER: &str = RGWREST_GET_HANDLER;
 
 const SEND_OP_FIELDS: usize = 12;
 const FINISH_OP_FIELDS: usize = 3;
@@ -256,37 +258,167 @@ fn checks(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Vec<PreflightCheck> {
             status: "ok",
             detail: format!("{GET_HANDLER} available in {radosgw}"),
         },
+        request_end_probe_check(dwarf, &radosgw),
         reseed_probe_check(dwarf, &radosgw),
+        rados_operate_probe_check(dwarf, &radosgw),
     ]
 }
 
-/// Advisory (non-fatal) availability of the Stage 3 cross-thread re-seed probe.
+/// PHASE B, advisory (non-fatal): can the per-submit re-seed attach to BOTH
+/// `rgw_rados_operate` overloads?
+///
+/// This is the check that says whether `--correlate-cross-thread` will actually
+/// correlate anything beyond the seed threads. Without it, a RADOS op submitted
+/// after the request's coroutine migrated off its seed thread -- which is most of
+/// them -- has no request context on its thread and is reported as a background
+/// op. So a `warn` here is the difference between "cross-thread correlation" and
+/// "cross-thread correlation in name only", and it names which overload is
+/// missing: losing the read overload loses GET/HEAD metadata reads, losing the
+/// write overload loses the entire PUT/DELETE data path.
+///
+/// It stays advisory because an RGW build without these symbols must still trace:
+/// it degrades to the pre-Phase-B behavior, exactly as it did before.
+///
+/// It ALSO reports the probe as unavailable when the request-END probe is not
+/// available, even if both overloads resolve perfectly: the per-submit re-seed
+/// looks every rados operate's `dpp` up in the bridge, and that is only safe while
+/// bridge entries are REVOKED at request end -- which only the END probe does.
+/// Without it, a recycled req_state/RGWOp address would hit a long-dead request's
+/// entry and stamp its trans_id onto a live op. The live attach gate makes the
+/// same call, so preflight can never advertise a probe the run will refuse.
+fn rados_operate_probe_check(dwarf: &DwarfInfo, radosgw: &str) -> PreflightCheck {
+    let mut gaps: Vec<String> = RGW_RADOS_OPERATE_OVERLOADS
+        .iter()
+        .filter_map(
+            |function| match dwarf.rados_operate_probe(radosgw, function) {
+                RadosOperateProbe::Available { .. } => None,
+                RadosOperateProbe::Unavailable(gap) => Some(gap.reason()),
+            },
+        )
+        .collect();
+
+    if matches!(
+        dwarf.request_end_probe(radosgw),
+        RequestEndProbe::Unavailable(_)
+    ) {
+        gaps.push(format!(
+            "the request-END probe ({REQ_STATE_DTOR}) is unavailable, and it is the ONLY thing that \
+             revokes a request's bridge entries -- without it a recycled req_state/RGWOp address \
+             could seed a DEAD request's trans_id onto a live RADOS op, so the per-submit re-seed \
+             is refused rather than risk mis-correlation"
+        ));
+    }
+
+    if gaps.is_empty() {
+        PreflightCheck {
+            name: "cross_thread_operate_probe".to_string(),
+            status: "ok",
+            detail: format!(
+                "both {RGW_RADOS_OPERATE} overloads available in {radosgw}; \
+                 --correlate-cross-thread can re-seed request context at every RADOS submit, so \
+                 ops submitted after a coroutine migration still correlate"
+            ),
+        }
+    } else {
+        PreflightCheck {
+            name: "cross_thread_operate_probe".to_string(),
+            status: "warn",
+            detail: format!(
+                "{}; --correlate-cross-thread will not re-seed at those submits, so RADOS ops \
+                 submitted after a coroutine migration stay uncorrelated (background/inferred)",
+                gaps.join("; ")
+            ),
+        }
+    }
+}
+
+/// Advisory (non-fatal) availability of the request-END probe
+/// (`req_state::~req_state`). Present => request spans carry a MEASURED end
+/// (`rgw.duration_quality = "measured"`). Absent => the tracer keeps working
+/// exactly as it did before the probe existed, deriving each request's end from
+/// its correlated RADOS child bounds (`rgw.duration_quality = "marker"`), so this
+/// is a `warn`, never a hard failure.
+///
+/// All THREE halves must resolve, and the check reports exactly which one did
+/// not: the destructor ADDRESS, the variant PROVENANCE proving that address is
+/// the complete/base destructor (D1/D2) and not the deleting one (D0), and the
+/// register-only raw-pointer descriptor for its `this` parameter. See
+/// [`DwarfInfo::request_end_probe`] -- this check and the live attach gate ask
+/// the same question of the same artifact, so preflight can never advertise a
+/// probe the run will refuse to attach.
+fn request_end_probe_check(dwarf: &DwarfInfo, radosgw: &str) -> PreflightCheck {
+    match dwarf.request_end_probe(radosgw) {
+        RequestEndProbe::Available { linkage, .. } => PreflightCheck {
+            name: "request_end_probe".to_string(),
+            status: "ok",
+            detail: format!(
+                "{REQ_STATE_DTOR} available in {radosgw} (linkage {linkage}); request spans will \
+                 carry a measured end (rgw.duration_quality=\"measured\")"
+            ),
+        },
+        RequestEndProbe::Unavailable(gap) => PreflightCheck {
+            name: "request_end_probe".to_string(),
+            status: "warn",
+            detail: format!(
+                "{}; request ends will be derived from RADOS child bounds \
+                 (rgw.duration_quality=\"marker\")",
+                gap.reason()
+            ),
+        },
+    }
+}
+
+/// Advisory (non-fatal) availability of the Stage 3 cross-thread re-seed probe,
+/// and of the ALTERNATE bridge key it registers.
+///
 /// A missing `rgw_process_authenticated` raw-pointer descriptor only degrades
 /// `--correlate-cross-thread` to same-thread behavior, so it is reported as a
-/// `warn` rather than failing preflight -- consistent with the build-id
-/// advisory style.
+/// `warn` rather than failing preflight -- consistent with the build-id advisory
+/// style.
+///
+/// A missing `RGWOp*&` descriptor is warned about SEPARATELY and just as loudly,
+/// because it is the difference between correlating an op's data path and not:
+/// RGW passes the executing RGWOp -- not the req_state -- as the `dpp` at most
+/// call sites inside `op->execute()`, so without that key the per-submit re-seed
+/// misses on exactly the ops the feature exists to recover, while every counter
+/// still looks healthy.
 fn reseed_probe_check(dwarf: &DwarfInfo, radosgw: &str) -> PreflightCheck {
     let present = dwarf
         .function_addr(radosgw, RGW_PROCESS_AUTHENTICATED)
         .is_some()
         && dwarf.function_has_raw_pointer_descriptor(radosgw, RGW_PROCESS_AUTHENTICATED);
-    if present {
-        PreflightCheck {
-            name: "cross_thread_reseed_probe".to_string(),
-            status: "ok",
-            detail: format!(
-                "{RGW_PROCESS_AUTHENTICATED} available in {radosgw}; --correlate-cross-thread can attach the re-seed bridge"
-            ),
-        }
-    } else {
-        PreflightCheck {
+    if !present {
+        return PreflightCheck {
             name: "cross_thread_reseed_probe".to_string(),
             status: "warn",
             detail: format!(
                 "{RGW_PROCESS_AUTHENTICATED} raw-pointer descriptor unavailable in {radosgw}; \
                  --correlate-cross-thread will fall back to same-thread correlation"
             ),
-        }
+        };
+    }
+    if !dwarf.function_has_rgw_op_descriptor(radosgw) {
+        return PreflightCheck {
+            name: "cross_thread_reseed_probe".to_string(),
+            status: "warn",
+            detail: format!(
+                "{RGW_PROCESS_AUTHENTICATED} available in {radosgw}, but its `RGWOp*&` descriptor \
+                 is not (the parameter is not register-resident at entry, or RGWOp's \
+                 DoutPrefixProvider base could not be proven to sit at offset 0). Requests will be \
+                 keyed by their req_state* ONLY -- and RGW passes the executing RGWOp, not the \
+                 req_state, as the dpp at most call sites in an op's data path, so those RADOS ops \
+                 will stay uncorrelated. Re-export the DWARF artifact with a current rgwtrace"
+            ),
+        };
+    }
+    PreflightCheck {
+        name: "cross_thread_reseed_probe".to_string(),
+        status: "ok",
+        detail: format!(
+            "{RGW_PROCESS_AUTHENTICATED} available in {radosgw} with both bridge-key descriptors \
+             (req_state* and RGWOp*&); --correlate-cross-thread can attach the re-seed bridge and \
+             key each request by both dpp identities"
+        ),
     }
 }
 
@@ -387,6 +519,7 @@ fn target_basename(path: &Path, label: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dwarf_json::{RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE};
 
     #[test]
     fn validates_required_dwarf_targets() {
@@ -496,6 +629,281 @@ mod tests {
         };
 
         assert!(validate_dwarf_targets(&dwarf, &targets).is_err());
+    }
+
+    #[test]
+    fn request_end_probe_check_is_ok_when_the_dtor_resolves() {
+        // All three halves present: the destructor address, the register-only
+        // raw-pointer descriptor for its `this` parameter, and the mangled
+        // linkage name PROVING the address is the complete-object destructor.
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_request_end_probe(
+            Some("_ZN9req_stateD1Ev"),
+            RAW_POINTER_VAR_FIELD,
+        ))
+        .unwrap();
+
+        let check = request_end_probe_check(&dwarf, "radosgw");
+
+        assert_eq!(check.name, "request_end_probe");
+        assert_eq!(check.status, "ok");
+        assert!(check.detail.contains("measured"), "{}", check.detail);
+        assert!(
+            check.detail.contains("_ZN9req_stateD1Ev"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn request_end_probe_check_warns_but_never_fails_without_the_dtor() {
+        // BACKWARD COMPATIBILITY: an RGW build whose destructor cannot be
+        // resolved must still pass preflight. The missing end probe is advisory
+        // only -- the run degrades to derived request durations.
+        let dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "radosgw")).unwrap();
+        let targets = ProbeTargets {
+            librados: "/tmp/librados.so.2".into(),
+            librbd: None,
+            libceph_common: "/tmp/libceph-common.so.2".into(),
+            radosgw: "/tmp/radosgw".into(),
+        };
+
+        // Not a hard error...
+        validate_dwarf_targets(&dwarf, &targets).unwrap();
+
+        // ...but surfaced as a warning that names the fallback behavior.
+        let check = request_end_probe_check(&dwarf, "radosgw");
+        assert_eq!(check.status, "warn");
+        assert!(check.detail.contains("marker"), "{}", check.detail);
+    }
+
+    #[test]
+    fn request_end_probe_check_warns_when_only_the_address_resolves() {
+        // A destructor address without a usable `this` descriptor cannot be
+        // probed (the BPF handler reads the register-only descriptor), so it must
+        // not be advertised as available.
+        let json = format!(
+            r#"{{
+              "version": "18.2.8-1jammy",
+              "arch": "amd64",
+              "libceph-common.so.2": {{
+                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2}},
+                "func2vf": {{
+                  "{SEND_OP}": {{"var_fields": {send}}},
+                  "{FINISH_OP}": {{"var_fields": {finish}}}
+                }}
+              }},
+              "radosgw": {{
+                "func2pc": {{"{GET_HANDLER}": 3, "{REQ_STATE_DTOR}": 4}},
+                "func2vf": {{"{GET_HANDLER}": {{"var_fields": {handler}}}}}
+              }}
+            }}"#,
+            send = var_fields(SEND_OP_FIELDS),
+            finish = var_fields(FINISH_OP_FIELDS),
+            handler = var_fields(GET_HANDLER_FIELDS),
+        );
+        let dwarf = DwarfInfo::from_str(&json).unwrap();
+
+        assert!(dwarf.function_addr("radosgw", REQ_STATE_DTOR).is_some());
+        assert_eq!(request_end_probe_check(&dwarf, "radosgw").status, "warn");
+    }
+
+    #[test]
+    fn request_end_probe_check_warns_when_the_variant_provenance_is_missing() {
+        // An artifact exported before `func2linkage` existed (or by a
+        // third-party producer): address + descriptor both resolve, but nothing
+        // proves the address is the complete/base destructor rather than the
+        // DELETING one. Preflight must warn, and the run must not attach.
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_request_end_probe(
+            None,
+            RAW_POINTER_VAR_FIELD,
+        ))
+        .unwrap();
+
+        let check = request_end_probe_check(&dwarf, "radosgw");
+
+        assert_eq!(check.status, "warn");
+        assert!(check.detail.contains("func2linkage"), "{}", check.detail);
+        assert!(check.detail.contains("marker"), "{}", check.detail);
+    }
+
+    #[test]
+    fn request_end_probe_check_warns_when_the_provenance_names_the_deleting_dtor() {
+        // The hazard this gate exists for: a producer that resolved the FIRST
+        // destructor with that demangled name hands us D0 (g++ emits it first).
+        // The address and descriptor checks both pass, so only the linkage name
+        // can catch it -- and it must, because probing D0 probes a function that
+        // never runs for a stack-allocated req_state.
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_request_end_probe(
+            Some("_ZN9req_stateD0Ev"),
+            RAW_POINTER_VAR_FIELD,
+        ))
+        .unwrap();
+
+        let check = request_end_probe_check(&dwarf, "radosgw");
+
+        assert_eq!(check.status, "warn");
+        assert!(
+            check.detail.contains("_ZN9req_stateD0Ev"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// Artifact carrying the request-END probe: the destructor address, the
+    /// raw-pointer `this` descriptor (register-located, single sentinel field),
+    /// and -- when `linkage` is `Some` -- the `func2linkage` variant provenance
+    /// for the address.
+    fn dwarf_json_with_request_end_probe(linkage: Option<&str>, descriptor: &str) -> String {
+        let func2linkage = match linkage {
+            Some(linkage) => format!(r#", "func2linkage": {{"{REQ_STATE_DTOR}": "{linkage}"}}"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+              "version": "18.2.8-1jammy",
+              "arch": "amd64",
+              "libceph-common.so.2": {{
+                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2}},
+                "func2vf": {{
+                  "{SEND_OP}": {{"var_fields": {send}}},
+                  "{FINISH_OP}": {{"var_fields": {finish}}}
+                }}
+              }},
+              "radosgw": {{
+                "func2pc": {{"{GET_HANDLER}": 3, "{REQ_STATE_DTOR}": 4}},
+                "func2vf": {{
+                  "{GET_HANDLER}": {{"var_fields": {handler}}},
+                  "{REQ_STATE_DTOR}": {{"var_fields": [{descriptor}]}}
+                }}{func2linkage}
+              }}
+            }}"#,
+            send = var_fields(SEND_OP_FIELDS),
+            finish = var_fields(FINISH_OP_FIELDS),
+            handler = var_fields(GET_HANDLER_FIELDS),
+        )
+    }
+
+    /// The exact raw-pointer descriptor shape native extraction emits for a
+    /// pointer parameter: register-located, one `{offset: 0, pointer: false}`.
+    const RAW_POINTER_VAR_FIELD: &str = r#"{"location":{"reg":5,"offset":0,"stack":false},"fields":[{"offset":0,"pointer":false}]}"#;
+
+    /// The reference-to-pointer descriptor: register-located, one
+    /// `{offset: 0, pointer: true}` -- the `RGWOp*& op` alternate bridge key.
+    const POINTER_REF_VAR_FIELD: &str =
+        r#"{"location":{"reg":4,"offset":0,"stack":false},"fields":[{"offset":0,"pointer":true}]}"#;
+
+    /// The mangled names of the two `rgw_rados_operate` overloads, as g++ emits
+    /// them. Used to give an artifact real, verifiable overload provenance.
+    const OPERATE_READ_LINKAGE: &str = "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_19ObjectReadOperationEPN4ceph6buffer7v15_2_04listE14optional_yieldi";
+    const OPERATE_WRITE_LINKAGE: &str = "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_20ObjectWriteOperationE14optional_yieldi";
+
+    /// A radosgw artifact carrying the full cross-thread feature set: the END probe
+    /// (address + D1 provenance + `this` descriptor), both `rgw_rados_operate`
+    /// overloads (addresses + overload provenance + `dpp` descriptors), and
+    /// `rgw_process_authenticated` with BOTH bridge-key descriptors. Knobs let each
+    /// half be removed so a check can be tested in isolation.
+    fn dwarf_json_with_cross_thread(end_probe: bool, rgw_op_descriptor: bool) -> String {
+        let (dtor_pc, dtor_vf, dtor_linkage) = if end_probe {
+            (
+                format!(r#", "{REQ_STATE_DTOR}": 4"#),
+                format!(r#", "{REQ_STATE_DTOR}": {{"var_fields": [{RAW_POINTER_VAR_FIELD}]}}"#),
+                format!(r#""{REQ_STATE_DTOR}": "_ZN9req_stateD1Ev", "#),
+            )
+        } else {
+            (String::new(), String::new(), String::new())
+        };
+        let authenticated_vf = if rgw_op_descriptor {
+            format!("[{RAW_POINTER_VAR_FIELD},{POINTER_REF_VAR_FIELD}]")
+        } else {
+            format!("[{RAW_POINTER_VAR_FIELD}]")
+        };
+        format!(
+            r#"{{
+              "version": "18.2.8-1jammy",
+              "arch": "amd64",
+              "libceph-common.so.2": {{
+                "func2pc": {{"{SEND_OP}": 1, "{FINISH_OP}": 2}},
+                "func2vf": {{
+                  "{SEND_OP}": {{"var_fields": {send}}},
+                  "{FINISH_OP}": {{"var_fields": {finish}}}
+                }}
+              }},
+              "radosgw": {{
+                "func2pc": {{
+                  "{GET_HANDLER}": 3{dtor_pc},
+                  "{RGW_PROCESS_AUTHENTICATED}": 5,
+                  "{read}": 6,
+                  "{write}": 7
+                }},
+                "func2vf": {{
+                  "{GET_HANDLER}": {{"var_fields": {handler}}},
+                  "{RGW_PROCESS_AUTHENTICATED}": {{"var_fields": {authenticated_vf}}},
+                  "{read}": {{"var_fields": [{RAW_POINTER_VAR_FIELD}]}},
+                  "{write}": {{"var_fields": [{RAW_POINTER_VAR_FIELD}]}}{dtor_vf}
+                }},
+                "func2linkage": {{
+                  {dtor_linkage}"{read}": "{OPERATE_READ_LINKAGE}",
+                  "{write}": "{OPERATE_WRITE_LINKAGE}"
+                }}
+              }}
+            }}"#,
+            send = var_fields(SEND_OP_FIELDS),
+            finish = var_fields(FINISH_OP_FIELDS),
+            handler = var_fields(GET_HANDLER_FIELDS),
+            read = RGW_RADOS_OPERATE_READ,
+            write = RGW_RADOS_OPERATE_WRITE,
+        )
+    }
+
+    #[test]
+    fn operate_probe_check_is_ok_when_both_overloads_and_the_end_probe_resolve() {
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_cross_thread(true, true)).unwrap();
+
+        let check = rados_operate_probe_check(&dwarf, "radosgw");
+
+        assert_eq!(check.status, "ok", "{}", check.detail);
+        assert_eq!(check.name, "cross_thread_operate_probe");
+    }
+
+    #[test]
+    fn operate_probe_check_warns_without_the_end_probe_even_when_both_overloads_resolve() {
+        // FINDING 3, preflight half. The per-submit re-seed looks EVERY rados
+        // operate's dpp up in the bridge, and only the END probe revokes bridge
+        // entries. Without it, entries live forever and a recycled req_state/RGWOp
+        // address (or a numerically-matching foreign dpp) hits a DEAD request's
+        // entry and stamps its trans_id. The live attach gate refuses to attach in
+        // that state, so preflight must not advertise the probe as available.
+        let dwarf = DwarfInfo::from_str(&dwarf_json_with_cross_thread(false, true)).unwrap();
+
+        let check = rados_operate_probe_check(&dwarf, "radosgw");
+
+        assert_eq!(
+            check.status, "warn",
+            "the operate probe must not be advertised without a revoking END probe: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("revokes a request's bridge entries"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn reseed_probe_check_warns_when_the_rgw_op_bridge_key_is_missing() {
+        // Without the `RGWOp*&` descriptor a request is keyed by its req_state*
+        // alone -- and RGW passes the executing RGWOp, not the req_state, as the dpp
+        // at most call sites in an op's data path. The re-seed then misses on
+        // exactly the ops it exists to recover, while every counter looks healthy.
+        // That must be visible BEFORE a live run, not inferred from an empty trace.
+        let with_key = DwarfInfo::from_str(&dwarf_json_with_cross_thread(true, true)).unwrap();
+        assert_eq!(reseed_probe_check(&with_key, "radosgw").status, "ok");
+
+        let without_key = DwarfInfo::from_str(&dwarf_json_with_cross_thread(true, false)).unwrap();
+        let check = reseed_probe_check(&without_key, "radosgw");
+
+        assert_eq!(check.status, "warn", "{}", check.detail);
+        assert!(check.detail.contains("RGWOp*&"), "{}", check.detail);
     }
 
     #[test]

@@ -19,7 +19,19 @@
         },
         {
           "key": "rgw.duration_quality",
-          "value": "marker"
+          "value": "measured"
+        },
+        {
+          "key": "rgw.request.tid",
+          "value": 7
+        },
+        {
+          "key": "rgw.request.measured_start_ns",
+          "value": 100
+        },
+        {
+          "key": "rgw.request.measured_end_ns",
+          "value": 250
         }
       ],
       "events": []
@@ -35,6 +47,10 @@
         {
           "key": "ceph.rados.duration_ns",
           "value": 70
+        },
+        {
+          "key": "ceph.rados.send_tid",
+          "value": 7
         },
         {
           "key": "ceph.rados.pool",
@@ -100,6 +116,10 @@
           "value": 20
         },
         {
+          "key": "ceph.rados.send_tid",
+          "value": 7
+        },
+        {
           "key": "ceph.rados.pool",
           "value": 16
         },
@@ -162,6 +182,10 @@
               "value": 20
             },
             {
+              "key": "ceph.rados.send_tid",
+              "value": 7
+            },
+            {
               "key": "ceph.rados.pool",
               "value": 16
             },
@@ -219,9 +243,12 @@
     }
   ],
   "diagnostics": {
-    "events_decoded": 3,
+    "events_decoded": 4,
     "decode_errors": 0,
     "request_markers": 1,
+    "request_end_markers": 1,
+    "measured_duration_requests": 1,
+    "derived_duration_requests": 0,
     "rados_ops": 2,
     "correlated_rados_ops": 1,
     "background_rados_ops": 1,
@@ -239,6 +266,9 @@
     },
     "spans_produced": 3,
     "expired_request_groups": 0,
+    "expired_open_requests": 0,
+    "late_request_markers_dropped": 0,
+    "emitted_request_keys": 0,
     "expired_background_rados_ops": 0,
     "truncated_trans_ids": 0,
     "truncated_object_names": 0,
@@ -257,6 +287,27 @@
     "bpf_reqstate_map_drops": 0,
     "bpf_reseed_hits": 0,
     "bpf_reseed_misses": 0,
-    "bpf_reseed_base_unresolved": 0
+    "bpf_reseed_base_unresolved": 0,
+    "bpf_request_end_hits": 0,
+    "bpf_request_end_misses": 0,
+    "bpf_request_end_base_unresolved": 0,
+    "bpf_sendop_stale_ctx_drops": 0,
+    "bpf_sendop_unverifiable_ctx": 0,
+    "bpf_operate_seed_hits": 0,
+    "bpf_operate_seed_misses": 0,
+    "bpf_operate_base_unresolved": 0,
+    "bpf_sendop_unbridged_ctx_drops": 0,
+    "bpf_operate_miss_ctx_cleared": 0,
+    "bpf_operate_unresolved_ctx_cleared": 0,
+    "bpf_rgw_op_key_inserts": 0,
+    "bpf_rgw_op_key_revokes": 0,
+    "bpf_rgw_op_key_revoke_skipped": 0,
+    "bpf_rgw_op_key_revoke_absent": 0,
+    "bpf_rgw_op_key_unresolved": 0,
+    "bpf_rgw_op_key_index_drops": 0,
+    "bpf_rgw_op_key_disabled": 0,
+    "bpf_operate_seed_hits_reqstate": 0,
+    "bpf_operate_seed_hits_rgwop": 0,
+    "bpf_operate_seed_hits_unattributed": 0
   }
 }

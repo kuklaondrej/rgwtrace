@@ -22,10 +22,14 @@ use tracing::{debug, info, warn};
 use crate::{
     cli::{Cli, OutputMode},
     collector::{BpfDiagnostics, Collector, TraceDocument},
-    dwarf_json::{module_key_for_path, DwarfInfo, VarFieldKernel},
+    dwarf_json::{
+        module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
+        VarFieldKernel, REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
+        RGW_RADOS_OPERATE_WRITE,
+    },
     events::{
         RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
-        RGWTRACE_EVENT_REQUEST_END,
+        RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
     },
     otel, preflight, targets,
 };
@@ -49,6 +53,27 @@ const BPF_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
 const BPF_DIAG_RESEED_HITS: u32 = 7;
 const BPF_DIAG_RESEED_MISSES: u32 = 8;
 const BPF_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
+const BPF_DIAG_REQUEST_END_HITS: u32 = 10;
+const BPF_DIAG_REQUEST_END_MISSES: u32 = 11;
+const BPF_DIAG_REQUEST_END_BASE_UNRESOLVED: u32 = 12;
+const BPF_DIAG_SENDOP_STALE_CTX_DROPS: u32 = 13;
+const BPF_DIAG_SENDOP_UNVERIFIABLE_CTX: u32 = 14;
+const BPF_DIAG_OPERATE_SEED_HITS: u32 = 15;
+const BPF_DIAG_OPERATE_SEED_MISSES: u32 = 16;
+const BPF_DIAG_OPERATE_BASE_UNRESOLVED: u32 = 17;
+const BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS: u32 = 18;
+const BPF_DIAG_OPERATE_MISS_CTX_CLEARED: u32 = 19;
+const BPF_DIAG_RGWOP_KEY_INSERTS: u32 = 20;
+const BPF_DIAG_RGWOP_KEY_REVOKES: u32 = 21;
+const BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED: u32 = 22;
+const BPF_DIAG_RGWOP_KEY_UNRESOLVED: u32 = 23;
+const BPF_DIAG_OPERATE_SEED_HITS_REQSTATE: u32 = 24;
+const BPF_DIAG_OPERATE_SEED_HITS_RGWOP: u32 = 25;
+const BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED: u32 = 26;
+const BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
+const BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
+const BPF_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
+const BPF_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -76,14 +101,33 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let mut skel = open.load()?;
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
-    let _links = attach_probes(&mut skel, dwarf, &targets, pid, cli.correlate_cross_thread)?;
+    // The BPF globals (`REQUEST_END_PROBE_ATTACHED`, `RGW_OP_BRIDGE_KEY_ENABLED`)
+    // are published INSIDE attach_probes, between the destructor attach and the
+    // first probe that can create or consume a bridge entry. Publishing them here,
+    // after every probe is already live, is exactly the ordering bug that let a
+    // request complete before its revoker existed -- see `ATTACH_ORDER`.
+    let attached = attach_probes(
+        &mut skel,
+        dwarf,
+        &targets,
+        pid,
+        cli.correlate_cross_thread,
+        !cli.disable_rgw_op_bridge_key,
+    )?;
+    let _links = attached.links;
     let timestamp_offset_ns = unix_boottime_offset_ns()?;
 
-    let collector = Arc::new(Mutex::new(if cli.correlate_inferred {
+    let mut collector_state = if cli.correlate_inferred {
         Collector::with_inferred_correlation(duration_ns(cli.inference_window))
     } else {
         Collector::default()
-    }));
+    };
+    // Same fact, userspace half: with the END probe attached, a request that has
+    // not produced an END is still OPEN and must not be TTL-expired out from
+    // under its pending END (which would export it twice). Without it, no END is
+    // ever coming and the plain idle TTL is correct.
+    collector_state.set_end_probe_attached(attached.request_end_probe);
+    let collector = Arc::new(Mutex::new(collector_state));
     let otlp_exporter = matches!(cli.output, OutputMode::Otlp).then(|| OtlpExporter::spawn(cli));
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
@@ -200,10 +244,18 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
             "merged OTLP spans stranded by a disconnected exporter into the end-of-run trace"
         );
     }
+    // The run summary belongs in the log, not only in the JSON body: with
+    // `--output otlp` the JSON document is never printed, so without it a live run
+    // cannot be evaluated without guessing.
+    //
+    // EVERY counter, rendered from `TraceDiagnostics::counters()` -- not a curated
+    // list of `info!` fields. The curated list was how the Phase B counters came to
+    // be missing from the OTLP export: a hand-maintained subset silently falls
+    // behind the struct, and the counters that go missing are always the newest
+    // ones, i.e. exactly the ones a validation run needs.
     info!(
         spans = trace.spans.len(),
-        otlp_queue_dropped_traces = trace.diagnostics.otlp_queue_dropped_traces,
-        otlp_queue_dropped_spans = trace.diagnostics.otlp_queue_dropped_spans,
+        diagnostics = %trace.diagnostics.summary(),
         "finished live tracing"
     );
     // Operator UX: OTLP export backpressure silently dropped batches during the
@@ -267,6 +319,33 @@ fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
         reseed_hits: read_bpf_counter(map, BPF_DIAG_RESEED_HITS)?,
         reseed_misses: read_bpf_counter(map, BPF_DIAG_RESEED_MISSES)?,
         reseed_base_unresolved: read_bpf_counter(map, BPF_DIAG_RESEED_BASE_UNRESOLVED)?,
+        request_end_hits: read_bpf_counter(map, BPF_DIAG_REQUEST_END_HITS)?,
+        request_end_misses: read_bpf_counter(map, BPF_DIAG_REQUEST_END_MISSES)?,
+        request_end_base_unresolved: read_bpf_counter(map, BPF_DIAG_REQUEST_END_BASE_UNRESOLVED)?,
+        sendop_stale_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_STALE_CTX_DROPS)?,
+        sendop_unverifiable_ctx: read_bpf_counter(map, BPF_DIAG_SENDOP_UNVERIFIABLE_CTX)?,
+        operate_seed_hits: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS)?,
+        operate_seed_misses: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_MISSES)?,
+        operate_base_unresolved: read_bpf_counter(map, BPF_DIAG_OPERATE_BASE_UNRESOLVED)?,
+        sendop_unbridged_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS)?,
+        operate_miss_ctx_cleared: read_bpf_counter(map, BPF_DIAG_OPERATE_MISS_CTX_CLEARED)?,
+        rgw_op_key_inserts: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INSERTS)?,
+        rgw_op_key_revokes: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKES)?,
+        rgw_op_key_revoke_skipped: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED)?,
+        rgw_op_key_unresolved: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_UNRESOLVED)?,
+        operate_seed_hits_reqstate: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_REQSTATE)?,
+        operate_seed_hits_rgwop: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_RGWOP)?,
+        operate_seed_hits_unattributed: read_bpf_counter(
+            map,
+            BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED,
+        )?,
+        operate_unresolved_ctx_cleared: read_bpf_counter(
+            map,
+            BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
+        )?,
+        rgw_op_key_revoke_absent: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
+        rgw_op_key_index_drops: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INDEX_DROPS)?,
+        rgw_op_key_disabled: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_DISABLED)?,
     })
 }
 
@@ -469,68 +548,548 @@ fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
     Ok(())
 }
 
+/// What `attach_probes` attached, beyond the links themselves.
+struct AttachedProbes {
+    links: Vec<Link>,
+    /// Whether the request-END probe (`req_state::~req_state`) is live. Drives
+    /// both the BPF `REQUEST_END_PROBE_ATTACHED` gate (whether a request context
+    /// found on a submitting thread can be liveness-checked against the bridge)
+    /// and the collector's open-request expiry model (whether an END is still
+    /// expected for a request that has not produced one).
+    request_end_probe: bool,
+}
+
+/// One step of the attach sequence. The ORDER of these steps is a correctness
+/// property, not a style choice -- see [`ATTACH_ORDER`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachStep {
+    /// `req_state::~req_state` -- the ONLY thing that deletes a bridge entry.
+    RequestEndProbe,
+    /// Publish the BPF globals (`REQUEST_END_PROBE_ATTACHED`,
+    /// `RGW_OP_BRIDGE_KEY_ENABLED`) that every probe below reads.
+    PublishBpfConfig,
+    /// `RGWREST::get_handler` -- creates a request's CANONICAL bridge entry.
+    GetHandler,
+    /// `rgw_process_authenticated` -- creates the ALTERNATE bridge entry, and
+    /// consumes the bridge (Stage-3 re-seed).
+    ProcessAuthenticated,
+    /// Both `rgw_rados_operate` overloads -- consume the bridge (Phase B).
+    RadosOperate,
+    /// `Objecter::_send_op` / `_finish_op` -- consume the seeded thread context
+    /// (this is what actually stamps a trans_id onto an op).
+    ObjecterOps,
+}
+
+impl AttachStep {
+    /// Does this step attach a probe that can CREATE a bridge entry?
+    fn is_bridge_producer(self) -> bool {
+        matches!(self, Self::GetHandler | Self::ProcessAuthenticated)
+    }
+
+    /// Does this step attach a probe that can READ a bridge entry (or the thread
+    /// context seeded from one) and act on it?
+    fn is_bridge_consumer(self) -> bool {
+        matches!(
+            self,
+            Self::ProcessAuthenticated | Self::RadosOperate | Self::ObjecterOps
+        )
+    }
+}
+
+/// THE ATTACH ORDER, and why it is this one.
+///
+/// A bridge entry is created by `get_handler` and revoked by ONE probe only: the
+/// `req_state` destructor. If `get_handler` attached first, a request could pass it
+/// -- creating its canonical bridge entry -- and then RUN TO COMPLETION before the
+/// destructor probe went live. Nothing would ever delete that entry. It would sit
+/// in `rgw_ctx_by_reqstate` for the rest of the run, and the moment
+/// `REQUEST_END_PROBE_ATTACHED` flipped to 1 it would start PASSING the `_send_op`
+/// liveness gate's identity check (`start_ns`/`tid` match the copy, because both
+/// came from the same dead request) -- so a later `_send_op` on that thread, or any
+/// per-submit seed that hit that entry, would stamp a DEAD request's trans_id onto
+/// a live op. That is a mis-correlation, which is strictly worse than no
+/// correlation, and it would be permanent: nothing can revoke an entry whose
+/// destructor was never probed.
+///
+/// So: the REVOKER attaches first, then the config it depends on is published,
+/// and only then can anything PRODUCE or CONSUME a bridge entry. Every entry that
+/// can ever exist is therefore created with its revoker already live.
+///
+/// `validate_attach_order` enforces exactly that, and `attach_probes` DRIVES this
+/// array rather than restating the order in code, so the order that is tested is
+/// the order that runs.
+const ATTACH_ORDER: [AttachStep; 6] = [
+    AttachStep::RequestEndProbe,
+    AttachStep::PublishBpfConfig,
+    AttachStep::GetHandler,
+    AttachStep::ProcessAuthenticated,
+    AttachStep::RadosOperate,
+    AttachStep::ObjecterOps,
+];
+
+/// Fail closed if the attach sequence would let a bridge entry exist before its
+/// revoker (or before the gate that depends on the revoker) is live. This is a
+/// tripwire for a future edit that reorders `ATTACH_ORDER`, and it runs before a
+/// single probe is attached.
+fn validate_attach_order(steps: &[AttachStep]) -> Result<()> {
+    let revoker = steps
+        .iter()
+        .position(|step| *step == AttachStep::RequestEndProbe)
+        .context(
+            "the attach order must include the request-END probe (the bridge's only revoker)",
+        )?;
+    let config = steps
+        .iter()
+        .position(|step| *step == AttachStep::PublishBpfConfig)
+        .context("the attach order must publish the BPF config")?;
+    if config < revoker {
+        bail!(
+            "attach order is unsafe: the BPF config is published before the request-END probe \
+             attaches, so REQUEST_END_PROBE_ATTACHED could claim a revoker that is not live yet"
+        );
+    }
+
+    for (idx, step) in steps.iter().enumerate() {
+        if step.is_bridge_producer() && idx < revoker {
+            bail!(
+                "attach order is unsafe: {step:?} can create a bridge entry before the request-END \
+                 probe is attached, so that entry could never be revoked and would eventually pass \
+                 the liveness gate for a DEAD request"
+            );
+        }
+        if (step.is_bridge_producer() || step.is_bridge_consumer()) && idx < config {
+            bail!(
+                "attach order is unsafe: {step:?} touches the bridge before the BPF config that \
+                 gates it has been published"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of an optional uprobe attach. `Skipped` is not an error -- the
+/// artifact simply has no address for the function -- but it is never silent:
+/// callers decide whether to debug-log it (a probe that is legitimately absent
+/// on this module) or warn about it (the END probe, whose absence silently
+/// downgrades every request duration the operator sees).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachOutcome {
+    Attached,
+    Skipped,
+}
+
 fn attach_probes(
     skel: &mut RgwtraceSkel<'_>,
     dwarf: &DwarfInfo,
     targets: &targets::ProbeTargets,
     pid: i32,
     correlate_cross_thread: bool,
-) -> Result<Vec<Link>> {
+    rgw_op_bridge_key: bool,
+) -> Result<AttachedProbes> {
+    // Fail closed BEFORE attaching anything: a reordered ATTACH_ORDER that could
+    // strand an unrevocable bridge entry must not be discovered in production.
+    validate_attach_order(&ATTACH_ORDER)?;
+
     let mut links = Vec::new();
+    let mut request_end_probe = false;
 
-    for path in targets.rados_libraries() {
-        attach_if_present(
-            &mut links,
-            &skel.progs.uprobe_send_op,
-            false,
-            pid,
-            path,
-            dwarf,
-            "Objecter::_send_op",
-        )?;
-        attach_if_present(
-            &mut links,
-            &skel.progs.uprobe_finish_op,
-            false,
-            pid,
-            path,
-            dwarf,
-            "Objecter::_finish_op",
-        )?;
-    }
-
-    attach_if_present(
-        &mut links,
-        &skel.progs.uprobe_rgw_get_handler,
-        false,
-        pid,
-        &targets.radosgw,
-        dwarf,
-        "RGWREST::get_handler",
-    )?;
-
-    // Cross-thread re-seed bridge (Stage 3): opt-in via --correlate-cross-thread
-    // and only when the varid-40 raw-pointer var_field actually resolved for the
-    // radosgw binary. With the flag off (or the descriptor absent) the probe is
-    // never attached, so the dormant BPF program cannot change any behavior --
-    // baseline is byte-for-byte identical.
-    if correlate_cross_thread && reseed_var_field_present(dwarf, &targets.radosgw) {
-        attach_if_present(
-            &mut links,
-            &skel.progs.uprobe_rgw_process_authenticated,
-            false,
-            pid,
-            &targets.radosgw,
-            dwarf,
-            "rgw_process_authenticated",
-        )?;
+    for step in ATTACH_ORDER {
+        match step {
+            // FIRST, ALWAYS. The bridge's only revoker. Every entry that can ever
+            // be created must be created with this probe already live.
+            //
+            // ON by default -- it is what makes `rgw.request` durations real -- but
+            // strictly OPTIONAL and FAIL SOFT: an RGW build whose destructor symbol
+            // or `this` descriptor cannot be resolved (stripped binary, unexpected
+            // destructor mangling, older build) simply keeps today's behavior, with
+            // request ends derived from the RADOS child bounds and
+            // `rgw.duration_quality = "marker"`. Preflight reports the same
+            // condition as an advisory `warn`, never a hard error.
+            //
+            // This is an ENTRY uprobe (`retprobe = false`), never a uretprobe: see
+            // the handler comment in bpf/rgwtrace.bpf.c.
+            AttachStep::RequestEndProbe => {
+                request_end_probe =
+                    attach_request_end_probe(&mut links, skel, dwarf, &targets.radosgw, pid)
+                        == AttachOutcome::Attached;
+            }
+            // Published from the ACTUAL attach outcome above, and BEFORE any probe
+            // that reads it. `REQUEST_END_PROBE_ATTACHED` tells the BPF side that
+            // the presence of a bridge entry is a meaningful LIVENESS signal for
+            // `_send_op`'s stamp gate -- true only because the revoker is now live.
+            // `RGW_OP_BRIDGE_KEY_ENABLED` is the operator's kill switch for the
+            // `RGWOp*` alternate key, read by the probe attached in the next step.
+            AttachStep::PublishBpfConfig => {
+                skel.maps.bss_data.REQUEST_END_PROBE_ATTACHED = u32::from(request_end_probe);
+                skel.maps.bss_data.RGW_OP_BRIDGE_KEY_ENABLED = u32::from(rgw_op_bridge_key);
+            }
+            AttachStep::GetHandler => {
+                attach_if_present(
+                    &mut links,
+                    &skel.progs.uprobe_rgw_get_handler,
+                    false,
+                    pid,
+                    &targets.radosgw,
+                    dwarf,
+                    "RGWREST::get_handler",
+                )?;
+                // The cross-thread bridge's precondition: get_handler must resolve
+                // the request's `req_state*` from a REGISTER, or nothing is ever
+                // bridged. With the END probe attached, `_send_op` then refuses to
+                // stamp any op at all (fail-closed: an unbridged context can never
+                // be revoked, so it could be a long-dead request's). That is a total
+                // correlation blackout and must be said out loud, not discovered
+                // from an empty trace.
+                warn_if_req_state_is_not_bridgeable(dwarf, &targets.radosgw, request_end_probe);
+            }
+            // Cross-thread correlation, opt-in via --correlate-cross-thread. It is
+            // ONE feature attached at TWO kinds of site, both gated by the one flag:
+            //
+            //   * the Stage-3 re-seed at `rgw_process_authenticated` (here): one
+            //     seed at one instant, on the request execute thread -- and the site
+            //     that registers a request's ALTERNATE bridge key (the `RGWOp*`);
+            //   * PHASE B, the per-submit re-seed at both `rgw_rados_operate`
+            //     overloads: the context re-established immediately before EVERY
+            //     RADOS submit, on whatever pool thread the coroutine has migrated
+            //     onto by then.
+            //
+            // Phase B is what actually makes the feature work (N fixed seed sites
+            // can never cover a coroutine that yields M times), and Stage 3 is now
+            // mostly redundant with it as a SEED -- but it is kept because it costs
+            // one probe on a cold path, it still covers a submit that reaches
+            // librados without passing through `rgw_rados_operate`, and it is the
+            // only site where the executing RGWOp* can be captured. With the flag
+            // off neither is attached, so the dormant BPF programs cannot change any
+            // behavior: baseline stays byte-for-byte identical.
+            AttachStep::ProcessAuthenticated => {
+                if correlate_cross_thread && reseed_var_field_present(dwarf, &targets.radosgw) {
+                    attach_if_present(
+                        &mut links,
+                        &skel.progs.uprobe_rgw_process_authenticated,
+                        false,
+                        pid,
+                        &targets.radosgw,
+                        dwarf,
+                        RGW_PROCESS_AUTHENTICATED,
+                    )?;
+                    if rgw_op_bridge_key {
+                        warn_if_rgw_op_key_unavailable(dwarf, &targets.radosgw);
+                    } else {
+                        info!(
+                            "--disable-rgw-op-bridge-key: requests are keyed by their req_state* \
+                             ONLY. RADOS ops whose dpp is the executing RGWOp will MISS the bridge \
+                             and stay uncorrelated -- read bpf_operate_seed_hits_rgwop from a run \
+                             WITH the key before deciding this is free"
+                        );
+                    }
+                }
+            }
+            // PHASE B REQUIRES THE END PROBE. The per-submit re-seed looks up EVERY
+            // rados operate's `dpp` in the bridge, including the many foreign dpps
+            // of background work. That is only safe while bridge entries are REVOKED
+            // at request end -- which only the END probe does. Without it, entries
+            // live forever, and a recycled req_state stack address or RGWOp heap
+            // address (or a numerically-matching foreign dpp) would HIT a long-dead
+            // request's entry and seed its trans_id onto a live submit.
+            // `request_ctx_is_live` cannot save us there either: with no revoker it
+            // is switched off and fails OPEN. So Phase B degrades to Phase A rather
+            // than risk mis-correlation.
+            AttachStep::RadosOperate => {
+                if correlate_cross_thread {
+                    if request_end_probe {
+                        attach_rados_operate_probes(&mut links, skel, dwarf, &targets.radosgw, pid);
+                    } else {
+                        warn!(
+                            "--correlate-cross-thread: the per-submit re-seed (rgw_rados_operate) \
+                             is DISABLED because the request-END probe did not attach. Nothing \
+                             would revoke a request's bridge entries, so a recycled \
+                             req_state/RGWOp address could seed a DEAD request's trans_id onto a \
+                             live RADOS op -- a mis-correlation, which is worse than no \
+                             correlation. Cross-thread correlation degrades to seeding at \
+                             get_handler/rgw_process_authenticated only; most ops submitted after \
+                             a coroutine migration will be reported as background/inferred"
+                        );
+                    }
+                }
+            }
+            AttachStep::ObjecterOps => {
+                for path in targets.rados_libraries() {
+                    attach_if_present(
+                        &mut links,
+                        &skel.progs.uprobe_send_op,
+                        false,
+                        pid,
+                        path,
+                        dwarf,
+                        "Objecter::_send_op",
+                    )?;
+                    attach_if_present(
+                        &mut links,
+                        &skel.progs.uprobe_finish_op,
+                        false,
+                        pid,
+                        path,
+                        dwarf,
+                        "Objecter::_finish_op",
+                    )?;
+                }
+            }
+        }
     }
 
     if links.is_empty() {
         bail!("no uprobes were attached; check DWARF JSON and target paths")
     }
 
-    Ok(links)
+    Ok(AttachedProbes {
+        links,
+        request_end_probe,
+    })
+}
+
+/// Warn when a request's `req_state*` is not register-resolvable at get_handler:
+/// the bridge is then never populated, and (with the END probe attached) the
+/// `_send_op` liveness gate fails closed on every context, so NOTHING is
+/// correlated. A silent empty trace would look like an idle gateway.
+fn warn_if_req_state_is_not_bridgeable(dwarf: &DwarfInfo, radosgw: &Path, end_probe: bool) {
+    let bridgeable = module_key_for_path(radosgw)
+        .is_some_and(|module| dwarf.get_handler_req_state_is_register_resolvable(&module));
+    if bridgeable {
+        return;
+    }
+    if end_probe {
+        warn!(
+            path = %radosgw.display(),
+            "this build's RGWREST::get_handler does not hold the req_state* in a register at \
+             entry, so no request can be bridged -- and with the request-END probe attached, ops \
+             are then left UNCORRELATED rather than stamped from a context that can never be \
+             verified or revoked (fail-closed). Expect zero RADOS correlation and a nonzero \
+             bpf_sendop_unbridged_ctx_drops; re-export the DWARF artifact, or run without the end \
+             probe to fall back to unverified same-thread stamping"
+        );
+    } else {
+        warn!(
+            path = %radosgw.display(),
+            "this build's RGWREST::get_handler does not hold the req_state* in a register at \
+             entry, so no request can be bridged: cross-thread correlation is unavailable and \
+             ops are stamped WITHOUT a liveness check (bpf_sendop_unverifiable_ctx)"
+        );
+    }
+}
+
+/// Warn when a request cannot be keyed by the `RGWOp*` executing it. RGW passes
+/// that pointer as the `dpp` at most call sites inside `op->execute()`, so without
+/// this key the per-submit re-seed misses on the whole op data path and Phase B
+/// recovers little or nothing -- while every counter still looks healthy.
+fn warn_if_rgw_op_key_unavailable(dwarf: &DwarfInfo, radosgw: &Path) {
+    let available = module_key_for_path(radosgw)
+        .is_some_and(|module| dwarf.function_has_rgw_op_descriptor(&module));
+    if available {
+        return;
+    }
+    warn!(
+        path = %radosgw.display(),
+        "--correlate-cross-thread: the artifact carries no proven `RGWOp*&` descriptor for \
+         {RGW_PROCESS_AUTHENTICATED}, so requests are keyed by their req_state* ONLY. RGW passes \
+         the executing RGWOp -- not the req_state -- as the `dpp` at most call sites in an op's \
+         data path, so those RADOS ops will MISS the bridge and stay uncorrelated. Re-export the \
+         DWARF artifact with a current rgwtrace (native extraction proves the identity from DWARF \
+         and refuses to guess it)"
+    );
+}
+
+/// PHASE B. Attach the per-submit re-seed to BOTH `rgw_rados_operate` overloads.
+///
+/// The two overloads are DISTINCT functions at DISTINCT addresses that share one
+/// demangled name, so each is resolved through the provenance-checked accessor
+/// (`DwarfInfo::rados_operate_probe`) which refuses any address whose MANGLED
+/// linkage name does not prove it is that very overload. Neither probe can end up
+/// on the other's address, and neither can be bound by "whichever symbol came
+/// first".
+///
+/// Attaching to only ONE of them is a legitimate partial state (e.g. an artifact
+/// that resolved the read overload but not the write one), and is strictly better
+/// than nothing: each probe carries its own hprobe descriptor extracted from its
+/// own definition, so a probe that attaches always reads the right register. It is
+/// warned about, because losing an overload silently loses an entire half of the
+/// data path -- every RADOS write, or every RADOS read -- from the traces.
+///
+/// FAIL SOFT, NEVER SILENT: an older/stripped RGW whose `rgw_rados_operate`
+/// symbols cannot be resolved keeps Phase A behavior (correlation only for ops
+/// submitted on a seed thread), with a warning that says exactly that.
+fn attach_rados_operate_probes(
+    links: &mut Vec<Link>,
+    skel: &mut RgwtraceSkel<'_>,
+    dwarf: &DwarfInfo,
+    radosgw: &Path,
+    pid: i32,
+) -> usize {
+    let read = attach_rados_operate_probe(
+        links,
+        &skel.progs.uprobe_rgw_rados_operate_read,
+        false,
+        dwarf,
+        radosgw,
+        pid,
+        RGW_RADOS_OPERATE_READ,
+    );
+    let write = attach_rados_operate_probe(
+        links,
+        &skel.progs.uprobe_rgw_rados_operate_write,
+        false,
+        dwarf,
+        radosgw,
+        pid,
+        RGW_RADOS_OPERATE_WRITE,
+    );
+
+    let attached = [read, write]
+        .iter()
+        .filter(|outcome| **outcome == AttachOutcome::Attached)
+        .count();
+    if attached == 0 {
+        warn!(
+            path = %radosgw.display(),
+            "--correlate-cross-thread: NEITHER rgw_rados_operate overload could be probed, so \
+             RADOS ops submitted after a coroutine migration cannot be correlated. Cross-thread \
+             correlation degrades to seeding at get_handler/rgw_process_authenticated only -- most \
+             request ops will still be reported as background/inferred"
+        );
+    }
+    attached
+}
+
+fn attach_rados_operate_probe(
+    links: &mut Vec<Link>,
+    prog: &libbpf_rs::ProgramMut<'_>,
+    retprobe: bool,
+    dwarf: &DwarfInfo,
+    radosgw: &Path,
+    pid: i32,
+    function: &'static str,
+) -> AttachOutcome {
+    let probe = module_key_for_path(radosgw)
+        .map(|module| dwarf.rados_operate_probe(&module, function))
+        .unwrap_or(RadosOperateProbe::Unavailable(
+            crate::dwarf_json::RadosOperateProbeGap {
+                function,
+                gap: crate::dwarf_json::ProvenanceGap::NoModule,
+            },
+        ));
+
+    let addr = match probe {
+        RadosOperateProbe::Available { addr, linkage } => {
+            debug!(
+                function,
+                linkage,
+                addr,
+                path = %radosgw.display(),
+                "resolved an rgw_rados_operate overload; attaching the per-submit re-seed uprobe"
+            );
+            addr
+        }
+        RadosOperateProbe::Unavailable(gap) => {
+            warn!(
+                function,
+                path = %radosgw.display(),
+                reason = %gap.reason(),
+                "per-submit cross-thread re-seed unavailable for this rgw_rados_operate overload; \
+                 RADOS ops it would have submitted stay uncorrelated (background/inferred)"
+            );
+            return AttachOutcome::Skipped;
+        }
+    };
+
+    match attach_uprobe(prog, retprobe, pid, radosgw, addr as usize) {
+        Ok(link) => {
+            links.push(link);
+            AttachOutcome::Attached
+        }
+        Err(err) => {
+            warn!(
+                function,
+                error = %format_args!("{err:#}"),
+                "failed to attach the per-submit cross-thread re-seed uprobe; continuing without it"
+            );
+            AttachOutcome::Skipped
+        }
+    }
+}
+
+/// Attach the request-END probe, degrading gracefully instead of failing the run,
+/// and NEVER silently.
+///
+/// Ways it can be unavailable, all non-fatal and all warned about, because each
+/// one silently changes what every `rgw.request` duration in the output means:
+/// 1. the artifact has no `req_state::~req_state` address (older/stripped RGW, or
+///    native extraction refused every destructor variant it saw);
+/// 2. the artifact cannot PROVE the address is the complete/base destructor
+///    (D1/D2) -- an imported artifact with no `func2linkage` provenance, or one
+///    naming the deleting destructor (D0). Refused: attaching an END uprobe to
+///    the wrong destructor variant is not a degradation, it is a wrong probe;
+/// 3. the varid-50 `this` descriptor is absent or is not the register-only
+///    raw-pointer shape the BPF handler reads (`fetch_param_ptr`);
+/// 4. the uprobe itself fails to attach in the kernel.
+///
+/// In every case the collector falls back to deriving request ends from the
+/// correlated RADOS child bounds, exactly as it did before this probe existed
+/// (`rgw.duration_quality = "marker"`). Requiring the end probe would break
+/// tracing on builds that worked, so it stays optional -- but the operator is
+/// told, at attach time, that their durations are derived rather than measured.
+fn attach_request_end_probe(
+    links: &mut Vec<Link>,
+    skel: &mut RgwtraceSkel<'_>,
+    dwarf: &DwarfInfo,
+    radosgw: &Path,
+    pid: i32,
+) -> AttachOutcome {
+    let probe = module_key_for_path(radosgw)
+        .map(|module| dwarf.request_end_probe(&module))
+        .unwrap_or(RequestEndProbe::Unavailable(RequestEndProbeGap::NoModule));
+
+    let addr = match probe {
+        RequestEndProbe::Available { addr, linkage } => {
+            debug!(
+                function = REQ_STATE_DTOR,
+                linkage,
+                addr,
+                path = %radosgw.display(),
+                "resolved the request-END destructor; attaching uprobe"
+            );
+            addr
+        }
+        RequestEndProbe::Unavailable(gap) => {
+            warn!(
+                function = REQ_STATE_DTOR,
+                path = %radosgw.display(),
+                reason = %gap.reason(),
+                "request-END probe unavailable; request span durations will be DERIVED from RADOS \
+                 child bounds (rgw.duration_quality=\"marker\") instead of measured"
+            );
+            return AttachOutcome::Skipped;
+        }
+    };
+
+    match attach_uprobe(
+        &skel.progs.uprobe_rgw_req_state_dtor,
+        false,
+        pid,
+        radosgw,
+        addr as usize,
+    ) {
+        Ok(link) => {
+            links.push(link);
+            AttachOutcome::Attached
+        }
+        Err(err) => {
+            warn!(
+                function = REQ_STATE_DTOR,
+                error = %format_args!("{err:#}"),
+                "failed to attach the request-END probe; continuing with DERIVED request durations"
+            );
+            AttachOutcome::Skipped
+        }
+    }
 }
 
 /// Whether the radosgw DWARF carries a valid varid-40 raw-pointer descriptor for
@@ -546,6 +1105,10 @@ fn reseed_var_field_present(dwarf: &DwarfInfo, radosgw: &Path) -> bool {
     })
 }
 
+/// Attach `function`'s uprobe if the artifact resolves an address for it in
+/// `path`'s module. Returns whether it was actually attached: an absent address
+/// is a legitimate skip (the function lives in another module), not an error, but
+/// the caller -- not this helper -- decides how loud that skip should be.
 fn attach_if_present(
     links: &mut Vec<Link>,
     prog: &libbpf_rs::ProgramMut<'_>,
@@ -554,13 +1117,13 @@ fn attach_if_present(
     path: &Path,
     dwarf: &DwarfInfo,
     function: &str,
-) -> Result<()> {
+) -> Result<AttachOutcome> {
     // Derive the artifact module key from the CANONICALIZED path so a soname
     // symlink (`librados.so.2`) resolves to the versioned module the artifact
     // keys by (`librados.so.2.0.0`). The uprobe still attaches to `path`, whose
     // canonical form is the same inode, so the attach target is unchanged.
     let Some(module) = module_key_for_path(path) else {
-        return Ok(());
+        return Ok(AttachOutcome::Skipped);
     };
     let Some(addr) = dwarf.function_addr(&module, function) else {
         debug!(
@@ -569,7 +1132,7 @@ fn attach_if_present(
             path = %path.display(),
             "no artifact module resolved a func2pc address; uprobe skipped"
         );
-        return Ok(());
+        return Ok(AttachOutcome::Skipped);
     };
     debug!(
         module = %module,
@@ -582,7 +1145,7 @@ fn attach_if_present(
     let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
         .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
     links.push(link);
-    Ok(())
+    Ok(AttachOutcome::Attached)
 }
 
 fn attach_uprobe(
@@ -624,16 +1187,18 @@ fn decode_event(data: &[u8]) -> Result<TraceEvent> {
     let event_type = u32::from_ne_bytes(data[..4].try_into()?);
     let payload = &data[EVENT_DATA_OFFSET..];
     match event_type {
+        // get_handler START marker: request identity + start_ns (end_ns == 0).
+        RGWTRACE_EVENT_REQUEST_START => Ok(TraceEvent::RequestStart(
+            read_payload::<RawRequestEvent>(payload)?.into(),
+        )),
+        // req_state::~req_state END marker: the request's measured end. Optional
+        // -- absent when the end probe could not attach.
         RGWTRACE_EVENT_REQUEST_END => Ok(TraceEvent::RequestEnd(
             read_payload::<RawRequestEvent>(payload)?.into(),
         )),
         RGWTRACE_EVENT_RADOS_OP => Ok(TraceEvent::RadosOp(
             read_payload::<RawRadosEvent>(payload)?.into(),
         )),
-        // RGWTRACE_EVENT_REQUEST_START is reserved in the ABI but never emitted
-        // in the single-marker model. Any such event flows through the same
-        // unknown-event path (counted as a decode error) rather than
-        // fabricating a request span.
         other => bail!("unknown event type {other}"),
     }
 }
@@ -732,6 +1297,89 @@ mod tests {
         assert!(!should_warn_no_request_markers(0, 0));
         // Markers but no RADOS ops -> a different situation, no warning.
         assert!(!should_warn_no_request_markers(2, 0));
+    }
+
+    #[test]
+    fn the_production_attach_order_never_lets_a_bridge_entry_outlive_its_revoker() {
+        // THE ORDERING INVARIANT. `get_handler` used to attach BEFORE the destructor
+        // probe, and the liveness gate's flag was only published after EVERY probe
+        // was up. A request could therefore pass get_handler -- creating its
+        // canonical bridge entry -- and COMPLETE before its destructor probe existed.
+        // Nothing would ever revoke that entry. It would then sit in the bridge for
+        // the whole run, and once the flag flipped to 1 it would PASS the liveness
+        // gate's identity check (its start_ns/tid match, because the copy and the
+        // entry came from the same dead request), letting a later _send_op inherit a
+        // DEAD request's trans_id. Permanent, and a mis-correlation.
+        validate_attach_order(&ATTACH_ORDER)
+            .expect("the shipped attach order must be safe by construction");
+
+        // Stated positionally as well, so a reorder cannot pass by accident.
+        let position = |step: AttachStep| {
+            ATTACH_ORDER
+                .iter()
+                .position(|candidate| *candidate == step)
+                .expect("step is in the attach order")
+        };
+        assert_eq!(position(AttachStep::RequestEndProbe), 0);
+        assert_eq!(position(AttachStep::PublishBpfConfig), 1);
+        for step in ATTACH_ORDER {
+            if step.is_bridge_producer() || step.is_bridge_consumer() {
+                assert!(
+                    position(step) > position(AttachStep::PublishBpfConfig),
+                    "{step:?} touches the bridge and must attach after the revoker and its config"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_attach_order_that_strands_a_bridge_entry_is_rejected() {
+        // The tripwire itself must actually trip -- otherwise the test above only
+        // proves that a constant equals itself.
+
+        // get_handler before the revoker: an entry created in that window can NEVER
+        // be revoked. This is the exact bug.
+        let err = validate_attach_order(&[
+            AttachStep::GetHandler,
+            AttachStep::RequestEndProbe,
+            AttachStep::PublishBpfConfig,
+            AttachStep::ProcessAuthenticated,
+            AttachStep::RadosOperate,
+            AttachStep::ObjecterOps,
+        ])
+        .expect_err("a producer before the revoker must be rejected");
+        assert!(format!("{err}").contains("GetHandler"));
+
+        // The config published before the revoker attached would claim a liveness
+        // signal that does not exist yet.
+        let err = validate_attach_order(&[
+            AttachStep::PublishBpfConfig,
+            AttachStep::RequestEndProbe,
+            AttachStep::GetHandler,
+            AttachStep::ProcessAuthenticated,
+            AttachStep::RadosOperate,
+            AttachStep::ObjecterOps,
+        ])
+        .expect_err("publishing the config before the revoker attaches must be rejected");
+        assert!(format!("{err}").contains("REQUEST_END_PROBE_ATTACHED"));
+
+        // A consumer (_send_op) before the config: it would read a gate value that
+        // has not been published.
+        let err = validate_attach_order(&[
+            AttachStep::RequestEndProbe,
+            AttachStep::ObjecterOps,
+            AttachStep::PublishBpfConfig,
+            AttachStep::GetHandler,
+            AttachStep::ProcessAuthenticated,
+            AttachStep::RadosOperate,
+        ])
+        .expect_err("a bridge consumer before the config must be rejected");
+        assert!(format!("{err}").contains("ObjecterOps"));
+
+        // A sequence with no revoker at all cannot be validated.
+        assert!(
+            validate_attach_order(&[AttachStep::PublishBpfConfig, AttachStep::GetHandler]).is_err()
+        );
     }
 
     #[test]
@@ -855,10 +1503,11 @@ mod tests {
     }
 
     #[test]
-    fn reserved_request_start_event_flows_through_unknown_path() {
-        // REQUEST_START is ABI-reserved but never emitted; if one ever arrives
-        // it is treated as an unknown event (decode error) rather than decoded
-        // into a request span.
+    fn decodes_request_start_event() {
+        // The get_handler START marker: identity + start_ns, and an end_ns of 0
+        // because get_handler cannot know when the request ends. It is a real
+        // event now (it used to be ABI-reserved and never emitted), and it opens
+        // the request the END marker later closes.
         let raw = RawRequestEvent {
             start_ns: 10,
             end_ns: 0,
@@ -868,13 +1517,15 @@ mod tests {
             trans_id: bytes("tx0001"),
         };
 
-        let err = decode_event(&event_data(
-            crate::events::RGWTRACE_EVENT_REQUEST_START,
-            &raw,
-        ))
-        .unwrap_err();
+        let event = decode_event(&event_data(RGWTRACE_EVENT_REQUEST_START, &raw)).unwrap();
 
-        assert!(err.to_string().contains("unknown event type 1"));
+        let TraceEvent::RequestStart(request) = event else {
+            panic!("expected request start event");
+        };
+        assert_eq!(request.start_ns, 10);
+        assert_eq!(request.end_ns, 0);
+        assert_eq!(request.tid, 7);
+        assert_eq!(request.trans_id, "tx0001");
     }
 
     #[test]
