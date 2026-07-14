@@ -274,10 +274,12 @@ impl RgwtraceBpf {
     /// PHASE B -- `rgw_rados_operate_seed` (both overloads). The `dpp` is used as
     /// an OPAQUE IDENTITY TOKEN: looked up by value, never dereferenced.
     ///
-    /// On a MISS it FAILS CLOSED and clears the thread's context. A miss proves the
-    /// dpp is not a request we track; it does NOT prove that the context lingering
-    /// on this pool thread belongs to the coroutine running here right now. Nothing
-    /// available at this probe can prove that, so nothing is assumed.
+    /// On a MISS it FAILS CLOSED and clears the thread's SEEDED context. A miss
+    /// proves the dpp is not a request we track; it does NOT prove that the copy
+    /// lingering on this pool thread belongs to the coroutine running here right now.
+    /// Nothing available at this probe can prove that, so nothing is assumed about a
+    /// copy PHASE B put there. A HOME context is a different animal -- see
+    /// `drop_seeded_ctx`.
     ///
     /// `dpp == 0` models an UNRESOLVED dpp (a null argument, or a descriptor that is
     /// not register-resident). It proves exactly as little as a foreign dpp, so it
@@ -290,7 +292,11 @@ impl RgwtraceBpf {
         );
         if dpp == 0 {
             self.count("operate_base_unresolved");
-            self.drop_thread_ctx(tid, "operate_unresolved_ctx_cleared");
+            self.drop_seeded_ctx(
+                tid,
+                "operate_unresolved_ctx_cleared",
+                "operate_unresolved_home_ctx_preserved",
+            );
             return;
         }
         if let Some(via) = self.reseed_thread_from_reqstate(dpp, tgid, tid) {
@@ -303,15 +309,39 @@ impl RgwtraceBpf {
             return;
         }
         self.count("operate_seed_misses");
-        self.drop_thread_ctx(tid, "operate_miss_ctx_cleared");
+        self.drop_seeded_ctx(
+            tid,
+            "operate_miss_ctx_cleared",
+            "operate_miss_home_ctx_preserved",
+        );
     }
 
-    /// `operate_drop_thread_ctx`: the fail-closed clear, counted under the reason it
-    /// happened for.
-    fn drop_thread_ctx(&mut self, tid: u32, diag: &'static str) {
-        if self.rgw_requests.remove(&tid).is_some() {
-            self.count(diag);
+    /// `operate_drop_seeded_ctx`: the fail-closed clear, SCOPED to the contexts Phase
+    /// B created, and counted under both of its outcomes.
+    ///
+    ///   HOME   (`ctx.tid == tid`): `get_handler` put this context on this very
+    ///          thread, for the request that STARTED here. It is the pre-Phase-B
+    ///          same-thread path -- the one that correlates AIO submits which never
+    ///          reach `rgw_rados_operate` at all -- and Phase B has no claim on it.
+    ///          PRESERVED. (An unscoped clear cost a live ListObjects request all 16
+    ///          of its `rgw.bucket_list` shard ops; see the coverage-regression test.)
+    ///   SEEDED (`ctx.tid != tid`): a COPY a re-seed migrated onto a thread that does
+    ///          not own the request. That is a Phase B artifact and exactly the
+    ///          stale-copy hazard Phase B multiplies. CLEARED.
+    ///
+    /// `ctx.tid` is the get_handler thread and is copied verbatim by every seed
+    /// (nothing ever rewrites it -- that is also what keeps the cross_thread label
+    /// honest), so the test is exact, not a heuristic.
+    fn drop_seeded_ctx(&mut self, tid: u32, cleared: &'static str, preserved: &'static str) {
+        let Some(cur) = self.rgw_requests.get(&tid) else {
+            return;
+        };
+        if cur.tid == tid {
+            self.count(preserved);
+            return;
         }
+        self.rgw_requests.remove(&tid);
+        self.count(cleared);
     }
 
     /// `request_ctx_is_live`: the `_send_op` stamp gate.
@@ -1194,6 +1224,198 @@ fn the_revocation_identity_holds_across_a_churning_run() {
 }
 
 // ---------------------------------------------------------------------------
+// COVERAGE REGRESSION (the ListObjects shards): the submit path that BYPASSES
+// `rgw_rados_operate` entirely.
+//
+// THE TEST GAP THAT LET A REGRESSION SHIP. Every Phase B test above drives its
+// submits THROUGH the operate probe -- and every assertion is either "a new op gets
+// correlated" or "no op gets mis-correlated". Neither shape can catch a LOSS of
+// coverage that already worked, and neither models RGW's OTHER submit path:
+//
+//   RGW issues a sharded bucket list through cls_rgw's AIO path
+//   (CLSRGWIssueBucketList -> IoCtx::aio_operate -> op_submit -> _send_op). It never
+//   passes through rgw_rados_operate. Those submits correlate ONLY because
+//   get_handler left the request's context on its own thread and nothing cleared it.
+//
+// So an unscoped fail-closed clear -- one foreign-dpp operate on that thread -- wiped
+// the context and stranded every subsequent AIO submit. On the live rig that was
+// exactly ONE `operate_miss_ctx_cleared`, and it cost a ListObjects request all 16 of
+// its `rgw.bucket_list` shard ops.
+// ---------------------------------------------------------------------------
+
+/// An AIO submit: `_send_op` with NO preceding `rgw_rados_operate` on this thread.
+/// This is the cls_rgw / `IoCtx::aio_operate` path, and it is the majority of a
+/// sharded `rgw.bucket_list`. Modelled by simply not calling the operate probe --
+/// which is precisely the shape no Phase B test had.
+fn aio_submit(bpf: &mut RgwtraceBpf, tid: u32) -> SendOp {
+    bpf.send_op(tid)
+}
+
+#[test]
+fn a_list_objects_request_keeps_all_its_bucket_list_shards_across_a_foreign_operate() {
+    // THE COVERAGE-REGRESSION TEST. It reproduces the live ListObjects shape exactly:
+    //
+    //   1. get_handler runs on thread T -> a HOME context (ctx.tid == T).
+    //   2. ONE rgw_rados_operate with a FOREIGN dpp fires on T (a stack DoutPrefix
+    //      wrapper -- the live run counted exactly one such clear).
+    //   3. 16 `rgw.bucket_list` shard ops are submitted on T through the AIO path,
+    //      with NO intervening operate.
+    //
+    // ALL 16 must correlate, as same_thread children. They did before Phase B; a
+    // feature that adds cross_thread metadata ops while silently deleting 16
+    // correlated shard ops is a NET LOSS for the request, and this assertion is the
+    // only thing standing between that and a live cluster.
+    let mut bpf = RgwtraceBpf::with_end_probe();
+    let list_tid = HANDLER_TID;
+    start_request(&mut bpf, REQ_STATE, RGW_OP, "tx-list", 1_000);
+
+    // 2. The foreign-dpp operate on the request's OWN thread.
+    bpf.rgw_rados_operate(FOREIGN_DPP, TGID, list_tid);
+    assert_eq!(bpf.diag("operate_seed_misses"), 1);
+    assert_eq!(
+        bpf.diag("operate_miss_ctx_cleared"),
+        0,
+        "a HOME context is not Phase B's to clear"
+    );
+    assert_eq!(
+        bpf.diag("operate_miss_home_ctx_preserved"),
+        1,
+        "and the fact that it was preserved must be VISIBLE in the diagnostics"
+    );
+
+    // 3. The 16 shard reads, submitted straight through librados AIO.
+    let shards: Vec<SendOp> = (0..16).map(|_| aio_submit(&mut bpf, list_tid)).collect();
+
+    for (shard, op) in shards.iter().enumerate() {
+        assert_eq!(
+            op,
+            &SendOp::Stamped {
+                trans_id: "tx-list".to_string(),
+                send_tid: list_tid,
+            },
+            "rgw.bucket_list shard {shard} lost its correlation -- this is the regression"
+        );
+    }
+
+    // ...and they are SAME-THREAD children: the marker's tid and the submit tid are
+    // the same thread, so the collector labels them `same_thread`, exactly as the
+    // pre-Phase-B build did.
+    let marker_tid = bpf.rgw_ctx_by_reqstate[&(REQ_STATE, TGID)].tid;
+    assert_eq!(marker_tid, list_tid);
+    assert_eq!(bpf.diag("sendop_stale_ctx_drops"), 0);
+    assert_eq!(bpf.diag("sendop_unbridged_ctx_drops"), 0);
+}
+
+#[test]
+fn an_unresolved_dpp_operate_also_leaves_a_home_context_alone() {
+    // The same regression through the other door. The null/unresolved-dpp clear is
+    // the same fail-closed rule and must be scoped the same way -- otherwise a build
+    // that sees null dpps on this path loses the AIO submits of every request whose
+    // home thread one ever lands on.
+    let mut bpf = RgwtraceBpf::with_end_probe();
+    start_request(&mut bpf, REQ_STATE, RGW_OP, "tx-list", 1_000);
+
+    bpf.rgw_rados_operate(0, TGID, HANDLER_TID);
+
+    assert_eq!(bpf.diag("operate_base_unresolved"), 1);
+    assert_eq!(bpf.diag("operate_unresolved_ctx_cleared"), 0);
+    assert_eq!(bpf.diag("operate_unresolved_home_ctx_preserved"), 1);
+    assert_eq!(
+        aio_submit(&mut bpf, HANDLER_TID).trans_id(),
+        Some("tx-list")
+    );
+}
+
+#[test]
+fn a_seeded_context_is_still_cleared_while_a_home_context_is_preserved() {
+    // The two halves of the scoped clear, side by side, so the scoping cannot be
+    // "fixed" by simply not clearing at all.
+    //
+    //   HOME   copy on the request's own thread   -> PRESERVED (pre-Phase-B path).
+    //   SEEDED copy on a migrated pool thread     -> CLEARED  (Phase B's own artifact,
+    //                                                and the stale-copy hazard).
+    let mut bpf = RgwtraceBpf::with_end_probe();
+    start_request(&mut bpf, REQ_STATE, RGW_OP, "tx-A", 1_000);
+
+    // Phase B migrates a COPY of A onto a pool thread.
+    bpf.rgw_rados_operate(RGW_OP, TGID, MIGRATED_TID);
+    assert_eq!(bpf.send_op(MIGRATED_TID).trans_id(), Some("tx-A"));
+
+    // A foreign operate on the MIGRATED thread clears that copy...
+    bpf.rgw_rados_operate(FOREIGN_DPP, TGID, MIGRATED_TID);
+    assert_eq!(bpf.diag("operate_miss_ctx_cleared"), 1);
+    assert_eq!(bpf.diag("operate_miss_home_ctx_preserved"), 0);
+    assert!(!bpf.rgw_requests.contains_key(&MIGRATED_TID));
+    assert_eq!(aio_submit(&mut bpf, MIGRATED_TID).trans_id(), None);
+
+    // ...while the same foreign operate on A's HOME thread leaves A alone.
+    bpf.rgw_rados_operate(FOREIGN_DPP, TGID, HANDLER_TID);
+    assert_eq!(bpf.diag("operate_miss_ctx_cleared"), 1);
+    assert_eq!(bpf.diag("operate_miss_home_ctx_preserved"), 1);
+    assert_eq!(aio_submit(&mut bpf, HANDLER_TID).trans_id(), Some("tx-A"));
+}
+
+#[test]
+fn an_ended_requests_home_context_still_cannot_stamp_a_later_aio_submit() {
+    // Preserving a HOME context does NOT re-open the dead-request hazard: the
+    // _send_op liveness gate is what defends against that, and it is untouched here.
+    // A request whose destructor ran on ANOTHER thread leaves its home context
+    // behind, and the gate still refuses it.
+    let mut bpf = RgwtraceBpf::with_end_probe();
+    start_request(&mut bpf, REQ_STATE, RGW_OP, "tx-A", 1_000);
+
+    // The foreign operate preserves the home context...
+    bpf.rgw_rados_operate(FOREIGN_DPP, TGID, HANDLER_TID);
+    assert_eq!(bpf.diag("operate_miss_home_ctx_preserved"), 1);
+
+    // ...and then A ends on a MIGRATED thread, so its home copy on HANDLER_TID is not
+    // the one the destructor clears. The bridge entry is gone regardless.
+    bpf.req_state_dtor(REQ_STATE, TGID, MIGRATED_TID);
+    assert!(bpf.rgw_requests.contains_key(&HANDLER_TID));
+
+    assert_eq!(
+        aio_submit(&mut bpf, HANDLER_TID),
+        SendOp::Background {
+            send_tid: HANDLER_TID
+        },
+        "a DEAD request's home context must never stamp a later AIO submit"
+    );
+    assert_eq!(bpf.diag("sendop_stale_ctx_drops"), 1);
+}
+
+#[test]
+fn the_home_thread_aio_hazard_is_pre_existing_and_not_introduced_by_phase_b() {
+    // THE ACCEPTED RESIDUAL HAZARD, stated as an executable fact rather than a
+    // footnote (docs/design-cross-thread-correlation.md 11).
+    //
+    // Another coroutine that migrates onto request A's HOME thread and submits through
+    // a path that never reaches `rgw_rados_operate` (the AIO path) inherits A's
+    // trans_id. Thread-keyed correlation cannot see that submit coming: it never
+    // reaches the probe that could clear or re-seed the thread.
+    //
+    // It is NOT a Phase B regression. The proof is that it behaves IDENTICALLY on a
+    // build where Phase B is not attached at all -- i.e. the PR#4 baseline that passed
+    // the zero-mis-correlation e2e gate. If a future change closes it, this test is
+    // where to come and celebrate.
+    for mut bpf in [
+        RgwtraceBpf::without_end_probe(), // the PR#4 baseline: no operate probe at all
+        RgwtraceBpf::with_end_probe(),    // Phase B attached
+    ] {
+        bpf.get_handler(HANDLER_TID, TGID, REQ_STATE, "tx-A", 1_000);
+
+        // Some other coroutine resumes on A's home thread and submits via AIO. There is
+        // no probe between the migration and the submit, so nothing can intervene.
+        assert_eq!(
+            aio_submit(&mut bpf, HANDLER_TID).trans_id(),
+            Some("tx-A"),
+            "KNOWN, ACCEPTED, DOCUMENTED: a non-operate submit on a request's home \
+             thread inherits that request's trans_id -- identically with and without \
+             Phase B"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // THE MEASUREMENT (F6): which key do the seeds actually hit, and can the RGWOp
 // key be dropped without breaking anything?
 // ---------------------------------------------------------------------------
@@ -1292,23 +1514,43 @@ fn model_matches_the_bpf_source() {
 
     // 3. Phase B seeds through the shared helper (no second bridge), for both
     //    overloads, and FAILS CLOSED on a miss -- AND on an unresolved/null dpp,
-    //    which proves exactly as little -- by clearing the thread's context.
+    //    which proves exactly as little -- by clearing the thread's SEEDED context.
     assert!(RGWTRACE_BPF.contains("int via = reseed_thread_from_reqstate(dpp, tgid, tid);"));
     assert!(RGWTRACE_BPF.contains("if (via != BRIDGE_SEED_MISS) {"));
     assert!(RGWTRACE_BPF.contains("return rgw_rados_operate_seed(ctx, 60);"));
     assert!(RGWTRACE_BPF.contains("return rgw_rados_operate_seed(ctx, 70);"));
+    // 3a. THE SCOPE OF THE CLEAR (the ListObjects regression). A HOME context --
+    //     `ctx->tid == tid`, i.e. one get_handler placed on the thread of the request
+    //     that started there -- is PRESERVED; only a SEEDED copy is cleared. This is
+    //     what `drop_seeded_ctx` above models, and what the AIO/no-operate submit path
+    //     depends on entirely.
     assert!(RGWTRACE_BPF.contains(concat!(
-        "static __always_inline void operate_drop_thread_ctx(__u32 tid, __u32 diag) {\n",
-        "  if (bpf_map_lookup_elem(&rgw_requests, &tid) != 0) {\n",
-        "    bpf_map_delete_elem(&rgw_requests, &tid);\n",
-        "    count_diag(diag);\n",
+        "static __always_inline void operate_drop_seeded_ctx(__u32 tid, __u32 cleared_diag,\n",
+        "                                                    __u32 preserved_diag) {\n",
+        "  struct rgw_request_ctx *cur = bpf_map_lookup_elem(&rgw_requests, &tid);\n",
+        "  if (cur == 0)\n",
+        "    return;\n",
+    )));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  if (cur->tid == tid) {\n",
+        "    count_diag(preserved_diag);\n",
+        "    return;\n",
         "  }\n",
+        "\n",
+        "  /* SEEDED: a Phase B copy on a thread that does not own the request. */\n",
+        "  bpf_map_delete_elem(&rgw_requests, &tid);\n",
+        "  count_diag(cleared_diag);\n",
         "}"
     )));
-    assert!(RGWTRACE_BPF
-        .contains("operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED);"));
-    assert!(RGWTRACE_BPF
-        .contains("operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED);"));
+    assert!(!RGWTRACE_BPF.contains("operate_drop_thread_ctx"));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED,\n",
+        "                          RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED);"
+    )));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,\n",
+        "                            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED);"
+    )));
 
     // 3b. A hit is attributed to the key it came in through by comparing the dpp
     //     against the bridged value's OWN keys -- exact, not inferred.

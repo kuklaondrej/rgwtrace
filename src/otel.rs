@@ -1013,8 +1013,22 @@ mod tests {
         // Vary span sizes so encoded lengths differ and the running estimate is
         // exercised across several batch boundaries.
         let document = trace_document_with_varied_sizes(40);
-        let base_len = spans_to_otlp_protobuf(&resource_attributes(&document), Vec::new()).len();
-        let max_bytes = (base_len + 128) * 3;
+        let attributes = resource_attributes(&document);
+        let base_len = spans_to_otlp_protobuf(&attributes, Vec::new()).len();
+
+        // SIZE THE CAP OFF THE SPAN PAYLOAD, NOT THE ENVELOPE. The resource
+        // attributes carry EVERY diagnostics counter, so `base_len` grows whenever a
+        // counter is added -- and a cap derived from it (this was `(base_len + 128) *
+        // 3`) grows with it, until all 40 spans fit in one batch and the test stops
+        // testing batching at all while still passing. Deriving the cap from the span
+        // bytes keeps the number of batches stable no matter how many counters exist.
+        let all_spans: Vec<Span> = build_sized_spans(&document)
+            .unwrap()
+            .into_iter()
+            .map(|sized| sized.span)
+            .collect();
+        let span_bytes = spans_to_otlp_protobuf(&attributes, all_spans).len() - base_len;
+        let max_bytes = base_len + span_bytes / 4;
 
         let batches = otlp_batches(&document, 512, max_bytes).unwrap();
 

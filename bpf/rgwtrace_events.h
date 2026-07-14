@@ -95,13 +95,14 @@ enum rgwtrace_diag_counter {
    * SEED_BASE_UNRESOLVED: the dpp parameter was not register-resolvable at entry
    * (a stack-located descriptor), so no seed was even attempted.
    *
-   * MISS_CTX_CLEARED: a miss that ALSO cleared a request context left on this
-   * thread. A miss proves the submit about to happen is not one we can attribute,
-   * and it does NOT prove that the context lingering on this pool thread belongs
-   * to the coroutine currently running here (request A can leave its context on
-   * every thread it ever ran an operate on; request B can then resume on one of
-   * them). So the context is dropped rather than trusted: the op comes out
-   * uncorrelated instead of stamped with another live request's trans_id. These
+   * MISS_CTX_CLEARED: a miss that ALSO cleared a SEEDED request context left on
+   * this thread (`ctx->tid != current tid`, i.e. a COPY Phase B migrated here from
+   * the request's get_handler thread). A miss proves the submit about to happen is
+   * not one we can attribute, and it does NOT prove that the copy lingering on this
+   * pool thread belongs to the coroutine currently running here (request A can
+   * leave its context on every thread it ever ran an operate on; request B can then
+   * resume on one of them). So the copy is dropped rather than trusted: the op comes
+   * out uncorrelated instead of stamped with another live request's trans_id. These
    * are the ops Phase B gives up on to stay honest.
    */
   RGWTRACE_DIAG_OPERATE_SEED_HITS = 15,
@@ -206,7 +207,39 @@ enum rgwtrace_diag_counter {
   RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT = 28,
   RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS = 29,
   RGWTRACE_DIAG_RGWOP_KEY_DISABLED = 30,
-  RGWTRACE_DIAG_COUNTERS = 31,
+  /*
+   * THE OTHER HALF OF THE FAIL-CLOSED CLEAR: the unproven submit found a HOME
+   * context on this thread and PRESERVED it.
+   *
+   * A HOME context is one `RGWREST::get_handler` placed on this very thread for the
+   * request that STARTED here (`ctx->tid == current tid`; `ctx->tid` is the
+   * get_handler thread and is copied verbatim by every re-seed, so the test is
+   * exact). A SEEDED context is a copy a re-seed migrated onto a thread that is NOT
+   * the request's get_handler thread (`ctx->tid != current tid`).
+   *
+   * The clear is scoped to SEEDED contexts because those are the ones Phase B
+   * created. An unscoped clear shipped a measured regression: RGW issues a sharded
+   * `rgw.bucket_list` through the cls_rgw AIO path, which never passes through
+   * `rgw_rados_operate`, so those submits correlate purely off the HOME context
+   * get_handler left on the thread. ONE foreign-dpp operate on that thread wiped it
+   * and stranded all 16 shard ops of a live ListObjects request. Clearing a HOME
+   * context also buys no soundness: an AIO submit that never reaches an operate
+   * inherits whatever context is on the thread either way (the accepted residual
+   * hazard -- see docs/design-cross-thread-correlation.md SS11).
+   *
+   * MISS_HOME_CTX_PRESERVED: a foreign-dpp miss left a HOME context alone. Expected
+   *   and healthy: it is the same-thread correlation path continuing to work.
+   * UNRESOLVED_HOME_CTX_PRESERVED: the same, for a dpp that could not be resolved at
+   *   all. A nonzero count here still means null/unresolvable dpps are reaching this
+   *   probe (read it together with OPERATE_BASE_UNRESOLVED).
+   *
+   * Read against MISS_CTX_CLEARED / UNRESOLVED_CTX_CLEARED, these say how often the
+   * fail-closed rule fired on a Phase B copy versus how often it declined to touch a
+   * context that predates Phase B.
+   */
+  RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED = 31,
+  RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED = 32,
+  RGWTRACE_DIAG_COUNTERS = 33,
 };
 
 struct rgwtrace_request_event {

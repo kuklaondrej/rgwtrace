@@ -287,6 +287,8 @@ pub struct BpfDiagnostics {
     pub rgw_op_key_revoke_absent: u64,
     pub rgw_op_key_index_drops: u64,
     pub rgw_op_key_disabled: u64,
+    pub operate_miss_home_ctx_preserved: u64,
+    pub operate_unresolved_home_ctx_preserved: u64,
 }
 
 // `Deserialize` is here for the tests only: it is what lets
@@ -409,22 +411,41 @@ pub struct TraceDiagnostics {
     // bridge is dead on this build -- see the get_handler warning at attach.
     pub bpf_sendop_unbridged_ctx_drops: u64,
     // The per-submit re-seed's fail-closed clear: a rados operate whose `dpp` is
-    // not a key of any traced request DROPPED whatever request context was on the
-    // submitting thread, instead of letting it stamp the op. This is the price of
-    // never mis-correlating: request A's context can be left on any pool thread it
-    // ran an operate on, and request B can resume on that same thread and submit
-    // through a dpp we cannot key. A miss proves nothing about who is running here,
-    // so nothing is assumed.
+    // not a key of any traced request DROPPED the SEEDED request context that was
+    // on the submitting thread (`ctx.tid != this tid` -- a copy Phase B migrated
+    // here), instead of letting it stamp the op. This is the price of never
+    // mis-correlating: request A's context can be left on any pool thread it ran an
+    // operate on, and request B can resume on that same thread and submit through a
+    // dpp we cannot key. A miss proves nothing about who is running here, so nothing
+    // is assumed about a copy PHASE B made.
     pub bpf_operate_miss_ctx_cleared: u64,
     // The per-submit seed's OTHER fail-closed clear: the `dpp` could not be
     // resolved at all (a stack-located descriptor, or a NULL dpp argument). It
-    // clears the thread's context for exactly the same reason a foreign-dpp miss
-    // does -- an unresolved dpp proves nothing about which coroutine is running
+    // clears the thread's SEEDED context for exactly the same reason a foreign-dpp
+    // miss does -- an unresolved dpp proves nothing about which coroutine is running
     // here -- and is counted separately because it means something completely
     // different: a foreign-dpp miss is the expected steady state, while a nonzero
     // count here means RGW passes null dpps on this path or the descriptor is
     // broken.
     pub bpf_operate_unresolved_ctx_cleared: u64,
+    // THE SCOPE OF THAT CLEAR, made visible. An unproven submit PRESERVES a HOME
+    // context -- one `get_handler` placed on this very thread for the request that
+    // STARTED here (`ctx.tid == this tid`) -- and only clears a SEEDED copy.
+    //
+    // The clear used to be unscoped, and that cost a live ListObjects request all 16
+    // of its `rgw.bucket_list` shard ops: RGW issues sharded bucket lists through the
+    // cls_rgw AIO path, which never passes through `rgw_rados_operate`, so those
+    // submits correlate purely off the HOME context on the thread -- and ONE
+    // foreign-dpp operate on that thread wiped it. Clearing a HOME context also buys
+    // no soundness (an AIO submit that never reaches an operate inherits the thread's
+    // context either way); see the accepted residual hazard in
+    // docs/design-cross-thread-correlation.md 11.
+    //
+    // Read these against the two `*_ctx_cleared` counters above: they say how often
+    // the fail-closed rule fired on a Phase B copy versus how often it declined to
+    // touch a context that predates Phase B. A healthy run has both nonzero.
+    pub bpf_operate_miss_home_ctx_preserved: u64,
+    pub bpf_operate_unresolved_home_ctx_preserved: u64,
     // MULTI-KEY bridge accounting. A request is findable under BOTH its req_state*
     // and the RGWOp* executing it, because RGW passes the RGWOp (not the req_state)
     // as the `dpp` at most call sites in an op's data path.
@@ -878,6 +899,10 @@ impl Collector {
             diagnostics.operate_seed_hits_unattributed;
         self.diagnostics.bpf_operate_unresolved_ctx_cleared =
             diagnostics.operate_unresolved_ctx_cleared;
+        self.diagnostics.bpf_operate_miss_home_ctx_preserved =
+            diagnostics.operate_miss_home_ctx_preserved;
+        self.diagnostics.bpf_operate_unresolved_home_ctx_preserved =
+            diagnostics.operate_unresolved_home_ctx_preserved;
         self.diagnostics.bpf_rgw_op_key_revoke_absent = diagnostics.rgw_op_key_revoke_absent;
         self.diagnostics.bpf_rgw_op_key_index_drops = diagnostics.rgw_op_key_index_drops;
         self.diagnostics.bpf_rgw_op_key_disabled = diagnostics.rgw_op_key_disabled;
@@ -2590,6 +2615,8 @@ mod tests {
             rgw_op_key_revoke_absent: 29,
             rgw_op_key_index_drops: 30,
             rgw_op_key_disabled: 31,
+            operate_miss_home_ctx_preserved: 32,
+            operate_unresolved_home_ctx_preserved: 33,
         });
 
         let document = collector.into_trace_document("rgwtrace");
@@ -2624,6 +2651,13 @@ mod tests {
         assert_eq!(document.diagnostics.bpf_rgw_op_key_revoke_absent, 29);
         assert_eq!(document.diagnostics.bpf_rgw_op_key_index_drops, 30);
         assert_eq!(document.diagnostics.bpf_rgw_op_key_disabled, 31);
+        assert_eq!(document.diagnostics.bpf_operate_miss_home_ctx_preserved, 32);
+        assert_eq!(
+            document
+                .diagnostics
+                .bpf_operate_unresolved_home_ctx_preserved,
+            33
+        );
     }
 
     #[test]

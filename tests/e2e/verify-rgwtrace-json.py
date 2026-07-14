@@ -26,6 +26,14 @@ SPAN_NAMES = {"rgw.request", "rados.op", "rgw.background.rados_op"}
 MEASURED_DURATION_QUALITIES = {"measured", "measured_extended"}
 DERIVED_DURATION_QUALITIES = {"marker", "rados_bounds"}
 VALID_DURATION_QUALITIES = MEASURED_DURATION_QUALITIES | DERIVED_DURATION_QUALITIES
+# The cls_rgw bucket-index list call, as rendered into `ceph.rados.ops`
+# ("call(rgw.bucket_list)"). RGW issues ONE per bucket-index shard.
+BUCKET_LIST_OP = "rgw.bucket_list"
+# How many bucket_list ops a run must observe before the list-shard gate is
+# enforced. >= 2 is the observable definition of "the bucket is sharded": a
+# single-shard bucket (or a listing that never reached the index) cannot show it,
+# and the gate stays inert rather than failing for the wrong reason.
+MIN_LIST_SHARDS = 2
 VALID_RADOS_ROLES = {
     "data",
     "bucket_index",
@@ -101,10 +109,19 @@ BPF_INFORMATIONAL_DIAGNOSTICS = [
     "bpf_operate_seed_hits_rgwop",
     # The fail-closed clears. `miss_ctx_cleared` is a resolved-but-foreign dpp;
     # `unresolved_ctx_cleared` is a dpp we could not resolve at all (null argument,
-    # or a descriptor that is not register-resident). Both drop the thread's context
-    # rather than let it stamp an op it cannot be proven to own.
+    # or a descriptor that is not register-resident). Both drop the thread's SEEDED
+    # context (a copy Phase B migrated here) rather than let it stamp an op it cannot
+    # be proven to own.
     "bpf_operate_miss_ctx_cleared",
     "bpf_operate_unresolved_ctx_cleared",
+    # ...and the other half of that decision: the unproven submit found a HOME
+    # context (`ctx.tid == this tid`: get_handler put it here for the request that
+    # STARTED on this thread) and PRESERVED it. Phase B did not create it and does not
+    # get to destroy it -- an unscoped clear cost a live ListObjects request all 16 of
+    # its `rgw.bucket_list` shard ops, which are submitted through the cls_rgw AIO path
+    # and never pass through rgw_rados_operate.
+    "bpf_operate_miss_home_ctx_preserved",
+    "bpf_operate_unresolved_home_ctx_preserved",
     "bpf_sendop_unbridged_ctx_drops",
     # MULTI-KEY bridge revocation accounting. The identity that must hold:
     #   inserts == revokes + revoke_skipped + revoke_absent + in-flight requests
@@ -501,6 +518,89 @@ def check_object_request_correlation(args, errors, manifest, workload, rados_spa
     }
 
 
+def is_bucket_list_span(span):
+    """A `cls_rgw` bucket-index list op (one per bucket-index SHARD)."""
+    return BUCKET_LIST_OP in str(attr_map(span).get("ceph.rados.ops", ""))
+
+
+def check_list_shard_correlation(errors, manifest, rados_spans, background_spans, request_by_id):
+    """A sharded ListObjects must correlate its `rgw.bucket_list` shard ops.
+
+    THE GAP THIS CLOSES. The gate enforced GET->read and PUT->write correlation and
+    zero mis-correlation, and nothing at all about a LIST. That is exactly the shape
+    that regressed: RGW issues a bucket listing as ONE `call(rgw.bucket_list)` per
+    bucket-index shard, through the cls_rgw AIO path (`CLSRGWIssueBucketList` ->
+    `IoCtx::aio_operate`) which NEVER passes through `rgw_rados_operate`. Those
+    submits correlate only off the request context `get_handler` left on the thread.
+    A fail-closed clear that also wiped that context turned all 16 shard ops of a
+    live ListObjects request into standalone background ops -- a NET LOSS of context
+    for the request -- while every existing assertion stayed green.
+
+    GUARDED: enforced only when the workload actually performed a LIST *and* the run
+    observed >= MIN_LIST_SHARDS bucket_list ops (i.e. the bucket really is sharded).
+    A single-shard bucket, or a build/workload with no listing, skips the check
+    rather than failing it.
+
+    Correlation is judged by IDENTITY (the shard op's parent request's trans_id ==
+    the LIST's x-amz-request-id), never by a time window: with a multi-second slack a
+    window proves nothing about which request a shard op belongs to.
+    """
+    list_ops = [
+        record
+        for record in (manifest or [])
+        if record.get("op") == "LIST"
+        and record.get("status", "ok") == "ok"
+        and record.get("x_amz_request_id")
+    ]
+    if not list_ops:
+        return None
+
+    correlated_shards = [span for span in rados_spans if is_bucket_list_span(span)]
+    stranded_shards = [span for span in background_spans if is_bucket_list_span(span)]
+    observed = len(correlated_shards) + len(stranded_shards)
+
+    summary = {
+        "list_requests": len(list_ops),
+        "bucket_list_ops": observed,
+        "bucket_list_ops_correlated": len(correlated_shards),
+        "bucket_list_ops_background": len(stranded_shards),
+        "enforced": False,
+        "per_request": {},
+    }
+
+    if observed < MIN_LIST_SHARDS:
+        # Not a sharded listing (or the listing never reached the bucket index).
+        # Nothing to enforce -- reported, so a skipped gate is never invisible.
+        summary["skipped_reason"] = (
+            f"observed {observed} bucket_list ops, need >= {MIN_LIST_SHARDS} to prove a sharded bucket"
+        )
+        return summary
+
+    summary["enforced"] = True
+    for record in list_ops:
+        request_id = record["x_amz_request_id"]
+        own = [
+            span
+            for span in correlated_shards
+            if span_parent_trans_id(span, request_by_id) == request_id
+        ]
+        summary["per_request"][request_id] = len(own)
+
+    best = max(summary["per_request"].values(), default=0)
+    if best < MIN_LIST_SHARDS:
+        fail(
+            errors,
+            f"LIST SHARD CORRELATION: the run observed {observed} rgw.bucket_list shard ops "
+            f"({len(stranded_shards)} of them emitted as standalone background ops), but no "
+            f"ListObjects request correlated more than {best} of them "
+            f"(per-request: {summary['per_request']!r}). A sharded bucket listing must attach "
+            f"its bucket_list shard ops to its own request -- they are submitted through the "
+            f"cls_rgw AIO path, which never reaches rgw_rados_operate, so they correlate only "
+            f"off the request context on the listing thread.",
+        )
+    return summary
+
+
 def verify_document(args, document, workload, manifest=None):
     errors = []
 
@@ -818,10 +918,14 @@ def verify_document(args, document, workload, manifest=None):
         trace_only_request_id_count = len(unexpected_trace_ids)
 
     manifest_coverage = None
+    list_shard_coverage = None
     if manifest is not None:
         slack_ns = args.time_slack_ms * 1_000_000
         manifest_coverage = check_object_request_correlation(
             args, errors, manifest, workload, rados_spans, background_spans, request_by_id, slack_ns
+        )
+        list_shard_coverage = check_list_shard_correlation(
+            errors, manifest, rados_spans, background_spans, request_by_id
         )
 
     summary = {
@@ -837,6 +941,8 @@ def verify_document(args, document, workload, manifest=None):
     }
     if manifest_coverage is not None:
         summary["manifest_coverage"] = manifest_coverage
+    if list_shard_coverage is not None:
+        summary["list_shard_coverage"] = list_shard_coverage
     return summary, errors
 
 
@@ -1249,6 +1355,287 @@ def manifest_self_test_manifest():
     ]
 
 
+def list_shard_self_test_document(shards_correlated, shards=3):
+    """A GET request plus a LIST request whose bucket-index listing is sharded.
+
+    `shards_correlated` picks the two live-observed shapes:
+      True  -- the healthy one: every `call(rgw.bucket_list)` shard op is a child of
+               the ListObjects request that issued it (same_thread -- the shards are
+               submitted through the cls_rgw AIO path on the request's own thread).
+      False -- THE REGRESSION: the same shard ops emitted as standalone
+               `rgw.background.rados_op`s with reason `missing_trans_id`, because the
+               request context was cleared off the listing thread. Every other
+               assertion in this verifier stays green in this shape, which is exactly
+               how it reached a live cluster.
+
+    The GET request keeps a correlated data op in BOTH shapes, so the regressed
+    document still satisfies `correlated_rados_ops > 0` and the counter equations --
+    i.e. the list-shard gate is the ONLY thing that can catch it.
+    """
+
+    def rados_attrs(*, pg_seed, obj, ops, role, rw, correlation, reason=None, duration=60, tid=7):
+        attrs = [
+            attr("ceph.rados.duration_ns", duration),
+            attr("ceph.rados.send_tid", tid),
+            attr("ceph.rados.pool", 1),
+            attr("ceph.rados.pg", f"1.{pg_seed:x}"),
+            attr("ceph.rados.pg_seed", pg_seed),
+            attr("ceph.rados.target_osd", 0),
+            attr("ceph.rados.acting", "[0,1,2]"),
+            attr("ceph.rados.object", obj),
+            attr("ceph.rados.ops", ops),
+            attr("ceph.rados.rw", rw),
+            attr("ceph.rados.offset", 0),
+            attr("ceph.rados.length", 0),
+            attr("rgw.rados_role", role),
+            attr("rgw.correlation", correlation),
+        ]
+        if reason is not None:
+            attrs.append(attr("rgw.correlation_reason", reason))
+        return attrs
+
+    spans = [
+        {
+            "trace_id": "1" * 32,
+            "span_id": "1" * 16,
+            "parent_span_id": None,
+            "name": "rgw.request",
+            "start_ns": 100,
+            "end_ns": 300,
+            "attributes": [
+                attr("rgw.trans_id", "tx-get"),
+                attr("rgw.request_class", "s3_request"),
+                attr("rgw.duration_quality", "measured"),
+                attr("rgw.request.tid", 7),
+                attr("rgw.request.measured_start_ns", 100),
+                attr("rgw.request.measured_end_ns", 300),
+            ],
+            "events": [],
+        },
+        {
+            "trace_id": "1" * 32,
+            "span_id": "2" * 16,
+            "parent_span_id": "1" * 16,
+            "name": "rados.op",
+            "start_ns": 120,
+            "end_ns": 180,
+            "attributes": rados_attrs(
+                pg_seed=42,
+                obj="bucket/get-key-aaa",
+                ops="read",
+                role="data",
+                rw="read",
+                correlation="same_thread",
+            ),
+            "events": [],
+        },
+        {
+            "trace_id": "4" * 32,
+            "span_id": "4" * 16,
+            "parent_span_id": None,
+            "name": "rgw.request",
+            "start_ns": 400,
+            "end_ns": 600,
+            "attributes": [
+                attr("rgw.trans_id", "tx-list"),
+                attr("rgw.request_class", "s3_request"),
+                attr("rgw.duration_quality", "measured"),
+                attr("rgw.request.tid", 9),
+                attr("rgw.request.measured_start_ns", 400),
+                attr("rgw.request.measured_end_ns", 600),
+            ],
+            "events": [],
+        },
+    ]
+
+    # One `call(rgw.bucket_list)` per bucket-index shard, all submitted on the
+    # listing request's own thread (tid 9) through the AIO path.
+    for shard in range(shards):
+        shard_attrs = rados_attrs(
+            pg_seed=0x50 + shard,
+            obj=f".dir.bucket-marker.{shard}",
+            ops="call(rgw.bucket_list)",
+            role="bucket_index",
+            rw="read",
+            correlation="same_thread" if shards_correlated else "none",
+            reason=None if shards_correlated else "missing_trans_id",
+            duration=20,
+            tid=9,
+        )
+        if shards_correlated:
+            spans.append(
+                {
+                    "trace_id": "4" * 32,
+                    "span_id": f"{shard + 5}" * 16,
+                    "parent_span_id": "4" * 16,
+                    "name": "rados.op",
+                    "start_ns": 420,
+                    "end_ns": 440,
+                    "attributes": shard_attrs,
+                    "events": [],
+                }
+            )
+        else:
+            spans.append(
+                {
+                    "trace_id": f"{shard + 5}" * 32,
+                    "span_id": f"{shard + 5}" * 16,
+                    "parent_span_id": None,
+                    "name": "rgw.background.rados_op",
+                    "start_ns": 420,
+                    "end_ns": 440,
+                    "attributes": shard_attrs,
+                    "events": [
+                        {
+                            "name": "rados.op",
+                            "time_ns": 440,
+                            "attributes": deepcopy(shard_attrs),
+                        }
+                    ],
+                }
+            )
+
+    correlated = 1 + (shards if shards_correlated else 0)
+    background = 0 if shards_correlated else shards
+    return {
+        "service_name": "rgwtrace-e2e",
+        "spans": spans,
+        "diagnostics": {
+            "events_decoded": 4 + 1 + shards,
+            "decode_errors": 0,
+            "request_markers": 2,
+            "request_end_markers": 2,
+            "measured_duration_requests": 2,
+            "derived_duration_requests": 0,
+            "rados_ops": 1 + shards,
+            "correlated_rados_ops": correlated,
+            "background_rados_ops": background,
+            "same_thread_correlations": correlated,
+            "inferred_correlations": 0,
+            "missing_trans_id_background_ops": background,
+            "background_rados_by_role": {"bucket_index": shards} if background else {},
+            "background_rados_by_reason": {"missing_trans_id": shards} if background else {},
+            "spans_produced": len(spans),
+        },
+    }
+
+
+def list_shard_self_test_workload():
+    return [
+        {
+            "name": "get_object",
+            "status": "ok",
+            "start_ns": 110,
+            "end_ns": 290,
+            "key": "get-key-aaa",
+            "x_amz_request_id": "tx-get",
+        },
+        {
+            "name": "list_objects",
+            "status": "ok",
+            "start_ns": 410,
+            "end_ns": 590,
+            "key": None,
+            "x_amz_request_id": "tx-list",
+        },
+    ]
+
+
+def list_shard_self_test_manifest():
+    return [
+        {
+            "name": "get_object",
+            "op": "GET",
+            "rw": "read",
+            "status": "ok",
+            "start_ns": 110,
+            "end_ns": 290,
+            "key": "get-key-aaa",
+            "x_amz_request_id": "tx-get",
+        },
+        {
+            "name": "list_objects",
+            "op": "LIST",
+            "rw": "read",
+            "status": "ok",
+            "start_ns": 410,
+            "end_ns": 590,
+            "key": None,
+            "x_amz_request_id": "tx-list",
+        },
+    ]
+
+
+def run_list_shard_self_test():
+    """The gate that would have caught the ListObjects shard regression."""
+    workload = list_shard_self_test_workload()
+    manifest = list_shard_self_test_manifest()
+
+    # 1. The healthy shape passes, and reports the gate as ENFORCED (a gate that
+    #    silently skipped itself would be worthless).
+    summary, errors = verify_document(
+        self_test_args(), list_shard_self_test_document(True), workload, manifest
+    )
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: correlated list shards failed: {error}", file=sys.stderr)
+        return 1
+    coverage = summary.get("list_shard_coverage") or {}
+    if not coverage.get("enforced"):
+        print(f"SELF-TEST ERROR: list-shard gate did not enforce: {coverage!r}", file=sys.stderr)
+        return 1
+    if coverage.get("bucket_list_ops_correlated") != 3:
+        print(f"SELF-TEST ERROR: list-shard coverage miscounted: {coverage!r}", file=sys.stderr)
+        return 1
+
+    # 2. THE REGRESSION: the same shard ops emitted as background ops MUST fail.
+    #    Every other check in this file passes on that document -- which is the whole
+    #    reason this gate exists.
+    _, errors = verify_document(
+        self_test_args(), list_shard_self_test_document(False), workload, manifest
+    )
+    if not any("LIST SHARD CORRELATION" in error for error in errors):
+        print(
+            "SELF-TEST ERROR: stranded rgw.bucket_list shard ops did not fail the list-shard gate",
+            file=sys.stderr,
+        )
+        print(json.dumps(errors, indent=2, sort_keys=True), file=sys.stderr)
+        return 1
+
+    # 3. GUARD: an unsharded listing (a single bucket_list op) must SKIP the gate,
+    #    not fail it. A single-shard bucket cannot prove anything about sharding.
+    document = list_shard_self_test_document(False, shards=1)
+    summary, errors = verify_document(self_test_args(), document, workload, manifest)
+    if any("LIST SHARD CORRELATION" in error for error in errors):
+        print(
+            "SELF-TEST ERROR: the list-shard gate fired on an UNSHARDED listing",
+            file=sys.stderr,
+        )
+        return 1
+    coverage = summary.get("list_shard_coverage") or {}
+    if coverage.get("enforced") or not coverage.get("skipped_reason"):
+        print(f"SELF-TEST ERROR: unsharded listing must report a skip reason: {coverage!r}", file=sys.stderr)
+        return 1
+
+    # 4. GUARD: a workload with no LIST at all leaves the gate inert.
+    no_list_manifest = [record for record in list_shard_self_test_manifest() if record["op"] != "LIST"]
+    no_list_workload = [record for record in workload if record["name"] != "list_objects"]
+    summary, errors = verify_document(
+        self_test_args(),
+        list_shard_self_test_document(False),
+        no_list_workload,
+        no_list_manifest,
+    )
+    if any("LIST SHARD CORRELATION" in error for error in errors):
+        print("SELF-TEST ERROR: the list-shard gate fired without a LIST workload", file=sys.stderr)
+        return 1
+    if summary.get("list_shard_coverage") is not None:
+        print("SELF-TEST ERROR: the list-shard gate must be inert without a LIST", file=sys.stderr)
+        return 1
+
+    return 0
+
+
 def set_span_object(document, span_id, value):
     for span in document["spans"]:
         if span.get("span_id") == span_id:
@@ -1551,6 +1938,9 @@ def run_self_test():
             return 1
 
     if run_manifest_self_test() != 0:
+        return 1
+
+    if run_list_shard_self_test() != 0:
         return 1
 
     print("verify-rgwtrace-json self-test passed")

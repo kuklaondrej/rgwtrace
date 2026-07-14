@@ -934,8 +934,8 @@ int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
  * to add a bpf_probe_read_user through `dpp` -- don't. Fail-closed by construction
  * is the entire point.
  *
- * WHY A MISS *CLEARS* THE THREAD'S CONTEXT. This is the fail-closed rule that
- * makes the per-submit seed safe, and it is not optional:
+ * WHY A MISS CLEARS A *SEEDED* CONTEXT. This is the fail-closed rule that makes
+ * the per-submit seed safe, and it is not optional:
  *
  *   Request A runs an operate on pool thread T -- the seed puts A's context on T.
  *   A yields. Request B resumes on T and submits through a dpp we cannot key.
@@ -948,17 +948,60 @@ int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
  * this probe can prove that (see the design doc's "current-coroutine identity"
  * section: the asio fiber stack is not a sound discriminator, because coroutine
  * stacks are pool-allocated and can neighbor each other). So on a miss we assume
- * NOTHING: whatever context is on this thread is dropped, and the op this call is
- * about to submit comes out uncorrelated.
+ * NOTHING about a context PHASE B ITSELF SCATTERED onto this thread: it is
+ * dropped, and the op this call is about to submit comes out uncorrelated.
  *
- * The cost is real and is counted (RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED): a
- * request's OWN operate through a wrapper dpp loses its correlation, and so does a
- * direct librados submit that follows a foreign operate on the same thread. Both
- * are a coverage loss. Stamping them would be a correctness loss, and one
- * mis-correlated op poisons the entire tool's credibility -- an uncorrelated op is
- * a known unknown, a mis-correlated one is a lie. The multi-key bridge is what
- * keeps this cost small: a request's own operates are keyed by BOTH its req_state*
- * and its RGWOp*, so they HIT rather than miss.
+ * WHY A MISS MUST *NOT* CLEAR A *HOME* CONTEXT. The clear above was originally
+ * unscoped -- any context on the thread was dropped -- and that shipped a real
+ * regression, measured on a live cluster: a ListObjects request LOST all 16 of its
+ * `rgw.bucket_list` shard ops, which the pre-Phase-B build correlated fine.
+ *
+ *   RGW issues those 16 shard reads through the cls_rgw AIO path
+ *   (CLSRGWIssueBucketList -> IoCtx::aio_operate), which NEVER passes through
+ *   rgw_rados_operate. They correlated only because get_handler had seeded
+ *   rgw_requests[T] on the request's OWN thread T and nothing ever cleared it. One
+ *   single foreign-dpp operate on T (the run showed exactly ONE) then wiped that
+ *   context, and every one of the 16 later AIO submits on T found nothing.
+ *
+ * So the clear must be SCOPED to the contexts Phase B is responsible for:
+ *
+ *   HOME   (ctx->tid == current tid): get_handler put this context on this very
+ *          thread, for the request that STARTED here. It is the pre-Phase-B
+ *          same-thread correlation path, it predates this probe, and Phase B has no
+ *          claim on it. PRESERVED. Clearing it buys nothing anyway: an AIO submit
+ *          that never reaches an operate would keep inheriting whatever context is
+ *          on the thread regardless, so the mis-correlation window the unscoped
+ *          clear was meant to close stays open either way (see the ACCEPTED
+ *          RESIDUAL HAZARD below).
+ *   SEEDED (ctx->tid != current tid): a COPY that a re-seed migrated onto a thread
+ *          that is NOT the request's get_handler thread. It is a Phase B artifact
+ *          with no ownership claim on this thread, and leaving it here is exactly
+ *          the stale-copy hazard Phase B multiplies. CLEARED.
+ *
+ * ctx->tid is the get_handler thread and is copied VERBATIM by every seed (nothing
+ * ever rewrites it -- that is what keeps the collector's cross_thread label
+ * honest), so this test is exact, not a heuristic.
+ *
+ * The two outcomes are counted separately (RGWTRACE_DIAG_OPERATE_*_CTX_CLEARED vs
+ * RGWTRACE_DIAG_OPERATE_*_HOME_CTX_PRESERVED) so a live run shows how often each
+ * happens.
+ *
+ * ACCEPTED RESIDUAL HAZARD (pre-existing, NOT introduced by Phase B). Preserving a
+ * HOME context means another coroutine that migrates onto that request's home
+ * thread and submits through a path that never reaches rgw_rados_operate (the AIO
+ * path above) still inherits that request's trans_id. That hazard is inherent to
+ * thread-keyed correlation on the non-operate submit path: it existed before Phase
+ * B, passed the zero-mis-correlation e2e gate, and no clear at THIS probe can close
+ * it (the submit in question never gets here). It is documented in
+ * docs/design-cross-thread-correlation.md SS11, not papered over.
+ *
+ * The cost of the clear is real and is counted (RGWTRACE_DIAG_OPERATE_MISS_CTX_
+ * CLEARED): a request's OWN operate through a wrapper dpp, on a MIGRATED thread,
+ * loses its correlation. That is a coverage loss. Stamping it would be a
+ * correctness loss, and one mis-correlated op poisons the entire tool's
+ * credibility -- an uncorrelated op is a known unknown, a mis-correlated one is a
+ * lie. The multi-key bridge is what keeps this cost small: a request's own operates
+ * are keyed by BOTH its req_state* and its RGWOp*, so they HIT rather than miss.
  *
  * COST. One hprobes lookup, one register read (no user memory access), one bridge
  * lookup, and -- only on a hit -- one stack copy plus one rgw_requests update. No
@@ -966,11 +1009,22 @@ int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
  * already does for the very op this call is about to submit, and it is dwarfed by
  * the RADOS round-trip that follows.
  */
-static __always_inline void operate_drop_thread_ctx(__u32 tid, __u32 diag) {
-  if (bpf_map_lookup_elem(&rgw_requests, &tid) != 0) {
-    bpf_map_delete_elem(&rgw_requests, &tid);
-    count_diag(diag);
+static __always_inline void operate_drop_seeded_ctx(__u32 tid, __u32 cleared_diag,
+                                                    __u32 preserved_diag) {
+  struct rgw_request_ctx *cur = bpf_map_lookup_elem(&rgw_requests, &tid);
+  if (cur == 0)
+    return;
+
+  /* HOME: this thread is the get_handler thread of the request whose context is
+   * sitting here. Not a Phase B copy; not Phase B's to drop. */
+  if (cur->tid == tid) {
+    count_diag(preserved_diag);
+    return;
   }
+
+  /* SEEDED: a Phase B copy on a thread that does not own the request. */
+  bpf_map_delete_elem(&rgw_requests, &tid);
+  count_diag(cleared_diag);
 }
 
 static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid) {
@@ -993,6 +1047,10 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
    * without clearing (the old behavior) was therefore a mis-correlation source and
    * not merely a coverage gap.
    *
+   * It clears a SEEDED context only, exactly like the foreign-dpp miss: a HOME
+   * context (one get_handler placed on its own request's thread) is not a Phase B
+   * copy and is preserved -- see operate_drop_seeded_ctx.
+   *
    * The clear is counted SEPARATELY from the foreign-dpp miss, because the two say
    * completely different things: a foreign-dpp miss is the expected steady state on
    * a busy gateway, while a nonzero OPERATE_UNRESOLVED_CTX_CLEARED means either
@@ -1004,14 +1062,16 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
   struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
   if (vf == 0) {
     count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);
-    operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED);
+    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
+                            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED);
     return 0;
   }
 
   __u64 dpp = fetch_param_ptr(ctx, vf);
   if (dpp == 0) {
     count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);
-    operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED);
+    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
+                            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED);
     return 0;
   }
 
@@ -1044,8 +1104,11 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
   count_diag(RGWTRACE_DIAG_OPERATE_SEED_MISSES);
 
   /* Miss: fail closed (see the header comment). Assume nothing about a context
-   * this submit did not prove. */
-  operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED);
+   * PHASE B put on this thread -- but do not touch the HOME context that
+   * get_handler put here for this thread's own request, which Phase B did not
+   * create and which the pre-Phase-B same-thread path depends on. */
+  operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED,
+                          RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED);
   return 0;
 }
 

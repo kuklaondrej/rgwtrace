@@ -74,6 +74,8 @@ const BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
 const BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
 const BPF_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
 const BPF_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
+const BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED: u32 = 31;
+const BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -346,6 +348,14 @@ fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
         rgw_op_key_revoke_absent: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
         rgw_op_key_index_drops: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INDEX_DROPS)?,
         rgw_op_key_disabled: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_DISABLED)?,
+        operate_miss_home_ctx_preserved: read_bpf_counter(
+            map,
+            BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED,
+        )?,
+        operate_unresolved_home_ctx_preserved: read_bpf_counter(
+            map,
+            BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED,
+        )?,
     })
 }
 

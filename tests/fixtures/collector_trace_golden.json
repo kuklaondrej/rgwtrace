@@ -299,6 +299,8 @@
     "bpf_sendop_unbridged_ctx_drops": 0,
     "bpf_operate_miss_ctx_cleared": 0,
     "bpf_operate_unresolved_ctx_cleared": 0,
+    "bpf_operate_miss_home_ctx_preserved": 0,
+    "bpf_operate_unresolved_home_ctx_preserved": 0,
     "bpf_rgw_op_key_inserts": 0,
     "bpf_rgw_op_key_revokes": 0,
     "bpf_rgw_op_key_revoke_skipped": 0,

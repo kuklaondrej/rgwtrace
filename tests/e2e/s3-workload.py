@@ -212,7 +212,23 @@ def main():
                 return response
 
             run_op(recorder, "get_object", bucket, alpha_key, get_alpha, op="GET", rw="read")
-            run_op(recorder, "list_objects", bucket, None, lambda: client.list_objects_v2(Bucket=bucket, Prefix="alpha"))
+            # Classified as LIST (not OTHER) so the verifier can arm its list-shard
+            # gate: RGW serves a bucket listing as ONE `call(rgw.bucket_list)` per
+            # bucket-index SHARD, submitted through the cls_rgw AIO path -- a submit
+            # path that never reaches `rgw_rados_operate`, and whose correlation is
+            # therefore not covered by any GET/PUT assertion.
+            #
+            # No Prefix: a prefixed list can be served from fewer shards, and the gate
+            # needs the listing to actually fan out across the bucket index.
+            run_op(
+                recorder,
+                "list_objects",
+                bucket,
+                None,
+                lambda: client.list_objects_v2(Bucket=bucket),
+                op="LIST",
+                rw="read",
+            )
 
             run_op(
                 recorder,

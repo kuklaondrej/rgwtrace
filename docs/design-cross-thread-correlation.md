@@ -617,15 +617,23 @@ Those are different claims, and Phase B made the gap dangerous:
 Phase B **amplifies** this: before it, only one or two threads ever carried A's
 context; now every thread A ever ran an operate on does.
 
-**Fix: on a miss, clear `rgw_requests[tid]`.** Nothing this submit did not prove
-is assumed. The op comes out uncorrelated.
+**Fix: on a miss, clear the SEEDED context on `rgw_requests[tid]`.** Nothing this
+submit did not prove is assumed *about a copy Phase B itself put there*.
+The op comes out uncorrelated.
 
-**Cost, honestly.** A request's *own* operate through an unkeyable wrapper dpp
-loses correlation, as does a direct librados submit that follows a foreign operate
-on the same thread. Counted in `RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED`. The
-multi-key bridge (§10.1) is what keeps the cost small: a request's own operates
-now hit under its `req_state*` **or** its `RGWOp*`, so the misses that remain are
-overwhelmingly genuine background/wrapper dpps.
+> **SCOPE CORRECTION (§11).** As first shipped this clear was **unscoped** — it
+> dropped *whatever* context was on the thread — and that regressed a live
+> ListObjects request by 16 ops. The clear now applies **only to SEEDED contexts**
+> (`ctx->tid != current tid`); a **HOME** context (`ctx->tid == current tid`, i.e.
+> one `get_handler` placed on its own request's thread) is **preserved**. Read §11
+> before touching `operate_drop_seeded_ctx`.
+
+**Cost, honestly.** A request's *own* operate through an unkeyable wrapper dpp, on
+a **migrated** thread, loses correlation. Counted in
+`RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED`. The multi-key bridge (§10.1) is what
+keeps the cost small: a request's own operates now hit under its `req_state*`
+**or** its `RGWOp*`, so the misses that remain are overwhelmingly genuine
+background/wrapper dpps.
 
 **Rejected: a "current-coroutine identity" check.** The obvious candidate is the
 **stack pointer**: asio coroutines run on their own fiber stacks, and a request's
@@ -734,13 +742,13 @@ the liveness gate **passes** it; and the op — which may belong to a completely
 different coroutine now running on `T` — is stamped as `A`. An unresolved `dpp`
 proves *exactly as little* as a foreign one.
 
-Both now clear (`operate_drop_thread_ctx`), and the clear is counted
-**separately** — `RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED` vs
-`..._MISS_CTX_CLEARED` — because the two say completely different things: a
-foreign-dpp miss is the expected steady state on a busy gateway, while an
-unresolved `dpp` means either that RGW passes null dpps on this path or that this
-build's descriptor is broken (in which case correlation is dead and must not look
-merely quiet).
+Both now clear (`operate_drop_seeded_ctx`) — and both clear a **SEEDED** context
+only, leaving a **HOME** one alone (§11). The clear is counted **separately** —
+`RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED` vs `..._MISS_CTX_CLEARED` — because
+the two say completely different things: a foreign-dpp miss is the expected steady
+state on a busy gateway, while an unresolved `dpp` means either that RGW passes
+null dpps on this path or that this build's descriptor is broken (in which case
+correlation is dead and must not look merely quiet).
 
 ### 10.8 The offset-0 proof must bind to a TYPE, not to a NAME
 
@@ -796,3 +804,159 @@ from the only channel available to check it.
 curated list cannot fall behind again. `every_diagnostics_field_reaches_every_
 output_path` is the tripwire, and it fails if any field of `TraceDiagnostics` is
 missing from the JSON, the log summary, or the OTLP resource.
+
+## 11. The fail-closed clear must be SCOPED — the ListObjects regression
+
+**[MEASURED]** on the live rig, re-running the same four S3 calls against the
+Phase B build. Phase B worked: ListObjects gained 3 new `cross_thread` metadata
+ops. It also **LOST all 16** of its `call(rgw.bucket_list)` shard ops, which the
+PR#4 baseline had correlated as `same_thread` children. They came out as
+standalone `rgw.background.rados_op` with `rgw.correlation_reason =
+missing_trans_id`. **Net context LOSS for that request.**
+
+The counters name the culprit exactly:
+
+```
+bpf_operate_seed_hits              = 10   (reqstate = 1, rgwop = 9)
+bpf_operate_miss_ctx_cleared       =  1   <-- ONE clear
+bpf_operate_unresolved_ctx_cleared =  0
+bpf_sendop_stale_ctx_drops         =  0   (not the liveness gate)
+bpf_sendop_unbridged_ctx_drops     =  0   (not a missing req_state*)
+```
+
+One clear. Sixteen lost ops.
+
+### 11.1 Why one clear cost sixteen ops
+
+RGW does **not** issue a sharded bucket listing through `rgw_rados_operate`. It
+goes through cls_rgw's **AIO** path:
+
+```
+RGWListBucket::execute -> RGWRados::Bucket::List::list_objects
+  -> cls_bucket_list_ordered -> CLSRGWIssueBucketList
+     -> IoCtx::aio_operate -> Objecter::op_submit -> _send_op   [ONE PER SHARD]
+```
+
+`rgw_rados_operate` is never on that stack. So those 16 submits were **never**
+correlated by Phase B at all — they were correlated in the PR#4 baseline purely
+because `uprobe_rgw_get_handler` seeded `rgw_requests[T]` on the request's own
+thread `T` and **nothing ever cleared it**.
+
+The unscoped fail-closed clear changed that. A single `rgw_rados_operate` with a
+foreign `dpp` (a stack `DoutPrefix` wrapper) running on that same thread `T` wiped
+`rgw_requests[T]`, and every one of the 16 later AIO submits on `T` then found no
+context:
+
+```
+get_handler(T)           -> rgw_requests[T] = ctx(A)      [HOME: ctx.tid == T]
+rgw_rados_operate(T, foreign dpp) -> MISS -> DELETE rgw_requests[T]   <-- the bug
+_send_op(T) x16          -> no context -> background, missing_trans_id
+```
+
+The blast radius is the point: the clear did not merely drop the op it fired on —
+it **stranded every later submit on that thread**, on a submit path the clear
+cannot even see.
+
+And the clear bought **no soundness** on that path. An AIO submit with no preceding
+operate uses whatever context is on the thread regardless; clearing at the operate
+probe cannot close a window belonging to a submit that never reaches the operate
+probe. It was pure cost.
+
+### 11.2 The fix: HOME vs SEEDED
+
+Phase B manages **only the contexts it created**:
+
+| | definition | who put it there | on an unproven submit |
+|---|---|---|---|
+| **HOME** | `ctx->tid == current tid` | `uprobe_rgw_get_handler`, for a request whose `get_handler` ran on **this** thread | **PRESERVED** |
+| **SEEDED** | `ctx->tid != current tid` | a re-seed (Phase B, or `rgw_process_authenticated`) migrated a **copy** here | **CLEARED** |
+
+`ctx->tid` is the get_handler thread and is copied **verbatim** by every seed —
+nothing ever rewrites it (that is also what keeps the `cross_thread` label honest,
+§9). So the test is **exact**, not a heuristic.
+
+* **Clear a SEEDED context.** It is a Phase B artifact with no ownership claim on
+  this thread, and leaving it is exactly the stale-copy hazard Phase B multiplies
+  (§10.2). Unchanged.
+* **Do NOT clear a HOME context.** That is the pre-existing PR#4 same-thread path.
+  It is what correlates the 16 shards, and Phase B must never regress what already
+  worked.
+
+Implemented in `operate_drop_seeded_ctx` (`bpf/rgwtrace.bpf.c`), used by both the
+foreign-dpp miss and the unresolved/null-dpp path.
+
+**The two outcomes are counted distinctly**, so a live run shows how often each
+happens:
+
+| counter | meaning |
+|---|---|
+| `bpf_operate_miss_ctx_cleared` | a foreign-dpp miss cleared a **SEEDED** copy |
+| `bpf_operate_unresolved_ctx_cleared` | an unresolved/null dpp cleared a **SEEDED** copy |
+| `bpf_operate_miss_home_ctx_preserved` | a foreign-dpp miss left a **HOME** context alone |
+| `bpf_operate_unresolved_home_ctx_preserved` | an unresolved/null dpp left a **HOME** context alone |
+
+On the regressed run, the first counter was 1 and the third would have been 0. On a
+healthy run the *preserved* counters are expected to be **nonzero** — that is the
+same-thread path continuing to work.
+
+### 11.3 ACCEPTED RESIDUAL HAZARD (pre-existing, bounded, not papered over)
+
+Preserving a HOME context leaves one hazard open, and it is stated plainly here
+rather than hidden:
+
+> **Another coroutine that migrates onto request A's home thread `T` and submits
+> through a path that never reaches `rgw_rados_operate` (i.e. the AIO path) will
+> inherit A's `trans_id`.**
+
+Properties of this hazard:
+
+* It is **inherent to thread-keyed correlation on the non-operate submit path**. The
+  submit in question never reaches the probe that could clear or re-seed the thread,
+  so **no clear at `rgw_rados_operate` can close it** — including the unscoped one
+  that caused the regression. Giving up the 16 shards bought nothing against it.
+* It is **PRE-EXISTING**: it shipped in PR#4 and passed the zero-mis-correlation e2e
+  gate. It is **not introduced by Phase B**. `the_home_thread_aio_hazard_is_pre_
+  existing_and_not_introduced_by_phase_b` (`tests/crossthread_phase_b.rs`) asserts
+  exactly that, by exercising the identical scenario **with Phase B not attached at
+  all** and observing the identical outcome.
+* It is **bounded by the liveness gate**: a *dead* request's home context can never
+  stamp anything (`request_ctx_is_live` rejects it, counted in
+  `bpf_sendop_stale_ctx_drops`). The hazard is confined to two **concurrently live**
+  requests sharing one thread, where one of them submits via AIO after the other's
+  coroutine has migrated in.
+* Phase B does add one new *source* of the same class in the opposite direction: a
+  seeded copy of request B, placed on A's home thread by B's own operate (B really
+  *is* running there at that instant, so the seed is correct), overwrites A's home
+  context — and A's next AIO submit on `T` would then be stamped as B. This is the
+  same hazard with the roles swapped, and it has the same single cure.
+* **The only real cure** is a submit-path identity that does not depend on the
+  thread — e.g. probing the cls_rgw/AIO submit site itself with a keyable `dpp`, or
+  a per-op identity threaded through the Objecter. Both are future work, out of scope
+  here, and neither is achievable by tightening the operate probe.
+
+The tool's contract is unchanged and honest: an uncorrelated op is a known unknown;
+this hazard is the one *documented* place where a correlated op can be wrong, it is
+inherited rather than introduced, and it is measured by the e2e mis-correlation gate
+rather than assumed away.
+
+### 11.4 The three test gaps that let this ship
+
+The regression was invisible to a 283-test suite. Three gaps, all now closed:
+
+1. **No test modeled a submit that BYPASSES `rgw_rados_operate`.** Every Phase B
+   test drove its submits *through* the operate probe. The AIO path — a `_send_op`
+   with **no** preceding operate on that thread — was never modeled, and that is
+   precisely where the clear did its damage. `tests/crossthread_phase_b.rs` now has
+   an `aio_submit()` that calls `send_op` with no operate, and uses it throughout.
+2. **No COVERAGE-REGRESSION test.** Every assertion was *"new ops get correlated"* or
+   *"no op gets mis-correlated"*. **None** asserted *"ops that were correlated before
+   must STILL be correlated."* `a_list_objects_request_keeps_all_its_bucket_list_
+   shards_across_a_foreign_operate` is that test: get_handler on `T`, a foreign-dpp
+   operate on `T`, then N AIO submits on `T` with no intervening operate — all N must
+   correlate as `same_thread` children. It **fails against the pre-fix code**.
+3. **The e2e gate never covered multi-shard LIST.** It enforced GET→read and
+   PUT→write correlation and zero mis-correlation, and *nothing* about a listing.
+   `check_list_shard_correlation` (`tests/e2e/verify-rgwtrace-json.py`) now requires a
+   ListObjects request to correlate its `rgw.bucket_list` shard ops — guarded so it is
+   enforced only when the workload actually performed a LIST **and** the run observed
+   ≥ 2 shard ops (the observable definition of a sharded bucket).

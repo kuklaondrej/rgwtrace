@@ -123,7 +123,11 @@ fn request_end_probe_wires_coverage_counters() {
     assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT = 28,"));
     assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS = 29,"));
     assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_RGWOP_KEY_DISABLED = 30,"));
-    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_COUNTERS = 31,"));
+    // The OTHER outcome of an unproven submit: a HOME context (get_handler's own, on
+    // its own thread) is PRESERVED rather than cleared. Appended, never renumbered.
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED = 31,"));
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED = 32,"));
+    assert!(RGWTRACE_EVENTS.contains("RGWTRACE_DIAG_COUNTERS = 33,"));
 }
 
 #[test]
@@ -522,7 +526,7 @@ fn rados_operate_seed_reuses_the_shared_reseed_helper() {
 }
 
 #[test]
-fn rados_operate_seed_fails_closed_by_clearing_context_on_a_foreign_dpp_miss() {
+fn rados_operate_seed_fails_closed_by_clearing_a_seeded_context_on_a_foreign_dpp_miss() {
     // INVARIANT CHANGE (was: "must not clear on miss"). The old rule traded a
     // correctness loss for a coverage gain, which is the wrong trade for this tool.
     //
@@ -535,34 +539,87 @@ fn rados_operate_seed_fails_closed_by_clearing_context_on_a_foreign_dpp_miss() {
     // here now -- and Phase B amplifies this, because it scatters A's context onto
     // every thread A ever ran an operate on.
     //
-    // So a miss now DROPS whatever is on the thread: nothing this submit did not
-    // prove is assumed. The cost (a request's own operate through a wrapper dpp
+    // So a miss DROPS the SEEDED copy Phase B put on this thread: nothing this
+    // submit did not prove is assumed about a context Phase B itself scattered. The
+    // cost (a request's own operate through a wrapper dpp, on a MIGRATED thread,
     // loses correlation) is counted, and it is small because the bridge is
     // multi-keyed: a request's own operates hit under its req_state* OR its RGWOp*.
+    //
+    // SECOND INVARIANT CHANGE (the ListObjects regression): the clear is SCOPED. It
+    // must NOT touch a HOME context -- one get_handler placed on this very thread for
+    // the request that started here (ctx->tid == tid). See
+    // `the_fail_closed_clear_preserves_a_home_context` below.
     let seed = phase_b_seed_body();
     assert!(
-        seed.contains("operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED);"),
-        "the per-submit seed must fail closed and clear thread context on a miss: {seed}"
-    );
-    assert!(
-        RGWTRACE_BPF.contains(concat!(
-            "static __always_inline void operate_drop_thread_ctx(__u32 tid, __u32 diag) {\n",
-            "  if (bpf_map_lookup_elem(&rgw_requests, &tid) != 0) {\n",
-            "    bpf_map_delete_elem(&rgw_requests, &tid);\n",
-            "    count_diag(diag);\n",
-            "  }\n",
-            "}"
+        seed.contains(concat!(
+            "  operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED,\n",
+            "                          RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED);"
         )),
-        "the coverage the fail-closed clear costs must be counted, never silent"
+        "the per-submit seed must fail closed and clear a SEEDED thread context on a miss: {seed}"
     );
     // The clear happens ONLY on the miss path -- a hit seeds and returns first.
     let hit = seed
         .find("count_diag(RGWTRACE_DIAG_OPERATE_SEED_HITS);")
         .expect("hit branch");
     let clear = seed
-        .find("operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED);")
+        .find("operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED,")
         .expect("clear");
     assert!(hit < clear, "the hit path must return before the clear");
+}
+
+#[test]
+fn the_fail_closed_clear_preserves_a_home_context() {
+    // THE REGRESSION THIS FIXES, pinned to the source. An unscoped clear wiped the
+    // context get_handler had put on the request's OWN thread, and a live run lost
+    // all 16 `rgw.bucket_list` shard ops of a ListObjects request: RGW issues those
+    // through the cls_rgw AIO path (CLSRGWIssueBucketList -> IoCtx::aio_operate),
+    // which NEVER passes through rgw_rados_operate, so they are correlated purely by
+    // the HOME context sitting on the thread. ONE foreign-dpp operate on that thread
+    // was enough to strand every one of them.
+    //
+    // HOME   (ctx->tid == tid): get_handler's own context, for the request that
+    //        STARTED on this thread. Phase B did not create it; Phase B must not
+    //        destroy it. PRESERVED, and counted.
+    // SEEDED (ctx->tid != tid): a copy a re-seed migrated onto a thread that does not
+    //        own the request. That IS Phase B's, and it is the stale-copy hazard.
+    //        CLEARED, and counted.
+    //
+    // ctx->tid is the get_handler thread, copied verbatim by every seed (nothing ever
+    // rewrites it), so the test is exact rather than a heuristic.
+    assert!(
+        RGWTRACE_BPF.contains(concat!(
+            "static __always_inline void operate_drop_seeded_ctx(__u32 tid, __u32 cleared_diag,\n",
+            "                                                    __u32 preserved_diag) {\n",
+            "  struct rgw_request_ctx *cur = bpf_map_lookup_elem(&rgw_requests, &tid);\n",
+            "  if (cur == 0)\n",
+            "    return;\n",
+        )),
+        "the fail-closed clear must inspect the context before dropping it"
+    );
+    assert!(
+        RGWTRACE_BPF.contains(concat!(
+            "  if (cur->tid == tid) {\n",
+            "    count_diag(preserved_diag);\n",
+            "    return;\n",
+            "  }\n",
+            "\n",
+            "  /* SEEDED: a Phase B copy on a thread that does not own the request. */\n",
+            "  bpf_map_delete_elem(&rgw_requests, &tid);\n",
+            "  count_diag(cleared_diag);\n",
+            "}"
+        )),
+        "a HOME context (ctx->tid == tid) must be PRESERVED and only a SEEDED copy cleared"
+    );
+    // Both outcomes are counted, and counted distinctly: a live run must be able to
+    // show how often the rule fired on a Phase B copy vs declined to touch a
+    // pre-Phase-B context.
+    assert!(RGWTRACE_BPF.contains("RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED"));
+    assert!(RGWTRACE_BPF.contains("RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED"));
+    // And the unscoped helper is GONE -- not merely unused.
+    assert!(
+        !RGWTRACE_BPF.contains("operate_drop_thread_ctx"),
+        "the unscoped clear must not survive anywhere in the program"
+    );
 }
 
 #[test]
@@ -575,13 +632,15 @@ fn an_unresolved_or_null_dpp_fails_closed_exactly_like_a_foreign_one() {
     // ALIVE so the liveness gate PASSES it, and the op -- which may belong to a
     // completely different coroutine now running on T -- is stamped as A.
     //
-    // An unresolved dpp proves exactly as little as a foreign one. Both now clear.
+    // An unresolved dpp proves exactly as little as a foreign one. Both now clear --
+    // and both clear a SEEDED context only, leaving a HOME one alone.
     let seed = phase_b_seed_body();
     assert!(seed.contains(concat!(
         "  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);\n",
         "  if (vf == 0) {\n",
         "    count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);\n",
-        "    operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED);\n",
+        "    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,\n",
+        "                            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED);\n",
         "    return 0;\n",
         "  }"
     )));
@@ -589,7 +648,8 @@ fn an_unresolved_or_null_dpp_fails_closed_exactly_like_a_foreign_one() {
         "  __u64 dpp = fetch_param_ptr(ctx, vf);\n",
         "  if (dpp == 0) {\n",
         "    count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);\n",
-        "    operate_drop_thread_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED);\n",
+        "    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,\n",
+        "                            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED);\n",
         "    return 0;\n",
         "  }"
     )));
