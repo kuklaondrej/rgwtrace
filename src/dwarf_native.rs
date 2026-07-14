@@ -134,9 +134,14 @@ const RGWREST_GET_HANDLER_FIELDS: &[&[&str]] = &[
 /// `optional_trailing_var_field`).
 const RGW_PROCESS_AUTHENTICATED_FIELDS: &[&[&str]] = &[&["s"], &["op"]];
 /// Request-END probe. `req_state::~req_state`'s only parameter is the implicit
-/// `this` (a `req_state*`), named by the same single-element raw-pointer path:
+/// `this` (a `req_state*`), described by the same single-element raw-pointer path:
 /// the pointer's own value, register-only, no dereference. The register itself
 /// comes from DWARF -- nothing here assumes the x86-64 `rdi`/DWARF-reg-5 ABI.
+///
+/// The name here is documentation only (as for `rgw_rados_operate` below): `this`
+/// is resolved POSITIONALLY, as formal parameter 0 (see
+/// [`FIRST_PARAM_PROBE_FUNCTIONS`]) -- it is `DW_AT_artificial` and its concrete
+/// DIE has no `DW_AT_name` to look up.
 const REQ_STATE_DTOR_FIELDS: &[&[&str]] = &[&["this"]];
 /// PHASE B. Both `rgw_rados_operate` overloads take the request's
 /// `const DoutPrefixProvider *dpp` as their FIRST parameter, and that pointer --
@@ -190,17 +195,29 @@ impl DppFacts {
 /// Probe functions whose single raw-pointer parameter is resolved POSITIONALLY --
 /// the subprogram's FIRST `DW_TAG_formal_parameter` -- rather than by name.
 ///
-/// Only the `rgw_rados_operate` overloads, and only because their mangled
-/// signature has ALREADY been checked (`rados_operate_overload` requires arg0 to
-/// be `const DoutPrefixProvider*` before the definition is accepted at all). Given
-/// that proof, position 0 IS the dpp, so we do not additionally have to trust that
-/// upstream keeps spelling the parameter `dpp` -- nor risk a name lookup matching
-/// a same-named local `DW_TAG_variable` inside an optimized body.
+/// * The `rgw_rados_operate` overloads, because their mangled signature has
+///   ALREADY been checked (`rados_operate_overload` requires arg0 to be
+///   `const DoutPrefixProvider*` before the definition is accepted at all). Given
+///   that proof, position 0 IS the dpp, so we do not additionally have to trust
+///   that upstream keeps spelling the parameter `dpp` -- nor risk a name lookup
+///   matching a same-named local `DW_TAG_variable` inside an optimized body.
+/// * `req_state::~req_state`, whose only parameter is the IMPLICIT OBJECT
+///   POINTER. A member function's parameter 0 is its `this` by language rule, and
+///   the definition has already been proven to be `req_state`'s destructor by its
+///   mangled linkage name (D1/D2), so position 0 IS the `req_state*` -- no weaker
+///   an argument than the one above. Position also happens to be the only thing
+///   that is reliably THERE: `this` is `DW_AT_artificial`, the concrete instance's
+///   parameter DIE carries no `DW_AT_name` of its own, and on an LTO build its
+///   name sits two `DW_AT_abstract_origin` hops away behind GCC's cdtor clones.
 ///
-/// Every other probe function keeps name-based lookup: a member function's first
-/// formal parameter is the implicit `this`, and `RGWREST::get_handler` wants its
-/// third parameter, so position 0 means nothing there.
-const FIRST_PARAM_PROBE_FUNCTIONS: &[&str] = &[RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE];
+/// `RGWREST::get_handler` and `Objecter::*` keep name-based lookup: they want a
+/// LATER parameter (`get_handler`'s `req_state*` is its third), so position 0
+/// means nothing there.
+const FIRST_PARAM_PROBE_FUNCTIONS: &[&str] = &[
+    RGW_RADOS_OPERATE_READ,
+    RGW_RADOS_OPERATE_WRITE,
+    REQ_STATE_DTOR,
+];
 
 #[allow(dead_code)]
 pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
@@ -413,7 +430,10 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
             resolved.entry(function).or_insert(ranked);
         }
     }
-    let (mut func2vf, dpp) = function_var_fields(&dwarf, &index, wanted)?;
+    // Extraction of the descriptors comes AFTER address resolution, and is fed the
+    // resolved addresses: each descriptor must be decoded at the PC its uprobe will
+    // fire at, and must come from the definition that owns that PC.
+    let (mut func2vf, dpp) = function_var_fields(&dwarf, &index, wanted, &resolved)?;
     // Refuse any function whose name resolved to two equally valid definitions at
     // different addresses -- there is nothing left to choose between them, so we
     // must not pick. Drop the descriptors with the address: an hprobe slot filled
@@ -536,10 +556,62 @@ fn has_all_functions<T>(result: &BTreeMap<String, T>, wanted: &[&str]) -> bool {
 /// which is required for real Ceph binaries where a probed function's parameter
 /// type (or a member/base type) is frequently defined in a different CU and is
 /// reached through a `DW_FORM_ref_addr` (`DebugInfoRef`) attribute.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DieRef<Offset> {
     unit: usize,
     offset: UnitOffset<Offset>,
+}
+
+/// Hard cap on how many DIEs an attribute may be inherited through. Real chains
+/// are two or three links; the cap only bounds work on adversarial/looping DWARF
+/// (the visited check already breaks cycles).
+const ORIGIN_CHAIN_LIMIT: usize = 8;
+
+/// The DIEs an attribute of `die` may be inherited from, NEAREST FIRST: `die`
+/// itself, then the transitive closure of its `DW_AT_abstract_origin` and
+/// `DW_AT_specification` references.
+///
+/// TRANSITIVE is the point. DWARF 5 §3.3.8.1 says a concrete instance DIE
+/// inherits every attribute it does not carry itself from the DIE its
+/// `DW_AT_abstract_origin` names -- and that DIE may in turn inherit from
+/// another. GCC's constructor/destructor CLONES make that stacking routine, and
+/// on an LTO build (which is how Ceph is built) it is exactly two hops:
+///
+/// ```text
+///   subprogram (concrete, low_pc)          formal_parameter (loclist, no name)
+///     -> abstract_origin: D2 clone           -> abstract_origin: clone's param
+///          (linkage _ZN9req_stateD2Ev)            (no DW_AT_name, no DW_AT_type)
+///     -> abstract_origin: D4 unified         -> abstract_origin: unified param
+///          (DW_AT_inline)                         (DW_AT_name "this", DW_AT_type)
+/// ```
+///
+/// Walking only ONE hop -- which every caller here used to do -- finds a DIE that
+/// carries neither the name nor the type, and so fails to recognise the implicit
+/// `this` of a destructor as `this` at all. That is the whole reason the
+/// request-END probe's descriptor went missing on real Ceph builds while every
+/// non-cdtor probe (whose parameter is one hop from its name) extracted fine.
+fn attribute_origin_chain<R: Reader>(
+    index: &DwarfUnitIndex<R>,
+    die: DieRef<R::Offset>,
+) -> Result<Vec<DieRef<R::Offset>>> {
+    let mut chain = vec![die];
+    let mut next = 0;
+    while next < chain.len() && chain.len() < ORIGIN_CHAIN_LIMIT {
+        let current = chain[next];
+        next += 1;
+        let unit = index.unit(current.unit);
+        let entry = unit.entry(current.offset)?;
+        for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
+            let Some(origin) = index.referenced_die(current.unit, &entry, attr)? else {
+                continue;
+            };
+            // Cycle guard: malformed DWARF may point an origin back at itself.
+            if !chain.contains(&origin) {
+                chain.push(origin);
+            }
+        }
+    }
+    Ok(chain)
 }
 
 /// Eagerly parsed set of compilation units, kept alive together so that DIEs
@@ -779,10 +851,21 @@ fn function_pcs<R: Reader>(
     Ok(result)
 }
 
+/// Extract every probe's descriptors, decoding each variable's location AT THE
+/// ADDRESS THE PROBE WILL ATTACH AT.
+///
+/// `probe_pcs` is the already-resolved address per probe key (`resolved` in
+/// [`parse_module`], i.e. the definition the mangled-linkage-name gate picked).
+/// Feeding it in is what ties the descriptor to the probed definition: a variable
+/// whose `DW_AT_location` is a location LIST has a different location at different
+/// PCs -- `this` is in RDI only at function entry and migrates to a callee-saved
+/// register a few instructions in -- so a descriptor is only meaningful when it is
+/// decoded at the exact PC the uprobe fires at.
 fn function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     wanted: &[&str],
+    probe_pcs: &BTreeMap<String, RankedPc>,
 ) -> Result<(BTreeMap<String, FunctionVarFields>, DppFacts)> {
     let mut result = BTreeMap::new();
     let mut facts = DppFacts::default();
@@ -799,6 +882,7 @@ fn function_var_fields<R: Reader>(
             &mut result,
             wanted,
             &mut facts,
+            probe_pcs,
         )?;
         if has_all_functions(&result, wanted) {
             break;
@@ -817,6 +901,7 @@ fn collect_function_var_fields<R: Reader>(
     result: &mut BTreeMap<String, FunctionVarFields>,
     wanted: &[&str],
     facts: &mut DppFacts,
+    probe_pcs: &BTreeMap<String, RankedPc>,
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
@@ -848,7 +933,14 @@ fn collect_function_var_fields<R: Reader>(
                 }
                 if let Some(paths) = probe_field_paths(key) {
                     if let Some(fields) = probe_function_var_fields(
-                        dwarf, index, unit_index, entry, key, paths, facts,
+                        dwarf,
+                        index,
+                        unit_index,
+                        entry,
+                        key,
+                        paths,
+                        facts,
+                        probe_pcs.get(key).map(|ranked| ranked.pc),
                     )? {
                         result.entry(key.to_string()).or_insert(fields);
                     }
@@ -864,7 +956,7 @@ fn collect_function_var_fields<R: Reader>(
     let mut children = node.children();
     while let Some(child) = children.next()? {
         collect_function_var_fields(
-            dwarf, index, unit_index, child, scopes, result, wanted, facts,
+            dwarf, index, unit_index, child, scopes, result, wanted, facts, probe_pcs,
         )?;
         if has_all_functions(result, wanted) {
             break;
@@ -894,6 +986,20 @@ fn optional_trailing_var_field(function: &str, idx: usize) -> bool {
     function == RGW_PROCESS_AUTHENTICATED && idx == 1
 }
 
+/// The descriptors for one probe function, read from ONE subprogram DIE.
+///
+/// `probe_pc` is the address this probe will be attached at, when it is already
+/// known (it always is for a probe that will actually attach: the address is
+/// resolved before this pass runs). It does two jobs:
+///
+/// 1. It is the PC the locations are decoded at, so a location LIST resolves to
+///    the range that covers the uprobe site rather than to some arbitrary range.
+/// 2. It selects the DIE. Only the subprogram whose code CONTAINS that address is
+///    allowed to describe it -- so a declaration DIE (no code), an abstract
+///    instance, or a DIFFERENT definition that happens to share the demangled name
+///    (the deleting destructor; a `req_state`-with-virtual-bases build where D1 and
+///    D2 are distinct functions) cannot supply the descriptors for an address that
+///    is not theirs.
 #[allow(clippy::too_many_arguments)]
 fn probe_function_var_fields<R: Reader>(
     dwarf: &Dwarf<R>,
@@ -903,14 +1009,34 @@ fn probe_function_var_fields<R: Reader>(
     function_name: &str,
     paths: &[&[&str]],
     facts: &mut DppFacts,
+    probe_pc: Option<u64>,
 ) -> Result<Option<FunctionVarFields>> {
     let unit = index.unit(unit_index);
-    let Some(pc) = entry_pc(dwarf, unit, function)? else {
-        debug!(
-            function = function_name,
-            "native DWARF probe rejected: missing function PC"
-        );
-        return Ok(None);
+    let pc = match probe_pc {
+        Some(probe_pc) => {
+            if !die_contains_pc(dwarf, unit, function, probe_pc)? {
+                debug!(
+                    function = function_name,
+                    probe_pc,
+                    "native DWARF probe rejected: this definition does not cover the probed address"
+                );
+                return Ok(None);
+            }
+            probe_pc
+        }
+        // No address resolved for this probe (it cannot attach, but a descriptor
+        // is still extracted for the artifact): fall back to this definition's own
+        // entry address, which is where a uprobe on it would fire.
+        None => {
+            let Some(pc) = entry_pc(dwarf, unit, function)? else {
+                debug!(
+                    function = function_name,
+                    "native DWARF probe rejected: missing function PC"
+                );
+                return Ok(None);
+            };
+            pc
+        }
     };
     let mut var_fields = Vec::new();
 
@@ -935,9 +1061,11 @@ fn probe_function_var_fields<R: Reader>(
         let Some(variable_name) = path.first() else {
             reject!("native DWARF probe rejected: empty field path");
         };
-        // The `rgw_rados_operate` overloads resolve their `dpp` by POSITION (first
-        // formal parameter), which their already-verified mangled signature proves
-        // is the `const DoutPrefixProvider*`. Every other probe resolves by name.
+        // The `rgw_rados_operate` overloads and the destructor resolve their single
+        // pointer parameter by POSITION (first formal parameter): their
+        // already-verified mangled name proves what parameter 0 is -- the
+        // `const DoutPrefixProvider*` for the overloads, the implicit `req_state*`
+        // `this` for the destructor. Every other probe resolves by name.
         let variable = if FIRST_PARAM_PROBE_FUNCTIONS.contains(&function_name) {
             find_first_formal_parameter(index, unit_index, function)?
         } else {
@@ -1589,50 +1717,36 @@ fn collect_function_pcs<R: Reader>(
 }
 
 /// Every mangled `DW_AT_linkage_name` reachable from `entry`: its own, plus the
-/// ones on its `DW_AT_abstract_origin` / `DW_AT_specification` targets (an
+/// ones anywhere up its `DW_AT_abstract_origin` / `DW_AT_specification` chain (an
 /// optimized concrete subprogram carries its own linkage name and inherits the
 /// declaration's through the origin chain).
+///
+/// The chain is walked TRANSITIVELY ([`attribute_origin_chain`]) so that a cdtor
+/// clone -- concrete -> D1/D2 clone -> D4 unified -> class declaration -- yields
+/// every name in it. Collecting MORE names cannot make an unacceptable definition
+/// acceptable: [`definition_ranking`] accepts a name only if the mangled grammar
+/// says it is the right variant/overload, so the deleting destructor's chain
+/// (D0 -> D4) still ranks nowhere and is still rejected.
 fn entry_linkage_names<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
     entry: &DebuggingInformationEntry<R>,
 ) -> Result<Vec<String>> {
+    let die = DieRef {
+        unit: unit_index,
+        offset: entry.offset(),
+    };
     let mut names = Vec::new();
-    if let Some(name) = linkage_name(
-        dwarf_for(dwarf, index, unit_index),
-        index.unit(unit_index),
-        entry,
-    )? {
-        names.push(name);
-    }
-    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
-        let Some(origin) = index.referenced_die(unit_index, entry, attr)? else {
-            continue;
-        };
-        let origin_unit = index.unit(origin.unit);
-        let origin_entry = origin_unit.entry(origin.offset)?;
+    for candidate in attribute_origin_chain(index, die)? {
+        let candidate_unit = index.unit(candidate.unit);
+        let candidate_entry = candidate_unit.entry(candidate.offset)?;
         if let Some(name) = linkage_name(
-            dwarf_for(dwarf, index, origin.unit),
-            origin_unit,
-            &origin_entry,
+            dwarf_for(dwarf, index, candidate.unit),
+            candidate_unit,
+            &candidate_entry,
         )? {
             names.push(name);
-        }
-        // A concrete instance points at an abstract instance, which in turn
-        // points at the class-scope declaration that carries the linkage name.
-        if let Some(specification) =
-            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
-        {
-            let spec_unit = index.unit(specification.unit);
-            let spec_entry = spec_unit.entry(specification.offset)?;
-            if let Some(name) = linkage_name(
-                dwarf_for(dwarf, index, specification.unit),
-                spec_unit,
-                &spec_entry,
-            )? {
-                names.push(name);
-            }
         }
     }
     Ok(names)
@@ -2158,9 +2272,11 @@ fn find_child_entry_by_name<'unit, R: Reader>(
 /// [`FIRST_PARAM_PROBE_FUNCTIONS`], where the mangled signature has already proven
 /// what parameter 0 is, so the position -- not the name -- is the identity.
 ///
-/// Follows the same `DW_AT_abstract_origin` / `DW_AT_specification` chain as
-/// [`find_function_variable`]: an optimized concrete subprogram frequently carries
-/// no parameter DIEs of its own and inherits them from the abstract instance.
+/// Searches the subprogram's OWN children first and only then its abstract /
+/// declaration instances ([`attribute_origin_chain`], nearest first). That order
+/// is what makes this usable for a probe descriptor: the concrete instance is the
+/// only DIE that carries `DW_AT_location`, and an abstract instance's parameter
+/// (which has the name and the type but no location) must never displace it.
 /// Deliberately ignores `DW_TAG_variable` (a local, never a parameter) and
 /// `DW_TAG_unspecified_parameters` (the `...` of a variadic).
 fn find_first_formal_parameter<R: Reader>(
@@ -2168,28 +2284,13 @@ fn find_first_formal_parameter<R: Reader>(
     unit_index: usize,
     function: &DebuggingInformationEntry<R>,
 ) -> Result<Option<DieRef<R::Offset>>> {
-    let mut candidates = vec![DieRef {
-        unit: unit_index,
-        offset: function.offset(),
-    }];
-
-    if let Some(origin) =
-        index.referenced_die(unit_index, function, gimli::DW_AT_abstract_origin)?
-    {
-        candidates.push(origin);
-        let origin_unit = index.unit(origin.unit);
-        let origin_entry = origin_unit.entry(origin.offset)?;
-        if let Some(specification) =
-            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
-        {
-            candidates.push(specification);
-        }
-    }
-    if let Some(specification) =
-        index.referenced_die(unit_index, function, gimli::DW_AT_specification)?
-    {
-        candidates.push(specification);
-    }
+    let candidates = attribute_origin_chain(
+        index,
+        DieRef {
+            unit: unit_index,
+            offset: function.offset(),
+        },
+    )?;
 
     for parent in candidates {
         let unit = index.unit(parent.unit);
@@ -2210,6 +2311,9 @@ fn find_first_formal_parameter<R: Reader>(
     Ok(None)
 }
 
+/// The named parameter/local of `function`, preferring the CONCRETE instance's own
+/// child (the only DIE that carries `DW_AT_location`) and falling back to the
+/// abstract/declaration instances up the origin chain, nearest first.
 fn find_function_variable<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
@@ -2217,36 +2321,16 @@ fn find_function_variable<R: Reader>(
     function: &DebuggingInformationEntry<R>,
     name: &str,
 ) -> Result<Option<DieRef<R::Offset>>> {
-    let function_ref = DieRef {
-        unit: unit_index,
-        offset: function.offset(),
-    };
-    if let Some(variable) = find_function_child_variable(dwarf, index, function_ref, name)? {
-        return Ok(Some(variable));
-    }
+    let candidates = attribute_origin_chain(
+        index,
+        DieRef {
+            unit: unit_index,
+            offset: function.offset(),
+        },
+    )?;
 
-    if let Some(origin) =
-        index.referenced_die(unit_index, function, gimli::DW_AT_abstract_origin)?
-    {
-        if let Some(variable) = find_function_child_variable(dwarf, index, origin, name)? {
-            return Ok(Some(variable));
-        }
-        let origin_unit = index.unit(origin.unit);
-        let origin_entry = origin_unit.entry(origin.offset)?;
-        if let Some(specification) =
-            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_specification)?
-        {
-            if let Some(variable) = find_function_child_variable(dwarf, index, specification, name)?
-            {
-                return Ok(Some(variable));
-            }
-        }
-    }
-
-    if let Some(specification) =
-        index.referenced_die(unit_index, function, gimli::DW_AT_specification)?
-    {
-        if let Some(variable) = find_function_child_variable(dwarf, index, specification, name)? {
+    for parent in candidates {
+        if let Some(variable) = find_function_child_variable(dwarf, index, parent, name)? {
             return Ok(Some(variable));
         }
     }
@@ -2284,10 +2368,14 @@ fn find_function_child_variable<R: Reader>(
 
 /// True if `entry` names the variable `name`, either directly via `DW_AT_name`
 /// or -- as on `-O2`/LTO builds where the concrete `DW_TAG_formal_parameter`
-/// carries only `DW_AT_location`+`DW_AT_abstract_origin` -- through the name of
-/// the DIE referenced by its `DW_AT_abstract_origin` (then, failing that,
-/// `DW_AT_specification`). Uses `index.referenced_die`, so cross-unit LTO
-/// origins encoded as `DW_FORM_ref_addr` (`DebugInfoRef`) resolve too.
+/// carries only `DW_AT_location`+`DW_AT_abstract_origin` -- through the name of a
+/// DIE anywhere up its abstract-origin/specification chain.
+///
+/// The chain is walked TRANSITIVELY ([`attribute_origin_chain`]). One hop is not
+/// enough: a cdtor clone's implicit `this` is two hops from the DIE that carries
+/// `DW_AT_name("this")`, and stopping at one hop lands on a DIE with no name at
+/// all -- so the parameter would not be recognised, the location-bearing concrete
+/// DIE would be passed over, and the descriptor lost.
 fn child_variable_name_matches<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
@@ -2295,26 +2383,17 @@ fn child_variable_name_matches<R: Reader>(
     entry: &DebuggingInformationEntry<R>,
     name: &str,
 ) -> Result<bool> {
-    if die_name(
-        dwarf_for(dwarf, index, unit_index),
-        index.unit(unit_index),
-        entry,
-    )?
-    .as_deref()
-        == Some(name)
-    {
-        return Ok(true);
-    }
-    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
-        let Some(origin) = index.referenced_die(unit_index, entry, attr)? else {
-            continue;
-        };
-        let origin_unit = index.unit(origin.unit);
-        let origin_entry = origin_unit.entry(origin.offset)?;
+    let die = DieRef {
+        unit: unit_index,
+        offset: entry.offset(),
+    };
+    for candidate in attribute_origin_chain(index, die)? {
+        let candidate_unit = index.unit(candidate.unit);
+        let candidate_entry = candidate_unit.entry(candidate.offset)?;
         if die_name(
-            dwarf_for(dwarf, index, origin.unit),
-            origin_unit,
-            &origin_entry,
+            dwarf_for(dwarf, index, candidate.unit),
+            candidate_unit,
+            &candidate_entry,
         )?
         .as_deref()
             == Some(name)
@@ -2329,26 +2408,17 @@ fn die_type<R: Reader>(
     index: &DwarfUnitIndex<R>,
     die: DieRef<R::Offset>,
 ) -> Result<Option<DieRef<R::Offset>>> {
-    let unit = index.unit(die.unit);
-    let entry = unit.entry(die.offset)?;
     // A direct `DW_AT_type` always wins. On `-O2`/LTO builds the concrete DIE
     // (e.g. a `DW_TAG_formal_parameter` carrying only location + origin) has no
-    // `DW_AT_type` of its own; the type lives on the abstract instance, so fall
-    // back to the `DW_AT_abstract_origin` target's type (then
-    // `DW_AT_specification`'s). Uses `index.referenced_die`, so cross-unit LTO
-    // origins encoded as `DW_FORM_ref_addr` (`DebugInfoRef`) resolve too.
-    if let Some(typedie) = index.referenced_die(die.unit, &entry, gimli::DW_AT_type)? {
-        return Ok(Some(typedie));
-    }
-    for attr in [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification] {
-        let Some(origin) = index.referenced_die(die.unit, &entry, attr)? else {
-            continue;
-        };
-        let origin_unit = index.unit(origin.unit);
-        let origin_entry = origin_unit.entry(origin.offset)?;
-        if let Some(typedie) =
-            index.referenced_die(origin.unit, &origin_entry, gimli::DW_AT_type)?
-        {
+    // `DW_AT_type` of its own; the type lives further up the abstract-origin
+    // chain -- TWO hops up for a cdtor clone's `this`, which is why the chain is
+    // walked transitively (see `attribute_origin_chain`). Uses
+    // `index.referenced_die`, so cross-unit LTO origins encoded as
+    // `DW_FORM_ref_addr` (`DebugInfoRef`) resolve too.
+    for candidate in attribute_origin_chain(index, die)? {
+        let unit = index.unit(candidate.unit);
+        let entry = unit.entry(candidate.offset)?;
+        if let Some(typedie) = index.referenced_die(candidate.unit, &entry, gimli::DW_AT_type)? {
             return Ok(Some(typedie));
         }
     }
@@ -2493,6 +2563,27 @@ fn demangle_function_name(linkage_name: &str) -> Option<String> {
         .split_once('(')
         .map_or(demangled.as_str(), |(name, _)| name);
     Some(without_args.trim().to_string())
+}
+
+/// Does the code of the subprogram `entry` cover `pc`?
+///
+/// Uses the DIE's full range set (`DW_AT_low_pc`/`DW_AT_high_pc`, or
+/// `DW_AT_ranges` -- an optimized Ceph function is routinely split into a hot and
+/// a cold range). A DIE with no code at all -- a declaration, or an abstract
+/// instance -- covers nothing, which is exactly the answer wanted for it.
+fn die_contains_pc<R: Reader>(
+    dwarf: &Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+    pc: u64,
+) -> Result<bool> {
+    let mut ranges = dwarf.die_ranges(unit, entry)?;
+    while let Some(range) = ranges.next()? {
+        if pc >= range.begin && pc < range.end {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn entry_pc<R: Reader>(
@@ -3772,6 +3863,442 @@ mod tests {
         assert_eq!(raw.fields.len(), 1);
         assert_eq!(raw.fields[0].offset, 0);
         assert!(!raw.fields[0].pointer);
+    }
+
+    // --- The LTO cdtor-clone destructor: what real Ceph actually looks like ---
+    //
+    // The `-O1 -fno-inline` destructor fixture above proves nothing about a real
+    // build, and that is exactly how the request-END probe shipped inert. At `-O1`
+    // GCC gives the concrete destructor's `this` a one-hop `DW_AT_abstract_origin`
+    // to a DIE that carries `DW_AT_name("this")`, and a location it can express as
+    // a single expression. Ceph is built `-O2 -flto`, where BOTH of those change:
+    //
+    //   * GCC's cdtor CLONING inserts an extra abstract instance (the D1/D2 clone)
+    //     between the concrete instance and the "unified" D4 abstract instance, so
+    //     the parameter's NAME and TYPE sit TWO `DW_AT_abstract_origin` hops away
+    //     and the concrete parameter DIE carries neither.
+    //   * `~req_state` is a big function, so `this` does not stay in RDI and its
+    //     `DW_AT_location` is a location LIST: RDI at entry, a callee-saved
+    //     register for the body, `DW_OP_entry_value` at the tail.
+    //
+    // This fixture reproduces both, and it is compiled from TWO translation units
+    // so that `-flto` is real. It is the same `radosgw`-shaped module as the Phase
+    // B overload fixture (both `rgw_rados_operate` overloads, `req_state` deriving
+    // `DoutPrefixProvider`) for a second reason: with no `RGWREST::get_handler` and
+    // no `rgw_process_authenticated` in the module, the DESTRUCTOR'S `this` is the
+    // ONLY parameter that can prove `req_state`'s `DoutPrefixProvider` base sits at
+    // offset 0 -- and that proof requires reading its `DW_AT_type` through the same
+    // two-hop chain. So if the chain walk regresses, the overload descriptors
+    // disappear too, and this test says so.
+    const RGW_LTO_DTOR_FIXTURE_SOURCE: &str = r#"
+            class DoutPrefixProvider {
+              public:
+                virtual ~DoutPrefixProvider() {}
+                virtual int get_id() const { return 0; }
+            };
+            struct Chunk { char* p; unsigned long n; };
+            struct req_state : public DoutPrefixProvider {
+              unsigned long id;
+              Chunk chunks[16];
+              req_state(unsigned long i);
+              ~req_state();
+              int get_id() const override { return (int)id; }
+            };
+            static volatile unsigned long sink;
+            extern void observe(unsigned long v);
+            extern unsigned long churn(unsigned long v);
+            req_state::req_state(unsigned long i) : id(i) {
+              for (int k = 0; k < 16; k++) { chunks[k].p = new char[8]; chunks[k].n = i + k; }
+            }
+            // Big enough that `this` cannot stay in the argument register: the loop
+            // makes calls, so `this` is forced into a callee-saved register for the
+            // body and DWARF describes it with a location LIST.
+            __attribute__((noinline, used)) req_state::~req_state() {
+              sink += id;
+              for (int k = 0; k < 16; k++) {
+                observe(chunks[k].n + id);
+                delete[] chunks[k].p;
+                sink += churn(chunks[k].n);
+                if (chunks[k].n & 1) { observe(id); sink ^= churn(chunks[k].n + 1); }
+                else { sink += get_id(); observe(sink); }
+              }
+              observe(sink + id);
+            }
+
+            namespace librados { inline namespace v14_2_0 {
+              class IoCtx { public: int fd; };
+              class ObjectReadOperation { public: int r; };
+              class ObjectWriteOperation { public: int w; };
+            }}
+            namespace ceph { namespace buffer { inline namespace v15_2_0 {
+              class list { public: int len; };
+            }}}
+            class optional_yield { public: int y; };
+            class CephString { public: const char* p; };
+
+            __attribute__((noinline, used))
+            int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx,
+                                  const CephString& oid, librados::ObjectWriteOperation *op,
+                                  optional_yield y, int flags) {
+              observe((unsigned long)dpp);
+              return dpp != 0 ? ioctx.fd + op->w + y.y + flags : (int)(unsigned long)oid.p;
+            }
+
+            __attribute__((noinline, used))
+            int rgw_rados_operate(const DoutPrefixProvider *dpp, librados::IoCtx& ioctx,
+                                  const CephString& oid, librados::ObjectReadOperation *op,
+                                  ceph::buffer::list* pbl, optional_yield y, int flags) {
+              observe((unsigned long)dpp);
+              return dpp != 0 ? ioctx.fd + op->r + pbl->len + y.y + flags : (int)(unsigned long)oid.p;
+            }
+
+            // Forces g++ to emit the DELETING destructor (D0) as well, so the
+            // D0-vs-D1/D2 hazard is present here too.
+            __attribute__((noinline, used)) void destroy(DoutPrefixProvider* p) { delete p; }
+
+            int main(int argc, char**) {
+              librados::IoCtx ioctx; CephString oid; optional_yield y;
+              librados::ObjectReadOperation rop; librados::ObjectWriteOperation wop;
+              ceph::buffer::list bl;
+              req_state s((unsigned long)argc);
+              const DoutPrefixProvider* dpp = &s;
+              int rc = rgw_rados_operate(dpp, ioctx, oid, &rop, &bl, y, argc)
+                     + rgw_rados_operate(dpp, ioctx, oid, &wop, y, argc);
+              destroy(new req_state((unsigned long)argc + 1));
+              return rc & 1;
+            }
+        "#;
+
+    const RGW_LTO_DTOR_FIXTURE_HELPER_SOURCE: &str = r#"
+            static volatile unsigned long g;
+            void observe(unsigned long v) { g += v; }
+            unsigned long churn(unsigned long v) { g ^= v * 2654435761u; return g; }
+        "#;
+
+    fn compile_lto_req_state_dtor_fixture() -> Option<std::path::PathBuf> {
+        compile_cpp_sources_flags_only(
+            "radosgw",
+            &[
+                ("radosgw", RGW_LTO_DTOR_FIXTURE_SOURCE),
+                ("radosgw-helper", RGW_LTO_DTOR_FIXTURE_HELPER_SOURCE),
+            ],
+            &["-g", "-O2", "-flto"],
+        )
+    }
+
+    /// What the DWARF of the fixture's concrete `req_state::~req_state` ACTUALLY
+    /// says about its implicit `this`, read independently of the extractor's
+    /// parameter lookup. The test uses it twice: to refuse to pass unless the
+    /// fixture really does reproduce the hazard, and as the ground truth for which
+    /// register `this` is in AT THE PROBE PC.
+    #[derive(Debug)]
+    struct DtorThisShape {
+        /// The concrete instance's own `this` DIE has a `DW_AT_name`. On the builds
+        /// that matter it does NOT -- the name is inherited.
+        param_has_own_name: bool,
+        /// `DW_AT_abstract_origin`/`DW_AT_specification` hops from the concrete
+        /// `this` DIE to the DIE that carries `DW_AT_name("this")`. Two on an LTO
+        /// cdtor clone; one on a plain `-O1` build.
+        hops_to_name: Option<usize>,
+        /// Entries in the parameter's location LIST. Zero means the location is a
+        /// single expression -- the case that proves nothing.
+        loclist_entries: usize,
+        /// The register `this` lives in at the destructor's ENTRY pc...
+        entry_reg: Option<i32>,
+        /// ...and the ones it migrates to afterwards, which a descriptor decoded at
+        /// the wrong PC would pick up instead.
+        later_regs: Vec<i32>,
+    }
+
+    fn req_state_dtor_this_shape(binary: &Path) -> Option<DtorThisShape> {
+        let data = fs::read(binary).ok()?;
+        let file = object::File::parse(data.as_slice()).ok()?;
+        let endian = if file.is_little_endian() {
+            RunTimeEndian::Little
+        } else {
+            RunTimeEndian::Big
+        };
+        let dwarf_owned =
+            Dwarf::load(|section| load_section(&file, section).map(|data| data.into_owned()))
+                .ok()?;
+        #[allow(deprecated)]
+        let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
+        let index = DwarfUnitIndex::load(&dwarf).ok()?;
+
+        // The CONCRETE destructor definition: a subprogram with code whose reachable
+        // mangled names make it an accepted (D1/D2) destructor.
+        let mut concrete = None;
+        'units: for unit_index in 0..index.main_len() {
+            let unit = index.unit(unit_index);
+            let mut entries = unit.entries();
+            while let Some((_, entry)) = entries.next_dfs().ok()? {
+                if entry.tag() != gimli::DW_TAG_subprogram {
+                    continue;
+                }
+                let Some(low_pc) = entry_pc(&dwarf, unit, entry).ok()? else {
+                    continue;
+                };
+                let names = entry_linkage_names(&dwarf, &index, unit_index, entry).ok()?;
+                if definition_rank(REQ_STATE_DTOR, &names).is_some() {
+                    concrete = Some((unit_index, entry.offset(), low_pc));
+                    break 'units;
+                }
+            }
+        }
+        let (unit_index, offset, low_pc) = concrete?;
+
+        // Its OWN first formal parameter -- the implicit `this`.
+        let unit = index.unit(unit_index);
+        let mut tree = unit.entries_tree(Some(offset)).ok()?;
+        let root = tree.root().ok()?;
+        let mut children = root.children();
+        let mut param = None;
+        while let Some(child) = children.next().ok()? {
+            if child.entry().tag() == gimli::DW_TAG_formal_parameter {
+                param = Some(child.entry().offset());
+                break;
+            }
+        }
+        let param = param?;
+        let param_entry = unit.entry(param).ok()?;
+
+        let param_has_own_name = die_name(&dwarf, unit, &param_entry).ok()?.is_some();
+
+        // Hops to the DIE that actually names it, following the inheritance chain
+        // link by link (this is the count the fix is about).
+        let mut hops_to_name = None;
+        let mut current = DieRef {
+            unit: unit_index,
+            offset: param,
+        };
+        for hop in 0..=ORIGIN_CHAIN_LIMIT {
+            let current_unit = index.unit(current.unit);
+            let current_entry = current_unit.entry(current.offset).ok()?;
+            if die_name(
+                dwarf_for(&dwarf, &index, current.unit),
+                current_unit,
+                &current_entry,
+            )
+            .ok()?
+            .as_deref()
+                == Some("this")
+            {
+                hops_to_name = Some(hop);
+                break;
+            }
+            let next = [gimli::DW_AT_abstract_origin, gimli::DW_AT_specification]
+                .into_iter()
+                .find_map(|attr| {
+                    index
+                        .referenced_die(current.unit, &current_entry, attr)
+                        .ok()
+                        .flatten()
+                });
+            match next {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+
+        // The location list, and the registers it names at entry and afterwards.
+        let mut loclist_entries = 0;
+        let mut entry_reg = None;
+        let mut later_regs = Vec::new();
+        if let Some(attr) = param_entry.attr(gimli::DW_AT_location).ok()? {
+            if let Some(mut locations) = dwarf.attr_locations(unit, attr.value()).ok()? {
+                while let Some(location) = locations.next().ok()? {
+                    loclist_entries += 1;
+                    let decoded = decode_location_expression(unit, None, location.data).ok()?;
+                    let Some(decoded) = decoded.filter(|decoded| !decoded.stack) else {
+                        continue;
+                    };
+                    if low_pc >= location.range.begin && low_pc < location.range.end {
+                        entry_reg = Some(decoded.reg);
+                    } else {
+                        later_regs.push(decoded.reg);
+                    }
+                }
+            }
+        }
+
+        Some(DtorThisShape {
+            param_has_own_name,
+            hops_to_name,
+            loclist_entries,
+            entry_reg,
+            later_regs,
+        })
+    }
+
+    #[test]
+    fn extracts_req_state_dtor_this_descriptor_from_an_lto_cdtor_clone_with_a_loclist_this() {
+        let Some(binary) = compile_lto_req_state_dtor_fixture() else {
+            eprintln!(
+                "SKIPPED extracts_req_state_dtor_this_descriptor_from_an_lto_cdtor_clone_with_a_loclist_this: \
+                 no working C++ compiler with -flto"
+            );
+            return;
+        };
+        let Some(shape) = req_state_dtor_this_shape(&binary) else {
+            eprintln!(
+                "SKIPPED ...lto_cdtor_clone...: no concrete D1/D2 destructor DIE in the fixture"
+            );
+            return;
+        };
+
+        // The fixture must reproduce the REAL hazard, or it proves nothing and must
+        // not be allowed to pass quietly -- which is precisely how the shipped bug
+        // slipped through a green test suite.
+        let reproduces_hazard = !shape.param_has_own_name
+            && shape.hops_to_name.is_some_and(|hops| hops >= 2)
+            && shape.loclist_entries >= 2
+            && shape.entry_reg.is_some()
+            && !shape.later_regs.is_empty();
+        if !reproduces_hazard {
+            eprintln!(
+                "SKIPPED extracts_req_state_dtor_this_descriptor_from_an_lto_cdtor_clone_with_a_loclist_this: \
+                 this toolchain did not emit the LTO cdtor-clone shape (artificial `this`, named \
+                 through >=2 abstract_origin hops, loclist-located and migrating out of the entry \
+                 register): {shape:?}"
+            );
+            return;
+        }
+        let entry_reg = shape.entry_reg.expect("checked above");
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let module = info.modules.get("radosgw").expect("radosgw module");
+
+        // THE regression. Before the origin-chain fix this key was simply absent:
+        // the concrete `this` DIE (the only one with a location) was not recognised
+        // as `this`, so extraction fell through to the abstract instance's parameter,
+        // which has no `DW_AT_location` at all -- and the request-END probe shipped
+        // with no descriptor, disabling itself and the cross-thread re-seed with it.
+        let fields = module.func2vf.get(REQ_STATE_DTOR).unwrap_or_else(|| {
+            panic!(
+                "no `this` descriptor for {REQ_STATE_DTOR}: DWARF puts it in DWARF register \
+                 {entry_reg} at the probed entry pc, so one MUST be extracted"
+            )
+        });
+
+        assert_eq!(fields.var_fields.len(), 1);
+        let raw = &fields.var_fields[0];
+        assert!(!raw.location.stack, "descriptor must not be stack-located");
+        assert_eq!(raw.location.offset, 0, "a raw pointer has no offset");
+        // The register-only raw-pointer shape the importer validates: one sentinel
+        // field, offset 0, no dereference.
+        assert_eq!(raw.fields.len(), 1);
+        assert_eq!(raw.fields[0].offset, 0);
+        assert!(!raw.fields[0].pointer);
+
+        // The register must be the one `this` is in AT THE PROBE PC (function entry:
+        // RDI / DWARF reg 5 on x86-64), never one of the registers it migrates to
+        // later in the body -- which is what a descriptor decoded at the wrong PC,
+        // or at no PC, would hand the BPF handler.
+        assert_eq!(
+            raw.location.reg, entry_reg,
+            "`this` must be read from the register DWARF gives it at the ENTRY pc"
+        );
+        assert!(
+            !shape.later_regs.contains(&raw.location.reg),
+            "descriptor picked a register from a LATER loclist range ({:?}); the uprobe fires at \
+             entry, where `this` is in DWARF register {entry_reg}",
+            shape.later_regs
+        );
+
+        // Still bound to the complete/base destructor, never the deleting one.
+        let symbols = dtor_symbol_addresses(&binary);
+        let addr = module
+            .func2pc
+            .get(REQ_STATE_DTOR)
+            .copied()
+            .expect("the destructor address must resolve");
+        let linkage = module
+            .func2linkage
+            .get(REQ_STATE_DTOR)
+            .expect("the destructor address must carry its variant provenance");
+        assert!(
+            dtor_variant_rank(linkage).is_some(),
+            "provenance {linkage} must be an ACCEPTED (D1/D2) destructor variant"
+        );
+        assert_eq!(symbols.get(linkage.as_str()), Some(&addr));
+        if let Some(deleting) = symbols.get("_ZN9req_stateD0Ev") {
+            assert_ne!(addr, *deleting, "must never bind the DELETING destructor");
+        }
+
+        // And the descriptors that depend on the SAME two-hop chain for their TYPE:
+        // this module has no `get_handler` and no `rgw_process_authenticated`, so the
+        // destructor's `this` is the only parameter that can prove `req_state`'s
+        // DoutPrefixProvider base is at offset 0 -- and without that proof the
+        // per-submit re-seed probes are (correctly) dropped. Their presence is the
+        // proof that the chain walk resolved the parameter's TYPE, not just its
+        // location.
+        for overload in RGW_RADOS_OPERATE_OVERLOADS {
+            assert!(
+                module.func2vf.contains_key(*overload),
+                "{overload} descriptor must survive: the dpp identity is proven from the \
+                 destructor's `this` type, through the same abstract-origin chain"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_the_req_state_dtor_descriptor_when_this_is_not_register_resident_at_entry() {
+        // The other half of the contract: extraction must still FAIL CLOSED. Built
+        // at `-O0`, this toolchain gives `this` a `DW_OP_fbreg` location -- it is on
+        // the stack at entry, so there is no register for the BPF handler to read
+        // and NO descriptor may be emitted. Nothing about resolving the parameter
+        // positionally, or through a longer origin chain, is allowed to turn a
+        // stack location into a register one.
+        let Some(binary) = compile_cpp_sources_flags_only(
+            "radosgw",
+            &[
+                ("radosgw", RGW_LTO_DTOR_FIXTURE_SOURCE),
+                ("radosgw-helper", RGW_LTO_DTOR_FIXTURE_HELPER_SOURCE),
+            ],
+            &["-g", "-O0"],
+        ) else {
+            return;
+        };
+        let Some(shape) = req_state_dtor_this_shape(&binary) else {
+            return;
+        };
+        if shape.entry_reg.is_some() {
+            eprintln!(
+                "SKIPPED refuses_the_req_state_dtor_descriptor_when_this_is_not_register_resident_at_entry: \
+                 this toolchain DOES keep `this` in a register at -O0 ({shape:?})"
+            );
+            return;
+        }
+
+        let info = from_paths(&[binary.as_path()]).unwrap();
+        let (module_key, module) = info
+            .modules
+            .iter()
+            .next()
+            .expect("the fixture module must parse");
+
+        // The destructor itself IS found -- so the absence below is a REFUSAL, not a
+        // failure to locate the function.
+        let addr = module
+            .func2pc
+            .get(REQ_STATE_DTOR)
+            .copied()
+            .expect("the destructor address must still resolve");
+        assert!(
+            !module.func2vf.contains_key(REQ_STATE_DTOR),
+            "a stack-located `this` must yield NO descriptor: there is no register to read it from"
+        );
+
+        // And the artifact says so in the importer's own words, rather than shipping
+        // an address whose descriptor is missing.
+        assert_eq!(
+            info.request_end_probe(module_key),
+            crate::dwarf_json::RequestEndProbe::Unavailable(
+                crate::dwarf_json::RequestEndProbeGap::NoDescriptor
+            ),
+            "the request-END probe must report itself unavailable (addr {addr:#x} resolved, but no \
+             register-only raw-pointer descriptor)"
+        );
     }
 
     #[test]
