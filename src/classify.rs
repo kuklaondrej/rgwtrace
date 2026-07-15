@@ -72,7 +72,10 @@ fn classify_background_object(object: &str) -> Option<RadosRole> {
     if object.starts_with("gc.") || object.starts_with("obj_delete_at_hint.") {
         return Some(RadosRole::Gc);
     }
-    if object.starts_with("notify.") {
+    if object.starts_with("notify.")
+        || object == "queues_list_object"
+        || object.starts_with("pubsub.")
+    {
         return Some(RadosRole::Notify);
     }
     if object.starts_with("bucket.sync-")
@@ -164,6 +167,17 @@ mod tests {
     #[test]
     fn classifies_background_objects() {
         assert_eq!(classify_rados(&event("notify.0", "")), RadosRole::Notify);
+        assert_eq!(
+            classify_rados(&event("queues_list_object", "")),
+            RadosRole::Notify
+        );
+        assert_eq!(
+            classify_rados(&event(
+                "pubsub..bucket.oku-bucket/3da11aba-1234-5678-9abc-def012345678.4321.1",
+                ""
+            )),
+            RadosRole::Notify
+        );
         assert_eq!(classify_rados(&event("gc.5", "")), RadosRole::Gc);
         assert_eq!(
             classify_rados(&event("bucket.sync-source-hints.", "")),
@@ -254,6 +268,17 @@ mod tests {
         );
         assert_eq!(
             classify_request("", Some("notify.0")),
+            RequestClass::RgwBackground
+        );
+        assert_eq!(
+            classify_request("", Some("queues_list_object")),
+            RequestClass::RgwBackground
+        );
+        assert_eq!(
+            classify_request(
+                "",
+                Some("pubsub..bucket.oku-bucket/3da11aba-1234-5678-9abc-def012345678.4321.1")
+            ),
             RequestClass::RgwBackground
         );
         assert_eq!(classify_request("", Some("unknown")), RequestClass::Unknown);
