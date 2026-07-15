@@ -90,6 +90,7 @@ struct OtlpExporterConfig {
     max_bytes_per_batch: usize,
     timeout: Duration,
     retries: u32,
+    diagnostics: bool,
 }
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
@@ -388,6 +389,7 @@ impl OtlpExporter {
             max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
             timeout: cli.otlp_timeout,
             retries: cli.otlp_retries,
+            diagnostics: cli.otlp_diagnostics,
         };
         let handle = thread::spawn(move || run_otlp_exporter(receiver, config));
         Self { sender, handle }
@@ -417,6 +419,7 @@ fn run_otlp_exporter(
                 max_bytes_per_batch: config.max_bytes_per_batch,
                 timeout: config.timeout,
                 retries: config.retries,
+                diagnostics: config.diagnostics,
             },
             &trace,
         )?;

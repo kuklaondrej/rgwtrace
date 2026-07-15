@@ -42,6 +42,16 @@ pub struct ExportConfig<'a> {
     pub max_bytes_per_batch: usize,
     pub timeout: Duration,
     pub retries: u32,
+    /// Opt-in: carry the run-summary counters into the OTLP stream.
+    ///
+    /// When `false` (the default) the resource carries only `service.name` and no
+    /// `rgwtrace.run_summary` span is emitted -- normal tracing, unpolluted by the
+    /// cumulative debug counters. When `true`, every batch's resource carries the
+    /// `rgwtrace.diag.*` attributes and the final export appends the
+    /// `rgwtrace.run_summary` span (and is therefore always delivered, even when
+    /// the final drain left no spans). The counters remain in the shutdown log and
+    /// the JSON output regardless of this flag.
+    pub diagnostics: bool,
 }
 
 /// One periodic drain of expired spans, mid-run. Sends nothing when the drain is
@@ -54,11 +64,14 @@ pub fn export_otlp_http(
     export(config, document, Export::Periodic)
 }
 
-/// The LAST export of a run. Unlike a periodic drain, this ALWAYS puts at least
+/// The LAST export of a run. With `config.diagnostics` on it ALWAYS puts at least
 /// one batch on the wire, and that batch carries the complete, final run summary
-/// -- both on the resource and as a synthetic [`RUN_SUMMARY_SPAN_NAME`] span.
+/// -- both on the resource and as a synthetic [`RUN_SUMMARY_SPAN_NAME`] span. With
+/// `config.diagnostics` off (the default) it carries no run summary, so an empty
+/// final drain sends nothing at all (the pre-diagnostics behavior) and a non-empty
+/// one exports its spans exactly like a periodic drain.
 ///
-/// WHY THIS IS NOT JUST `export_otlp_http`. The final BPF counters are merged out
+/// WHY THIS IS NOT JUST `export_otlp_http` (when diagnostics are on). The final BPF counters are merged out
 /// of the BPF maps only after the poll loop exits, so the end-of-run document is
 /// the ONLY one that carries the run's true totals. But by then the periodic
 /// drains have usually taken every span, leaving that document with ZERO spans --
@@ -105,17 +118,24 @@ fn export(
         bail!("OTLP max spans per batch must be at least 1");
     }
 
-    let resource_attributes = resource_attributes(document);
+    let resource_attributes = resource_attributes(document, config.diagnostics);
     let mut batches = otlp_batches(
         document,
         config.max_spans_per_batch,
         config.max_bytes_per_batch,
+        config.diagnostics,
     )?;
-    if kind == Export::Final {
+    if kind == Export::Final && config.diagnostics {
         // Its OWN batch, appended last: it is therefore the final batch on the
         // wire (so a consumer reading "the last batch's resource" reads the final
         // counters), and it exists even when `batches` is empty -- which is the
         // whole point, because an empty final trace is the common case.
+        //
+        // Gated on `diagnostics`: this span is the ONLY reason a diagnostics-off
+        // final export would ever force an empty batch onto the wire. With
+        // diagnostics off there is nothing to deliver, so an empty final drain
+        // sends nothing -- the pre-diagnostics behavior -- and a non-empty final
+        // drain still exports its spans below.
         batches.push(vec![run_summary_span(document)?]);
     }
     let client = Client::builder()
@@ -187,19 +207,27 @@ fn export(
     Ok(diagnostics)
 }
 
-/// Resource attributes for the export: `service.name` plus the run's summary
-/// diagnostics.
+/// Resource attributes for the export: `service.name`, plus the run's summary
+/// diagnostics ONLY when opted in via `diagnostics`.
 ///
-/// The diagnostics are the only channel through which an OTLP-only run can be
-/// evaluated: with `--output otlp` the JSON document (which carries the full
-/// `trace.diagnostics` block) is never printed, so correlation coverage, the
-/// cross-thread bridge hit rate, and request-end-probe coverage would otherwise
-/// be invisible to the backend. They are cumulative run totals repeated on every
-/// batch, so a consumer should read the LAST batch's values (or simply the
-/// end-of-run summary log), not sum them.
-fn resource_attributes(document: &TraceDocument) -> Vec<KeyValue> {
+/// The diagnostics are opt-in (`--otlp-diagnostics`, default off). When on they
+/// are the channel through which an OTLP-only run can be evaluated: with
+/// `--output otlp` the JSON document (which carries the full `trace.diagnostics`
+/// block) is never printed, so correlation coverage, the cross-thread bridge hit
+/// rate, and request-end-probe coverage would otherwise be invisible to the
+/// backend. They are cumulative run totals repeated on every batch, so a consumer
+/// should read the LAST batch's values (or simply the end-of-run summary log),
+/// not sum them.
+///
+/// When off (the default) the resource carries just `service.name`: the counters
+/// are cumulative debug data, not request telemetry, and shipping them onto every
+/// span's resource pollutes the tracing backend. They remain available in the
+/// shutdown log and JSON output regardless.
+fn resource_attributes(document: &TraceDocument, diagnostics: bool) -> Vec<KeyValue> {
     let mut attributes = vec![string_key_value("service.name", &document.service_name)];
-    attributes.extend(diagnostic_attributes(&document.diagnostics));
+    if diagnostics {
+        attributes.extend(diagnostic_attributes(&document.diagnostics));
+    }
     attributes
 }
 
@@ -499,6 +527,7 @@ fn otlp_batches(
     document: &TraceDocument,
     max_spans_per_batch: usize,
     max_bytes_per_batch: usize,
+    diagnostics: bool,
 ) -> Result<Vec<Vec<Span>>> {
     let sized_spans = build_sized_spans(document)?;
     if sized_spans.is_empty() {
@@ -513,8 +542,10 @@ fn otlp_batches(
     // the real encoded batch size, so a batch flushed under
     // `max_bytes_per_batch` still respects the limit once actually encoded.
     // Built from the same resource attributes the real batches carry (including
-    // the diagnostics), so the empty-envelope cost is not underestimated.
-    let base_len = spans_to_otlp_protobuf(&resource_attributes(document), Vec::new()).len();
+    // the diagnostics, when opted in), so the empty-envelope cost is not
+    // underestimated.
+    let base_len =
+        spans_to_otlp_protobuf(&resource_attributes(document, diagnostics), Vec::new()).len();
 
     let mut batches = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
@@ -679,7 +710,7 @@ mod tests {
             .map(span_to_otlp)
             .collect::<Result<Vec<_>>>()?;
         Ok(spans_to_otlp_protobuf(
-            &resource_attributes(document),
+            &resource_attributes(document, true),
             spans,
         ))
     }
@@ -714,18 +745,21 @@ mod tests {
     #[test]
     fn every_diagnostics_field_reaches_every_output_path() {
         // THE TRIPWIRE. The run summary has three sinks -- the JSON document, the
-        // end-of-run log line, and the OTLP resource attributes -- and only the JSON
-        // one is free (serde). The other two were CURATED LISTS, and the curated
-        // OTLP list had rotted: it omitted `bpf_operate_seed_*`,
-        // `bpf_operate_miss_ctx_cleared`, `bpf_rgw_op_key_*`,
+        // end-of-run log line, and (opt-in) the OTLP resource attributes / summary
+        // span -- and only the JSON one is free (serde). The other two were CURATED
+        // LISTS, and the curated OTLP list had rotted: it omitted
+        // `bpf_operate_seed_*`, `bpf_operate_miss_ctx_cleared`, `bpf_rgw_op_key_*`,
         // `bpf_sendop_unbridged_ctx_drops` and `emitted_request_keys` -- i.e. every
         // counter that says whether the cross-thread bridge is actually WORKING.
-        // An `--output otlp` run never prints the JSON, so a live validation could
-        // not tell a working Phase B from an inert one.
         //
-        // This test fails if a counter is added to the struct and any output path
-        // does not carry it. It is deliberately name-driven, not value-driven: it
-        // must break for a field that does not exist yet.
+        // The OTLP sinks are now opt-in (`--otlp-diagnostics`, default off), so this
+        // test asserts the two invariants that survive the flag:
+        //   * with the flag ON, every counter reaches ALL sinks (as today);
+        //   * JSON + log carry every counter ALWAYS, regardless of the flag, so a
+        //     live validation can always read the numbers off the shutdown log.
+        //
+        // It is deliberately name-driven, not value-driven: it must break for a
+        // field that does not exist yet.
         let diagnostics = fully_populated_diagnostics();
 
         // Source of truth: the struct's own serde representation.
@@ -734,7 +768,6 @@ mod tests {
         };
         let counters = diagnostics.counters();
         let summary = diagnostics.summary();
-        let otlp = diagnostic_attributes(&diagnostics);
 
         // 1. `counters()` covers every field of the struct (maps flattened).
         let mut expected: Vec<String> = Vec::new();
@@ -760,16 +793,27 @@ mod tests {
             counters.len()
         );
 
-        // 2. OTLP carries every counter, with its value.
+        let document = TraceDocument {
+            service_name: "rgwtrace".to_string(),
+            spans: Vec::new(),
+            diagnostics: diagnostics.clone(),
+        };
+
+        // 2. WITH THE FLAG ON: the OTLP resource carries service.name plus every
+        //    counter, and nothing else.
+        let resource_on = resource_attributes(&document, true);
         for (name, value) in &counters {
             let key = format!("{OTLP_DIAGNOSTIC_PREFIX}{name}");
-            let attribute = otlp.iter().find(|kv| kv.key == key).unwrap_or_else(|| {
-                panic!(
-                    "diagnostics counter {name} is NOT exported over OTLP. An --output otlp run \
-                     cannot see it, so the feature it measures cannot be validated on a live rig. \
-                     Export it via TraceDiagnostics::counters()."
-                )
-            });
+            let attribute = resource_on
+                .iter()
+                .find(|kv| kv.key == key)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "diagnostics counter {name} is NOT exported over OTLP with \
+                         --otlp-diagnostics. A live-validation run cannot see it, so the feature \
+                         it measures cannot be validated. Export it via TraceDiagnostics::counters()."
+                    )
+                });
             assert_eq!(
                 attribute.value.as_ref().unwrap().value,
                 Some(any_value::Value::IntValue(*value as i64)),
@@ -777,12 +821,29 @@ mod tests {
             );
         }
         assert_eq!(
-            otlp.len(),
-            counters.len(),
-            "OTLP must export exactly the run-summary counters, no more and no fewer"
+            resource_on.len(),
+            counters.len() + 1,
+            "with the flag on the resource must be service.name plus exactly the run-summary counters"
         );
 
-        // 3. The end-of-run log line carries every counter, with its value.
+        // 2b. WITH THE FLAG OFF (the default): the OTLP resource carries NO
+        //     diagnostics -- just service.name. This is the opt-in's whole point.
+        let resource_off = resource_attributes(&document, false);
+        assert_eq!(
+            resource_off.len(),
+            1,
+            "with the flag off the resource must be service.name alone"
+        );
+        assert!(
+            !resource_off
+                .iter()
+                .any(|kv| kv.key.starts_with(OTLP_DIAGNOSTIC_PREFIX)),
+            "no rgwtrace.diag.* attribute may reach OTLP when the flag is off"
+        );
+
+        // 3. THE LOG LINE ALWAYS carries every counter, with its value, regardless
+        //    of the flag -- `summary()` takes no flag, so an operator can always
+        //    read the numbers off the shutdown log without polluting OTLP.
         for (name, value) in &counters {
             assert!(
                 summary.contains(&format!("{name}={value}")),
@@ -790,14 +851,20 @@ mod tests {
             );
         }
 
-        // 4. The run-summary SPAN carries every counter, with its value. This is
-        //    the sink that survives an empty final trace: a span-less batch's
-        //    resource attributes reach the collector but are stored by nothing.
-        let document = TraceDocument {
-            service_name: "rgwtrace".to_string(),
-            spans: Vec::new(),
-            diagnostics: diagnostics.clone(),
-        };
+        // 3b. THE JSON DOCUMENT ALWAYS carries every counter, regardless of the
+        //     flag. serde takes no flag; `expected` above is literally the struct's
+        //     serde shape, and section 1 proved `counters()` equals it, so every
+        //     counter is in the JSON `trace.diagnostics` block unconditionally.
+        assert_eq!(
+            expected.len(),
+            counters.len(),
+            "the JSON diagnostics block must carry exactly the run-summary counters"
+        );
+
+        // 4. WITH THE FLAG ON: the run-summary SPAN carries every counter, with its
+        //    value. This is the sink that survives an empty final trace: a span-less
+        //    batch's resource attributes reach the collector but are stored by
+        //    nothing.
         let span = run_summary_span_document(&document, 1_000);
         for (name, value) in &counters {
             let key = format!("{OTLP_DIAGNOSTIC_PREFIX}{name}");
@@ -825,13 +892,41 @@ mod tests {
     fn otlp_resource_carries_the_service_name_alongside_the_diagnostics() {
         let document = trace_document(1);
 
-        let attributes = resource_attributes(&document);
+        // Diagnostics ON (`--otlp-diagnostics`): service.name plus every counter.
+        let attributes = resource_attributes(&document, true);
 
         assert_eq!(attributes[0].key, "service.name");
         assert_eq!(
             attributes.len(),
             1 + document.diagnostics.counters().len(),
             "the resource must be service.name plus every run-summary counter"
+        );
+    }
+
+    /// Diagnostics OFF (the default): the resource carries JUST `service.name` --
+    /// no `rgwtrace.diag.*` attributes. This is the whole point of the opt-in: a
+    /// normal tracing run does not pollute the backend's resource with cumulative
+    /// debug counters.
+    #[test]
+    fn otlp_resource_omits_the_diagnostics_by_default() {
+        let mut document = trace_document(1);
+        // Non-zero counters so a leak would be visible, not masked by zeros.
+        document.diagnostics.bpf_operate_seed_hits_reqstate = 41;
+        document.diagnostics.rados_ops = 128;
+
+        let attributes = resource_attributes(&document, false);
+
+        assert_eq!(
+            attributes.len(),
+            1,
+            "with diagnostics off the resource must be service.name alone"
+        );
+        assert_eq!(attributes[0].key, "service.name");
+        assert!(
+            !attributes
+                .iter()
+                .any(|kv| kv.key.starts_with(OTLP_DIAGNOSTIC_PREFIX)),
+            "no rgwtrace.diag.* attribute may appear when diagnostics are off"
         );
     }
 
@@ -904,7 +999,7 @@ mod tests {
     fn batches_otlp_spans_by_count() {
         let document = trace_document(5);
 
-        let batches = otlp_batches(&document, 2, 0).unwrap();
+        let batches = otlp_batches(&document, 2, 0, true).unwrap();
 
         assert_eq!(batches.len(), 3);
         assert_eq!(batches[0].len(), 2);
@@ -919,7 +1014,7 @@ mod tests {
         let one_span_size = to_otlp_protobuf(&trace_document(1)).unwrap().len();
         let max_bytes = one_span_size + 8;
 
-        let batches = otlp_batches(&document, 512, max_bytes).unwrap();
+        let batches = otlp_batches(&document, 512, max_bytes, true).unwrap();
 
         assert_eq!(batches.len(), 3);
         assert!(batches.iter().all(|batch| batch.len() == 1));
@@ -1013,7 +1108,9 @@ mod tests {
         // Vary span sizes so encoded lengths differ and the running estimate is
         // exercised across several batch boundaries.
         let document = trace_document_with_varied_sizes(40);
-        let attributes = resource_attributes(&document);
+        // Diagnostics ON: the resource carries every counter, the largest
+        // envelope the batcher must size against.
+        let attributes = resource_attributes(&document, true);
         let base_len = spans_to_otlp_protobuf(&attributes, Vec::new()).len();
 
         // SIZE THE CAP OFF THE SPAN PAYLOAD, NOT THE ENVELOPE. The resource
@@ -1030,7 +1127,7 @@ mod tests {
         let span_bytes = spans_to_otlp_protobuf(&attributes, all_spans).len() - base_len;
         let max_bytes = base_len + span_bytes / 4;
 
-        let batches = otlp_batches(&document, 512, max_bytes).unwrap();
+        let batches = otlp_batches(&document, 512, max_bytes, true).unwrap();
 
         assert!(batches.len() > 1, "test should exercise multiple batches");
         assert_eq!(batched_span_ids(&batches), document_span_ids(&document));
@@ -1039,7 +1136,7 @@ mod tests {
             // Encode the batch exactly as the export path would and compare the
             // real wire size against the estimate-derived flush threshold.
             let encoded =
-                spans_to_otlp_protobuf(&resource_attributes(&document), batch.clone()).len();
+                spans_to_otlp_protobuf(&resource_attributes(&document, true), batch.clone()).len();
             assert!(
                 span_count == 1 || encoded <= max_bytes,
                 "flushed batch of {span_count} spans encoded to {encoded} bytes, exceeding max {max_bytes}"
@@ -1153,6 +1250,93 @@ mod tests {
         assert!(
             out.is_empty(),
             "a successful export must not dump the trace"
+        );
+    }
+
+    /// FLAG OFF (the default): a final export carries a CLEAN resource
+    /// (service.name only, no `rgwtrace.diag.*`) and NO `rgwtrace.run_summary`
+    /// span, while the run's own spans still go out normally -- and the JSON
+    /// document for the same run still carries the full diagnostics block. This is
+    /// the whole point of the opt-in: validation stays possible off OTLP without
+    /// polluting the tracing backend with cumulative debug counters.
+    #[test]
+    fn flag_off_final_export_carries_a_clean_resource_and_no_run_summary_span() {
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(200)]);
+        let mut trace = trace_document(2);
+        trace.diagnostics.bpf_operate_seed_hits_reqstate = 41;
+        trace.diagnostics.rados_ops = 128;
+
+        let diagnostics =
+            export_final_otlp_http(export_config_no_diagnostics(&endpoint, 2), &trace).unwrap();
+
+        // One batch: the run's spans, and NO extra run-summary batch.
+        assert_eq!(
+            diagnostics.batches, 1,
+            "no run-summary batch is appended with the flag off"
+        );
+        let bodies = handle.join().unwrap();
+        assert_eq!(bodies.len(), 1);
+        let request = decode_export_request(&bodies[0]);
+
+        // The resource is service.name ALONE -- no rgwtrace.diag.* attributes.
+        let resource = only_resource_spans(&request).resource.as_ref().unwrap();
+        assert!(
+            resource
+                .attributes
+                .iter()
+                .all(|kv| kv.key == "service.name"),
+            "with the flag off the OTLP resource must carry no rgwtrace.diag.* attributes"
+        );
+        assert_eq!(
+            int_attribute(&resource.attributes, "rgwtrace.diag.rados_ops"),
+            None,
+            "no diagnostics counter may reach the resource with the flag off"
+        );
+
+        // No rgwtrace.run_summary span rode along; only the run's own spans.
+        let spans = request_spans(&request);
+        assert_eq!(spans.len(), 2, "only the run's own spans are exported");
+        assert!(
+            spans.iter().all(|span| span.name != RUN_SUMMARY_SPAN_NAME),
+            "the run-summary span must not be emitted with the flag off"
+        );
+
+        // ...but the JSON document for the same run still carries every counter.
+        let json = serde_json::to_value(&trace.diagnostics).unwrap();
+        assert_eq!(json["bpf_operate_seed_hits_reqstate"], 41);
+        assert_eq!(json["rados_ops"], 128);
+    }
+
+    /// FLAG OFF, THE EMPTY-FINAL-DRAIN CASE. With `--otlp-diagnostics` off there is
+    /// no run summary to deliver, so an empty final drain -- the normal end to a
+    /// live run once the periodic drains have taken every span -- sends NOTHING at
+    /// all. This is the pre-diagnostics behavior: an empty batch carrying only a
+    /// service.name resource is worth nothing to a backend, so there is no reason
+    /// to contact the endpoint. Contrast
+    /// `final_export_delivers_the_run_summary_when_the_last_drain_left_no_spans`,
+    /// which is the flag-ON case and MUST still deliver a batch.
+    #[test]
+    fn flag_off_final_export_of_an_empty_drain_sends_nothing() {
+        // No scripted responses: the server accepts nothing and returns at once.
+        // A spurious empty batch would surface as a body here (and would also fail
+        // the client, which has no response queued). Nothing must be sent.
+        let (endpoint, handle) = spawn_mock_server(vec![]);
+        let mut trace = trace_document(0);
+        trace.diagnostics.bpf_operate_seed_hits_reqstate = 41;
+        assert!(trace.spans.is_empty(), "this is the empty-final-trace case");
+
+        let diagnostics =
+            export_final_otlp_http(export_config_no_diagnostics(&endpoint, 2), &trace).unwrap();
+
+        assert_eq!(
+            diagnostics.batches, 0,
+            "an empty final drain with the flag off must put nothing on the wire"
+        );
+        assert_eq!(diagnostics.attempts, 0, "no request may be attempted");
+        let bodies = handle.join().unwrap();
+        assert!(
+            bodies.is_empty(),
+            "with the flag off there is nothing to deliver, so no batch is sent"
         );
     }
 
@@ -1286,6 +1470,9 @@ mod tests {
         );
     }
 
+    /// A config with OTLP diagnostics ON -- the flag-on behavior the run-summary
+    /// delivery tests assert against. The default in production is OFF; tests that
+    /// exercise the off path build their own config or call `diagnostics_off`.
     fn export_config(endpoint: &str, retries: u32) -> ExportConfig<'_> {
         ExportConfig {
             endpoint,
@@ -1295,6 +1482,16 @@ mod tests {
             max_bytes_per_batch: 0,
             timeout: Duration::from_secs(5),
             retries,
+            diagnostics: true,
+        }
+    }
+
+    /// The same config with OTLP diagnostics OFF -- the default -- so the flag-off
+    /// tests assert the clean-resource, no-summary-span behavior.
+    fn export_config_no_diagnostics(endpoint: &str, retries: u32) -> ExportConfig<'_> {
+        ExportConfig {
+            diagnostics: false,
+            ..export_config(endpoint, retries)
         }
     }
 

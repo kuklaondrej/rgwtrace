@@ -87,6 +87,7 @@ fn main() -> Result<()> {
                     max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
                     timeout: cli.otlp_timeout,
                     retries: cli.otlp_retries,
+                    diagnostics: cli.otlp_diagnostics,
                 },
                 &trace,
                 &document,
@@ -111,21 +112,27 @@ fn trace_output_document(
 }
 
 /// The FINAL export of an `--output otlp` session: everything the live loop's
-/// periodic drains left behind, plus the run summary.
+/// periodic drains left behind, plus -- when `--otlp-diagnostics` is set -- the
+/// run summary.
 ///
-/// It is deliberately UNCONDITIONAL. It used to be skipped when the trace had no
-/// spans -- and an empty final trace is the NORMAL end to a live run, because the
-/// periodic drains have already taken every span by then. But the final BPF
-/// counters are merged only after the poll loop exits, so this document is the
-/// only one that carries the run's true totals; skipping its export left the
-/// backend holding an earlier, stale snapshot and the final numbers nowhere.
-/// `otel::export_final_otlp_http` therefore always puts a diagnostics-bearing
-/// batch on the wire, spans or no spans.
+/// With `--otlp-diagnostics` on it is deliberately UNCONDITIONAL. An empty final
+/// trace is the NORMAL end to a live run, because the periodic drains have already
+/// taken every span by then. But the final BPF counters are merged only after the
+/// poll loop exits, so this document is the only one that carries the run's true
+/// totals; skipping its export would leave the backend holding an earlier, stale
+/// snapshot and the final numbers nowhere. `otel::export_final_otlp_http`
+/// therefore always puts a diagnostics-bearing batch on the wire, spans or no
+/// spans.
 ///
-/// The consequence to accept: an `--output otlp` run that captured nothing now
-/// still contacts the endpoint, so an unreachable endpoint is reported as a
-/// failure instead of exiting silently. That is the correct trade -- "I asked for
-/// OTLP and nothing was delivered" must never be indistinguishable from success.
+/// The consequence to accept, WITH the flag: an `--output otlp` run that captured
+/// nothing still contacts the endpoint, so an unreachable endpoint is reported as
+/// a failure instead of exiting silently. That is the correct trade -- "I asked
+/// for OTLP diagnostics and nothing was delivered" must never be indistinguishable
+/// from success.
+///
+/// With the flag off (the default) there is no run summary to force onto the wire,
+/// so an empty final drain sends nothing -- the pre-diagnostics behavior -- and a
+/// non-empty one exports its spans normally.
 fn export_trace_otlp(
     config: otel::ExportConfig<'_>,
     trace: &TraceDocument,

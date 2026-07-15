@@ -41,6 +41,25 @@ pub struct Cli {
     #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
     pub otlp_flush_interval: Duration,
 
+    /// Emit the run-summary diagnostic counters into the OTLP stream for live
+    /// validation (default off).
+    ///
+    /// When set, every exported batch carries the cumulative run counters as
+    /// `rgwtrace.diag.*` attributes on `ResourceSpans.resource`, and the final
+    /// export adds a synthetic zero-duration `rgwtrace.run_summary` span carrying
+    /// the same counters -- so a backend such as Tempo can surface numbers like
+    /// `bpf_operate_seed_hits_reqstate` on an `--output otlp` run that never prints
+    /// the JSON document.
+    ///
+    /// It is OFF by default because these are cumulative debug counters, not
+    /// request telemetry: shipping them onto every span's resource and as a
+    /// synthetic span pollutes the tracing backend. The same counters are ALWAYS
+    /// available -- regardless of this flag -- in the end-of-run shutdown log line
+    /// and in the `trace.diagnostics` block of the JSON output, so live validation
+    /// never requires polluting OTLP.
+    #[arg(long)]
+    pub otlp_diagnostics: bool,
+
     #[arg(long, default_value = "120", value_parser = parse_duration_secs)]
     pub correlation_ttl: Duration,
 
