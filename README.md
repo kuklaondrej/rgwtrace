@@ -336,3 +336,11 @@ Late async, cross-thread, startup, and background operations may appear as stand
 See [Architecture](ARCHITECTURE.md) for the event pipeline, trace model, captured fields, and current limitations.
 
 See [Production Runbook](RUNBOOK.md) for operating commands, preflight checks, OTLP troubleshooting, and background span interpretation.
+
+---
+
+## Credit
+
+`rgwtrace` is built on top of the [cephtrace](https://github.com/taodd/cephtrace) project by Dongdong Tao and contributors. Its BPF tracing code and DWARF probe-extraction approach are derived from cephtrace's `radostrace` implementation.
+
+In accordance with the GPL-2.0 license of the upstream work, `rgwtrace` is distributed under GPL-2.0-only. See [`NOTICE`](NOTICE) for the derivation details and [`LICENSE.GPL-2.0`](LICENSE.GPL-2.0) for the full license text.

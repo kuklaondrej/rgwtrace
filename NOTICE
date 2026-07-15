@@ -1,5 +1,14 @@
-rgwtrace includes BPF tracing code derived from the Ceph cephtrace/radostrace tracing implementation.
+rgwtrace is built on top of the cephtrace project:
 
-Ceph is developed by the Ceph authors and contributors. The derived BPF files in `bpf/` are distributed under GPL-2.0-only with SPDX headers.
+    https://github.com/taodd/cephtrace
 
-Project license text is available in `LICENSE.GPL-2.0`.
+by Dongdong Tao and contributors. Its BPF tracing code and DWARF
+probe-extraction approach are derived from the cephtrace/radostrace
+tracing implementation.
+
+Ceph is developed by the Ceph authors and contributors. The derived
+BPF files in `bpf/` are distributed under GPL-2.0-only with SPDX headers.
+
+In accordance with the GPL-2.0 license of the upstream cephtrace work,
+rgwtrace as a whole is distributed under GPL-2.0-only. The full project
+license text is available in `LICENSE.GPL-2.0`.
