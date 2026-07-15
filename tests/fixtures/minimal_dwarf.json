@@ -29,7 +29,8 @@
   "radosgw": {
     "build_id": "222222",
     "func2pc": {
-      "RGWREST::get_handler": 12288
+      "RGWREST::get_handler": 12288,
+      "rgw_process_authenticated": 16384
     },
     "func2vf": {
       "RGWREST::get_handler": {
@@ -37,6 +38,14 @@
           {
             "location": {"reg": 6, "offset": 0, "stack": false},
             "fields": [{"offset": 32, "pointer": true}]
+          }
+        ]
+      },
+      "rgw_process_authenticated": {
+        "var_fields": [
+          {
+            "location": {"reg": 1, "offset": 0, "stack": false},
+            "fields": [{"offset": 0, "pointer": false}]
           }
         ]
       }

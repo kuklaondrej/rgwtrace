@@ -41,11 +41,84 @@ pub struct Cli {
     #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
     pub otlp_flush_interval: Duration,
 
+    /// Emit the run-summary diagnostic counters into the OTLP stream for live
+    /// validation (default off).
+    ///
+    /// When set, every exported batch carries the cumulative run counters as
+    /// `rgwtrace.diag.*` attributes on `ResourceSpans.resource`, and the final
+    /// export adds a synthetic zero-duration `rgwtrace.run_summary` span carrying
+    /// the same counters -- so a backend such as Tempo can surface numbers like
+    /// `bpf_operate_seed_hits_reqstate` on an `--output otlp` run that never prints
+    /// the JSON document.
+    ///
+    /// It is OFF by default because these are cumulative debug counters, not
+    /// request telemetry: shipping them onto every span's resource and as a
+    /// synthetic span pollutes the tracing backend. The same counters are ALWAYS
+    /// available -- regardless of this flag -- in the end-of-run shutdown log line
+    /// and in the `trace.diagnostics` block of the JSON output, so live validation
+    /// never requires polluting OTLP.
+    #[arg(long)]
+    pub otlp_diagnostics: bool,
+
     #[arg(long, default_value = "120", value_parser = parse_duration_secs)]
     pub correlation_ttl: Duration,
 
     #[arg(long)]
     pub correlate_inferred: bool,
+
+    /// Opt in to the fail-closed cross-thread RGW->RADOS correlation bridge
+    /// (default off).
+    ///
+    /// RGW runs each S3 request as an asio coroutine that migrates to a different
+    /// io_context pool thread at every yield, so request context written at one
+    /// instant is abandoned at the next migration and the RADOS ops submitted
+    /// afterwards look like background ops. This flag re-establishes the request's
+    /// context on whatever thread is about to submit, at EVERY RADOS submit
+    /// (`rgw_rados_operate`, both overloads), plus once on the execute thread
+    /// (`rgw_process_authenticated`). Ops submitted from a migrated thread are then
+    /// correlated and labelled `cross_thread`.
+    ///
+    /// Fail-closed and zero-mis-correlation by construction: the request is
+    /// identified by the pointer VALUE of the `DoutPrefixProvider*` the submit
+    /// carries (never dereferenced, never type-assumed), which is numerically the
+    /// `req_state*` for a request's own dpp; any other dpp simply misses the bridge
+    /// and correlates nothing. `_send_op` additionally re-validates every context
+    /// against the request's liveness before stamping it. With the flag off no
+    /// re-seed probe is attached and behavior is identical to not having the
+    /// feature. Ops that never route through `rgw_rados_operate` (notably the
+    /// striped `rgw::Aio` object-data path) remain `background`/`inferred`.
+    #[arg(long)]
+    pub correlate_cross_thread: bool,
+
+    /// Drop the `RGWOp*` ALTERNATE bridge key, keying requests by their
+    /// `req_state*` alone (default: the alternate key is ON).
+    ///
+    /// The alternate key is INSURANCE. It exists only in case RGW does not pass the
+    /// `req_state` as the `DoutPrefixProvider*` at the `rgw_rados_operate` call
+    /// sites -- inside an op's `execute()`, RGW often passes the `RGWOp` (`this`)
+    /// instead. Without a matching key those submits miss the bridge and stay
+    /// uncorrelated.
+    ///
+    /// It is also the ONE part of this design with a residual mis-correlation
+    /// hazard that no amount of pointer-identity logic can remove:
+    /// `RGWHandler_REST_S3Website::retarget` can free and replace an `RGWOp` while
+    /// its request is still ALIVE, so a different `DoutPrefixProvider` heap object
+    /// can be allocated at that address, be passed as a dpp, and be seeded as that
+    /// request -- and the liveness gate PASSES, because the request genuinely is
+    /// alive.
+    ///
+    /// Whether that risk buys anything is a MEASUREMENT, not an argument. Run with
+    /// the key ON and read the run summary:
+    ///
+    ///   bpf_operate_seed_hits_reqstate healthy, bpf_operate_seed_hits_rgwop ~0
+    ///       -> the key buys nothing. Pass this flag; the hazard disappears.
+    ///   bpf_operate_seed_hits_rgwop is a large share of bpf_operate_seed_hits
+    ///       -> the key is load-bearing. Keep it.
+    ///
+    /// Takes effect without a rebuild: it is published to the BPF side as a global
+    /// before the probe that writes the key is attached.
+    #[arg(long)]
+    pub disable_rgw_op_bridge_key: bool,
 
     #[arg(long, default_value = "1", value_parser = parse_duration_secs)]
     pub inference_window: Duration,
@@ -53,7 +126,12 @@ pub struct Cli {
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
 
-    #[arg(long, default_value = "warn")]
+    // Default to `info` (not `warn`): native DWARF extraction can take ~30s+ on
+    // real targets, and the "starting live tracing" / "finished live tracing"
+    // readiness lines are `info!`. At `warn` an operator saw an empty stderr log
+    // and started their workload before the trace window opened, mis-diagnosing
+    // it as a probe that never fired. Logs go to stderr, so stdout stays clean.
+    #[arg(long, default_value = "info")]
     pub log_level: String,
 
     #[arg(short = 'p', long)]

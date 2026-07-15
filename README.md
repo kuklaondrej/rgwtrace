@@ -122,7 +122,13 @@ When `--correlate-inferred` is enabled, `--inference-window` controls the conser
 
 Use `RUST_LOG=rgwtrace=debug` or `--log-level debug` for internal diagnostics.
 
-JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request markers, RADOS ops, correlated/background RADOS ops, same-thread and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, expired background RADOS ops, dropped OTLP queue spans, and BPF-side ring-buffer/map/probe-read failures.
+JSON output includes `trace.diagnostics` counters for decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, BPF-side ring-buffer/map/probe-read failures, and the informational re-seed (`bpf_reseed_*`), per-submit cross-thread re-seed (`bpf_operate_seed_hits`, its per-key split `bpf_operate_seed_hits_reqstate` / `bpf_operate_seed_hits_rgwop` / `bpf_operate_seed_hits_unattributed`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_unresolved_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_revoke_absent`, `bpf_rgw_op_key_unresolved`, `bpf_rgw_op_key_index_drops`, `bpf_rgw_op_key_disabled`), request-end probe (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters, plus `emitted_request_keys` (the no-duplicate tombstone's occupancy).
+
+**Every one of those counters reaches every output path**, and that is enforced by a test rather than by a maintained list: the log summary, the JSON `trace.diagnostics` block, and -- when opted in -- the OTLP resource attributes and OTLP run-summary span are all generated from `TraceDiagnostics`' own serde representation (`TraceDiagnostics::counters()`), so a counter added to the struct appears in every sink automatically. The complete run summary is **always** logged at end of run (`finished live tracing` / `rgwtrace shutdown summary`, as a `diagnostics=` field of `key=value` pairs) and **always** present in the JSON `trace.diagnostics` block, regardless of any flag.
+
+**Emitting the run summary into OTLP is opt-in via `--otlp-diagnostics` (default off).** These are cumulative debug counters, not request telemetry, so by default an `--output otlp` run carries a clean resource (`service.name` only) and no run-summary span -- the tracing backend is not polluted. Because a live-validation run can always read the same counters off the shutdown log or the JSON output, the default stays clean and validation still works.
+
+**With `--otlp-diagnostics`, `--output otlp` also delivers a guaranteed final batch** -- even when the run's last drain left no spans, which is the normal case, because the periodic drains have usually exported every span by then while the final BPF counters are only merged after the poll loop exits. That batch carries the final counters twice: on its Resource as `rgwtrace.diag.*`, and on a synthetic zero-duration span named **`rgwtrace.run_summary`** whose attributes are the same `rgwtrace.diag.*` names. Search your backend for the `rgwtrace.run_summary` span to read a run's final numbers; a span-less batch's Resource attributes reach the collector but most trace backends store nothing from a batch with no spans, which is why the span exists. One consequence, **with the flag on**: the run always contacts its endpoint, so an unreachable endpoint is reported as a failure (with the trace dumped to stdout as JSON) rather than exiting silently. **With the flag off** an empty final drain simply sends nothing.
 
 OTLP mode logs the same trace counters plus export batches, attempts, and failures when internal logging is enabled.
 
@@ -235,25 +241,58 @@ sudo RGWTRACE_DWARF_JSON=/path/to/rgwtrace_dwarf.json tests/e2e/functional-test-
 
 ## Trace
 
-Correlated request output:
+A trace is one `rgw.request` parent span with a `rados.op` child per RADOS op the request issued. RADOS work that cannot be tied to a request is emitted standalone as `rgw.background.rados_op`:
 
 ```text
-rgw.request
-  rados.op
+rgw.request                 rgw.background.rados_op
+  rados.op                    (uncorrelated RADOS work)
   rados.op
 ```
 
-Fallback output for uncorrelated RADOS work:
+### Worked example
+
+The diagrams below are real captures (anonymized: bucket, key, access key, transaction ID, and thread IDs replaced; timings and structure unchanged). Each bar is a `rados.op` child on a shared time axis; `thread` is the op's submitting thread (`ceph.rados.send_tid`), and `T0 (home)` is the request marker's own thread (`rgw.request.tid`).
+
+A `GET my-bucket/report.pdf` on a cold cache. RGW authenticates on the request's home thread, then its asio coroutine migrates across four `io_context` pool threads as each metadata read yields. The first op is `same_thread`; every op after the first migration is recovered by the cross-thread re-seed bridge and labelled `cross_thread`:
 
 ```text
-rgw.background.rados_op
+rgw.request  GET my-bucket/report.pdf   trans_id=tx…e3b21-zone  tid=T0  quality=measured  49.6 ms
+
+  child (rados.op)       correlation  thread    |0 ───────── time ─────────► 50          |
+  auth stat + read       same_thread  T0 (home) |███████████                             | 13.7 ms
+  bucket entrypoint rd   cross_thread T1        |                       █████            |  6.2 ms
+  bucket instance read   cross_thread T2        |                            █████████   | 11.8 ms
+  user info read         cross_thread T3        |                                      █ |  0.4 ms
+  head stat + read       cross_thread T4        |                                       █|  0.6 ms
 ```
+
+A `DELETE my-bucket/report.pdf`. This is the case the cross-thread work exists for: the head `stat` runs on the home thread, but the entire write path — the bucket-index prepare and the object removal — is dispatched onto other pool threads and would otherwise be lost:
+
+```text
+rgw.request  DELETE my-bucket/report.pdf   trans_id=tx…a1c7f-zone  tid=T0  quality=measured  41.0 ms
+
+  child (rados.op)       correlation  thread    |0 ───────── time ─────────► 41          |
+  head stat              same_thread  T0 (home) | █                                      |  0.6 ms
+  index prepare_op       cross_thread T1        |  ██                                    |  1.6 ms
+  obj_remove             cross_thread T2        |   ████████████████████████████████████ | 36.8 ms
+```
+
+Without `--correlate-cross-thread`, that same DELETE keeps only the `same_thread` head `stat`; `index prepare_op` and `obj_remove` fall out as standalone `rgw.background.rados_op` spans with `rgw.correlation_reason = "missing_trans_id"`, and the request span, having no later child, ends at ~1 ms instead of 41 ms.
 
 RADOS child spans include object, op list, pool, PG, PG seed, acting set, target OSD, direction, offset, length, duration, and role attributes.
 
-RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`.
+RADOS spans also include `rgw.correlation`. Correlated request children use `same_thread` when the RADOS op ran on the request's own execute thread; children recovered by the opt-in cross-thread re-seed bridge (`--correlate-cross-thread`) use `cross_thread` with `rgw.correlation_reason = "reseed_bridge"`; optional inferred children use `inferred` with `rgw.correlation_reason = "pid_time_window"`; standalone background spans use `none` with a correlation reason such as `missing_trans_id`, `classified_background_role`, `no_inference_candidate`, or `ambiguous_inference_candidates`. The `same_thread`/`cross_thread` split is derived late, when spans are built, from whether the op's send thread matches the request marker's thread, so `correlated_rados_ops == same_thread_correlations + cross_thread_correlations + inferred_correlations`. `cross_thread` ops are the ones submitted after the request's asio coroutine migrated to another `io_context` pool thread; they are recovered by re-seeding the request's context at every RADOS submit (`rgw_rados_operate`, both overloads), looking the submit's `DoutPrefixProvider*` up by pointer value in a bridge that keys each request by **both** identities RGW may pass for it (its `req_state*` and the `RGWOp*` executing it). It is opt-in and build-dependent, requires the request-END probe (the only thing that revokes bridge entries), and fails closed: object-payload I/O dispatched through `rgw::Aio`/`aio_operate` does not route through that frame, and a submit whose `dpp` is an unkeyable stack wrapper is left uncorrelated rather than guessed at — both stay `background`/`inferred` (see `docs/design-cross-thread-correlation.md`).
 
-Request spans include `rgw.duration_quality`. Current live captures normally use `marker` because the safe RGW probe observes a request marker rather than the full lifecycle; the span still envelopes any correlated RADOS child bounds. If future start/end probes are active, the value is `request_lifecycle`; request groups built only from RADOS bounds use `rados_bounds`.
+Request spans include `rgw.duration_quality`, which tells a real duration from a reconstructed one:
+
+- `measured` -- the request-END probe (`req_state::~req_state`, an entry uprobe on the destructor that `process_request` runs at scope exit) fired, and **both** span bounds are the request's real ones.
+- `measured_extended` -- the END probe fired, but a span bound had to be stretched to envelope a correlated RADOS child: the end pushed out past a late child, or the start pulled back to a child that began before the request marker (children are never clamped into their parent). The untouched real interval stays available on `rgw.request.measured_start_ns` / `rgw.request.measured_end_ns`.
+- `marker` -- no END marker: on builds where the destructor address, its variant provenance, or its `this` descriptor cannot be resolved, the probe is not attached and the request's end is **derived** from its correlated RADOS child bounds (the pre-end-probe behavior). Preflight reports this as a `request_end_probe` warning, and so does the run itself at attach time.
+- `rados_bounds` -- no request marker at all; the group was built from RADOS timestamps only, so neither bound is measured.
+
+There is still no `request_lifecycle` value, and no return probe anywhere: a `process_request` return probe crashes RGW (a uretprobe patches the return address on the stack while asio switches fiber stacks underneath it).
+
+RADOS spans carry `ceph.rados.send_tid` (the submitting thread) and request spans carry `rgw.request.tid` (the request marker's thread). When they differ, the op was submitted after an asio coroutine migration.
 
 When fixed BPF capture limits truncate values, RADOS spans include `rgwtrace.truncated` with affected fields.
 

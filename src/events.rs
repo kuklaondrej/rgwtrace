@@ -7,6 +7,14 @@ pub const MAX_TRANS_ID: usize = 128;
 pub const MAX_OBJECT_NAME: usize = 128;
 pub const MAX_RADOS_OPS: usize = 3;
 
+// Two-marker model (mirrored in bpf/rgwtrace_events.h).
+// START is emitted at `RGWREST::get_handler` entry (the earliest point the
+// trans_id is known) and carries the request's start_ns with `end_ns == 0`.
+// END is emitted at `req_state::~req_state` entry -- the true, unconditional end
+// of the request -- and carries the seeded start_ns plus a REAL end_ns. END is
+// OPTIONAL: on builds where the destructor symbol/descriptor cannot be resolved
+// the probe is not attached, no END arrives, and the collector derives the span
+// end from the correlated RADOS child bounds (see `request_duration_quality`).
 pub const RGWTRACE_EVENT_REQUEST_START: u32 = 1;
 pub const RGWTRACE_EVENT_REQUEST_END: u32 = 2;
 pub const RGWTRACE_EVENT_RADOS_OP: u32 = 3;
@@ -63,7 +71,12 @@ pub struct RawRadosEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
+    /// `RGWREST::get_handler` marker: opens the request (identity + start_ns).
+    /// Its `end_ns` is always 0 -- get_handler cannot know when the request ends.
     RequestStart(RequestEvent),
+    /// `req_state::~req_state` marker: the request's REAL end. Carries the
+    /// start_ns seeded at get_handler plus a measured `end_ns`. Optional: absent
+    /// on builds where the destructor probe could not attach.
     RequestEnd(RequestEvent),
     RadosOp(RadosEvent),
 }
@@ -276,7 +289,7 @@ mod tests {
 
     #[test]
     fn timestamp_offset_keeps_zero_end_timestamp() {
-        let mut event = TraceEvent::RequestStart(RequestEvent {
+        let mut event = TraceEvent::RequestEnd(RequestEvent {
             start_ns: 10,
             end_ns: 0,
             pid: 1,
@@ -287,8 +300,8 @@ mod tests {
 
         event.add_timestamp_offset(1000);
 
-        let TraceEvent::RequestStart(request) = event else {
-            panic!("expected request start event");
+        let TraceEvent::RequestEnd(request) = event else {
+            panic!("expected request end event");
         };
         assert_eq!(request.start_ns, 1010);
         assert_eq!(request.end_ns, 0);

@@ -96,12 +96,12 @@ fn discover_library(
 
     for path in common_library_paths(soname) {
         if path.exists() {
-            return Ok(path);
+            return Ok(canonical_or_original(path));
         }
     }
 
     if let Some(path) = ldconfig_path(soname) {
-        return Ok(path);
+        return Ok(canonical_or_original(path));
     }
 
     let pid_hint = pid.map(|pid| format!(" for pid {pid}")).unwrap_or_default();
@@ -135,11 +135,11 @@ fn discover_optional_library(
 
     for path in common_library_paths(soname) {
         if path.exists() {
-            return Ok(Some(path));
+            return Ok(Some(canonical_or_original(path)));
         }
     }
 
-    Ok(ldconfig_path(soname))
+    Ok(ldconfig_path(soname).map(canonical_or_original))
 }
 
 fn discover_radosgw(explicit: Option<PathBuf>, pid: Option<i32>) -> Result<PathBuf> {
@@ -168,11 +168,21 @@ fn discover_radosgw(explicit: Option<PathBuf>, pid: Option<i32>) -> Result<PathB
     ] {
         let path = PathBuf::from(path);
         if path.exists() {
-            return Ok(path);
+            return Ok(canonical_or_original(path));
         }
     }
 
     bail!("failed to discover radosgw executable; pass --radosgw-path")
+}
+
+/// Resolve symlinks (the soname `librados.so.2` -> versioned `librados.so.2.0.0`
+/// real file) so discovery yields the same versioned basename that `--pid`/maps
+/// discovery reports from the mmap'd path and that the artifact keys modules by.
+/// Falls back to the original path if canonicalization fails (e.g. a
+/// `/proc/<pid>/root` path, or a path that does not resolve), so discovery never
+/// fails on a resolvable-but-uncanonicalizable path.
+fn canonical_or_original(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
 }
 
 fn read_process_maps(pid: i32) -> Result<BTreeMap<String, PathBuf>> {
@@ -284,8 +294,11 @@ mod tests {
             otlp_max_spans_per_batch: 512,
             otlp_max_bytes_per_batch: 0,
             otlp_flush_interval: std::time::Duration::from_secs(30),
+            otlp_diagnostics: false,
             correlation_ttl: std::time::Duration::from_secs(120),
             correlate_inferred: false,
+            correlate_cross_thread: false,
+            disable_rgw_op_bridge_key: false,
             inference_window: std::time::Duration::from_secs(1),
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),

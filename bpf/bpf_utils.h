@@ -100,4 +100,44 @@ static __always_inline __u64 fetch_var_member_addr(__u64 cur_addr,
   return cur_addr;
 }
 
+/*
+ * Raw-pointer parameter fetch for register-at-entry descriptors: return the
+ * value of the parameter's ABI register, or 0 when the descriptor is
+ * stack-located (post-prologue spill). Register-only by design -- it never
+ * composes a varloc via fetch_var_member_addr, so there is no double-varloc
+ * risk. Callers treat 0 as "unresolved" and fail closed.
+ */
+static __always_inline __u64 fetch_param_ptr(const struct pt_regs *const ctx,
+                                             struct VarField *vf) {
+  if (vf == 0 || vf->varloc.stack)
+    return 0;
+  return fetch_register(ctx, vf->varloc.reg);
+}
+
+/*
+ * Reference-to-pointer parameter fetch. A C++ REFERENCE to a pointer (`RGWOp*&
+ * op`) is passed as the ADDRESS of the caller's pointer variable, so the ABI
+ * register holds a `RGWOp**` and exactly ONE user read yields the `RGWOp*`
+ * itself.
+ *
+ * This is a read of the POINTEE, not a struct-field walk: no member offset is
+ * applied, no inheritance offset is assumed, and the pointed-at type is proven
+ * from DWARF (`reference -> pointer -> RGWOp`) before the descriptor that leads
+ * here is ever emitted (see `probe_function_var_fields` in src/dwarf_native.rs).
+ * The VALUE it returns is used only as an opaque bridge key -- it is never
+ * dereferenced.
+ *
+ * Fails closed: 0 on an unresolved (stack-located) descriptor or a failed read.
+ */
+static __always_inline __u64 fetch_param_ptr_ref(const struct pt_regs *const ctx,
+                                                 struct VarField *vf) {
+  __u64 addr = fetch_param_ptr(ctx, vf);
+  if (addr == 0)
+    return 0;
+  __u64 value = 0;
+  if (rgwtrace_probe_read_user(&value, sizeof(value), (void *)addr) != 0)
+    return 0;
+  return value;
+}
+
 #endif

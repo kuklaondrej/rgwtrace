@@ -24,12 +24,20 @@ RGW_SECRET_KEY="${RGW_SECRET_KEY:-rgwtrace-secret-key-rgwtrace-secret-key}"
 RGWTRACE_BIN="${RGWTRACE_BIN:-${PROJECT_ROOT}/target/release/rgwtrace}"
 RGWTRACE_DWARF_JSON="${RGWTRACE_DWARF_JSON:-}"
 KEEP_E2E_RESOURCES="${KEEP_E2E_RESOURCES:-0}"
+WORKLOAD_CONCURRENT_REQUESTS="${WORKLOAD_CONCURRENT_REQUESTS:-4}"
+# Baseline (pre-cross-thread-bridge) correlation-rate thresholds. The manifest
+# object->request cross-check enforces zero mis-correlation unconditionally;
+# these coverage-rate gates stay at 0 until Stage 3's bridge lands, then get
+# raised to 0.90 (0.80 concurrent) per design-cross-thread-correlation.md §1.
+REQUIRE_GET_READ_CORRELATION="${REQUIRE_GET_READ_CORRELATION:-0}"
+REQUIRE_PUT_WRITE_CORRELATION="${REQUIRE_PUT_WRITE_CORRELATION:-0}"
 
 PREFLIGHT_JSON="${ARTIFACT_DIR}/preflight.json"
 PREFLIGHT_LOG="${ARTIFACT_DIR}/preflight.log"
 TRACE_JSON="${ARTIFACT_DIR}/trace.json"
 TRACE_LOG="${ARTIFACT_DIR}/rgwtrace.log"
 WORKLOAD_JSONL="${ARTIFACT_DIR}/workload.jsonl"
+WORKLOAD_MANIFEST="${ARTIFACT_DIR}/workload-manifest.json"
 WORKLOAD_LOG="${ARTIFACT_DIR}/workload.log"
 VERIFY_LOG="${ARTIFACT_DIR}/verify.log"
 NATIVE_DWARF_JSON="${ARTIFACT_DIR}/native-dwarf.json"
@@ -439,6 +447,9 @@ run_workload() {
         --access-key "${RGW_ACCESS_KEY}" \
         --secret-key "${RGW_SECRET_KEY}" \
         --output "${WORKLOAD_JSONL}" \
+        --manifest "${WORKLOAD_MANIFEST}" \
+        --unique-keys \
+        --concurrent-requests "${WORKLOAD_CONCURRENT_REQUESTS}" \
         >"${WORKLOAD_LOG}" 2>&1; then
         err "S3 workload failed; see ${WORKLOAD_LOG} and ${WORKLOAD_JSONL}"
         return 1
@@ -450,6 +461,9 @@ verify_trace() {
     if ! python3 "${SCRIPT_DIR}/verify-rgwtrace-json.py" \
         --trace "${TRACE_JSON}" \
         --workload "${WORKLOAD_JSONL}" \
+        --workload-manifest "${WORKLOAD_MANIFEST}" \
+        --require-get-read-correlation "${REQUIRE_GET_READ_CORRELATION}" \
+        --require-put-write-correlation "${REQUIRE_PUT_WRITE_CORRELATION}" \
         --min-request-spans 3 \
         --min-rados-spans 3 \
         --expect-role data \
@@ -470,6 +484,7 @@ main() {
         "${TRACE_JSON}" \
         "${TRACE_LOG}" \
         "${WORKLOAD_JSONL}" \
+        "${WORKLOAD_MANIFEST}" \
         "${WORKLOAD_LOG}" \
         "${VERIFY_LOG}" \
         "${NATIVE_DWARF_JSON}" \
