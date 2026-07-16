@@ -448,10 +448,12 @@ def main():
         phase = args.bench_phase
 
         if phase == "prepare":
-            bucket = args.bucket or f"rgwtrace-bench-{uuid.uuid4().hex[:12]}"
-            seed_keys = bench_prepare(args, bucket)
+            # Validate before any network side effect: preparing without a state
+            # path would create and seed a bucket that no cleanup phase can find.
             if not args.bench_state:
                 raise SystemExit("--bench-phase prepare requires --bench-state")
+            bucket = args.bucket or f"rgwtrace-bench-{uuid.uuid4().hex[:12]}"
+            seed_keys = bench_prepare(args, bucket)
             write_bench_state(args.bench_state, bucket, seed_keys)
             return
 

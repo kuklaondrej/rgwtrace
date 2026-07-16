@@ -3,7 +3,6 @@
 bench-results/
 .DS_Store
 trace-data/
-bench-results/
 *.o
 *.skel.rs
 *.tmp.bpf.o
