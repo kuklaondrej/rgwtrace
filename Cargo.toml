@@ -1,3 +1,9 @@
+[workspace]
+# The root package is the implicit primary member; `bench` is an additive,
+# self-contained microbenchmark member (see bench/README.md). It reuses the
+# root's dependency set, so this does not change the resolved dependency graph.
+members = ["bench"]
+
 [package]
 name = "rgwtrace"
 version = "0.1.0"

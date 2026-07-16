@@ -3,6 +3,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import io
 import json
+import math
 import threading
 import time
 import uuid
@@ -36,6 +37,56 @@ def parse_args():
         help="give every object a run-unique key so the object->request mapping is "
         "unambiguous (recommended when arming the correlation gate)",
     )
+    # --- benchmark mode (additive; --requests 0 keeps the historical functional
+    # workload untouched so the e2e test's behaviour is unchanged) ---------------
+    parser.add_argument(
+        "--requests",
+        type=int,
+        default=0,
+        help="benchmark mode: total number of measured PUT/GET requests to drive "
+        "with a fixed op mix and object size (0 = run the functional workload instead)",
+    )
+    parser.add_argument(
+        "--object-size",
+        type=int,
+        default=4096,
+        help="benchmark mode: object payload size in bytes (default 4096)",
+    )
+    parser.add_argument(
+        "--put-fraction",
+        type=float,
+        default=0.5,
+        help="benchmark mode: fraction of requests that are PUTs (0..1, default 0.5); "
+        "the remainder are GETs of pre-seeded objects",
+    )
+    parser.add_argument(
+        "--seed-objects",
+        type=int,
+        default=0,
+        help="benchmark mode: number of objects to pre-seed for GETs and PUT overwrites "
+        "(0 = derive from --concurrent-requests)",
+    )
+    parser.add_argument(
+        "--summary",
+        default=None,
+        help="write an aggregate latency/throughput summary (JSON) for this run; "
+        "the A/B benchmark harness pools these across phases",
+    )
+    parser.add_argument(
+        "--bench-phase",
+        choices=("all", "prepare", "run", "cleanup"),
+        default="all",
+        help="benchmark mode split: 'prepare' creates+seeds the bucket, 'run' drives "
+        "only the measured request window, 'cleanup' deletes; 'all' (default) does "
+        "everything in one process. The A/B harness uses prepare/run/cleanup so the "
+        "server-side CPU delta brackets only measured traffic",
+    )
+    parser.add_argument(
+        "--bench-state",
+        default=None,
+        help="benchmark mode: path to the JSON state file shared between "
+        "--bench-phase prepare/run/cleanup (bucket name + seed keys)",
+    )
     return parser.parse_args()
 
 
@@ -57,10 +108,16 @@ class Recorder:
     the request that operated on a given object.
     """
 
-    def __init__(self, handle):
+    def __init__(self, handle, buffered=False):
         self._handle = handle
         self._lock = threading.Lock()
         self._manifest_records = []
+        # In buffered mode (benchmark) the per-op JSONL lines are held in memory
+        # and written once, AFTER the timed section, so file I/O and its flush do
+        # not fall inside the measured throughput window. Functional mode keeps
+        # its historical per-op flush (buffered=False).
+        self._buffered = buffered
+        self._workload_buffer = []
 
     def record(self, name, bucket, key, start_ns, end_ns, status, op, rw, request_id=None, error=None):
         workload_record = {
@@ -80,11 +137,21 @@ class Recorder:
         manifest_record["op"] = op
         manifest_record["rw"] = rw
 
-        line = json.dumps(workload_record, sort_keys=True) + "\n"
         with self._lock:
-            self._handle.write(line)
-            self._handle.flush()
             self._manifest_records.append(manifest_record)
+            if self._buffered:
+                self._workload_buffer.append(workload_record)
+            else:
+                self._handle.write(json.dumps(workload_record, sort_keys=True) + "\n")
+                self._handle.flush()
+
+    def flush_buffered(self):
+        """Write all buffered workload lines (benchmark mode, post-timing)."""
+        with self._lock:
+            for record in self._workload_buffer:
+                self._handle.write(json.dumps(record, sort_keys=True) + "\n")
+            self._handle.flush()
+            self._workload_buffer = []
 
     def manifest_records(self):
         with self._lock:
@@ -148,6 +215,219 @@ def run_concurrent_object_roundtrip(args, recorder, bucket, key, index):
     return key
 
 
+def _percentile(sorted_values, quantile):
+    """Linear-interpolated percentile over an already-sorted list (microseconds)."""
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = (len(sorted_values) - 1) * quantile
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return sorted_values[lo]
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * (pos - lo)
+
+
+def _latency_stats(latencies_us):
+    values = sorted(latencies_us)
+    stats = {
+        "count": len(values),
+        "min_us": values[0] if values else None,
+        "max_us": values[-1] if values else None,
+        "mean_us": (sum(values) / len(values)) if values else None,
+        "p50_us": _percentile(values, 0.50),
+        "p95_us": _percentile(values, 0.95),
+        "p99_us": _percentile(values, 0.99),
+        # Raw latencies are retained so a caller (the A/B harness) can pool
+        # samples across repeats and recompute true pooled percentiles.
+        "latencies_us": values,
+    }
+    return stats
+
+
+def build_summary(records, wall_ns, args, bucket, mode):
+    """Aggregate per-op latency percentiles and throughput from recorded ops.
+
+    Only status=="ok" ops are counted. "ALL" pools PUT and GET (the measured
+    request mix); setup/teardown ops (bucket create/delete, classified OTHER)
+    are reported under their own op key but excluded from "ALL".
+    """
+    by_op = {}
+    for record in records:
+        if record.get("status") != "ok":
+            continue
+        start_ns = record.get("start_ns")
+        end_ns = record.get("end_ns")
+        if start_ns is None or end_ns is None:
+            continue
+        op = record.get("op") or "OTHER"
+        by_op.setdefault(op, []).append((end_ns - start_ns) / 1000.0)
+
+    ops = {op: _latency_stats(latencies) for op, latencies in by_op.items()}
+    measured = []
+    for op in ("PUT", "GET"):
+        measured.extend(by_op.get(op, []))
+    ops["ALL"] = _latency_stats(measured)
+
+    wall_s = wall_ns / 1e9 if wall_ns else 0.0
+    throughput_rps = (len(measured) / wall_s) if wall_s > 0 else None
+    return {
+        "version": 1,
+        "mode": mode,
+        "bucket": bucket,
+        "requests": args.requests,
+        "concurrency": max(0, args.concurrent_requests),
+        "object_size": args.object_size,
+        "put_fraction": args.put_fraction,
+        "wall_ns": wall_ns,
+        "throughput_rps": throughput_rps,
+        "ops": ops,
+    }
+
+
+def write_summary(path, summary):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _benchmark_op_plan(args, seed_keys):
+    """Build a deterministic (op, key) plan of length args.requests.
+
+    PUTs overwrite keys from the bounded seed pool (so cleanup is trivial and
+    object count stays fixed); GETs read from the same pool. The mix is laid out
+    deterministically from --put-fraction so a run is reproducible.
+    """
+    total = max(0, args.requests)
+    put_target = int(round(total * min(max(args.put_fraction, 0.0), 1.0)))
+    plan = []
+    puts = 0
+    for index in range(total):
+        # Deterministic Bresenham-style interleave of PUTs across the sequence.
+        want_put = int(round((index + 1) * put_target / total)) > puts if total else False
+        key = seed_keys[index % len(seed_keys)]
+        if want_put:
+            plan.append(("PUT", key))
+            puts += 1
+        else:
+            plan.append(("GET", key))
+    return plan
+
+
+def _seed_keys(args):
+    concurrency = max(1, args.concurrent_requests)
+    seed_count = args.seed_objects if args.seed_objects > 0 else max(concurrency, 1)
+    return [f"bench-obj-{index}" for index in range(seed_count)]
+
+
+def _run_benchmark_worker(client, plan_slice, recorder, bucket, payload, worker_index):
+    for op_index, (op, key) in enumerate(plan_slice):
+        if op == "PUT":
+            run_op(
+                recorder,
+                f"bench_put_w{worker_index}_{op_index}",
+                bucket,
+                key,
+                lambda key=key: client.put_object(Bucket=bucket, Key=key, Body=payload),
+                op="PUT",
+                rw="write",
+            )
+        else:
+            def get_object(key=key):
+                response = client.get_object(Bucket=bucket, Key=key)
+                try:
+                    response["Body"].read()
+                finally:
+                    response["Body"].close()
+                return response
+
+            run_op(
+                recorder,
+                f"bench_get_w{worker_index}_{op_index}",
+                bucket,
+                key,
+                get_object,
+                op="GET",
+                rw="read",
+            )
+
+
+def bench_prepare(args, bucket):
+    """Create the bucket and seed objects (unmeasured). Returns the seed keys."""
+    client = make_client(args)
+    client.create_bucket(Bucket=bucket)
+    payload = b"\0" * max(0, args.object_size)
+    seed_keys = _seed_keys(args)
+    for key in seed_keys:
+        client.put_object(Bucket=bucket, Key=key, Body=payload)
+    return seed_keys
+
+
+def bench_run(args, recorder, bucket, seed_keys):
+    """Drive only the measured request window and return its wall time (ns).
+
+    All boto3 clients are constructed and the thread pool is pre-warmed BEFORE
+    the timer starts, and per-op JSONL is buffered (see Recorder), so the timed
+    window contains request work only -- not client/thread setup or file I/O.
+    """
+    payload = b"\0" * max(0, args.object_size)
+    concurrency = max(1, args.concurrent_requests)
+    plan = _benchmark_op_plan(args, seed_keys)
+    slices = [plan[worker::concurrency] for worker in range(concurrency)]
+
+    clients = [make_client(args) for _ in range(concurrency)]
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+    try:
+        # Force worker threads to spin up before the timed section.
+        list(executor.map(lambda _idx: None, range(concurrency)))
+        start_ns = time.time_ns()
+        if args.requests > 0:
+            futures = [
+                executor.submit(
+                    _run_benchmark_worker,
+                    clients[worker],
+                    slices[worker],
+                    recorder,
+                    bucket,
+                    payload,
+                    worker,
+                )
+                for worker in range(concurrency)
+            ]
+            for future in futures:
+                future.result()
+        wall_ns = time.time_ns() - start_ns
+    finally:
+        executor.shutdown(wait=True)
+    return wall_ns
+
+
+def bench_cleanup(args, bucket, seed_keys):
+    """Delete seed objects and the bucket (unmeasured)."""
+    client = make_client(args)
+    for key in seed_keys:
+        try:
+            client.delete_object(Bucket=bucket, Key=key)
+        except Exception:
+            pass
+    try:
+        client.delete_bucket(Bucket=bucket)
+    except Exception:
+        pass
+
+
+def write_bench_state(path, bucket, seed_keys):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"bucket": bucket, "seed_keys": seed_keys}, handle, sort_keys=True)
+        handle.write("\n")
+
+
+def read_bench_state(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def write_manifest(path, args, bucket, recorder):
     document = {
         "version": 1,
@@ -163,6 +443,50 @@ def write_manifest(path, args, bucket, recorder):
 
 def main():
     args = parse_args()
+
+    if args.requests > 0:
+        phase = args.bench_phase
+
+        if phase == "prepare":
+            bucket = args.bucket or f"rgwtrace-bench-{uuid.uuid4().hex[:12]}"
+            seed_keys = bench_prepare(args, bucket)
+            if not args.bench_state:
+                raise SystemExit("--bench-phase prepare requires --bench-state")
+            write_bench_state(args.bench_state, bucket, seed_keys)
+            return
+
+        if phase == "cleanup":
+            if not args.bench_state:
+                raise SystemExit("--bench-phase cleanup requires --bench-state")
+            state = read_bench_state(args.bench_state)
+            bench_cleanup(args, state["bucket"], state["seed_keys"])
+            return
+
+        if phase == "run":
+            if not args.bench_state:
+                raise SystemExit("--bench-phase run requires --bench-state")
+            state = read_bench_state(args.bench_state)
+            bucket, seed_keys = state["bucket"], state["seed_keys"]
+            with open(args.output, "w", encoding="utf-8") as handle:
+                recorder = Recorder(handle, buffered=True)
+                wall_ns = bench_run(args, recorder, bucket, seed_keys)
+                recorder.flush_buffered()
+        else:  # phase == "all": single-shot prepare+run+cleanup
+            bucket = args.bucket or f"rgwtrace-bench-{uuid.uuid4().hex[:12]}"
+            with open(args.output, "w", encoding="utf-8") as handle:
+                recorder = Recorder(handle, buffered=True)
+                seed_keys = bench_prepare(args, bucket)
+                wall_ns = bench_run(args, recorder, bucket, seed_keys)
+                recorder.flush_buffered()
+                bench_cleanup(args, bucket, seed_keys)
+
+        summary = build_summary(recorder.manifest_records(), wall_ns, args, bucket, "benchmark")
+        if args.summary:
+            write_summary(args.summary, summary)
+        if args.manifest:
+            write_manifest(args.manifest, args, bucket, recorder)
+        return
+
     bucket = args.bucket or f"rgwtrace-e2e-{uuid.uuid4().hex[:12]}"
     # A run token keeps object keys unique across requests (and across runs) so
     # the verifier's object->request mapping is unambiguous when --unique-keys is set.
@@ -323,6 +647,12 @@ def main():
                     pass
             if args.manifest:
                 write_manifest(args.manifest, args, bucket, recorder)
+            if args.summary:
+                records = recorder.manifest_records()
+                starts = [r["start_ns"] for r in records if r.get("start_ns") is not None]
+                ends = [r["end_ns"] for r in records if r.get("end_ns") is not None]
+                wall_ns = (max(ends) - min(starts)) if starts and ends else 0
+                write_summary(args.summary, build_summary(records, wall_ns, args, bucket, "functional"))
 
 
 if __name__ == "__main__":
