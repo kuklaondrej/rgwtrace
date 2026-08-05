@@ -1,5 +1,6 @@
 /target
 /dist
+bench-results/
 .DS_Store
 trace-data/
 *.o
