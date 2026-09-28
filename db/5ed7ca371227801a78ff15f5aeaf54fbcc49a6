@@ -1,0 +1,32 @@
+RUNBOOK.md
+  s_e89c9dc9b8f37a::t_d8234871f8c7f8 5-6,46-51,103-114,275-276
+  s_e89c9dc9b8f37a::t_b79912af1009a6 277
+docs/development.md
+  s_e89c9dc9b8f37a::t_b7f201046a30b4 1-128
+ARCHITECTURE.md
+  s_e89c9dc9b8f37a::t_d8234871f8c7f8 5-6
+AGENTS.md
+  s_e89c9dc9b8f37a::t_d8234871f8c7f8 102-105
+docs/README.md
+  s_e89c9dc9b8f37a::t_b7f201046a30b4 1-39
+README.md
+  s_e89c9dc9b8f37a::t_b7f201046a30b4 3,5-7,9,11-14,17-19,22,24,26-29,31,34-37,40-41,43-45,47,49-52,54-55,57,59-64,66,68-70,72-73
+docs/trace-examples.md
+  s_e89c9dc9b8f37a::t_b7f201046a30b4 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "db5ed7ca371227801a78ff15f5aeaf54fbcc49a6",
+  "prompts": {},
+  "sessions": {
+    "s_e89c9dc9b8f37a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e7c5-9460-7930-ae8c-dd523c80f50c",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
