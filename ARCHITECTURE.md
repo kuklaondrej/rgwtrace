@@ -2,6 +2,8 @@
 
 Live tracing pipeline for RGW and RADOS.
 
+[Documentation index](docs/README.md) · [Example traces](docs/trace-examples.md)
+
 ---
 
 ## Follow
