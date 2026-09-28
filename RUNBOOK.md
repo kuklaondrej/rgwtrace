@@ -2,6 +2,8 @@
 
 Operational notes for running `rgwtrace` against live RGW hosts.
 
+[Documentation index](docs/README.md) · [Building and testing](docs/development.md)
+
 ---
 
 ## Requirements
@@ -40,6 +42,12 @@ sudo rgwtrace \
 ```
 
 Use `--import-json` when native debug info is unavailable or when comparing against the `cephtrace` oracle.
+
+Validate an imported artifact without attaching probes:
+
+```sh
+rgwtrace --import-json /path/to/dwarf.json --dry-run --output json
+```
 
 If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout.
 
@@ -91,6 +99,18 @@ sudo rgwtrace \
 Logging defaults to `info` so the `starting live tracing` / `finished live tracing` readiness lines are visible: native DWARF extraction can take ~30s+, and starting a workload before `starting live tracing` prints yields an empty trace that looks like a dead probe. Logs go to stderr, so stdout stays clean for JSON. If RADOS ops are captured but no RGW request markers, the run ends with a `no RGW request markers captured` warning pointing at exactly that timing mistake. Pass `--log-level warn` for quieter output or `RUST_LOG=rgwtrace=debug` to also see export queue summaries, export attempts, and retry details.
 
 Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobuf payloads. The byte limit is checked before gzip compression; `0` disables byte-based splitting.
+
+The exporter sends OTLP/HTTP protobuf (`Content-Type: application/x-protobuf`)
+over HTTP or HTTPS. `--service-name` sets the `service.name` resource attribute.
+Use `--otlp-timeout` and `--otlp-retries` to tune delivery, and repeat
+`--otlp-header 'Name:Value'` for any required headers.
+
+In live OTLP mode, `--otlp-flush-interval` controls how often eligible spans are
+queued for the background exporter. `--correlation-ttl` governs retention of
+correlation state; open requests awaiting an END marker have a separate lifetime
+backstop. `--inference-window` governs optional inferred correlation and is
+independent of the retention setting. See `rgwtrace --help` for all options and
+defaults.
 
 ---
 
@@ -251,6 +271,9 @@ RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipp
 ---
 
 ## Verification
+
+See [Building and testing](docs/development.md) for build dependencies,
+container builds, and self-hosted E2E runner setup.
 
 Run local checks before shipping changes:
 

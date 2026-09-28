@@ -99,7 +99,10 @@ Every feature or significant change updates docs in the **same PR**. Style is pr
 
 - `ARCHITECTURE.md` — design / pipeline changes
 - `RUNBOOK.md` — operational or CLI-flag changes
-- `README.md` — overview and workflows
+- `README.md` — concise project overview and entry point to documentation
+- `docs/README.md` — documentation index
+- `docs/development.md` — build instructions and local/live test setup
+- `docs/trace-examples.md` — annotated trace examples
 
 For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` if it doesn't exist) explaining what happened, why, and the fix. Comments explain *why*, not *what*.
 
