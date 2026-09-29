@@ -1,0 +1,21 @@
+docs/dependency-audit.md
+  s_8f56404a79256a::t_122269a71bcefe 1-22
+Cargo.lock
+  s_8f56404a79256a::t_6169d0c55ec0f5 171,173,1336,1338,1360,1362
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0b22275d15ae22f70507b9ad73ab7019230880f7",
+  "prompts": {},
+  "sessions": {
+    "s_8f56404a79256a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0e825-8a81-7ae0-a94c-5339dc57e6dd",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
