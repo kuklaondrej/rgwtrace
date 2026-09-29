@@ -91,7 +91,7 @@ pub struct SynState {
 impl SynState {
     pub fn new() -> Self {
         // trans_id: a NUL-terminated string for get_handler's str read.
-        let mut trans_id = b"bench-trans-id".to_vec();
+        let mut trans_id = SYN_TRANS_ID.to_vec();
         trans_id.push(0);
         let trans_id = trans_id.into_boxed_slice();
 
@@ -321,8 +321,10 @@ mod tests {
         assert_ne!(state.syn_op.ops_start, 0);
         // Pointers survive a move of SynState (Box contents do not move).
         let p1 = state.req_state_ptr();
+        let op1 = state.syn_op_ptr();
         let moved = state;
         assert_eq!(moved.req_state_ptr(), p1);
+        assert_eq!(moved.syn_op_ptr(), op1);
     }
 
     #[test]
