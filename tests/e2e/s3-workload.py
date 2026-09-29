@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import math
+import subprocess
 import threading
 import time
 import uuid
@@ -18,6 +19,9 @@ def parse_args():
     parser.add_argument("--access-key", required=True)
     parser.add_argument("--secret-key", required=True)
     parser.add_argument("--bucket", default=None)
+    parser.add_argument("--bucket-shards", type=int, default=0,
+                        help="reshard the functional-test bucket before traffic (requires local RGW admin)")
+    parser.add_argument("--rgw-admin", default="radosgw-admin")
     parser.add_argument("--output", required=True, help="per-operation workload JSONL log")
     parser.add_argument(
         "--manifest",
@@ -511,6 +515,17 @@ def main():
         recorder = Recorder(handle)
         try:
             run_op(recorder, "create_bucket", bucket, None, lambda: client.create_bucket(Bucket=bucket))
+
+            if args.bucket_shards:
+                if args.bucket_shards < 2:
+                    raise ValueError("--bucket-shards must be at least 2")
+                subprocess.run([args.rgw_admin, "bucket", "reshard", "--bucket", bucket,
+                                "--num-shards", str(args.bucket_shards), "--yes-i-really-mean-it"],
+                               check=True, capture_output=True, text=True)
+                stats = subprocess.run([args.rgw_admin, "bucket", "stats", "--bucket", bucket],
+                                       check=True, capture_output=True, text=True)
+                if json.loads(stats.stdout).get("num_shards") != args.bucket_shards:
+                    raise RuntimeError("RGW bucket shard count does not match the requested test fixture")
 
             run_op(
                 recorder,
