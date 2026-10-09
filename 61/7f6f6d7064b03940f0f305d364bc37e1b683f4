@@ -1,0 +1,23 @@
+docs/bugfix-script-temp-dirs-and-credentials.md
+  s_4d990597f39574::t_2cc8d4185fec7d 1-130
+docs/README.md
+  s_4d990597f39574::t_e125c6529b23ab 40-42
+docs/development.md
+  s_4d990597f39574::t_33f0ba2deb42f0 39-44,112,114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "617f6f6d7064b03940f0f305d364bc37e1b683f4",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
