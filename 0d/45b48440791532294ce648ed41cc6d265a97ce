@@ -1,0 +1,25 @@
+ARCHITECTURE.md
+  s_4d990597f39574::t_9e9b7a27342807 222-229
+RUNBOOK.md
+  s_4d990597f39574::t_2f17a33403175e 105-165,192-196
+docs/README.md
+  s_4d990597f39574::t_f2bbd65187ef8d 38-39
+docs/bugfix-otlp-export-hardening.md
+  s_4d990597f39574::t_62bb2933569273 1-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0d45b48440791532294ce648ed41cc6d265a97ce",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
