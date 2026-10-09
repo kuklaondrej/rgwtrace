@@ -1,0 +1,19 @@
+src/otel.rs
+  s_4d990597f39574::t_cc82803508eeb3 53-56,83,109,251-256,437,442-446,448,457,477-479,556-565,1810-1863
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d56baa7b5f9c5bd7914b84bf7b52329794698589",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
