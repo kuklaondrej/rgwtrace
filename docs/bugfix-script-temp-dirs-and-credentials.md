@@ -59,6 +59,15 @@ Every writable directory the privileged scripts use goes through
   current uid, and must have no group/other write bits. `/tmp` itself is
   refused (world-writable; the sticky bit does not stop another user from
   creating entries in it).
+- Every ancestor is checked too, before anything is created: it must be owned
+  by root or the current uid, and be either not group/other writable or
+  sticky. Otherwise another user could rename our (correctly owned, 0700)
+  directory away after the check and put theirs at the same path, which the
+  scripts then write to and execute from by name. A sticky `/tmp` passes
+  because only an entry's owner can rename it there; a 0777 non-sticky
+  `/srv/shared` does not. Symlink components on the path must be owned by
+  root or us, since anyone else could re-point them. Covered by
+  `tests/scripts/private-dir-test.sh`, which `scripts/verify.sh` runs.
 
 The check uses GNU `stat -c` and falls back to BSD `stat -f` only so it can be
 exercised on macOS; the scripts remain Linux-only.
@@ -82,13 +91,16 @@ exactly as safe as asking the operator to do it first.
 - **export**: refuses to run outside a container (`/.dockerenv`,
   `/run/.containerenv`, `$container`) unless `RGWTRACE_ALLOW_HOST_EXPORT=1`.
   `ARTIFACT_DIR`, `CARGO_HOME`, `RUSTUP_HOME` and `CARGO_TARGET_DIR` live in
-  private directories. `rustup-init` is downloaded as a pinned release binary
+  private directories, each passed through the same check (the toolchain
+  binaries cargo runs as root live under `RUSTUP_HOME`). `rustup-init` is downloaded as a pinned release binary
   (`RUSTUP_INIT_VERSION`, currently 1.29.1) and compared with the SHA-256
   rustup publishes next to it, recorded in the script per architecture; the
   comment there says how to refresh it. The Ceph release key is downloaded to
   a private file and its fingerprint compared with the pinned
   `08B73419AC32B4E966C1A330E84AC2C0460F3994` before it is dearmored into the
-  keyring. Ceph's docs do not print the full fingerprint; the long key ID
+  keyring, and the file must contain exactly one primary key: `gpg --dearmor`
+  installs the whole file, so a second key appended by a compromised mirror
+  would otherwise be trusted by APT even though only the first was checked. Ceph's docs do not print the full fingerprint; the long key ID
   `E84AC2C0460F3994` is the one published in Ceph's 2015 signing-key security
   notice, and the pinned fingerprint ends in exactly that ID (computed from the
   key served by `download.ceph.com` on 2026-10-09). The `dwarf-artifact`

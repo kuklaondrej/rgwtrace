@@ -101,6 +101,27 @@ install_base_tools() {
         gnupg
 }
 
+# Print the primary-key fingerprint of an armored key file, refusing a file
+# that carries more than one primary key: gpg --dearmor installs the whole
+# file into the APT keyring, so a second key appended by a compromised server
+# would be trusted too even though only the first one was checked.
+ceph_key_single_fingerprint() {
+    local key_file="$1"
+    local listing pub_count
+    listing="$(gpg --batch --with-colons --show-keys --with-fingerprint "${key_file}" 2>/dev/null)" || {
+        err "gpg could not parse ${key_file}"
+        return 1
+    }
+    pub_count="$(printf '%s\n' "${listing}" | awk -F: '$1 == "pub"' | wc -l | tr -d ' ')"
+    if [[ "${pub_count}" != "1" ]]; then
+        err "expected exactly one primary key in ${key_file}, found ${pub_count}"
+        return 1
+    fi
+    # The first fpr record follows the (only) pub record; later ones belong to
+    # its subkeys.
+    printf '%s\n' "${listing}" | awk -F: '$1 == "fpr" { print $10; exit }'
+}
+
 configure_ceph_repo() {
     local codename="$1"
     local repo_url="https://download.ceph.com/debian-${CEPH_VERSION}"
@@ -119,8 +140,7 @@ configure_ceph_repo() {
     local key_asc="${WORK_DIR}/ceph-release.asc"
     local fingerprint
     curl --proto '=https' --tlsv1.2 -fsSL https://download.ceph.com/keys/release.asc -o "${key_asc}"
-    fingerprint="$(gpg --batch --with-colons --show-keys --with-fingerprint "${key_asc}" 2>/dev/null \
-        | awk -F: '$1 == "fpr" { print $10; exit }')"
+    fingerprint="$(ceph_key_single_fingerprint "${key_asc}")" || exit 1
     if [[ "${fingerprint}" != "${CEPH_RELEASE_KEY_FINGERPRINT}" ]]; then
         err "Ceph release key fingerprint mismatch: got '${fingerprint:-<none>}', expected ${CEPH_RELEASE_KEY_FINGERPRINT}"
         exit 1
@@ -229,6 +249,9 @@ install_rust_toolchain() {
     export CARGO_HOME="${CARGO_HOME:-${WORK_DIR}/cargo-home}"
     export RUSTUP_HOME="${RUSTUP_HOME:-${WORK_DIR}/rustup-home}"
     rgwtrace_require_private_dir "${CARGO_HOME}" "CARGO_HOME" || exit 1
+    # The toolchain binaries cargo runs as root live under RUSTUP_HOME, so it
+    # needs the same guarantee as CARGO_HOME.
+    rgwtrace_require_private_dir "${RUSTUP_HOME}" "RUSTUP_HOME" || exit 1
 
     if ! command -v rustup >/dev/null 2>&1 && [[ ! -x "${CARGO_HOME}/bin/rustup" ]]; then
         info "installing rustup"
