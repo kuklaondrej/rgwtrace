@@ -1,0 +1,21 @@
+src/collector_bench.rs
+  s_4d990597f39574::t_c0cebf0e779366 1-271
+src/main.rs
+  s_4d990597f39574::t_59298489e0fa84 6-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5bcc042774111bb8821993cb5bfe07aa480d974e",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
