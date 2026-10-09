@@ -1,0 +1,31 @@
+src/cli.rs
+  s_4d990597f39574::t_f56e6397acb761 26-31
+src/live/linux.rs
+  s_4d990597f39574::t_2909fc57f4961f 87-90,136-138,386,390,398,419
+src/main.rs
+  s_4d990597f39574::t_cceaf7833ca77b 30-36,91-93
+src/otel.rs
+  s_4d990597f39574::t_b173372fdabef4 1,20,36-110,114,217,229,238,616-618,627-633,641,1159-1161,1168-1228,1804,1806,1842,1957,1966-2007
+src/targets.rs
+  s_4d990597f39574::t_a2d4b36e026a1f 291
+tests/cli_otlp_config.rs
+  s_4d990597f39574::t_d7e2706be4117c 1-64
+tests/fixtures/otlp_test_ca.pem
+  s_4d990597f39574::t_3af5b414c05c17 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "52762d9e482b6516cd7fb241b88b7f260f3c21cc",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
