@@ -303,6 +303,7 @@ mod tests {
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),
             pid: None,
+            all_processes: false,
             timeout: None,
             dry_run: false,
             preflight: false,

@@ -66,3 +66,52 @@ fn export_dwarf_json_emits_full_loaded_probe_metadata() {
     assert_eq!(json["radosgw"]["build_id"], "222222");
     assert_eq!(json["trace"], Value::Null);
 }
+
+/// Live tracing without `--pid` used to attach every uprobe system-wide
+/// (`pid = -1`), so every librados client on the node -- OSDs, qemu/librbd,
+/// other gateways, CLI tools -- paid the probe cost and shared the ring buffer.
+/// Without `--pid` a live run must now refuse to start unless the operator opts
+/// in with `--all-processes`.
+#[test]
+fn live_tracing_without_pid_is_refused() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rgwtrace"))
+        .args([
+            "--import-json",
+            "tests/fixtures/minimal_dwarf.json",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("failed to run rgwtrace");
+
+    assert!(
+        !output.status.success(),
+        "live tracing without --pid must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--pid") && stderr.contains("--all-processes"),
+        "the error must name both --pid and the --all-processes opt-in: {stderr}"
+    );
+}
+
+#[test]
+fn all_processes_conflicts_with_pid() {
+    let output = Command::new(env!("CARGO_BIN_EXE_rgwtrace"))
+        .args([
+            "--import-json",
+            "tests/fixtures/minimal_dwarf.json",
+            "--pid",
+            "1",
+            "--all-processes",
+        ])
+        .output()
+        .expect("failed to run rgwtrace");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "clap must reject --pid together with --all-processes: {stderr}"
+    );
+}

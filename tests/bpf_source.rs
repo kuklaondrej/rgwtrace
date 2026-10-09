@@ -780,8 +780,12 @@ fn revocation_is_total_and_survives_an_lru_eviction_of_the_canonical_entry() {
     // `this` pointer. The record is keyed by that very pointer, so without it there
     // is nothing to look up. Every other path -- crucially the canonical-entry miss
     // -- must fall through to the revocation.
+    // (The process-scope gate's own early return precedes all of this: a foreign
+    // process never inserted a record either.)
+    let gate = "  if (rgwtrace_foreign_process())\n    return 0;\n";
+    let after_gate = dtor.find(gate).expect("process-scope gate") + gate.len();
     assert_eq!(
-        dtor[..record_read].matches("return 0;").count(),
+        dtor[after_gate..record_read].matches("return 0;").count(),
         2,
         "only an absent/unresolvable `this` may return before the revocation"
     );
@@ -918,4 +922,93 @@ fn dwarf_native_demangling_uses_fallible_api() {
 fn dwarf_native_symbol_lookup_ignores_local_non_text_symbols() {
     assert!(DWARF_NATIVE.contains("!symbol.is_global()"));
     assert!(DWARF_NATIVE.contains("symbol.kind() != SymbolKind::Text"));
+}
+
+const CEPH_ABI: &str = include_str!("../bpf/ceph_abi.h");
+
+/// The text of every `SEC("uprobe...")` program, from its section attribute up to
+/// (not including) the next one.
+fn uprobe_programs() -> Vec<&'static str> {
+    let starts: Vec<usize> = RGWTRACE_BPF
+        .match_indices("SEC(\"uprobe")
+        .map(|(idx, _)| idx)
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, start)| {
+            let end = starts.get(i + 1).copied().unwrap_or(RGWTRACE_BPF.len());
+            &RGWTRACE_BPF[*start..end]
+        })
+        .collect()
+}
+
+#[test]
+fn every_uprobe_program_drops_foreign_processes_before_doing_anything() {
+    // F6: the uprobes used to fire for every process on the node that maps the
+    // probed libraries. The per-process filter is a .rodata constant set by
+    // userspace before load (0 = --all-processes), and every program must test it
+    // FIRST -- before any map lookup, map update, or probe read -- so a foreign
+    // process pays only one helper call and never touches shared state.
+    assert!(RGWTRACE_BPF.contains("const volatile __u32 TARGET_TGID = 0;"));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "static __always_inline bool rgwtrace_foreign_process(void) {\n",
+        "  return TARGET_TGID != 0 && (bpf_get_current_pid_tgid() >> 32) != TARGET_TGID;\n",
+        "}\n"
+    )));
+
+    let programs = uprobe_programs();
+    assert!(
+        programs.len() >= 7,
+        "expected every uprobe program, found {}",
+        programs.len()
+    );
+    for program in programs {
+        let body_start = program.find("{\n").expect("program body") + 2;
+        let body = &program[body_start..];
+        assert!(
+            body.starts_with("  if (rgwtrace_foreign_process())\n    return 0;\n"),
+            "uprobe program must gate on the target tgid as its first statement:\n{}",
+            &program[..program.len().min(240)]
+        );
+    }
+}
+
+#[test]
+fn userspace_publishes_the_target_tgid_before_load() {
+    // The gate is only as good as the value behind it: it is written into
+    // .rodata on the OPEN skeleton (a const volatile is frozen at load), from
+    // --pid, and is 0 only for --all-processes.
+    assert!(LIVE_LINUX.contains("rodata.TARGET_TGID = target_tgid;"));
+    let configure = LIVE_LINUX
+        .find("open.maps.rodata_data")
+        .expect("configure_rodata call");
+    let load = LIVE_LINUX.find("open.load()").expect("skeleton load");
+    assert!(configure < load, "rodata must be configured before load");
+}
+
+#[test]
+fn rados_op_key_is_scoped_by_process() {
+    // F6: rados_ops was keyed by (cid, tid) only, so two processes -- or two
+    // failed probe reads, which leave the key at {0, 0} -- shared one entry. The
+    // tgid makes the key process-scoped; the pad is explicit so the zeroed key
+    // hashes deterministically.
+    assert!(CEPH_ABI.contains(concat!(
+        "struct client_op_key {\n",
+        "  __u64 cid;\n",
+        "  __u64 tid;\n",
+        "  __u32 tgid;\n",
+        "  __u32 _pad;\n",
+        "};"
+    )));
+    for program in ["int uprobe_send_op(", "int uprobe_finish_op("] {
+        let start = RGWTRACE_BPF.find(program).expect(program);
+        let body = &RGWTRACE_BPF[start..];
+        let key_init = body
+            .find("struct client_op_key key = {};")
+            .expect("zeroed key");
+        let tgid = body.find("key.tgid = get_pid();").expect("tgid stamp");
+        let first_map_op = body.find("&rados_ops, &key").expect("rados_ops use");
+        assert!(key_init < tgid && tgid < first_map_op, "{program}");
+    }
 }
