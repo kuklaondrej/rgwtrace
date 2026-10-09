@@ -150,7 +150,7 @@ impl TestElf {
             0,
         ]);
 
-        let mut append = |out: &mut Vec<u8>, data: &[u8]| {
+        let append = |out: &mut Vec<u8>, data: &[u8]| {
             while !out.len().is_multiple_of(8) {
                 out.push(0);
             }
