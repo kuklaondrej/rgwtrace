@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use gimli::{
     AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Dwarf, EndianSlice,
-    EntriesTreeNode, Operation, Reader, RunTimeEndian, UnitOffset,
+    EntriesTreeNode, Operation, Reader, ReaderOffset, RunTimeEndian, UnitOffset,
 };
 use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::{debug, warn};
@@ -567,6 +567,46 @@ struct DieRef<Offset> {
 /// (the visited check already breaks cycles).
 const ORIGIN_CHAIN_LIMIT: usize = 8;
 
+/// Hard cap on how many type DIEs one type walk may follow (typedef/cv
+/// qualifiers, and pointer/reference indirections within one field-path step).
+/// Real chains are a handful of links; only a reference cycle in malformed DWARF
+/// reaches the cap, and the walk then fails instead of spinning forever.
+const TYPE_CHAIN_LIMIT: usize = 64;
+
+/// Hard cap on how many classes one member lookup may search through the
+/// inheritance graph. The graph is already de-duplicated (a visited set breaks
+/// cycles and diamonds); this only bounds the work an adversarial file can force.
+const INHERITANCE_SEARCH_LIMIT: usize = 4096;
+
+/// Hard cap on namespace/class nesting for the RECURSIVE function walkers
+/// ([`collect_function_pcs`], [`collect_function_var_fields`]). They stop at every
+/// subprogram, so they only ever descend through scopes -- a few dozen levels in
+/// the deepest real C++. They stay recursive because the `EntriesTree` they walk
+/// skips a subprogram's body via `DW_AT_sibling` without parsing it; the cap keeps
+/// a hostile file from turning that recursion into a stack overflow (which aborts
+/// the process rather than returning an error).
+const SCOPE_NESTING_LIMIT: usize = 256;
+
+/// Human-readable location of a DIE for error messages: its `.debug_info`
+/// section offset (what `readelf --debug-dump=info` / `llvm-dwarfdump` print), and
+/// which file it lives in.
+fn die_location<R: Reader>(index: &DwarfUnitIndex<R>, die: DieRef<R::Offset>) -> String {
+    let section = if index.is_sup(die.unit) {
+        "supplementary (DWZ) .debug_info"
+    } else {
+        ".debug_info"
+    };
+    let unit = index.unit(die.unit);
+    match die.offset.to_debug_info_offset(&unit.header) {
+        Some(offset) => format!("DIE at {section} offset {:#x}", offset.0.into_u64()),
+        None => format!(
+            "DIE at unit offset {:#x} in {section} unit {}",
+            die.offset.0.into_u64(),
+            die.unit
+        ),
+    }
+}
+
 /// The DIEs an attribute of `die` may be inherited from, NEAREST FIRST: `die`
 /// itself, then the transitive closure of its `DW_AT_abstract_origin` and
 /// `DW_AT_specification` references.
@@ -840,6 +880,7 @@ fn function_pcs<R: Reader>(
             index,
             unit_index,
             root,
+            0,
             &mut Vec::new(),
             &mut result,
             wanted,
@@ -878,6 +919,7 @@ fn function_var_fields<R: Reader>(
             index,
             unit_index,
             root,
+            0,
             &mut Vec::new(),
             &mut result,
             wanted,
@@ -897,6 +939,7 @@ fn collect_function_var_fields<R: Reader>(
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
     node: EntriesTreeNode<R>,
+    depth: usize,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
     wanted: &[&str],
@@ -905,6 +948,19 @@ fn collect_function_var_fields<R: Reader>(
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
+    }
+    if depth > SCOPE_NESTING_LIMIT {
+        anyhow::bail!(
+            "DWARF scope nesting deeper than {SCOPE_NESTING_LIMIT} levels at {} \
+             (malformed DWARF?)",
+            die_location(
+                index,
+                DieRef {
+                    unit: unit_index,
+                    offset: node.entry().offset(),
+                }
+            )
+        );
     }
 
     let unit = index.unit(unit_index);
@@ -956,7 +1012,16 @@ fn collect_function_var_fields<R: Reader>(
     let mut children = node.children();
     while let Some(child) = children.next()? {
         collect_function_var_fields(
-            dwarf, index, unit_index, child, scopes, result, wanted, facts, probe_pcs,
+            dwarf,
+            index,
+            unit_index,
+            child,
+            depth + 1,
+            scopes,
+            result,
+            wanted,
+            facts,
+            probe_pcs,
         )?;
         if has_all_functions(result, wanted) {
             break;
@@ -1408,69 +1473,104 @@ fn type_definition_die<R: Reader>(
         return Ok(None);
     };
     for unit_index in 0..index.len() {
-        let unit = index.unit(unit_index);
-        let mut tree = unit.entries_tree(None)?;
-        let root = tree.root()?;
-        let mut scopes = Vec::new();
-        if let Some(found) =
-            find_type_definition(dwarf, index, unit_index, root, &path, &mut scopes)?
-        {
+        if let Some(found) = find_type_definition(dwarf, index, unit_index, &path)? {
             return Ok(Some(found));
         }
     }
     Ok(None)
 }
 
-/// Find the non-declaration class/struct DIE whose enclosing scopes plus own name
-/// equal `path`, anywhere under `node`.
+/// Enclosing-scope stack for an iterative `next_dfs` walk: a scope pushed at
+/// depth `d` encloses every DIE deeper than `d`, and is popped as soon as the walk
+/// returns to depth `d` or shallower.
+///
+/// The type/scope searches below walk a WHOLE unit, subprogram bodies included,
+/// so their depth is whatever lexical-block / inlined-subroutine nesting the file
+/// has. Doing that with `next_dfs` instead of recursion keeps stack use constant,
+/// however deep the tree -- a recursive walker overflows (and aborts the process)
+/// on a hostile file's deep nesting.
+struct DfsScopes {
+    depth: isize,
+    scopes: Vec<(isize, String)>,
+}
+
+impl DfsScopes {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Account for the `delta` `next_dfs` returned with the current entry and
+    /// drop every scope the walk has left.
+    fn step(&mut self, delta: isize) {
+        self.depth += delta;
+        while self
+            .scopes
+            .last()
+            .is_some_and(|(scope_depth, _)| *scope_depth >= self.depth)
+        {
+            self.scopes.pop();
+        }
+    }
+
+    /// The scopes enclosing the current entry, outermost first.
+    fn enclosing(&self) -> impl Iterator<Item = &str> {
+        self.scopes.iter().map(|(_, name)| name.as_str())
+    }
+
+    fn len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Open `scope` (the current entry's own scope name) for its descendants.
+    fn push(&mut self, scope: String) {
+        self.scopes.push((self.depth, scope));
+    }
+}
+
+/// Find the non-declaration class/struct DIE in unit `unit_index` whose
+/// enclosing scopes plus own name equal `path`.
 fn find_type_definition<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
-    node: EntriesTreeNode<R>,
     path: &[String],
-    scopes: &mut Vec<String>,
 ) -> Result<Option<DieRef<R::Offset>>> {
     let unit = index.unit(unit_index);
     let dwarf = dwarf_for(dwarf, index, unit_index);
-    let entry = node.entry();
-    let is_definition = matches!(
-        entry.tag(),
-        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
-    ) && !entry_flag(entry, gimli::DW_AT_declaration)?;
-    let name = die_name(dwarf, unit, entry)?;
+    let mut scopes = DfsScopes::new();
+    let mut entries = unit.entries();
+    while let Some((delta, entry)) = entries.next_dfs()? {
+        scopes.step(delta);
+        let is_definition = matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+        ) && !entry_flag(entry, gimli::DW_AT_declaration)?;
+        let name = die_name(dwarf, unit, entry)?;
 
-    if is_definition {
-        if let Some(name) = &name {
-            // The candidate's identity is its scope stack plus its own name. Only an
-            // exact match on the WHOLE path is the same type.
-            if path.len() == scopes.len() + 1
-                && path[..scopes.len()] == scopes[..]
-                && path[scopes.len()] == *name
-            {
-                return Ok(Some(DieRef {
-                    unit: unit_index,
-                    offset: entry.offset(),
-                }));
+        if is_definition {
+            if let Some(name) = &name {
+                // The candidate's identity is its scope stack plus its own name. Only
+                // an exact match on the WHOLE path is the same type.
+                if path.len() == scopes.len() + 1
+                    && scopes
+                        .enclosing()
+                        .eq(path[..scopes.len()].iter().map(String::as_str))
+                    && path[scopes.len()] == *name
+                {
+                    return Ok(Some(DieRef {
+                        unit: unit_index,
+                        offset: entry.offset(),
+                    }));
+                }
             }
         }
-    }
 
-    let scope = scope_name(dwarf, unit, entry)?;
-    if let Some(scope) = &scope {
-        scopes.push(scope.clone());
-    }
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(found) = find_type_definition(dwarf, index, unit_index, child, path, scopes)? {
-            if scope.is_some() {
-                scopes.pop();
-            }
-            return Ok(Some(found));
+        if let Some(scope) = scope_name(dwarf, unit, entry)? {
+            scopes.push(scope);
         }
-    }
-    if scope.is_some() {
-        scopes.pop();
     }
     Ok(None)
 }
@@ -1658,17 +1758,32 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_function_pcs<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
     node: EntriesTreeNode<R>,
+    depth: usize,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, RankedPc>,
     wanted: &[&str],
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
+    }
+    if depth > SCOPE_NESTING_LIMIT {
+        anyhow::bail!(
+            "DWARF scope nesting deeper than {SCOPE_NESTING_LIMIT} levels at {} \
+             (malformed DWARF?)",
+            die_location(
+                index,
+                DieRef {
+                    unit: unit_index,
+                    offset: node.entry().offset(),
+                }
+            )
+        );
     }
 
     let unit = index.unit(unit_index);
@@ -1704,7 +1819,16 @@ fn collect_function_pcs<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_pcs(dwarf, index, unit_index, child, scopes, result, wanted)?;
+        collect_function_pcs(
+            dwarf,
+            index,
+            unit_index,
+            child,
+            depth + 1,
+            scopes,
+            result,
+            wanted,
+        )?;
         if has_all_functions(result, wanted) {
             break;
         }
@@ -1868,39 +1992,17 @@ fn entry_scopes<R: Reader>(
 ) -> Result<Option<Vec<String>>> {
     let dwarf = dwarf_for(dwarf, index, die.unit);
     let unit = index.unit(die.unit);
-    let mut tree = unit.entries_tree(None)?;
-    let root = tree.root()?;
-    find_entry_scopes(dwarf, unit, root, die.offset, &mut Vec::new())
-}
-
-fn find_entry_scopes<R: Reader>(
-    dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    node: EntriesTreeNode<R>,
-    offset: gimli::UnitOffset<R::Offset>,
-    scopes: &mut Vec<String>,
-) -> Result<Option<Vec<String>>> {
-    let entry = node.entry();
-    if entry.offset() == offset {
-        return Ok(Some(scopes.clone()));
-    }
-
-    let scope = scope_name(dwarf, unit, entry)?;
-    if let Some(scope) = &scope {
-        scopes.push(scope.clone());
-    }
-
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(found) = find_entry_scopes(dwarf, unit, child, offset, scopes)? {
-            return Ok(Some(found));
+    let mut scopes = DfsScopes::new();
+    let mut entries = unit.entries();
+    while let Some((delta, entry)) = entries.next_dfs()? {
+        scopes.step(delta);
+        if entry.offset() == die.offset {
+            return Ok(Some(scopes.enclosing().map(str::to_string).collect()));
+        }
+        if let Some(scope) = scope_name(dwarf, unit, entry)? {
+            scopes.push(scope);
         }
     }
-
-    if scope.is_some() {
-        scopes.pop();
-    }
-
     Ok(None)
 }
 
@@ -1928,6 +2030,9 @@ fn translate_field_path_from<R: Reader>(
     path: &[&str],
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
+    // Pointer/reference hops do not advance `field_index`, so a pointer type that
+    // (directly or through qualifiers) points at itself would loop here forever.
+    let mut indirections = 0;
     while field_index < path.len() {
         typedie = peel_type_qualifiers(index, typedie)?;
         let typedie_unit = index.unit(typedie.unit);
@@ -1937,6 +2042,16 @@ fn translate_field_path_from<R: Reader>(
             | gimli::DW_TAG_rvalue_reference_type
             | gimli::DW_TAG_pointer_type => {
                 fields[field_index].pointer = true;
+                indirections += 1;
+                if indirections > TYPE_CHAIN_LIMIT {
+                    anyhow::bail!(
+                        "type chain at {} exceeds {TYPE_CHAIN_LIMIT} pointer/reference \
+                         indirections while resolving field {:?} (malformed DWARF: \
+                         reference cycle?)",
+                        die_location(index, typedie),
+                        path[field_index]
+                    );
+                }
                 let Some(next_type) = die_type(index, typedie)? else {
                     return Ok(None);
                 };
@@ -2026,11 +2141,8 @@ fn translate_named_type_field_path<R: Reader>(
         field_index,
     };
     for unit_index in 0..index.len() {
-        let unit = index.unit(unit_index);
-        let mut tree = unit.entries_tree(None)?;
-        let root = tree.root()?;
         if let Some(fields) =
-            find_named_type_field_path(dwarf, index, unit_index, root, &search, resolving)?
+            find_named_type_field_path(dwarf, index, unit_index, &search, resolving)?
         {
             return Ok(Some(fields));
         }
@@ -2045,23 +2157,28 @@ struct NamedTypeFieldSearch<'a> {
     field_index: usize,
 }
 
+/// Try every definition of `search.type_name` in unit `unit_index`, in DIE
+/// order, and return the first one the remaining field path resolves through.
+/// Iterative (`next_dfs`) for the same reason as [`find_type_definition`].
 fn find_named_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
-    node: EntriesTreeNode<R>,
     search: &NamedTypeFieldSearch<'_>,
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
     let unit = index.unit(unit_index);
-    let entry = node.entry();
-    if matches!(
-        entry.tag(),
-        gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
-    ) && die_name(dwarf_for(dwarf, index, unit_index), unit, entry)?.as_deref()
-        == Some(search.type_name)
-        && !entry_flag(entry, gimli::DW_AT_declaration)?
-    {
+    let unit_dwarf = dwarf_for(dwarf, index, unit_index);
+    let mut entries = unit.entries();
+    while let Some((_, entry)) = entries.next_dfs()? {
+        if !matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
+        ) || die_name(unit_dwarf, unit, entry)?.as_deref() != Some(search.type_name)
+            || entry_flag(entry, gimli::DW_AT_declaration)?
+        {
+            continue;
+        }
         let typedie = DieRef {
             unit: unit_index,
             offset: entry.offset(),
@@ -2079,16 +2196,6 @@ fn find_named_type_field_path<R: Reader>(
             return Ok(Some(fields));
         }
     }
-
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(fields) =
-            find_named_type_field_path(dwarf, index, unit_index, child, search, resolving)?
-        {
-            return Ok(Some(fields));
-        }
-    }
-
     Ok(None)
 }
 
@@ -2190,8 +2297,10 @@ fn add_location_offset(location: &mut VarLocationJson, offset: i64) -> Result<()
 
 fn peel_type_qualifiers<R: Reader>(
     index: &DwarfUnitIndex<R>,
-    mut typedie: DieRef<R::Offset>,
+    start: DieRef<R::Offset>,
 ) -> Result<DieRef<R::Offset>> {
+    let mut typedie = start;
+    let mut hops = 0;
     while matches!(
         index.entry(typedie)?.tag(),
         gimli::DW_TAG_typedef
@@ -2202,6 +2311,14 @@ fn peel_type_qualifiers<R: Reader>(
         let Some(next_type) = die_type(index, typedie)? else {
             break;
         };
+        hops += 1;
+        if hops > TYPE_CHAIN_LIMIT {
+            anyhow::bail!(
+                "type qualifier chain starting at {} exceeds {TYPE_CHAIN_LIMIT} typedef/cv links \
+                 (malformed DWARF: reference cycle?)",
+                die_location(index, start)
+            );
+        }
         typedie = next_type;
     }
     Ok(typedie)
@@ -2213,8 +2330,23 @@ fn find_member_entry<R: Reader>(
     typedie: DieRef<R::Offset>,
     member_name: &str,
 ) -> Result<Option<DieRef<R::Offset>>> {
+    // Base classes are searched depth-first, each at most once: `visited` breaks
+    // an inheritance cycle (impossible in C++, possible in a hostile file) and
+    // keeps a diamond from being walked once per path to it.
     let mut queue = vec![typedie];
+    let mut visited: Vec<DieRef<R::Offset>> = Vec::new();
     while let Some(parent) = queue.pop() {
+        if visited.contains(&parent) {
+            continue;
+        }
+        if visited.len() >= INHERITANCE_SEARCH_LIMIT {
+            anyhow::bail!(
+                "member lookup for {member_name:?} from {} searched more than \
+                 {INHERITANCE_SEARCH_LIMIT} base classes (malformed DWARF?)",
+                die_location(index, typedie)
+            );
+        }
+        visited.push(parent);
         let unit = index.unit(parent.unit);
         // A member's owning struct may live in the DWZ supplementary file
         // (reached via `DW_FORM_GNU_ref_alt` on `DW_AT_type`); its member names
@@ -5779,3 +5911,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dwarf_native_robustness_tests.rs"]
+mod robustness_tests;
