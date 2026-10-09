@@ -1,0 +1,23 @@
+docs/bugfix-target-scoping.md
+  s_4d990597f39574::t_f291be0c21d8de 125-132,154
+src/dwarf_native.rs
+  s_4d990597f39574::t_4727c965750061 2791-2792,2827-2830,2832-2845,3011-3036
+src/targets.rs
+  s_4d990597f39574::t_63f1acd1726978 13,91-92,126-127,302-326,343-348,358-360,364-373,377-380,401-408,415,830-882
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "65fd4275f8c1f6d81d95cbd964e704172831e939",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
