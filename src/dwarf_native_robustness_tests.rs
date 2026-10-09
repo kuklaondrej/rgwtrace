@@ -553,20 +553,37 @@ fn explicit_version_needs_no_lookup_for_a_containerized_target() {
 // Demangling prefilter.
 // ---------------------------------------------------------------------------
 
-/// Probe-relevant and unrelated mangled names, including the variants the
-/// linkage-name gate must still see (D0/D1/D2 destructors, both
-/// `rgw_rados_operate` overloads) and a Mach-O style leading underscore.
-const MANGLED_SAMPLES: &[&str] = &[
-    "_ZN8Objecter8_send_opEPNS_2OpE",
-    "_ZN8Objecter10_finish_opEPNS_2OpEi",
-    "_ZN7RGWREST11get_handlerEPN3rgw3sal6DriverEP9req_stateRKNS0_4auth16StrategyRegistryERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERi",
-    "_Z25rgw_process_authenticatedP15RGWHandler_RESTRP5RGWOpP10RGWRequestP9req_stateoN5boost4asio...",
-    "_ZN9req_stateD0Ev",
-    "_ZN9req_stateD1Ev",
-    "_ZN9req_stateD2Ev",
-    "__ZN9req_stateD2Ev",
-    "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_09IoCtxEERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_16ObjectReadOperationEPN4ceph6buffer7v15_2_04listEN5boost4asio...",
-    "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_09IoCtxEERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_17ObjectWriteOperationEN5boost4asio...",
+/// Complete mangled definitions of every probe, paired with the probe key each
+/// must resolve to: all three destructor variants (only D1/D2 are accepted for
+/// the key; D0 must still reach the linkage-name gate), both
+/// `rgw_rados_operate` overloads, and a Mach-O style leading underscore.
+const PROBE_SAMPLES: &[(&str, &str)] = &[
+    ("_ZN8Objecter8_send_opEPNS_2OpE", "Objecter::_send_op"),
+    ("_ZN8Objecter10_finish_opEPNS_2OpEi", "Objecter::_finish_op"),
+    (
+        "_ZN7RGWREST11get_handlerEPN3rgw3sal6DriverEP9req_stateRKNS0_4auth16StrategyRegistryERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERi",
+        RGWREST_GET_HANDLER,
+    ),
+    (
+        "_Z25rgw_process_authenticatedP15RGWHandler_RESTRP5RGWOpP10RGWRequestP9req_state14optional_yieldPN3rgw3sal6DriverEb",
+        RGW_PROCESS_AUTHENTICATED,
+    ),
+    ("_ZN9req_stateD0Ev", REQ_STATE_DTOR),
+    ("_ZN9req_stateD1Ev", REQ_STATE_DTOR),
+    ("_ZN9req_stateD2Ev", REQ_STATE_DTOR),
+    ("__ZN9req_stateD2Ev", REQ_STATE_DTOR),
+    (
+        "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_19ObjectReadOperationEPN4ceph6buffer7v15_2_04listE14optional_yieldi",
+        RGW_RADOS_OPERATE_READ,
+    ),
+    (
+        "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_05IoCtxERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_20ObjectWriteOperationE14optional_yieldi",
+        RGW_RADOS_OPERATE_WRITE,
+    ),
+];
+
+/// Names that must NOT pass the prefilter.
+const UNRELATED_SAMPLES: &[&str] = &[
     "_ZN8Objecter9op_submitEPNS_2OpEPmPi",
     "_ZNSt6vectorIiSaIiEE9push_backERKi",
     "_ZN5boost4asio6detail9scheduler3runERNS_6system10error_codeE",
@@ -596,23 +613,32 @@ fn assert_prefilter_is_sound(names: impl IntoIterator<Item = String>) -> usize {
 
 #[test]
 fn prefilter_keeps_every_probe_definition() {
-    for name in MANGLED_SAMPLES {
-        let Some(demangled) = demangle_function_name(name) else {
-            continue;
-        };
-        if !probe_keys(&demangled, PROBE_FUNCTIONS).is_empty() {
-            assert!(may_name_probe(name, PROBE_FUNCTIONS), "{name}");
-        }
+    for (name, key) in PROBE_SAMPLES {
+        // Every sample must actually exercise the matcher: a name that fails to
+        // demangle, or demangles to something else, would make this test vacuous.
+        let demangled = demangle_function_name(name)
+            .unwrap_or_else(|| panic!("probe sample {name} does not demangle"));
+        assert!(
+            probe_keys(&demangled, PROBE_FUNCTIONS).contains(key),
+            "probe sample {name} demangles to {demangled}, not a candidate for {key}"
+        );
+        assert!(
+            may_name_probe(name, PROBE_FUNCTIONS),
+            "prefilter dropped {name}"
+        );
+        assert!(
+            may_name_probe(name, &[key]),
+            "prefilter dropped {name} for {key}"
+        );
     }
-    assert!(!may_name_probe(
-        "_ZN5boost4asio6detail9scheduler3runERNS_6system10error_codeE",
-        PROBE_FUNCTIONS
-    ));
-    assert!(!may_name_probe(
-        "_ZN8Objecter9op_submitEPNS_2OpEPmPi",
-        PROBE_FUNCTIONS
-    ));
-    assert_prefilter_is_sound(MANGLED_SAMPLES.iter().map(|name| name.to_string()));
+    for name in UNRELATED_SAMPLES {
+        assert!(!may_name_probe(name, PROBE_FUNCTIONS), "{name}");
+    }
+    let all = PROBE_SAMPLES
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(UNRELATED_SAMPLES.iter().copied());
+    assert_prefilter_is_sound(all.map(str::to_string));
 }
 
 #[test]
