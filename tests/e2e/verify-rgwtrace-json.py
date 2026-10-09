@@ -59,6 +59,11 @@ VALID_BACKGROUND_REASONS = {
     # kept as background rather than re-grouped, because re-grouping would emit a
     # SECOND request span with the same span id.
     "request_already_emitted",
+    # A trans_id-carrying op for a request the collector does not hold and that
+    # started before the no-duplicate tombstone's horizon (its key may have been
+    # rotated out), so it cannot be proven new. Kept as background for the same
+    # reason as request_already_emitted.
+    "request_outside_tombstone_horizon",
 }
 BPF_FAILURE_DIAGNOSTICS = [
     "bpf_ringbuf_request_drops",
@@ -168,6 +173,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Verify rgwtrace JSON from a live RGW e2e run")
     parser.add_argument("--trace")
     parser.add_argument("--workload")
+    parser.add_argument(
+        "--trace-format",
+        choices=["auto", "json", "jsonl"],
+        default="auto",
+        help="json: one --output json document; jsonl: --output jsonl (one document "
+        "per drain, merged before verification); auto: detect",
+    )
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--min-request-spans", type=int, default=1)
     parser.add_argument("--min-rados-spans", type=int, default=1)
@@ -214,6 +226,69 @@ def parse_args():
 def load_json(path):
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_trace(path, trace_format="auto"):
+    """Load an --output json document, or an --output jsonl stream merged into one.
+
+    auto: a file holding exactly one JSON value is json; otherwise every
+    non-empty line must be a document and the file is jsonl.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    if trace_format == "json":
+        return json.loads(text), []
+    if trace_format == "auto":
+        try:
+            return json.loads(text), []
+        except json.JSONDecodeError:
+            pass
+    lines = [json.loads(line) for line in text.splitlines() if line.strip()]
+    return merge_jsonl_documents(lines)
+
+
+def merge_jsonl_documents(lines):
+    """Fold the per-drain documents of an --output jsonl run into the single
+    document --output json would have printed, plus any stream-level errors.
+
+    Each line carries that drain's spans and the CUMULATIVE diagnostics at that
+    moment, with spans_produced counting the line's own spans. So: spans are
+    concatenated, diagnostics are the LAST line's (the run's final totals), and
+    spans_produced is the sum. A span repeated across lines then fails the
+    ordinary duplicate-span_id check -- which is exactly the "never emitted twice"
+    invariant streaming must keep.
+    """
+    errors = []
+    if not lines:
+        return {"trace": {"spans": [], "diagnostics": {}}}, ["jsonl stream has no documents"]
+    spans = []
+    previous = {}
+    for index, line in enumerate(lines, start=1):
+        trace = line.get("trace", line)
+        line_spans = trace.get("spans", [])
+        diagnostics = trace.get("diagnostics", {})
+        if diagnostics.get("spans_produced") != len(line_spans):
+            errors.append(
+                f"jsonl line {index}: spans_produced={diagnostics.get('spans_produced')} "
+                f"but the line has {len(line_spans)} spans"
+            )
+        for key, value in diagnostics.items():
+            # Cumulative counters never go backwards (spans_produced is per line).
+            if key == "spans_produced" or not isinstance(value, int):
+                continue
+            if value < previous.get(key, 0):
+                errors.append(f"jsonl line {index}: cumulative counter {key} went backwards")
+        previous = diagnostics
+        spans.extend(line_spans)
+    final = lines[-1]
+    trace = dict(final.get("trace", final))
+    diagnostics = dict(trace.get("diagnostics", {}))
+    diagnostics["spans_produced"] = len(spans)
+    trace["spans"] = spans
+    trace["diagnostics"] = diagnostics
+    merged = dict(final) if "trace" in final else {}
+    merged["trace"] = trace
+    return merged, errors
 
 
 def load_workload(path):
@@ -658,8 +733,11 @@ def verify_document(args, document, workload, manifest=None):
         fail(errors, "expected same_thread_correlations > 0")
     if diagnostics.get("spans_produced") != len(spans):
         fail(errors, f"spans_produced={diagnostics.get('spans_produced')} but JSON has {len(spans)} spans")
-    if diagnostics.get("rados_ops") != len(rados_spans) + len(background_spans):
-        fail(errors, f"rados_ops={diagnostics.get('rados_ops')} but JSON has {len(rados_spans)} child and {len(background_spans)} background RADOS spans")
+    # An op dropped because the --output json buffer cap was reached is counted in
+    # rados_ops but rendered as no span.
+    buffer_dropped_ops = diagnostics.get("buffer_full_dropped_rados_ops", 0)
+    if diagnostics.get("rados_ops") != len(rados_spans) + len(background_spans) + buffer_dropped_ops:
+        fail(errors, f"rados_ops={diagnostics.get('rados_ops')} but JSON has {len(rados_spans)} child and {len(background_spans)} background RADOS spans (+{buffer_dropped_ops} dropped at the buffer cap)")
     if diagnostics.get("correlated_rados_ops") != len(rados_spans):
         fail(errors, f"correlated_rados_ops={diagnostics.get('correlated_rados_ops')} but JSON has {len(rados_spans)} rados.op spans")
     if diagnostics.get("background_rados_ops") != len(background_spans):
@@ -1814,6 +1892,77 @@ def run_manifest_self_test():
     return 0
 
 
+def split_into_jsonl(document):
+    """valid_self_test_document as an --output jsonl run would stream it: the
+    request with its child in one drain, the background span in the final line,
+    each line carrying cumulative diagnostics and its own spans_produced."""
+    spans = document["spans"]
+    request_and_child = [span for span in spans if span["name"] != "rgw.background.rados_op"]
+    background = [span for span in spans if span["name"] == "rgw.background.rados_op"]
+    first = deepcopy(document)
+    first["spans"] = request_and_child
+    first["diagnostics"]["spans_produced"] = len(request_and_child)
+    last = deepcopy(document)
+    last["spans"] = background
+    last["diagnostics"]["spans_produced"] = len(background)
+    return [{"dwarf": {"version": "19.2.3"}, "trace": first}, {"dwarf": {"version": "19.2.3"}, "trace": last}]
+
+
+def run_jsonl_self_test():
+    import os
+    import tempfile
+
+    args = self_test_args()
+    workload = valid_self_test_workload()
+
+    def verify_lines(lines):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as handle:
+            for line in lines:
+                handle.write(json.dumps(line) + "\n")
+            path = handle.name
+        try:
+            document, stream_errors = load_trace(path, "auto")
+        finally:
+            os.unlink(path)
+        _, errors = verify_document(args, document, workload)
+        return stream_errors + errors
+
+    errors = verify_lines(split_into_jsonl(valid_self_test_document()))
+    if errors:
+        for error in errors:
+            print(f"SELF-TEST ERROR: valid jsonl stream failed: {error}", file=sys.stderr)
+        return 1
+
+    cases = [
+        (
+            # The core streaming invariant: a request must never be emitted twice
+            # under one span id, even across drains.
+            "span repeated across lines",
+            lambda lines: lines[1]["trace"]["spans"].append(deepcopy(lines[0]["trace"]["spans"][0])),
+            "duplicate span_id",
+        ),
+        (
+            "per-line spans_produced",
+            lambda lines: lines[0]["trace"]["diagnostics"].update({"spans_produced": 7}),
+            "jsonl line 1: spans_produced=7",
+        ),
+        (
+            "cumulative counter regression",
+            lambda lines: lines[0]["trace"]["diagnostics"].update({"rados_ops": 99}),
+            "cumulative counter rados_ops went backwards",
+        ),
+    ]
+    for name, mutate, expected_error in cases:
+        lines = split_into_jsonl(valid_self_test_document())
+        mutate(lines)
+        errors = verify_lines(lines)
+        if not any(expected_error in error for error in errors):
+            print(f"SELF-TEST ERROR: jsonl {name} case did not fail with {expected_error!r}", file=sys.stderr)
+            print(json.dumps(errors, indent=2, sort_keys=True), file=sys.stderr)
+            return 1
+    return 0
+
+
 def run_self_test():
     args = self_test_args()
     workload = valid_self_test_workload()
@@ -1943,6 +2092,9 @@ def run_self_test():
     if run_list_shard_self_test() != 0:
         return 1
 
+    if run_jsonl_self_test() != 0:
+        return 1
+
     print("verify-rgwtrace-json self-test passed")
     return 0
 
@@ -1952,10 +2104,11 @@ def main():
     if args.self_test:
         return run_self_test()
 
-    document = load_json(args.trace)
+    document, stream_errors = load_trace(args.trace, args.trace_format)
     workload = load_workload(args.workload)
     manifest = load_manifest(args.workload_manifest) if args.workload_manifest else None
     summary, errors = verify_document(args, document, workload, manifest)
+    errors = stream_errors + errors
     print(json.dumps(summary, indent=2, sort_keys=True))
 
     if errors:
