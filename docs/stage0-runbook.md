@@ -72,9 +72,12 @@ full log are written to `STAGE0_OUTDIR`. By default that is a fresh private
 `mktemp -d` directory (mode 0700; the path is printed). If you set
 `STAGE0_OUTDIR` yourself, it is created 0700 when missing; an existing
 directory must be owned by you, must not be a symlink, and must not be
-group/other writable. The script refuses anything else, because the generated
-program is executed by a privileged `bpftrace` and a directory another local
-user controls would let them choose what it runs.
+group/other writable. Every parent directory must be owned by root or by you
+and must be either not group/other writable or sticky (so `/tmp/x` is fine,
+`/srv/shared/x` under a 0777 `/srv/shared` is not). The script refuses
+anything else, because the generated program is executed by a privileged
+`bpftrace` and a directory another local user controls, or can swap out, would
+let them choose what it runs.
 
 To just resolve symbols and generate the program without attaching (e.g. on a
 host without a live RGW):

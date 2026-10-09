@@ -11,6 +11,7 @@ cargo clippy --all-targets -- -D warnings
 python3 tests/e2e/verify-rgwtrace-json.py --self-test
 git diff --check
 git diff --cached --check
+bash tests/scripts/private-dir-test.sh
 
 if [[ "${VERIFY_AUDIT:-0}" == "1" ]]; then
   if ! command -v cargo-audit >/dev/null 2>&1; then

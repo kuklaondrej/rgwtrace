@@ -27,8 +27,61 @@ rgwtrace_dir_owner_and_mode() {
         || stat -f '%u %OLp' "${dir}" 2>/dev/null
 }
 
+# rgwtrace_require_safe_ancestors DIR [LABEL]
+#   Every directory above DIR must prevent another user from swapping DIR out
+#   from under us after the check (rename ours away, drop theirs in). That
+#   holds when each ancestor is owned by root or by us AND is either not
+#   group/other writable or sticky (a sticky /tmp only lets the owner of an
+#   entry rename it). Symlink components on the logical path are checked too:
+#   one owned by another user could be re-pointed.
+rgwtrace_require_safe_ancestors() {
+    local dir="$1"
+    local label="${2:-directory}"
+    local parent phys owner mode
+
+    if [[ "${dir}" != /* ]]; then
+        dir="${PWD}/${dir}"
+    fi
+    parent="$(dirname "${dir}")"
+    while :; do
+        if [[ -L "${parent}" ]]; then
+            read -r owner _ < <(rgwtrace_dir_owner_and_mode "${parent}") || true
+            if [[ "${owner}" != "0" && "${owner}" != "${EUID}" ]]; then
+                printf '[private-dir] refusing %s %s: path component %s is a symlink owned by uid %s\n' \
+                    "${label}" "$1" "${parent}" "${owner:-?}" >&2
+                return 1
+            fi
+        fi
+        phys="$(cd -P -- "${parent}" 2>/dev/null && pwd -P)" || {
+            printf '[private-dir] refusing %s %s: cannot resolve parent %s\n' "${label}" "$1" "${parent}" >&2
+            return 1
+        }
+        read -r owner mode < <(rgwtrace_dir_owner_and_mode "${phys}") || true
+        if [[ -z "${owner}" || -z "${mode}" ]]; then
+            printf '[private-dir] could not stat parent %s of %s %s\n' "${phys}" "${label}" "$1" >&2
+            return 1
+        fi
+        if [[ "${owner}" != "0" && "${owner}" != "${EUID}" ]]; then
+            printf '[private-dir] refusing %s %s: parent %s is owned by uid %s, who could replace it\n' \
+                "${label}" "$1" "${phys}" "${owner}" >&2
+            return 1
+        fi
+        if (( (8#${mode} & 8#022) != 0 )) && [[ ! -k "${phys}" ]]; then
+            printf '[private-dir] refusing %s %s: parent %s is group/other writable and not sticky, so another user could replace the directory\n' \
+                "${label}" "$1" "${phys}" >&2
+            return 1
+        fi
+        [[ "${parent}" == "/" ]] && break
+        parent="$(dirname "${parent}")"
+    done
+    return 0
+}
+
 # rgwtrace_require_private_dir DIR [LABEL]
 #   Ensure DIR is safe to write into as the current user:
+#     - every ancestor must be unable to swap DIR out (see
+#       rgwtrace_require_safe_ancestors); this is checked first so nothing is
+#       created under a parent we then refuse.
 #     - if it does not exist, create it (mkdir without -p, mode 0700). mkdir
 #       fails on an existing path of any kind, so a symlink planted at DIR
 #       cannot be followed; the parent must already exist.
@@ -48,6 +101,8 @@ rgwtrace_require_private_dir() {
         printf '[private-dir] refusing %s %s: it is a symlink\n' "${label}" "${dir}" >&2
         return 1
     fi
+
+    rgwtrace_require_safe_ancestors "${dir}" "${label}" || return 1
 
     if [[ ! -e "${dir}" ]]; then
         if ! mkdir -m 0700 "${dir}"; then
