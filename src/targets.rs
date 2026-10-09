@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
@@ -249,7 +248,10 @@ fn common_library_paths(soname: &str) -> Vec<PathBuf> {
 }
 
 fn ldconfig_path(soname: &str) -> Option<PathBuf> {
-    let output = Command::new("ldconfig").arg("-p").output().ok()?;
+    let output = crate::host_tools::system_command(crate::host_tools::LDCONFIG)?
+        .arg("-p")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

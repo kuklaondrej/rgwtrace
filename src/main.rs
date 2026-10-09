@@ -6,6 +6,7 @@ mod collector;
 mod dwarf_input;
 mod dwarf_json;
 mod dwarf_native;
+mod host_tools;
 mod live;
 mod otel;
 mod preflight;

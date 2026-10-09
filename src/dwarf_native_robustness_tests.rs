@@ -484,3 +484,67 @@ fn version_search_handles_needle_edges() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// Ceph version resolution for containerized targets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn recognises_proc_pid_root_paths() {
+    assert_eq!(
+        proc_pid_root(Path::new("/proc/42/root/usr/bin/radosgw")),
+        Some(PathBuf::from("/proc/42/root"))
+    );
+    assert_eq!(proc_pid_root(Path::new("/usr/bin/radosgw")), None);
+    assert_eq!(
+        proc_pid_root(Path::new("/proc/self/root/usr/bin/radosgw")),
+        None
+    );
+    assert_eq!(
+        proc_pid_root(Path::new("/proc/42/rootfs/usr/bin/radosgw")),
+        None
+    );
+    assert_eq!(
+        proc_pid_root(Path::new("proc/42/root/usr/bin/radosgw")),
+        None
+    );
+}
+
+#[test]
+fn containerized_target_without_embedded_version_asks_for_ceph_version() {
+    // No such pid: its root cannot be proven to be the host's, so the host
+    // package database must not be consulted.
+    let path = PathBuf::from("/proc/4294967295/root/usr/bin/radosgw");
+
+    let err = format!("{:#}", resolve_ceph_version(&[&path]).unwrap_err());
+    assert!(err.contains("--ceph-version"), "{err}");
+    assert!(
+        err.contains("/proc/4294967295/root/usr/bin/radosgw"),
+        "{err}"
+    );
+}
+
+#[test]
+fn host_rooted_targets_keep_the_package_lookup() {
+    assert!(shares_host_root(Path::new("/usr/bin/radosgw")));
+    assert!(resolve_ceph_version(&[Path::new("/usr/bin/radosgw")]).is_ok());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn own_pid_root_is_the_host_root() {
+    let path = PathBuf::from(format!("/proc/{}/root/usr/bin/radosgw", std::process::id()));
+    assert!(shares_host_root(&path));
+}
+
+#[test]
+fn explicit_version_needs_no_lookup_for_a_containerized_target() {
+    let path = temp_file("radosgw", &tiny_elf(&[]));
+    let options = NativeOptions {
+        ceph_version: Some("18.2.8".to_string()),
+        ..NativeOptions::default()
+    };
+
+    let info = from_paths_with_options(&[&path], &options).unwrap();
+    assert_eq!(info.version.as_deref(), Some("18.2.8"));
+}

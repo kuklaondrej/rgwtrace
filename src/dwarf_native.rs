@@ -4,7 +4,6 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
@@ -279,8 +278,11 @@ pub fn from_paths_with_options(
         .ceph_version
         .as_deref()
         .and_then(clean_version)
-        .or(embedded_version)
-        .or_else(|| resolve_ceph_version(paths));
+        .or(embedded_version);
+    let version = match version {
+        Some(version) => Some(version),
+        None => resolve_ceph_version(paths)?,
+    };
 
     Ok(DwarfInfo {
         version,
@@ -291,8 +293,76 @@ pub fn from_paths_with_options(
 
 /// Version sources beyond the targets' own bytes (which [`parse_module`]
 /// already scanned).
-fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
-    microceph_ceph_version(paths).or_else(package_manager_ceph_version)
+///
+/// The HOST package database is consulted only when every target lives under
+/// the host's own root. A target reached through `/proc/<pid>/root` of a
+/// container belongs to whatever Ceph the container image ships; the host's
+/// `radosgw` package (if any) says nothing about it, and the version selects the
+/// `ceph_osd_op` ABI layout the BPF side reads -- a wrong guess there is wrong
+/// reads, not a missing feature. So that case is an error asking for the
+/// version, never a guess.
+fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Result<Option<String>> {
+    if let Some(version) = microceph_ceph_version(paths) {
+        return Ok(Some(version));
+    }
+    let foreign: Vec<String> = paths
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|path| !shares_host_root(path))
+        .map(|path| path.display().to_string())
+        .collect();
+    if !foreign.is_empty() {
+        bail!(
+            "no embedded \"ceph version\" string found in the targets, and the host package \
+             database cannot describe {} (another mount namespace's root); pass \
+             --ceph-version with the version the target process runs",
+            foreign.join(", ")
+        );
+    }
+    Ok(package_manager_ceph_version())
+}
+
+/// `/proc/<pid>/root` when `path` is reached through a numeric pid's root link.
+fn proc_pid_root(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut components = path.components();
+    let (
+        Some(Component::RootDir),
+        Some(Component::Normal(proc)),
+        Some(Component::Normal(pid)),
+        Some(Component::Normal(root)),
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return None;
+    };
+    let pid = pid.to_str()?;
+    (proc == "proc" && root == "root" && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| Path::new("/proc").join(pid).join("root"))
+}
+
+/// Whether host-side metadata (the package database) describes `path`: true
+/// unless `path` is under a `/proc/<pid>/root` that is NOT the host's own `/`.
+/// A process that merely runs on the host (not in a container) shares the host
+/// root -- same device and inode -- and keeps the package lookup.
+fn shares_host_root(path: &Path) -> bool {
+    let Some(root) = proc_pid_root(path) else {
+        return true;
+    };
+    same_file(&root, Path::new("/"))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        // Cannot prove it is the host root: treat it as foreign.
+        _ => false,
+    }
 }
 
 /// Offset of the first `needle` in `haystack`. Jumps between occurrences of the
@@ -388,24 +458,29 @@ fn clean_version(version: &str) -> Option<String> {
 
 fn package_manager_ceph_version() -> Option<String> {
     for package in ["radosgw", "librados2", "ceph-common"] {
-        if let Some(version) =
-            command_output_version("dpkg-query", &["-W", "-f=${Version}", package])
-        {
+        if let Some(version) = command_output_version(
+            crate::host_tools::DPKG_QUERY,
+            &["-W", "-f=${Version}", package],
+        ) {
             return Some(version);
         }
     }
     for package in ["ceph-radosgw", "librados2", "ceph-common"] {
-        if let Some(version) =
-            command_output_version("rpm", &["-q", "--qf", "%{VERSION}-%{RELEASE}", package])
-        {
+        if let Some(version) = command_output_version(
+            crate::host_tools::RPM,
+            &["-q", "--qf", "%{VERSION}-%{RELEASE}", package],
+        ) {
             return Some(version);
         }
     }
     None
 }
 
-fn command_output_version(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
+fn command_output_version(candidates: &[&str], args: &[&str]) -> Option<String> {
+    let output = crate::host_tools::system_command(candidates)?
+        .args(args)
+        .output()
+        .ok()?;
     output
         .status
         .success()
