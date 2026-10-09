@@ -67,6 +67,11 @@ struct VarField {
   int size;
 };
 
+/* Mirrored by VarFieldKernel in src/dwarf_json.rs, which asserts the same size. */
+#define RGWTRACE_VAR_FIELD_SIZE 96
+_Static_assert(sizeof(struct VarField) == RGWTRACE_VAR_FIELD_SIZE,
+               "struct VarField layout drifted from VarFieldKernel in src/dwarf_json.rs");
+
 static inline int ceph_osd_op_call(int op) {
   return op == CEPH_OSD_OP_CALL;
 }

@@ -5,6 +5,90 @@ const CEPH_ABI: &str = include_str!("../bpf/ceph_abi.h");
 const DWARF_NATIVE: &str = include_str!("../src/dwarf_native.rs");
 const LIVE_LINUX: &str = include_str!("../src/live/linux.rs");
 const CLI: &str = include_str!("../src/cli.rs");
+const EVENTS_RS: &str = include_str!("../src/events.rs");
+const DWARF_JSON_RS: &str = include_str!("../src/dwarf_json.rs");
+
+/// Every `RGWTRACE_*` ABI constant the C headers define -- enum members
+/// (`NAME = value,`) and `#define RGWTRACE_* value` layout sizes -- as
+/// `(name, value-text)` pairs.
+fn header_abi_constants(header: &str) -> Vec<(String, String)> {
+    let mut constants = Vec::new();
+    for line in header.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("#define ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+                if name.starts_with("RGWTRACE_") {
+                    constants.push((name.to_string(), value.to_string()));
+                }
+            }
+        } else if line.starts_with("RGWTRACE_") {
+            if let Some((name, value)) = line.trim_end_matches(',').split_once(" = ") {
+                constants.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    constants
+}
+
+/// The value text of `pub const NAME: <ty> = <value>;` in a Rust source file.
+fn rust_const_value<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("pub const {name}: ");
+    let start = source.find(&needle)? + needle.len();
+    let rest = &source[start..];
+    let value = &rest[rest.find(" = ")? + 3..];
+    Some(&value[..value.find(';')?])
+}
+
+#[test]
+fn every_header_abi_constant_is_mirrored_byte_for_byte_in_rust() {
+    // AGENTS.md: RGWTRACE_* constants are mirrored byte-for-byte between the C
+    // headers and the Rust side. This used to be checked by hand-picked substrings,
+    // which cannot notice a constant that exists on only one side. Every constant
+    // the headers define must now appear, with the same value text, in
+    // src/events.rs (event types, truncation flags, diagnostics counters, record
+    // layout) or src/dwarf_json.rs (the hprobes descriptor layout).
+    let mut checked = 0;
+    for header in [RGWTRACE_EVENTS, CEPH_ABI] {
+        for (name, value) in header_abi_constants(header) {
+            let rust = rust_const_value(EVENTS_RS, &name)
+                .or_else(|| rust_const_value(DWARF_JSON_RS, &name))
+                .unwrap_or_else(|| panic!("{name} is defined in C but not mirrored in Rust"));
+            assert_eq!(rust, value, "{name}: C says {value}, Rust says {rust}");
+            checked += 1;
+        }
+    }
+    // 3 event types + 6 truncation flags + 34 diagnostics entries at least.
+    assert!(checked >= 43, "only {checked} ABI constants found");
+}
+
+#[test]
+fn event_layout_is_asserted_at_compile_time_on_both_sides() {
+    // Substring mirror checks cannot see a struct whose SIZE drifted. Both sides
+    // now refuse to compile when the layout disagrees with the documented sizes.
+    for assertion in [
+        "_Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,",
+        "_Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,",
+        "_Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,",
+        "_Static_assert(offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,",
+    ] {
+        assert!(RGWTRACE_EVENTS.contains(assertion), "missing: {assertion}");
+    }
+    assert!(CEPH_ABI.contains("_Static_assert(sizeof(struct VarField) == RGWTRACE_VAR_FIELD_SIZE,"));
+    for assertion in [
+        "assert!(size_of::<RawRequestEvent>() == RGWTRACE_REQUEST_EVENT_SIZE);",
+        "assert!(size_of::<RawRadosEvent>() == RGWTRACE_RADOS_EVENT_SIZE);",
+        "assert!(size_of::<RawEvent>() == RGWTRACE_EVENT_SIZE);",
+        "assert!(offset_of!(RawEvent, data) == RGWTRACE_EVENT_DATA_OFFSET);",
+    ] {
+        assert!(EVENTS_RS.contains(assertion), "missing: {assertion}");
+    }
+    assert!(
+        DWARF_JSON_RS.contains("assert!(size_of::<VarFieldKernel>() == RGWTRACE_VAR_FIELD_SIZE);")
+    );
+    // The diagnostics indices now live next to the rest of the mirror, not in the
+    // Linux-only runner.
+    assert!(!LIVE_LINUX.contains("const BPF_DIAG_"));
+}
 
 #[test]
 fn object_name_read_uses_verifier_bounded_length() {

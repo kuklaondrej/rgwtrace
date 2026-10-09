@@ -104,6 +104,17 @@ pub struct VarFieldKernel {
     pub size: i32,
 }
 
+/// `sizeof(struct VarField)` in bpf/ceph_abi.h, which asserts the same number.
+pub const RGWTRACE_VAR_FIELD_SIZE: usize = 96;
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<VarFieldKernel>() == RGWTRACE_VAR_FIELD_SIZE);
+    assert!(offset_of!(VarFieldKernel, fields) == 12);
+    assert!(offset_of!(VarFieldKernel, size) == 92);
+};
+
 /// The request-START probe: the earliest site where the request's `trans_id` and
 /// its `req_state*` (the bridge's canonical key) are both available.
 pub const RGWREST_GET_HANDLER: &str = "RGWREST::get_handler";

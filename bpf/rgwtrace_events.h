@@ -6,6 +6,10 @@
 
 #include "ceph_abi.h"
 
+#ifndef offsetof
+#define offsetof(type, member) __builtin_offsetof(type, member)
+#endif
+
 enum rgwtrace_event_type {
   RGWTRACE_EVENT_REQUEST_START = 1,
   RGWTRACE_EVENT_REQUEST_END = 2,
@@ -280,5 +284,28 @@ struct rgwtrace_event {
     struct rgwtrace_rados_event rados;
   } data;
 };
+
+/*
+ * WIRE LAYOUT. These sizes are the ABI contract with src/events.rs, which
+ * asserts the same numbers against its #[repr(C)] mirrors at compile time; both
+ * builds fail if either side drifts.
+ *
+ *   struct rgwtrace_request_event   160 bytes
+ *   struct rgwtrace_rados_event     560 bytes (cls_ops: 3 x (16 + 32))
+ *   struct rgwtrace_event           568 bytes; `data` starts at offset 8
+ */
+#define RGWTRACE_EVENT_DATA_OFFSET 8
+#define RGWTRACE_REQUEST_EVENT_SIZE 160
+#define RGWTRACE_RADOS_EVENT_SIZE 560
+#define RGWTRACE_EVENT_SIZE 568
+
+_Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,
+               "rgwtrace_request_event layout drifted from src/events.rs");
+_Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,
+               "rgwtrace_rados_event layout drifted from src/events.rs");
+_Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,
+               "rgwtrace_event layout drifted from src/events.rs");
+_Static_assert(offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,
+               "rgwtrace_event data offset drifted from src/events.rs");
 
 #endif

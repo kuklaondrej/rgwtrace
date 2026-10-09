@@ -27,10 +27,7 @@ use crate::{
         VarFieldKernel, REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
         RGW_RADOS_OPERATE_WRITE,
     },
-    events::{
-        RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
-        RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
-    },
+    events::*,
     otel, preflight, targets,
 };
 
@@ -40,42 +37,8 @@ mod skel {
 
 use skel::*;
 
-const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
 const OTLP_EXPORT_QUEUE_CAPACITY: usize = 2;
-const BPF_DIAG_RINGBUF_REQUEST_DROPS: u32 = 0;
-const BPF_DIAG_RINGBUF_RADOS_DROPS: u32 = 1;
-const BPF_DIAG_RADOS_MAP_DROPS: u32 = 2;
-const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
-const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
-const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
-const BPF_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
-const BPF_DIAG_RESEED_HITS: u32 = 7;
-const BPF_DIAG_RESEED_MISSES: u32 = 8;
-const BPF_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
-const BPF_DIAG_REQUEST_END_HITS: u32 = 10;
-const BPF_DIAG_REQUEST_END_MISSES: u32 = 11;
-const BPF_DIAG_REQUEST_END_BASE_UNRESOLVED: u32 = 12;
-const BPF_DIAG_SENDOP_STALE_CTX_DROPS: u32 = 13;
-const BPF_DIAG_SENDOP_UNVERIFIABLE_CTX: u32 = 14;
-const BPF_DIAG_OPERATE_SEED_HITS: u32 = 15;
-const BPF_DIAG_OPERATE_SEED_MISSES: u32 = 16;
-const BPF_DIAG_OPERATE_BASE_UNRESOLVED: u32 = 17;
-const BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS: u32 = 18;
-const BPF_DIAG_OPERATE_MISS_CTX_CLEARED: u32 = 19;
-const BPF_DIAG_RGWOP_KEY_INSERTS: u32 = 20;
-const BPF_DIAG_RGWOP_KEY_REVOKES: u32 = 21;
-const BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED: u32 = 22;
-const BPF_DIAG_RGWOP_KEY_UNRESOLVED: u32 = 23;
-const BPF_DIAG_OPERATE_SEED_HITS_REQSTATE: u32 = 24;
-const BPF_DIAG_OPERATE_SEED_HITS_RGWOP: u32 = 25;
-const BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED: u32 = 26;
-const BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
-const BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
-const BPF_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
-const BPF_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
-const BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED: u32 = 31;
-const BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
 
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
@@ -312,50 +275,59 @@ fn merge_bpf_diagnostics(map: &impl MapCore, collector: &Arc<Mutex<Collector>>) 
 
 fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
     Ok(BpfDiagnostics {
-        ringbuf_request_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_REQUEST_DROPS)?,
-        ringbuf_rados_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_RADOS_DROPS)?,
-        rados_map_drops: read_bpf_counter(map, BPF_DIAG_RADOS_MAP_DROPS)?,
-        rados_finish_misses: read_bpf_counter(map, BPF_DIAG_RADOS_FINISH_MISSES)?,
-        request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
-        probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
-        reqstate_map_drops: read_bpf_counter(map, BPF_DIAG_REQSTATE_MAP_DROPS)?,
-        reseed_hits: read_bpf_counter(map, BPF_DIAG_RESEED_HITS)?,
-        reseed_misses: read_bpf_counter(map, BPF_DIAG_RESEED_MISSES)?,
-        reseed_base_unresolved: read_bpf_counter(map, BPF_DIAG_RESEED_BASE_UNRESOLVED)?,
-        request_end_hits: read_bpf_counter(map, BPF_DIAG_REQUEST_END_HITS)?,
-        request_end_misses: read_bpf_counter(map, BPF_DIAG_REQUEST_END_MISSES)?,
-        request_end_base_unresolved: read_bpf_counter(map, BPF_DIAG_REQUEST_END_BASE_UNRESOLVED)?,
-        sendop_stale_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_STALE_CTX_DROPS)?,
-        sendop_unverifiable_ctx: read_bpf_counter(map, BPF_DIAG_SENDOP_UNVERIFIABLE_CTX)?,
-        operate_seed_hits: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS)?,
-        operate_seed_misses: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_MISSES)?,
-        operate_base_unresolved: read_bpf_counter(map, BPF_DIAG_OPERATE_BASE_UNRESOLVED)?,
-        sendop_unbridged_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS)?,
-        operate_miss_ctx_cleared: read_bpf_counter(map, BPF_DIAG_OPERATE_MISS_CTX_CLEARED)?,
-        rgw_op_key_inserts: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INSERTS)?,
-        rgw_op_key_revokes: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKES)?,
-        rgw_op_key_revoke_skipped: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED)?,
-        rgw_op_key_unresolved: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_UNRESOLVED)?,
-        operate_seed_hits_reqstate: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_REQSTATE)?,
-        operate_seed_hits_rgwop: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_RGWOP)?,
+        ringbuf_request_drops: read_bpf_counter(map, RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS)?,
+        ringbuf_rados_drops: read_bpf_counter(map, RGWTRACE_DIAG_RINGBUF_RADOS_DROPS)?,
+        rados_map_drops: read_bpf_counter(map, RGWTRACE_DIAG_RADOS_MAP_DROPS)?,
+        rados_finish_misses: read_bpf_counter(map, RGWTRACE_DIAG_RADOS_FINISH_MISSES)?,
+        request_context_drops: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS)?,
+        probe_read_failures: read_bpf_counter(map, RGWTRACE_DIAG_PROBE_READ_FAILURES)?,
+        reqstate_map_drops: read_bpf_counter(map, RGWTRACE_DIAG_REQSTATE_MAP_DROPS)?,
+        reseed_hits: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_HITS)?,
+        reseed_misses: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_MISSES)?,
+        reseed_base_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED)?,
+        request_end_hits: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_END_HITS)?,
+        request_end_misses: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_END_MISSES)?,
+        request_end_base_unresolved: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_REQUEST_END_BASE_UNRESOLVED,
+        )?,
+        sendop_stale_ctx_drops: read_bpf_counter(map, RGWTRACE_DIAG_SENDOP_STALE_CTX_DROPS)?,
+        sendop_unverifiable_ctx: read_bpf_counter(map, RGWTRACE_DIAG_SENDOP_UNVERIFIABLE_CTX)?,
+        operate_seed_hits: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_HITS)?,
+        operate_seed_misses: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_MISSES)?,
+        operate_base_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED)?,
+        sendop_unbridged_ctx_drops: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_SENDOP_UNBRIDGED_CTX_DROPS,
+        )?,
+        operate_miss_ctx_cleared: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED)?,
+        rgw_op_key_inserts: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_INSERTS)?,
+        rgw_op_key_revokes: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKES)?,
+        rgw_op_key_revoke_skipped: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKE_SKIPPED)?,
+        rgw_op_key_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_UNRESOLVED)?,
+        operate_seed_hits_reqstate: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_OPERATE_SEED_HITS_REQSTATE,
+        )?,
+        operate_seed_hits_rgwop: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_HITS_RGWOP)?,
         operate_seed_hits_unattributed: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED,
+            RGWTRACE_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED,
         )?,
         operate_unresolved_ctx_cleared: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
+            RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
         )?,
-        rgw_op_key_revoke_absent: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
-        rgw_op_key_index_drops: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INDEX_DROPS)?,
-        rgw_op_key_disabled: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_DISABLED)?,
+        rgw_op_key_revoke_absent: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
+        rgw_op_key_index_drops: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS)?,
+        rgw_op_key_disabled: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_DISABLED)?,
         operate_miss_home_ctx_preserved: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED,
+            RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED,
         )?,
         operate_unresolved_home_ctx_preserved: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED,
+            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED,
         )?,
     })
 }
@@ -1193,12 +1165,12 @@ fn attach_uprobe(
 }
 
 fn decode_event(data: &[u8]) -> Result<TraceEvent> {
-    if data.len() < EVENT_DATA_OFFSET {
+    if data.len() < RGWTRACE_EVENT_DATA_OFFSET {
         bail!("event too short: {}", data.len());
     }
 
     let event_type = u32::from_ne_bytes(data[..4].try_into()?);
-    let payload = &data[EVENT_DATA_OFFSET..];
+    let payload = &data[RGWTRACE_EVENT_DATA_OFFSET..];
     match event_type {
         // get_handler START marker: request identity + start_ns (end_ns == 0).
         RGWTRACE_EVENT_REQUEST_START => Ok(TraceEvent::RequestStart(
@@ -1271,8 +1243,8 @@ fn is_squid_or_newer(version: &str) -> Option<bool> {
 }
 
 const _: () = {
-    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
-    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
+    assert!(RGWTRACE_EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
+    assert!(RGWTRACE_EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
 };
 
 #[cfg(test)]

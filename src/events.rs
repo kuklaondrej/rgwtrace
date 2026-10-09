@@ -28,6 +28,52 @@ pub const RGWTRACE_TRUNC_RADOS_OPS: u32 = 1 << 3;
 pub const RGWTRACE_TRUNC_CLS_NAME: u32 = 1 << 4;
 pub const RGWTRACE_TRUNC_METHOD_NAME: u32 = 1 << 5;
 
+// Diagnostics counter indices into the BPF `diagnostics` PERCPU_ARRAY. Mirrored
+// from `enum rgwtrace_diag_counter` in bpf/rgwtrace_events.h, which documents
+// what each counter means. Append only; never renumber.
+pub const RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS: u32 = 0;
+pub const RGWTRACE_DIAG_RINGBUF_RADOS_DROPS: u32 = 1;
+pub const RGWTRACE_DIAG_RADOS_MAP_DROPS: u32 = 2;
+pub const RGWTRACE_DIAG_RADOS_FINISH_MISSES: u32 = 3;
+pub const RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
+pub const RGWTRACE_DIAG_PROBE_READ_FAILURES: u32 = 5;
+pub const RGWTRACE_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
+pub const RGWTRACE_DIAG_RESEED_HITS: u32 = 7;
+pub const RGWTRACE_DIAG_RESEED_MISSES: u32 = 8;
+pub const RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
+pub const RGWTRACE_DIAG_REQUEST_END_HITS: u32 = 10;
+pub const RGWTRACE_DIAG_REQUEST_END_MISSES: u32 = 11;
+pub const RGWTRACE_DIAG_REQUEST_END_BASE_UNRESOLVED: u32 = 12;
+pub const RGWTRACE_DIAG_SENDOP_STALE_CTX_DROPS: u32 = 13;
+pub const RGWTRACE_DIAG_SENDOP_UNVERIFIABLE_CTX: u32 = 14;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS: u32 = 15;
+pub const RGWTRACE_DIAG_OPERATE_SEED_MISSES: u32 = 16;
+pub const RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED: u32 = 17;
+pub const RGWTRACE_DIAG_SENDOP_UNBRIDGED_CTX_DROPS: u32 = 18;
+pub const RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED: u32 = 19;
+pub const RGWTRACE_DIAG_RGWOP_KEY_INSERTS: u32 = 20;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKES: u32 = 21;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKE_SKIPPED: u32 = 22;
+pub const RGWTRACE_DIAG_RGWOP_KEY_UNRESOLVED: u32 = 23;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_REQSTATE: u32 = 24;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_RGWOP: u32 = 25;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED: u32 = 26;
+pub const RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
+pub const RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
+pub const RGWTRACE_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
+pub const RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED: u32 = 31;
+pub const RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
+pub const RGWTRACE_DIAG_COUNTERS: u32 = 33;
+
+// Wire layout of `struct rgwtrace_event` and its payloads, asserted below against
+// the #[repr(C)] mirrors. bpf/rgwtrace_events.h defines and _Static_asserts the
+// same numbers, so a drift on either side fails that side's build.
+pub const RGWTRACE_EVENT_DATA_OFFSET: usize = 8;
+pub const RGWTRACE_REQUEST_EVENT_SIZE: usize = 160;
+pub const RGWTRACE_RADOS_EVENT_SIZE: usize = 560;
+pub const RGWTRACE_EVENT_SIZE: usize = 568;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawClsOp {
@@ -69,6 +115,44 @@ pub struct RawRadosEvent {
     pub trans_id: [u8; MAX_TRANS_ID],
     pub object_name: [u8; MAX_OBJECT_NAME],
 }
+
+/// `struct rgwtrace_event`: the full-size record. Only used to pin the layout;
+/// records are decoded by `type` from their payload, and a request record is
+/// reserved shorter than this (see `RGWTRACE_REQUEST_RECORD_SIZE`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawEvent {
+    pub event_type: u32,
+    pub data: RawEventData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union RawEventData {
+    pub request: RawRequestEvent,
+    pub rados: RawRadosEvent,
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<RawClsOp>() == MAX_CLS_NAME + MAX_METHOD_NAME);
+    assert!(size_of::<RawRequestEvent>() == RGWTRACE_REQUEST_EVENT_SIZE);
+    assert!(offset_of!(RawRequestEvent, pid) == 16);
+    assert!(offset_of!(RawRequestEvent, flags) == 24);
+    assert!(offset_of!(RawRequestEvent, trans_id) == 28);
+    assert!(size_of::<RawRadosEvent>() == RGWTRACE_RADOS_EVENT_SIZE);
+    assert!(offset_of!(RawRadosEvent, sent_ns) == 16);
+    assert!(offset_of!(RawRadosEvent, rw) == 72);
+    assert!(offset_of!(RawRadosEvent, ops_size) == 76);
+    assert!(offset_of!(RawRadosEvent, acting) == 84);
+    assert!(offset_of!(RawRadosEvent, ops) == 148);
+    assert!(offset_of!(RawRadosEvent, cls_ops) == 154);
+    assert!(offset_of!(RawRadosEvent, trans_id) == 298);
+    assert!(offset_of!(RawRadosEvent, object_name) == 426);
+    assert!(size_of::<RawEvent>() == RGWTRACE_EVENT_SIZE);
+    assert!(offset_of!(RawEvent, data) == RGWTRACE_EVENT_DATA_OFFSET);
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
