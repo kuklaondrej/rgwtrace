@@ -1,0 +1,25 @@
+tests/scripts/private-dir-test.sh
+  s_4d990597f39574::t_e8e93ca0e102d8 1-77
+docs/stage0-runbook.md
+  s_4d990597f39574::t_3a7b405cd65330 75-80
+scripts/lib/private-dir.sh
+  s_4d990597f39574::t_6a2f563f74bebc 30-79,82-84,105-106
+scripts/verify.sh
+  s_4d990597f39574::t_e1fabba1a55e97 14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "de1ca08069b6df6edcd3dcdbcf6cead8099bb0d2",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
