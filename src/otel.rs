@@ -113,7 +113,9 @@ fn export(
     document: &TraceDocument,
     kind: Export,
 ) -> Result<ExportDiagnostics> {
-    validate_otlp_endpoint(config.endpoint)?;
+    let endpoint = validate_otlp_endpoint(config.endpoint)?;
+    // The only form of the endpoint that reaches a log line.
+    let logged_endpoint = redact_url(&endpoint);
     if config.max_spans_per_batch == 0 {
         bail!("OTLP max spans per batch must be at least 1");
     }
@@ -167,7 +169,7 @@ fn export(
                 max_attempts,
                 batch = batch_idx + 1,
                 batches = batch_count,
-                endpoint = config.endpoint,
+                endpoint = %logged_endpoint,
                 timeout_ms = config.timeout.as_millis(),
                 spans = span_count,
                 body_bytes = body.bytes.len(),
@@ -175,12 +177,7 @@ fn export(
                 compression = ?config.compression,
                 "exporting OTLP traces"
             );
-            match send_once(
-                &client,
-                config.endpoint,
-                headers.clone(),
-                body.bytes.clone(),
-            ) {
+            match send_once(&client, &endpoint, headers.clone(), body.bytes.clone()) {
                 Ok(()) => {
                     info!(
                         spans = span_count,
@@ -362,19 +359,20 @@ fn spans_to_otlp_protobuf(resource_attributes: &[KeyValue], spans: Vec<Span>) ->
 
 fn send_once(
     client: &Client,
-    endpoint: &str,
+    endpoint: &Url,
     headers: HeaderMap,
     body: Vec<u8>,
 ) -> Result<(), ExportError> {
     let response = client
-        .post(endpoint)
+        .post(endpoint.clone())
         .headers(headers)
         .body(body)
         .send()
         .map_err(|err| {
             ExportError::retryable(format!(
-                "failed to send OTLP request to {endpoint}: {}",
-                error_chain(&err)
+                "failed to send OTLP request to {}: {}",
+                redact_url(endpoint),
+                scrub_url_secrets(error_chain(&err), endpoint)
             ))
         })?;
     let status = response.status();
@@ -394,15 +392,96 @@ fn send_once(
         )));
     }
 
-    let body = response
-        .text()
-        .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+    let body = read_error_body(response);
     let message = format!("OTLP endpoint returned {status}: {body}");
     if is_retryable_status(status) {
         Err(ExportError::retryable(message))
     } else {
         Err(ExportError::fatal(message))
     }
+}
+
+/// How much of an error response body is kept for the log. A collector's error
+/// page is a sentence; anything longer is an HTML error page or a proxy's
+/// splash, and this message is repeated on every retry.
+const ERROR_BODY_EXCERPT_BYTES: usize = 1024;
+
+/// The error response body as a log-safe excerpt. Reads at most one byte past
+/// the excerpt limit off the socket -- enough to know the body was longer --
+/// so a misconfigured endpoint that answers with megabytes of HTML costs
+/// neither memory nor a verbatim dump of itself on every attempt.
+fn read_error_body(response: reqwest::blocking::Response) -> String {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    match response
+        .take(ERROR_BODY_EXCERPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) => body_excerpt(&bytes),
+        Err(err) => format!("failed to read response body: {err}"),
+    }
+}
+
+/// `bytes` as a bounded, single-line-safe string: lossily decoded, cut to
+/// [`ERROR_BODY_EXCERPT_BYTES`] on a character boundary, control characters
+/// (newlines, escape sequences a hostile body could use to forge log lines)
+/// rendered as escapes, and a marker saying how much was dropped.
+fn body_excerpt(bytes: &[u8]) -> String {
+    let truncated = bytes.len() > ERROR_BODY_EXCERPT_BYTES;
+    let kept = &bytes[..bytes.len().min(ERROR_BODY_EXCERPT_BYTES)];
+    let text = String::from_utf8_lossy(kept);
+    let mut excerpt = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            excerpt.extend(ch.escape_default());
+        } else {
+            excerpt.push(ch);
+        }
+    }
+    if truncated {
+        // Only the excerpt was read, so the real length is unknown; say so
+        // rather than inventing a byte count.
+        excerpt.push_str(" [truncated]");
+    }
+    excerpt
+}
+
+/// Remove every form of `url`'s secrets from `text`, an error chain that was
+/// not written by us. reqwest's Display appends ` for url (<url>)` with the
+/// userinfo already stripped but the query string intact, and a future version
+/// may print it differently again, so this does not depend on one rendering:
+/// it replaces the URL as given and as reqwest renders it, then the query
+/// string and the password on their own wherever they occur.
+fn scrub_url_secrets(text: String, url: &Url) -> String {
+    let redacted = redact_url(url);
+    let mut without_userinfo = url.clone();
+    let _ = without_userinfo.set_password(None);
+    let _ = without_userinfo.set_username("");
+    let mut text = text
+        .replace(url.as_str(), &redacted)
+        .replace(without_userinfo.as_str(), &redacted);
+    if let Some(query) = url.query().filter(|query| !query.is_empty()) {
+        text = text.replace(&format!("?{query}"), "");
+    }
+    if let Some(password) = url.password().filter(|password| !password.is_empty()) {
+        text = text.replace(password, "<redacted>");
+    }
+    text
+}
+
+/// `url` as it may appear in a log line or an error: scheme, host, port and
+/// path only. Userinfo (`user:pass@`) and the query string are where
+/// credentials live when an operator puts them in the endpoint URL
+/// (`?api-key=...`), and the endpoint is logged on every export attempt.
+fn redact_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    // Both setters only fail for cannot-be-a-base URLs; the endpoint is
+    // validated to be http(s), which can always carry (and drop) userinfo.
+    let _ = redacted.set_password(None);
+    let _ = redacted.set_username("");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 fn span_to_otlp(span: &SpanDocument) -> Result<Span> {
@@ -630,11 +709,14 @@ struct EncodedBody {
     uncompressed_len: usize,
 }
 
-fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+/// Parse and check the endpoint. The error for an unparseable endpoint quotes
+/// it verbatim: nothing has been redacted yet because nothing could be parsed,
+/// and the operator who typed it needs to see what was wrong with it.
+fn validate_otlp_endpoint(endpoint: &str) -> Result<Url> {
     let url =
         Url::parse(endpoint).with_context(|| format!("invalid OTLP endpoint {endpoint:?}"))?;
     match url.scheme() {
-        "http" | "https" => Ok(()),
+        "http" | "https" => Ok(url),
         scheme => bail!("unsupported OTLP endpoint scheme {scheme:?}; use http:// or https://"),
     }
 }
@@ -1485,6 +1567,209 @@ mod tests {
             2,
             "should exhaust both attempts"
         );
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_from_logged_urls() {
+        let url = Url::parse("https://alice:s3cr3t@tempo.example.net:4318/v1/traces?api-key=k3y#x")
+            .unwrap();
+        assert_eq!(redact_url(&url), "https://tempo.example.net:4318/v1/traces");
+
+        // Nothing to redact: the URL passes through unchanged, so the log stays
+        // useful for the common case.
+        let plain = Url::parse("http://localhost:4318/v1/traces").unwrap();
+        assert_eq!(redact_url(&plain), "http://localhost:4318/v1/traces");
+    }
+
+    #[test]
+    fn error_body_excerpt_is_capped_and_escaped() {
+        // A hostile or merely verbose body: a forged log line, an ANSI escape, and
+        // more than the cap.
+        let mut body = b"bad request\r\n\x1b[31mFAKE LOG LINE\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', 2 * ERROR_BODY_EXCERPT_BYTES));
+
+        let excerpt = body_excerpt(&body);
+
+        assert!(
+            !excerpt.contains('\n') && !excerpt.contains('\r') && !excerpt.contains('\x1b'),
+            "control characters must be escaped: {excerpt:?}"
+        );
+        assert!(
+            excerpt.starts_with("bad request\\r\\n\\u{1b}[31mFAKE LOG LINE\\n"),
+            "{excerpt}"
+        );
+        assert!(excerpt.ends_with(" [truncated]"), "{excerpt}");
+        // The cap bounds the excerpt; escaping can only add a few bytes per
+        // control character, so 2x is a generous ceiling.
+        assert!(
+            excerpt.len() < 2 * ERROR_BODY_EXCERPT_BYTES,
+            "{}",
+            excerpt.len()
+        );
+
+        // Cutting inside a multi-byte character must not panic; the lossy decode
+        // of the cut tail is acceptable, a crash is not.
+        let mut straddle = vec![b'a'; ERROR_BODY_EXCERPT_BYTES - 1];
+        straddle.extend("é".as_bytes());
+        straddle.push(b'z');
+        let excerpt = body_excerpt(&straddle);
+        assert!(excerpt.ends_with(" [truncated]"), "{excerpt}");
+    }
+
+    /// The cap holds on the wire, not just in the helper: an 8 KiB error page
+    /// yields an error of about 1 KiB.
+    #[test]
+    fn error_response_body_is_capped() {
+        let page = "x".repeat(8 * 1024);
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            )
+            .into_boxed_str(),
+        );
+        let (endpoint, handle) = spawn_mock_server(vec![response]);
+        let document = trace_document(1);
+
+        let err = export_otlp_http(export_config(&endpoint, 0), &document).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("400"), "{message}");
+        assert!(message.contains("[truncated]"), "{message}");
+        assert!(
+            message.len() < ERROR_BODY_EXCERPT_BYTES + 512,
+            "the error must carry an excerpt, not the page: {} bytes",
+            message.len()
+        );
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    /// NOTHING SECRET REACHES THE LOG. The operator's header values (API keys,
+    /// tenant ids) and anything they put in the endpoint URL (userinfo, an
+    /// `?api-key=` query) must not appear in any log line or error message on
+    /// any path: the per-attempt debug line, the retry warning, the final error,
+    /// and the connection-failure error whose text comes from reqwest (which
+    /// prints the full URL it was given). Asserts on captured log TEXT at debug
+    /// level, the most verbose an operator can turn on.
+    #[test]
+    fn header_values_and_endpoint_secrets_never_reach_the_log() {
+        const HEADER_SECRET: &str = "hunter2-apikey-secret";
+        const USERINFO_SECRET: &str = "basic-pass-secret";
+        const QUERY_SECRET: &str = "query-key-secret";
+        let headers = vec![
+            ("X-Api-Key".to_string(), HEADER_SECRET.to_string()),
+            ("X-Scope-OrgID".to_string(), "tenant-secret".to_string()),
+        ];
+        let document = trace_document(1);
+
+        // A retry then success: exercises the debug, warn and info lines.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(503), http_response(200)]);
+        let secret_endpoint = endpoint
+            .replace("http://", &format!("http://alice:{USERINFO_SECRET}@"))
+            + &format!("?api-key={QUERY_SECRET}");
+        let config = ExportConfig {
+            headers: &headers,
+            ..export_config(&secret_endpoint, 3)
+        };
+        let logged = capture_log(|| {
+            export_otlp_http(config, &document).unwrap();
+        });
+        assert_eq!(handle.join().unwrap().len(), 2);
+        assert!(
+            logged.contains("exporting OTLP traces") && logged.contains("retrying"),
+            "the capture must have seen the export: {logged}"
+        );
+        assert!(
+            logged.contains("/v1/traces"),
+            "the host and path stay: {logged}"
+        );
+        for secret in [
+            HEADER_SECRET,
+            "tenant-secret",
+            USERINFO_SECRET,
+            QUERY_SECRET,
+            "alice",
+        ] {
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
+
+        // A connection failure: the error text is reqwest's, URL included.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_endpoint = format!(
+            "http://alice:{USERINFO_SECRET}@{}/v1/traces?api-key={QUERY_SECRET}",
+            closed.local_addr().unwrap()
+        );
+        drop(closed);
+        let config = ExportConfig {
+            headers: &headers,
+            ..export_config(&closed_endpoint, 0)
+        };
+        let mut error = String::new();
+        let logged = capture_log(|| {
+            error = format!("{:#}", export_otlp_http(config, &document).unwrap_err());
+        });
+        assert!(error.contains("failed to send OTLP request"), "{error}");
+        for secret in [HEADER_SECRET, USERINFO_SECRET, QUERY_SECRET, "alice"] {
+            assert!(
+                !error.contains(secret),
+                "{secret:?} leaked into the error: {error}"
+            );
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
+    }
+
+    /// Run `body` with the log captured at DEBUG and return what this thread
+    /// logged.
+    ///
+    /// The subscriber is installed GLOBALLY, once per test binary, and writes to a
+    /// thread-local buffer. A scoped (`with_default`) subscriber is not reliable
+    /// under the parallel test runner: a test on another thread that logs with no
+    /// subscriber of its own makes tracing-core recompute the shared callsite
+    /// cache from THAT thread's (absent) default, caching the callsite as "never
+    /// interested" for every thread -- and the capture here comes back empty
+    /// whenever such a test happens to run concurrently. With a global default,
+    /// every thread's recomputation sees a real subscriber. Per-thread buffers
+    /// keep the captures of concurrently running tests apart; the exporter runs
+    /// synchronously on the calling thread, so its log lands in this thread's
+    /// buffer.
+    fn capture_log(body: impl FnOnce()) -> String {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLocalSink)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            // Another test module may have installed its own global first; its
+            // subscriber then receives the events, which the assertions below
+            // report as an empty capture rather than silently passing.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOG.with(|log| log.borrow_mut().clear());
+        body();
+        CAPTURED_LOG.with(|log| String::from_utf8(log.borrow().clone()).expect("log must be UTF-8"))
+    }
+
+    thread_local! {
+        static CAPTURED_LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLocalSink;
+
+    impl Write for ThreadLocalSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOG.with(|log| log.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     /// A 3xx is an ERROR, never followed. reqwest's default policy follows up to
