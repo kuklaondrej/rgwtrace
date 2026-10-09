@@ -304,6 +304,7 @@ mod tests {
             log_level: "warn".to_string(),
             pid: None,
             timeout: None,
+            ringbuf_size: 16 * 1024 * 1024,
             dry_run: false,
             preflight: false,
             export_dwarf_json: false,

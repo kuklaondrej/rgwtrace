@@ -308,4 +308,23 @@ _Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,
 _Static_assert(offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,
                "rgwtrace_event data offset drifted from src/events.rs");
 
+/*
+ * A request marker as it is RESERVED on the ring: the same header and payload
+ * offset as struct rgwtrace_event, but without the RADOS arm of the union. It
+ * is 168 bytes instead of 568, so request markers take ~3.4x less ring space.
+ * Userspace decodes by `type` and needs only header + payload bytes.
+ */
+struct rgwtrace_request_record {
+  __u32 type;
+  __u32 _pad;
+  struct rgwtrace_request_event request;
+};
+
+#define RGWTRACE_REQUEST_RECORD_SIZE 168
+
+_Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,
+               "rgwtrace_request_record layout drifted from src/events.rs");
+_Static_assert(offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,
+               "rgwtrace_request_record payload offset drifted from struct rgwtrace_event");
+
 #endif

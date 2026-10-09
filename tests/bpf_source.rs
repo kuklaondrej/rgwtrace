@@ -1025,3 +1025,40 @@ fn dwarf_native_symbol_lookup_ignores_local_non_text_symbols() {
     assert!(DWARF_NATIVE.contains("!symbol.is_global()"));
     assert!(DWARF_NATIVE.contains("symbol.kind() != SymbolKind::Text"));
 }
+
+#[test]
+fn request_records_are_reserved_at_their_own_size() {
+    // Every record used to reserve the full union (568 bytes) even though a
+    // request payload is 160, so request markers burned ~3.5x the ring space they
+    // need. They now reserve exactly header + request payload.
+    assert!(RGWTRACE_EVENTS.contains("struct rgwtrace_request_record {"));
+    assert!(RGWTRACE_EVENTS.contains(
+        "_Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,"
+    ));
+    assert!(RGWTRACE_EVENTS.contains(
+        "_Static_assert(offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,"
+    ));
+    let emit = &RGWTRACE_BPF[RGWTRACE_BPF
+        .find("static __always_inline void emit_request_event(")
+        .expect("emit_request_event exists")..];
+    let emit = &emit[..emit.find("\n}\n").expect("emit_request_event ends")];
+    assert!(emit.contains(
+        "struct rgwtrace_request_record *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);"
+    ));
+    assert!(!emit.contains("struct rgwtrace_event *e"));
+    // RADOS records still use the full-size layout.
+    assert!(RGWTRACE_BPF
+        .contains("struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);"));
+}
+
+#[test]
+fn ring_buffer_size_is_configured_before_load() {
+    // The 256 KiB ring held ~474 records: any userspace stall over ~25 ms at 20k
+    // ops/s dropped events. The size now comes from --ringbuf-size and is applied
+    // to the OPEN object, since a ring buffer cannot be resized once loaded.
+    assert!(RGWTRACE_BPF.contains(
+        "  __uint(max_entries, RGWTRACE_DEFAULT_RINGBUF_BYTES);\n} events SEC(\".maps\");"
+    ));
+    assert!(LIVE_LINUX.contains(".events\n        .set_max_entries(cli.ringbuf_size)"));
+    assert!(CLI.contains("pub ringbuf_size: u32,"));
+}

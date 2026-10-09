@@ -239,9 +239,16 @@ struct {
   __uint(max_entries, 8192);
 } hprobes SEC(".maps");
 
+/*
+ * Sized at runtime from --ringbuf-size (bpf_map__set_max_entries on the open
+ * object; a ring buffer cannot be resized after load). The declared value is
+ * only the default that flag mirrors. See the flag's help for the sizing math.
+ */
+#define RGWTRACE_DEFAULT_RINGBUF_BYTES (16 * 1024 * 1024)
+
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 256 * 1024);
+  __uint(max_entries, RGWTRACE_DEFAULT_RINGBUF_BYTES);
 } events SEC(".maps");
 
 /*
@@ -306,7 +313,9 @@ const volatile __u32 CEPH_OSD_OP_BUFFER_DATA_OFFSET = 0;
 static __always_inline void emit_request_event(__u32 type,
                                                struct rgw_request_ctx *ctx,
                                                __u64 end_ns) {
-  struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+  /* Reserved at request-record size, not the full union (see
+   * struct rgwtrace_request_record). */
+  struct rgwtrace_request_record *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e == 0) {
     count_diag(RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS);
     return;
@@ -314,13 +323,13 @@ static __always_inline void emit_request_event(__u32 type,
 
   __builtin_memset(e, 0, sizeof(*e));
   e->type = type;
-  e->data.request.start_ns = ctx->start_ns;
-  e->data.request.end_ns = end_ns;
-  e->data.request.pid = ctx->pid;
-  e->data.request.tid = ctx->tid;
-  e->data.request.flags = ctx->flags;
-  __builtin_memcpy(e->data.request.trans_id, ctx->trans_id,
-                   sizeof(e->data.request.trans_id));
+  e->request.start_ns = ctx->start_ns;
+  e->request.end_ns = end_ns;
+  e->request.pid = ctx->pid;
+  e->request.tid = ctx->tid;
+  e->request.flags = ctx->flags;
+  __builtin_memcpy(e->request.trans_id, ctx->trans_id,
+                   sizeof(e->request.trans_id));
   bpf_ringbuf_submit(e, 0);
 }
 

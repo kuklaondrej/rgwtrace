@@ -140,6 +140,18 @@ pub struct Cli {
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
+    /// Size of the BPF ring buffer that carries events to userspace, in bytes
+    /// (suffixes K/M/G, binary). Must be a power of two and a multiple of the
+    /// page size; it is locked kernel memory for the whole run.
+    ///
+    /// The buffer only has to absorb userspace stalls: a RADOS record is 576
+    /// bytes on the ring, so the 16 MiB default holds ~29k records, i.e. ~1.4 s
+    /// of a gateway doing 20k RADOS ops/s with the reader stopped. The old fixed
+    /// 256 KiB held ~470 records (~25 ms). A full buffer drops new events and
+    /// counts them in `bpf_ringbuf_*_drops`.
+    #[arg(long, default_value = "16M", value_parser = parse_ringbuf_size)]
+    pub ringbuf_size: u32,
+
     #[arg(long)]
     pub dry_run: bool,
 
@@ -206,6 +218,43 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(number)
 }
 
+/// The largest ring buffer accepted, as a sanity bound on locked kernel memory.
+const MAX_RINGBUF_BYTES: u64 = 1024 * 1024 * 1024;
+/// The smallest page size Linux runs with; the kernel re-checks the real one.
+const MIN_PAGE_BYTES: u64 = 4096;
+
+fn parse_ringbuf_size(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    let digits_end = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(digits_end);
+    let number = digits
+        .parse::<u64>()
+        .map_err(|err| format!("invalid size {value:?}: {err}"))?;
+    let multiplier: u64 = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1024,
+        "m" | "mib" => 1024 * 1024,
+        "g" | "gib" => 1024 * 1024 * 1024,
+        _ => return Err(format!("invalid size suffix {suffix:?} in {value:?}")),
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size {value:?} overflows"))?;
+    if !bytes.is_power_of_two() || bytes < MIN_PAGE_BYTES {
+        return Err(format!(
+            "ring buffer size {bytes} must be a power of two of at least {MIN_PAGE_BYTES} bytes"
+        ));
+    }
+    if bytes > MAX_RINGBUF_BYTES {
+        return Err(format!(
+            "ring buffer size {bytes} exceeds the {MAX_RINGBUF_BYTES}-byte limit"
+        ));
+    }
+    u32::try_from(bytes).map_err(|_| format!("ring buffer size {bytes} does not fit in u32"))
+}
+
 fn parse_http_header(value: &str) -> Result<(String, String), String> {
     let Some((name, header_value)) = value.split_once(':') else {
         return Err("header must use NAME:VALUE syntax".to_string());
@@ -216,4 +265,34 @@ fn parse_http_header(value: &str) -> Result<(String, String), String> {
         return Err("header name and value must be non-empty".to_string());
     }
     Ok((name.to_string(), header_value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ringbuf_size_accepts_bytes_and_binary_suffixes() {
+        assert_eq!(parse_ringbuf_size("16777216"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("16M"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("16MiB"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("256k"), Ok(256 * 1024));
+        assert_eq!(parse_ringbuf_size("1G"), Ok(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn ringbuf_size_rejects_what_the_kernel_would_reject() {
+        // BPF ring buffers must be a power-of-two multiple of the page size.
+        assert!(parse_ringbuf_size("0").is_err());
+        assert!(parse_ringbuf_size("3M").is_err());
+        assert!(parse_ringbuf_size("2048").is_err());
+        assert!(parse_ringbuf_size("2G").is_err());
+        assert!(parse_ringbuf_size("lots").is_err());
+    }
+
+    #[test]
+    fn default_ringbuf_size_is_16_mib() {
+        let cli = Cli::parse_from(["rgwtrace"]);
+        assert_eq!(cli.ringbuf_size, 16 * 1024 * 1024);
+    }
 }

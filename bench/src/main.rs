@@ -71,10 +71,10 @@ mod linux {
     // prevent. Ringbuf sizes must be a power-of-two multiple of the page size;
     // 16 MiB qualifies.
     const TIMED_EVENTS_RING_BYTES: u32 = 16 * 1024 * 1024;
-    // R2: the ringbuf_saturation phase KEEPS the production 256 KiB size (the
-    // default declared in bpf/rgwtrace.bpf.c) because it measures the real
-    // ~474-record capacity limit. It runs against a SECOND skeleton instance that
-    // does not resize the map.
+    // R2: the ringbuf_saturation phase pins the ring at 256 KiB -- the size
+    // rgwtrace shipped with before --ringbuf-size (default now 16 MiB) -- because
+    // it measures the record-capacity math (~455 RADOS records of 576 ring bytes)
+    // against a known size. It runs against a SECOND skeleton instance.
     const PRODUCTION_EVENTS_RING_BYTES: u32 = 256 * 1024;
     // Bounded wait for the drainer to fully consume a warmup/timed window before
     // the diagnostics counters are snapshotted. Generous; a real stall errors out
@@ -683,7 +683,7 @@ mod linux {
         /// bpf_ringbuf_reserve/submit cost is capacity-independent.
         timed_events_ring_bytes: u32,
         /// R2: the events ring size (bytes) used by the ringbuf_saturation phase --
-        /// the production default, whose ~474-record limit that phase measures.
+        /// 256 KiB, whose ~455-record limit that phase measures.
         saturation_events_ring_bytes: u32,
     }
 
@@ -1255,14 +1255,13 @@ mod linux {
         };
 
         // === Phase: ring-buffer saturation ================================
-        // R2: this phase MUST use the production 256 KiB events ring (not the timed
-        // phases' 16 MiB one), because it measures the real ~474-record capacity.
-        // So it runs against a SECOND skeleton instance loaded WITHOUT resizing the
-        // events map. All of skel1's uprobe links are dropped by now, so attaching
+        // R2: this phase MUST use a 256 KiB events ring (the pre---ringbuf-size
+        // production size, not the 16 MiB one), because it measures the ~455-record
+        // capacity math. So it runs against a SECOND skeleton instance sized to it. All of skel1's uprobe links are dropped by now, so attaching
         // the saturation skeleton's send/finish to the same symbols is conflict-free.
         {
             let mut sat_object = MaybeUninit::uninit();
-            let sat_skel = load_rgwtrace_skel(&mut sat_object, None)?;
+            let sat_skel = load_rgwtrace_skel(&mut sat_object, Some(PRODUCTION_EVENTS_RING_BYTES))?;
             let _ = sat_skel.maps.rgw_requests.delete(&tid.to_ne_bytes());
             let _l1 = sat_skel.progs.uprobe_send_op.attach_uprobe_with_opts(
                 pid,
@@ -1283,8 +1282,8 @@ mod linux {
                 },
             )?;
 
-            // Variant A: flood WITHOUT draining. The ~256 KiB ring fills after
-            // ~474 records of ~544 B, then every further reserve fails.
+            // Variant A: flood WITHOUT draining. The 256 KiB ring fills after
+            // ~455 records of 576 ring bytes, then every further reserve fails.
             let a_before = read_diag(&sat_skel.maps.diagnostics, DIAG_RINGBUF_RADOS_DROPS)?;
             for _ in 0..cfg.flood {
                 black_box(target::syn_send_op(black_box(op)));
@@ -1314,7 +1313,7 @@ mod linux {
                 read_diag(&sat_skel.maps.diagnostics, DIAG_RINGBUF_RADOS_DROPS)? - b_before;
             let (_s, _e, b_rados, _bad, _err) = counters.snapshot();
 
-            // The production ring holds ~474 records; assert the measured capacity
+            // The 256 KiB ring holds ~455 RADOS records; assert the measured capacity
             // is in that neighbourhood (tolerant of record-size/overhead rounding).
             const SAT_CAP_MIN: u64 = 400;
             const SAT_CAP_MAX: u64 = 600;
@@ -1460,7 +1459,8 @@ mod linux {
     /// returned skel borrows `obj`, which must outlive it.
     ///
     /// `events_ring_bytes = Some(n)` resizes the events ringbuf to `n` bytes
-    /// before load (R1). `None` keeps the production 256 KiB default (R2).
+    /// before load (R1, R2). `None` keeps the default declared in
+    /// bpf/rgwtrace.bpf.c (16 MiB, the --ringbuf-size default).
     fn load_rgwtrace_skel(
         obj: &mut MaybeUninit<libbpf_rs::OpenObject>,
         events_ring_bytes: Option<u32>,

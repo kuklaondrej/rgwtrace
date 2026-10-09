@@ -62,8 +62,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     info!(pid, "starting live tracing");
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
-    let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
+    let mut open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
     configure_rodata(open.maps.rodata_data, dwarf.version.as_deref())?;
+    configure_map_sizes(&mut open, cli)?;
     let mut skel = open.load()?;
 
     populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
@@ -520,6 +521,37 @@ fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result
     rodata.CEPH_OSD_OP_BUFFER_RAW_OFFSET = 8;
     rodata.CEPH_OSD_OP_BUFFER_DATA_OFFSET = 32;
     Ok(())
+}
+
+/// Apply the run's map sizes to the OPEN object: max_entries is fixed at load,
+/// and a ring buffer in particular cannot be resized afterwards.
+fn configure_map_sizes(open: &mut OpenRgwtraceSkel<'_>, cli: &Cli) -> Result<()> {
+    let page_size = page_size()?;
+    if u64::from(cli.ringbuf_size) % page_size != 0 {
+        bail!(
+            "--ringbuf-size {} is not a multiple of this host's {page_size}-byte page size",
+            cli.ringbuf_size
+        );
+    }
+    open.maps
+        .events
+        .set_max_entries(cli.ringbuf_size)
+        .with_context(|| {
+            format!(
+                "failed to size the events ring buffer to {} bytes",
+                cli.ringbuf_size
+            )
+        })?;
+    info!(ringbuf_bytes = cli.ringbuf_size, "configured BPF map sizes");
+    Ok(())
+}
+
+fn page_size() -> Result<u64> {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(size)
+        .ok()
+        .filter(|size| *size > 0)
+        .context("sysconf(_SC_PAGESIZE) failed")
 }
 
 fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
@@ -1572,6 +1604,47 @@ mod tests {
         let err = decode_event(&data).unwrap_err();
 
         assert!(err.to_string().contains("unknown event type 99"));
+    }
+
+    #[test]
+    fn decodes_a_request_record_reserved_at_its_own_size() {
+        // The BPF side reserves request markers at RGWTRACE_REQUEST_RECORD_SIZE
+        // (header + request payload), not at the full union size. Exactly that
+        // many bytes must decode; one byte fewer must not.
+        let raw = RawRequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 42,
+            tid: 7,
+            flags: 0,
+            trans_id: bytes("tx0003"),
+        };
+        for event_type in [RGWTRACE_EVENT_REQUEST_START, RGWTRACE_EVENT_REQUEST_END] {
+            let data = event_data(event_type, &raw);
+            assert_eq!(data.len(), RGWTRACE_REQUEST_RECORD_SIZE);
+            let event = decode_event(&data).unwrap();
+            let (TraceEvent::RequestStart(request) | TraceEvent::RequestEnd(request)) = event
+            else {
+                panic!("expected a request event");
+            };
+            assert_eq!(request.trans_id, "tx0003");
+
+            let err = decode_event(&data[..RGWTRACE_REQUEST_RECORD_SIZE - 1]).unwrap_err();
+            assert!(err.to_string().contains("payload too short"));
+        }
+    }
+
+    #[test]
+    fn rejects_a_rados_record_cut_to_request_size() {
+        // A RADOS record is still reserved at the full union size; a record cut
+        // at the (smaller) request size must not be decoded as a RADOS op.
+        let mut data = RGWTRACE_EVENT_RADOS_OP.to_ne_bytes().to_vec();
+        data.resize(RGWTRACE_REQUEST_RECORD_SIZE, 0);
+        let err = decode_event(&data).unwrap_err();
+        assert!(err.to_string().contains("payload too short"));
+
+        data.resize(RGWTRACE_EVENT_SIZE, 0);
+        assert!(decode_event(&data).is_ok());
     }
 
     #[test]

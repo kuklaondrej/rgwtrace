@@ -73,6 +73,10 @@ pub const RGWTRACE_EVENT_DATA_OFFSET: usize = 8;
 pub const RGWTRACE_REQUEST_EVENT_SIZE: usize = 160;
 pub const RGWTRACE_RADOS_EVENT_SIZE: usize = 560;
 pub const RGWTRACE_EVENT_SIZE: usize = 568;
+/// `struct rgwtrace_request_record`: request markers are reserved at this size,
+/// not `RGWTRACE_EVENT_SIZE`, so a decoder must accept a record that ends right
+/// after the request payload.
+pub const RGWTRACE_REQUEST_RECORD_SIZE: usize = 168;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -152,6 +156,9 @@ const _: () = {
     assert!(offset_of!(RawRadosEvent, object_name) == 426);
     assert!(size_of::<RawEvent>() == RGWTRACE_EVENT_SIZE);
     assert!(offset_of!(RawEvent, data) == RGWTRACE_EVENT_DATA_OFFSET);
+    assert!(
+        RGWTRACE_REQUEST_RECORD_SIZE == RGWTRACE_EVENT_DATA_OFFSET + RGWTRACE_REQUEST_EVENT_SIZE
+    );
 };
 
 #[derive(Clone, Debug, Serialize)]
