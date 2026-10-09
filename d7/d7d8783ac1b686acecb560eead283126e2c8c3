@@ -1,0 +1,23 @@
+ARCHITECTURE.md
+  s_4d990597f39574::t_8d6172caa0b747 259
+docs/bugfix-long-session-data-integrity.md
+  s_4d990597f39574::t_3abfdfb085b371 144-147
+src/live/linux.rs
+  s_4d990597f39574::t_b2b1b4aa88722b 8,84-117,256,274,445-459,462-465,467-479,503,556-558,590,596-599,1540,1545,1553,1568-1621,1627,1632,1705-1707,1721,1724
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d7d7d8783ac1b686acecb560eead283126e2c8c3",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
