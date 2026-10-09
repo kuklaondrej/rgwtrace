@@ -1,0 +1,29 @@
+tests/fixtures/otlp_test_other_ca.pem
+  s_4d990597f39574::t_91327955183110 1-12
+docs/bugfix-otlp-export-hardening.md
+  s_4d990597f39574::t_c375095a80e5d5 52-57,78-86
+tests/fixtures/otlp_test_ca.pem
+  s_4d990597f39574::t_0aec54f2418872 2-11
+Cargo.lock
+  s_4d990597f39574::t_b8436d2bbd24a9 1283
+Cargo.toml
+  s_4d990597f39574::t_640bf48f0db013 30-35
+tests/cli_otlp_config.rs
+  s_4d990597f39574::t_9f1a92ec670fde 136-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "582d2f3b000a45a38f74c0b55b47b9fd66de6536",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
