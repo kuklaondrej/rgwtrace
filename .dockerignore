@@ -1,6 +1,22 @@
-/target
-/dist
-/.git
-*.o
-*.skel.rs
-*.tmp.bpf.o
+# Allowlist: the image build (docker/Dockerfile) copies the whole context, so
+# everything not needed by `cargo build --release` stays out. This keeps local
+# benchmark results, traces, agent state and env files out of the image layers.
+*
+
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!build.rs
+!src/
+!bpf/
+!bench/
+!tests/
+
+# Re-excluded inside the allowlisted trees (last matching rule wins).
+**/target/
+**/__pycache__/
+**/*.pyc
+**/*.o
+**/*.skel.rs
+**/*.tmp.bpf.o
+**/.DS_Store
