@@ -1,0 +1,34 @@
+AGENTS.md
+  s_4d990597f39574::t_f90fd1512bc140 73-76
+docs/README.md
+  s_4d990597f39574::t_884f65c1a54ff0 40-42
+ARCHITECTURE.md
+  s_4d990597f39574::t_bc11e096d20b57 13
+  s_4d990597f39574::t_a24a0a9f5ac7fa 25-55
+docs/design-cross-thread-correlation.md
+  s_4d990597f39574::t_c01cb9fe61dd46 130-133
+README.md
+  s_4d990597f39574::t_423783d9da5c3b 40-43
+docs/bugfix-target-scoping.md
+  s_4d990597f39574::t_498781c0d3601a 1-147
+RUNBOOK.md
+  s_4d990597f39574::t_2b37b73cb45dc3 32-34
+  s_4d990597f39574::t_958d013d14fa11 13-14
+  s_4d990597f39574::t_f0c20aafb5983f 124-131
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "027b58fa88fabb498fba0d5827618e62ff307a6c",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
