@@ -1280,6 +1280,7 @@ dependencies = [
  "opentelemetry-proto",
  "prost",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tracing",

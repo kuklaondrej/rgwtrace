@@ -49,7 +49,12 @@ built and what it is allowed to say.
   most 1 KiB off the socket and control characters are escaped
   (`body_excerpt`). The regression test captures the log at debug level and
   asserts that neither header values nor URL secrets appear on the success,
-  retry and connection-failure paths.
+  retry and connection-failure paths. A later review pointed out that an
+  intermediary may echo the rejected request (URL, auth header) in its error
+  page, so the error body excerpt now goes through the same URL scrub plus a
+  header-value scrub (`scrub_header_values`) before it is logged; and that
+  `read_header_file` checked a pathname and then re-opened it, so it now opens
+  once and checks that handle's metadata.
 
 - **Header sources** (`src/otlp_headers.rs`): `--otlp-header-file` (one
   `Name: Value` per line, `#` comments; refused if world-readable) and the
@@ -70,9 +75,15 @@ built and what it is allowed to say.
 
 - **`--otlp-ca-cert <pem>`** adds a PEM bundle via `add_root_certificate`
   (rustls). A missing, non-PEM or certificate-less file is refused at startup
-  with an error naming the flag; `tests/cli_otlp_config.rs` checks this at the
-  binary level, against a committed self-signed fixture
-  (`tests/fixtures/otlp_test_ca.pem`, certificate only).
+  with an error naming the flag. `tests/cli_otlp_config.rs` checks the flag at
+  the binary level, and proves TRUST rather than parsing: a local rustls HTTPS
+  collector (test-only server certificate for `127.0.0.1` signed by the fixture
+  CA, `tests/fixtures/otlp_test_server.der` / `otlp_test_server_key.der`) is
+  rejected without the flag and with an unrelated CA
+  (`otlp_test_other_ca.pem`), and receives the export with
+  `otlp_test_ca.pem`. The fixture CAs' private keys were discarded after
+  signing; `rustls` is a dev-dependency only, at the crate, version and
+  provider reqwest already compiles.
 
 - **`--redact-object-names`** replaces every `ceph.rados.object` with the
   FNV-1a 64 hash of the name as 16 hex digits -- the same hash the span ids
