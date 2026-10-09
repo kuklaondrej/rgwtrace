@@ -55,16 +55,29 @@ of its pid. The predicate is unchanged, including the existing quirk that a
 START-only marker (`end_ns == 0`) covers `[0, start + window]`.
 
 ```
-candidates   (pid) and (pid, tid) -> BTreeSet<(upper_ns, lower_ns, key)>
+candidates   (pid) and (pid, tid) -> CandidateSet
+               from_zero  START-only markers [0, upper], by upper
+               bounded    IntervalSet: per power-of-two length class, by lower
 pending      id -> op                    (id = arrival order)
              (event_time, id)            which pending ops a drain finalizes
-             NoCandidate   by (pid, op_start)
-             AmbiguousAll  by (pid, send_tid, op_start)
+             every op      IntervalSet by pid
+             NoCandidate   IntervalSet by pid
+             AmbiguousAll  IntervalSet by (pid, send_tid)
              witnessed     (candidate key, id) for the 2 candidates recorded per ambiguous op
 ```
 
-A query is a range scan from `upper >= op.start` that stops at the second
-candidate. A pending op is re-decided only when its decision can change:
+A query stops at the second candidate. It also cannot walk non-overlapping
+requests: an `IntervalSet` keeps intervals in power-of-two length classes, each
+ordered by start. An overlapping interval of length `< 2^k` must start in
+`[op.start - (2^k - 1), op.end]`, so each class is a short range scan. The only
+non-overlapping entries visited are class-k requests that ended shortly before
+the op, a concurrency-sized set. (An earlier revision ordered candidates by
+`upper` only. A query with zero or one candidate then walked every newer resident
+request: 47-52 µs per such op at 20k groups, now ~0.4 µs.) START-only markers
+would all fall into the top length class, so they are kept apart, ordered by
+`upper`. There, every entry from `op.start` up is a candidate.
+
+A pending op is re-decided only when its decision can change:
 
 * A candidate appears. This can change a `NoCandidate` op (it now has one). It can
   change an `AmbiguousAll` op if the new candidate is on the op's `send_tid`,
@@ -114,9 +127,12 @@ turns a late tagged op into a background op with reason
 * Under `--correlate-inferred` the grace is never shorter than
   `--inference-window`, because a closed request stays an inference candidate for
   that long after its end.
-* A group that is still one of the two recorded candidates of a pending inference
-  keeps the full TTL. If it expired early, an ambiguous op could be inferred onto
-  its rival on the strength of an expiry, not of evidence.
+* A group that is still a candidate of ANY pending inference, recorded as a
+  witness or not, keeps the full TTL. Take three candidates A, B and C of one op,
+  with A and B recorded. If C expired at the grace and A later at the TTL, the op
+  would be inferred onto B, where the old TTL-only expiry still had B and C and
+  left it ambiguous. Groups that are no pending op's candidate cannot change any
+  pending decision when they go.
 
 Groups whose END has not arrived (open) and groups on builds without the END
 probe keep their old clocks.
@@ -147,6 +163,7 @@ runs differ by more than noise.
 | decode + ingest a tagged RADOS op | 272-284 ns, 9.27 allocs | ~267 ns, 6.29 allocs |
 | inference marker pair, 2k groups / 1k pending | 18.4-18.6 ms | 0.92-1.0 µs |
 | inference marker pair, 20k groups / 5k pending | 1.41-1.43 s | 1.3-1.8 µs |
+| untagged op with no candidate, 20k newer groups | 47-52 µs (first revision of this PR; the old code was also O(groups)) | 0.41-0.42 µs |
 | drain, 200k groups / 1k expired: under the lock | 37-43 ms (render included) | 0.8-1.9 ms |
 | drain, 200k groups / 20k expired: under the lock | 120-128 ms (render included) | 7.2-10.1 ms |
 | render 1k / 20k expired groups (exporter thread) | (inside the lock above) | 5-11 ms / 120-163 ms |

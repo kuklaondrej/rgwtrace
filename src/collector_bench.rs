@@ -279,3 +279,44 @@ fn collector_bench_drain() {
     drain_bench(200_000, 1_000);
     drain_bench(200_000, 20_000);
 }
+
+/// An untagged op with NO candidate, older than every resident request: the
+/// case an `upper`-ordered candidate scan cannot cut short (every newer request
+/// has `upper >= op.start`, none overlaps).
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn collector_bench_inference_no_candidate() {
+    const GROUPS: u64 = 20_000;
+    const OPS: u64 = 1_000;
+    let mut collector = Collector::with_inferred_correlation(SEC);
+    collector.set_end_probe_attached(true);
+    for i in 0..GROUPS {
+        let start = 10 * SEC + i * MS;
+        let id = trans_id(i);
+        collector.push(TraceEvent::RequestStart(request(
+            &id,
+            (i % 64) as u32,
+            start,
+            0,
+        )));
+        collector.push(TraceEvent::RequestEnd(request(
+            &id,
+            (i % 64) as u32,
+            start,
+            start + 50 * MS,
+        )));
+    }
+    let started = Instant::now();
+    for i in 0..OPS {
+        let mut raw = raw_rados("", "bucket-object", i * 1_000);
+        raw.send_tid = 9_999;
+        collector.push(TraceEvent::RadosOp(RadosEvent::from(raw)));
+    }
+    report(
+        &format!("inference_no_candidate_op groups={GROUPS}"),
+        OPS,
+        started.elapsed().as_nanos(),
+        0,
+    );
+    black_box(collector);
+}

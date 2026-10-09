@@ -380,7 +380,125 @@ struct PendingOp {
 /// Default for `--inference-max-pending`.
 pub const DEFAULT_INFERENCE_MAX_PENDING: usize = 65_536;
 
-type CandidateSet = BTreeSet<(u64, u64, Arc<str>)>;
+/// Closed intervals `[lower, upper]` tagged with a `K`, indexed so that an
+/// overlap query visits only entries that can overlap.
+///
+/// A single ordering cannot do that for intervals. Ordered by `upper`, a query
+/// for an OLD interval walks every newer entry (all have `upper >= start`, none
+/// `lower <= end`); ordered by `lower`, it has to start an unknown distance back.
+/// So entries are split by length into power-of-two classes, each ordered by
+/// `lower`: an overlapping entry of length `< 2^k` must start in
+/// `[start - (2^k - 1), end]`, and every non-overlapping entry visited in that
+/// range is a class-k interval that ended shortly before `start` -- a bounded,
+/// concurrency-sized set rather than everything resident.
+#[derive(Debug)]
+struct IntervalSet<K> {
+    by_length: BTreeMap<u32, BTreeSet<(u64, u64, K)>>,
+}
+
+impl<K> Default for IntervalSet<K> {
+    fn default() -> Self {
+        Self {
+            by_length: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord + Clone> IntervalSet<K> {
+    fn length_class(lower: u64, upper: u64) -> u32 {
+        64 - upper.saturating_sub(lower).leading_zeros()
+    }
+
+    fn insert(&mut self, lower: u64, upper: u64, key: K) {
+        self.by_length
+            .entry(Self::length_class(lower, upper))
+            .or_default()
+            .insert((lower, upper, key));
+    }
+
+    fn remove(&mut self, lower: u64, upper: u64, key: K) {
+        let class = Self::length_class(lower, upper);
+        if let Some(entries) = self.by_length.get_mut(&class) {
+            entries.remove(&(lower, upper, key));
+            if entries.is_empty() {
+                self.by_length.remove(&class);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_length.is_empty()
+    }
+
+    /// Every entry whose start lies in the window an overlapping entry of its
+    /// class must start in, as `(upper, key)`, class by class. Callers keep only
+    /// those with `upper >= lower` -- the remainder is the bounded overscan.
+    fn near<'a>(
+        &'a self,
+        lower: u64,
+        upper: u64,
+        min_key: &'a K,
+    ) -> impl Iterator<Item = (u64, &'a K)> + 'a {
+        self.by_length.iter().flat_map(move |(class, entries)| {
+            let reach = if *class >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << class) - 1
+            };
+            entries
+                .range((lower.saturating_sub(reach), 0, min_key.clone())..)
+                .take_while(move |(start, _, _)| *start <= upper)
+                .map(|(_, end, key)| (*end, key))
+        })
+    }
+
+    fn overlapping<'a>(
+        &'a self,
+        lower: u64,
+        upper: u64,
+        min_key: &'a K,
+    ) -> impl Iterator<Item = &'a K> + 'a {
+        self.near(lower, upper, min_key)
+            .filter(move |(end, _)| *end >= lower)
+            .map(|(_, key)| key)
+    }
+}
+
+/// The candidate markers of one pid (or one thread).
+///
+/// START-only markers have `lower == 0` (their interval is `[0, start + window]`,
+/// see [`CandidateSlot::of`]) and would all land in the top length class, where
+/// the [`IntervalSet`] bound is useless; they are kept apart, ordered by `upper`,
+/// where every entry from `op.start` up IS a candidate.
+#[derive(Debug, Default)]
+struct CandidateSet {
+    from_zero: BTreeSet<(u64, Arc<str>)>,
+    bounded: IntervalSet<Arc<str>>,
+}
+
+impl CandidateSet {
+    fn insert(&mut self, slot: CandidateSlot, key: &Arc<str>) {
+        if slot.lower_ns == 0 {
+            self.from_zero.insert((slot.upper_ns, Arc::clone(key)));
+        } else {
+            self.bounded
+                .insert(slot.lower_ns, slot.upper_ns, Arc::clone(key));
+        }
+    }
+
+    fn remove(&mut self, slot: CandidateSlot, key: &Arc<str>) {
+        if slot.lower_ns == 0 {
+            self.from_zero.remove(&(slot.upper_ns, Arc::clone(key)));
+        } else {
+            self.bounded
+                .remove(slot.lower_ns, slot.upper_ns, Arc::clone(key));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.from_zero.is_empty() && self.bounded.is_empty()
+    }
+}
 
 /// `--correlate-inferred` state, indexed so that a request marker costs work
 /// proportional to the pending ops it can actually affect.
@@ -411,25 +529,28 @@ type CandidateSet = BTreeSet<(u64, u64, Arc<str>)>;
 struct Inference {
     window_ns: u64,
     max_pending: usize,
-    /// Candidate markers per pid and per (pid, tid), as (upper, lower, key):
-    /// scanning from `upper >= op.start` visits candidates first.
+    /// Candidate markers per pid and per (pid, tid).
     by_pid: HashMap<u32, CandidateSet>,
     by_thread: HashMap<(u32, u32), CandidateSet>,
     pending: BTreeMap<u64, PendingOp>,
     /// (event time, id): which pending ops are past the TTL at a drain.
     pending_by_time: BTreeSet<(u64, u64)>,
     /// `NoCandidate` ops per pid, as (op start, id).
-    unresolved: HashMap<u32, BTreeSet<(u64, u64)>>,
+    unresolved: HashMap<u32, IntervalSet<u64>>,
+    /// Every pending op per pid, as (op start, id): which requests are still a
+    /// candidate of some pending op (and so must keep the full TTL).
+    pending_by_pid: HashMap<u32, IntervalSet<u64>>,
     /// `AmbiguousAll` ops per (pid, send_tid), as (op start, id).
-    ambiguous_all: HashMap<(u32, u32), BTreeSet<(u64, u64)>>,
+    ambiguous_all: HashMap<(u32, u32), IntervalSet<u64>>,
     /// (candidate key, op id) for each recorded witness of an ambiguous op.
     witnessed: BTreeSet<(Arc<str>, u64)>,
     dirty: BTreeSet<u64>,
-    /// Longest pending op interval seen: bounds the by-start range scans.
-    max_pending_span_ns: u64,
     next_id: u64,
     /// Range sentinel (the minimum `Arc<str>`), allocated once.
     min_key: Arc<str>,
+    /// Candidate entries visited by queries: test-observable proof that a query
+    /// does not walk non-overlapping requests.
+    scanned: std::cell::Cell<u64>,
 }
 
 impl Inference {
@@ -467,10 +588,17 @@ impl Inference {
     }
 
     fn first_two(&self, set: &CandidateSet, span: OpSpan) -> (Option<Arc<str>>, Option<Arc<str>>) {
-        let mut candidates = set
-            .range((span.start_ns, 0, Arc::clone(&self.min_key))..)
-            .filter(|(_, lower_ns, _)| *lower_ns <= span.end_ns)
-            .map(|(_, _, key)| Arc::clone(key));
+        // `[0, upper]` overlaps the op exactly when `upper >= op.start`.
+        let from_zero = set
+            .from_zero
+            .range((span.start_ns, Arc::clone(&self.min_key))..)
+            .map(|(_, key)| (u64::MAX, key));
+        let bounded = set.bounded.near(span.start_ns, span.end_ns, &self.min_key);
+        let mut candidates = from_zero
+            .chain(bounded)
+            .inspect(|_| self.scanned.set(self.scanned.get() + 1))
+            .filter(|(upper_ns, _)| *upper_ns >= span.start_ns)
+            .map(|(_, key)| Arc::clone(key));
         let first = candidates.next();
         let second = first.as_ref().and_then(|_| candidates.next());
         (first, second)
@@ -485,9 +613,8 @@ impl Inference {
         new: Option<CandidateSlot>,
     ) {
         if let Some(old) = old {
-            let entry = (old.upper_ns, old.lower_ns, Arc::clone(key));
-            remove_from(&mut self.by_pid, old.pid, &entry);
-            remove_from(&mut self.by_thread, (old.pid, old.tid), &entry);
+            remove_candidate_from(&mut self.by_pid, old.pid, old, key);
+            remove_candidate_from(&mut self.by_thread, (old.pid, old.tid), old, key);
             let witnessed = self
                 .witnessed
                 .range((Arc::clone(key), 0)..=(Arc::clone(key), u64::MAX))
@@ -495,43 +622,37 @@ impl Inference {
             self.dirty.extend(witnessed);
         }
         if let Some(new) = new {
-            let entry = (new.upper_ns, new.lower_ns, Arc::clone(key));
-            self.by_pid
-                .entry(new.pid)
-                .or_default()
-                .insert(entry.clone());
+            self.by_pid.entry(new.pid).or_default().insert(new, key);
             self.by_thread
                 .entry((new.pid, new.tid))
                 .or_default()
-                .insert(entry);
-            let dirty = self.overlapping(self.unresolved.get(&new.pid), new);
+                .insert(new, key);
+            let dirty = Self::overlapping(self.unresolved.get(&new.pid), new);
             self.dirty.extend(dirty);
-            let dirty = self.overlapping(self.ambiguous_all.get(&(new.pid, new.tid)), new);
+            let dirty = Self::overlapping(self.ambiguous_all.get(&(new.pid, new.tid)), new);
             self.dirty.extend(dirty);
         }
     }
 
-    /// Ids in `ops` (by start time) whose interval overlaps `slot`.
-    fn overlapping(&self, ops: Option<&BTreeSet<(u64, u64)>>, slot: CandidateSlot) -> Vec<u64> {
-        let Some(ops) = ops else {
-            return Vec::new();
-        };
-        let from = slot.lower_ns.saturating_sub(self.max_pending_span_ns);
-        ops.range((from, 0)..=(slot.upper_ns, u64::MAX))
-            .map(|(_, id)| *id)
-            .filter(|id| {
-                self.pending
-                    .get(id)
-                    .is_some_and(|op| op.span.end_ns >= slot.lower_ns)
-            })
-            .collect()
+    /// Ids in `ops` whose interval overlaps `slot`.
+    fn overlapping(ops: Option<&IntervalSet<u64>>, slot: CandidateSlot) -> Vec<u64> {
+        ops.map_or_else(Vec::new, |ops| {
+            ops.overlapping(slot.lower_ns, slot.upper_ns, &0)
+                .copied()
+                .collect()
+        })
     }
 
-    fn is_witness(&self, key: &Arc<str>) -> bool {
-        self.witnessed
-            .range((Arc::clone(key), 0)..=(Arc::clone(key), u64::MAX))
-            .next()
-            .is_some()
+    /// Whether `slot` is a candidate of ANY pending op (recorded or not). Such a
+    /// request must keep the full TTL: dropping it early changes a pending op's
+    /// candidate set, and later expiries could then leave a single survivor and
+    /// infer the op onto it on the strength of an expiry, not of evidence.
+    fn is_candidate_of_pending(&self, slot: CandidateSlot) -> bool {
+        self.pending_by_pid.get(&slot.pid).is_some_and(|ops| {
+            ops.overlapping(slot.lower_ns, slot.upper_ns, &0)
+                .next()
+                .is_some()
+        })
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -545,13 +666,13 @@ impl Inference {
     }
 
     fn park(&mut self, id: u64, op: PendingOp) {
-        let entry = (op.span.start_ns, id);
+        let (start, end) = (op.span.start_ns, op.span.end_ns);
         match &op.state {
             PendingState::NoCandidate => {
                 self.unresolved
                     .entry(op.event.pid)
                     .or_default()
-                    .insert(entry);
+                    .insert(start, end, id);
             }
             PendingState::AmbiguousTid(witnesses) => {
                 for key in witnesses {
@@ -566,15 +687,16 @@ impl Inference {
                     self.ambiguous_all
                         .entry((op.event.pid, op.event.send_tid))
                         .or_default()
-                        .insert(entry);
+                        .insert(start, end, id);
                 }
             }
         }
-        self.max_pending_span_ns = self
-            .max_pending_span_ns
-            .max(op.span.end_ns - op.span.start_ns);
         self.pending_by_time
             .insert((rados_event_time_ns(&op.event), id));
+        self.pending_by_pid
+            .entry(op.event.pid)
+            .or_default()
+            .insert(start, end, id);
         self.pending.insert(id, op);
     }
 
@@ -583,19 +705,22 @@ impl Inference {
         self.dirty.remove(&id);
         self.pending_by_time
             .remove(&(rados_event_time_ns(&op.event), id));
-        let entry = (op.span.start_ns, id);
+        let (start, end) = (op.span.start_ns, op.span.end_ns);
+        remove_op_from(&mut self.pending_by_pid, op.event.pid, start, end, id);
         match &op.state {
             PendingState::NoCandidate => {
-                remove_from(&mut self.unresolved, op.event.pid, &entry);
+                remove_op_from(&mut self.unresolved, op.event.pid, start, end, id);
             }
             PendingState::AmbiguousTid(witnesses) | PendingState::AmbiguousAll(witnesses) => {
                 for key in witnesses {
                     self.witnessed.remove(&(Arc::clone(key), id));
                 }
-                remove_from(
+                remove_op_from(
                     &mut self.ambiguous_all,
                     (op.event.pid, op.event.send_tid),
-                    &entry,
+                    start,
+                    end,
+                    id,
                 );
             }
         }
@@ -639,17 +764,37 @@ fn reindex(
     }
 }
 
-/// Remove `entry` from the set at `map[key]`, dropping the set once empty so the
-/// map does not accumulate one empty set per pid/thread ever seen.
-fn remove_from<K, T>(map: &mut HashMap<K, BTreeSet<T>>, key: K, entry: &T)
-where
+fn remove_candidate_from<K>(
+    map: &mut HashMap<K, CandidateSet>,
+    map_key: K,
+    slot: CandidateSlot,
+    key: &Arc<str>,
+) where
     K: std::hash::Hash + Eq,
-    T: Ord,
 {
-    if let Some(set) = map.get_mut(&key) {
-        set.remove(entry);
+    if let Some(set) = map.get_mut(&map_key) {
+        set.remove(slot, key);
         if set.is_empty() {
-            map.remove(&key);
+            map.remove(&map_key);
+        }
+    }
+}
+
+/// Remove op `id` from the set at `map[map_key]`, dropping the set once empty so
+/// the map does not accumulate one empty set per pid/thread ever seen.
+fn remove_op_from<K>(
+    map: &mut HashMap<K, IntervalSet<u64>>,
+    map_key: K,
+    start: u64,
+    end: u64,
+    id: u64,
+) where
+    K: std::hash::Hash + Eq,
+{
+    if let Some(set) = map.get_mut(&map_key) {
+        set.remove(start, end, id);
+        if set.is_empty() {
+            map.remove(&map_key);
         }
     }
 }
@@ -1567,18 +1712,18 @@ impl Collector {
                 builder.expiry = Some(slot);
                 continue;
             }
-            // A group that is a witness of a pending inference keeps the full TTL:
-            // removing it early could leave that op with a single surviving
-            // candidate and infer it there on the strength of an expiry, not of
-            // evidence. Bounded by twice the pending cap.
-            if slot.class == ExpiryClass::Ended
-                && slot.clock_ns > cutoff_ns
-                && self
-                    .inference
-                    .as_ref()
-                    .is_some_and(|inference| inference.is_witness(&key))
-            {
-                continue;
+            // A group that is still a candidate of a pending inference keeps the
+            // full TTL -- recorded witness or not. Removing it early changes that
+            // op's candidate set, and a later expiry could then leave one
+            // survivor and infer the op onto it on the strength of an expiry,
+            // not of evidence.
+            if slot.class == ExpiryClass::Ended && slot.clock_ns > cutoff_ns {
+                let candidate = builder.candidate;
+                if let (Some(inference), Some(candidate)) = (self.inference.as_ref(), candidate) {
+                    if inference.is_candidate_of_pending(candidate) {
+                        continue;
+                    }
+                }
             }
             expired.push(key);
         }

@@ -814,3 +814,68 @@ fn a_request_still_witnessing_a_pending_inference_keeps_the_full_ttl() {
         Some("ambiguous_inference_candidates")
     );
 }
+
+#[test]
+fn a_third_unrecorded_candidate_keeps_the_full_ttl_too() {
+    // Three closed requests overlap one long untagged op; only two are recorded
+    // as its witnesses. If the third expired at the grace, the later TTL expiry
+    // of a witness would leave one candidate and infer the op onto it -- under
+    // the old TTL-only expiry the third was still there and the op stayed
+    // ambiguous. Every candidate of a pending op must keep the TTL.
+    let mut collector = Collector::with_inferred_correlation(0);
+    collector.set_end_probe_attached(true);
+    collector.set_closed_request_grace(20);
+    push(&mut collector, "tx-a", 1, 1, 10);
+    push(&mut collector, "tx-b", 2, 1, 20);
+    push(&mut collector, "tx-c", 3, 1, 30);
+    collector.push(untagged("op", 0, 5, 40));
+    // Grace cutoff 40: all three are past the grace, none past the TTL (100).
+    assert!(collector.drain_expired("rgwtrace", 60, 100).is_none());
+    assert!(collector.requests.contains_key("tx-c"));
+    // TTL cutoff 15: tx-a goes; the op (time 40) stays pending.
+    collector.drain_expired("rgwtrace", 115, 100);
+    // Any marker re-decides the op: tx-b AND tx-c are still candidates.
+    collector.push(TraceEvent::RequestStart(marker(
+        "tx-other", 99, 3, 5_000, 0,
+    )));
+    let document = collector.into_trace_document("rgwtrace");
+    assert_eq!(
+        outcome(std::slice::from_ref(&document))
+            .background
+            .get("op")
+            .map(String::as_str),
+        Some("ambiguous_inference_candidates")
+    );
+}
+
+#[test]
+fn a_query_with_no_candidate_does_not_walk_newer_requests() {
+    // An op older than every resident request has no candidate, and none of
+    // those requests can be one; deciding that must not visit each of them.
+    let mut collector = Collector::with_inferred_correlation(10);
+    for i in 0..10_000u64 {
+        let at = 1_000 + i * 100;
+        push(
+            &mut collector,
+            &format!("tx{i}"),
+            1 + (i % 8) as u32,
+            at,
+            at + 50,
+        );
+    }
+    let before = collector.inference.as_ref().unwrap().scanned.get();
+    collector.push(untagged("old", 0, 100, 200));
+    let scanned = collector.inference.as_ref().unwrap().scanned.get() - before;
+    assert!(
+        scanned < 64,
+        "a no-candidate query visited {scanned} candidate entries"
+    );
+    let document = collector.into_trace_document("rgwtrace");
+    assert_eq!(
+        outcome(std::slice::from_ref(&document))
+            .background
+            .get("old")
+            .map(String::as_str),
+        Some("no_inference_candidate")
+    );
+}
