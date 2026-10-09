@@ -218,3 +218,18 @@ aggregate — it is producer-only, not per-call timed).
 * `bench/src/stats.rs` — pure aggregation (median/spread/derive) + unit tests.
 * `bench/src/main.rs` — the harness.
 * `scripts/bench-overhead.sh` — the entry point.
+
+## Collector (userspace) microbenchmarks
+
+The BPF harness above measures the probes. The userspace consumer -- event
+decode, collector ingest, `--correlate-inferred` markers, and the expiry drain --
+is measured by ignored tests in `src/collector_bench.rs`, which need neither root
+nor Linux:
+
+```sh
+cargo test --release collector_bench -- --ignored --nocapture --test-threads=1
+```
+
+Each prints `BENCH ...` lines with time per operation and heap allocations
+(counted by a thread-local counting allocator that exists only in test builds).
+See `docs/perf-collector-hot-path.md` for reference numbers.
