@@ -35,5 +35,7 @@ superseded by later sections in the same document.
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
+  redaction, header sources, client reuse, private CAs, and object-name redaction.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.

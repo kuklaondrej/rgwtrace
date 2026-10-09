@@ -102,8 +102,67 @@ Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobu
 
 The exporter sends OTLP/HTTP protobuf (`Content-Type: application/x-protobuf`)
 over HTTP or HTTPS. `--service-name` sets the `service.name` resource attribute.
-Use `--otlp-timeout` and `--otlp-retries` to tune delivery, and repeat
-`--otlp-header 'Name:Value'` for any required headers.
+Use `--otlp-timeout` and `--otlp-retries` to tune delivery.
+
+### Request headers and credentials
+
+**Do not put secrets on argv.** `--otlp-header 'Name:Value'` is visible to every
+local user through `/proc/<pid>/cmdline` and `ps`; use it for non-secret headers
+(a tenant id such as `X-Scope-OrgID`) only. Credentials go in one of the two
+sources that are not on the command line:
+
+```sh
+# A header file: one `Name: Value` per line, `#` comments, blank lines ignored.
+# Refused if world-readable -- chmod 600 (or 640 for a group) first.
+sudo install -m 600 /dev/null /etc/rgwtrace/otlp-headers
+printf 'X-Api-Key: %s\n' "$API_KEY" | sudo tee /etc/rgwtrace/otlp-headers >/dev/null
+sudo rgwtrace ... --output otlp --otlp-header-file /etc/rgwtrace/otlp-headers
+
+# Or the OpenTelemetry environment variable: `k=v,k2=v2`, percent-encoded.
+# OTEL_EXPORTER_OTLP_TRACES_HEADERS, if set, replaces it (not merged), per the spec.
+sudo OTEL_EXPORTER_OTLP_HEADERS="X-Api-Key=$API_KEY" rgwtrace ... --output otlp
+```
+
+The three sources are merged by header name (case-insensitive); for a name
+present in more than one, **file > environment > `--otlp-header`**, the inverse
+of how exposed each source is. A parse or permission error names the source,
+the line or entry number and the header name, never a value. Header values are
+never logged at any log level.
+
+Credentials in the endpoint URL (`https://user:pass@...` or `?api-key=...`)
+work but are discouraged for the same argv reason; the URL is logged with its
+userinfo and query string removed, and error messages are scrubbed the same way.
+
+### TLS and private CAs
+
+```sh
+--otlp-endpoint https://tempo.internal:4318/v1/traces --otlp-ca-cert /etc/ssl/internal-ca.pem
+```
+
+`--otlp-ca-cert` adds a PEM bundle of root certificates to trust alongside the
+bundled web roots, so a collector behind an internal PKI no longer needs plain
+`http://`. The file is read and validated at startup; a missing or non-PEM file
+fails before DWARF loading.
+
+**Redirects are never followed.** A `3xx` from the endpoint is a fatal export
+error: following it would re-send the headers (credentials) and the trace body
+to whatever host `Location` names, possibly from https down to http. Point
+`--otlp-endpoint` at the final URL.
+
+### The default endpoint is plaintext
+
+The default `--otlp-endpoint` is `http://localhost:4318/v1/traces`: fine for a
+collector on the same host, but anything crossing a network should use
+`https://`. Traces carry `ceph.rados.object` values, which are S3 object keys,
+`<uid>.buckets` user names, tenant names and (for `AuthMeta` objects) access-key
+ids. If those must not reach the backend at all, pass **`--redact-object-names`**:
+every `ceph.rados.object` becomes the FNV-1a 64 hash of the name (16 hex
+digits), the span carries `rgwtrace.redacted = "ceph.rados.object"`, and
+`rgw.rados_role` is still classified from the raw name on the host. The hash is
+stable, so one object's ops still group together and can be joined with a hash
+computed elsewhere; it applies to JSON and OTLP output alike. The
+[end-to-end object correlation gate](#end-to-end-objectrequest-correlation-gate)
+matches raw S3 keys, so do not combine it with this flag.
 
 In live OTLP mode, `--otlp-flush-interval` controls how often eligible spans are
 queued for the background exporter. `--correlation-ttl` governs retention of
@@ -130,8 +189,11 @@ defaults.
 - `timed out`: firewall, routing, load balancer, or collector availability issue.
 - HTTP `404`: wrong path; OTLP/HTTP traces usually use `/v1/traces`.
 - HTTP `415`: receiver does not accept OTLP protobuf on that endpoint.
-- TLS/certificate errors: verify the endpoint certificate chain from the RGW host and use `http://` only for trusted local networks.
-- HTTP `4xx`: endpoint/auth/config issue; not retried.
+- TLS/certificate errors: verify the endpoint certificate chain from the RGW host; for an internal CA pass `--otlp-ca-cert <pem>`. Use `http://` only on the same host or a trusted local network.
+- HTTP `3xx`: the endpoint redirects and rgwtrace refuses to follow (it would re-send credentials and the trace elsewhere); set `--otlp-endpoint` to the final URL.
+- `is world-readable`: the `--otlp-header-file` must not be readable by others; `chmod 600` it.
+- `invalid OTEL_EXPORTER_OTLP_HEADERS`: the variable is `k=v,k2=v2` with percent-encoding; the error gives the entry number, never the value.
+- HTTP `4xx`: endpoint/auth/config issue; not retried. The response body is logged as a 1 KiB excerpt with control characters escaped.
 - HTTP `429` or `5xx`: retried according to `--otlp-retries`.
 
 ---
