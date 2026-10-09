@@ -1485,7 +1485,7 @@ mod linux {
         for (key, vf) in descriptor_set() {
             skel.maps
                 .hprobes
-                .update(&key.to_ne_bytes(), vf.as_bytes(), MapFlags::ANY)
+                .update(&key.to_ne_bytes(), &vf.as_bytes(), MapFlags::ANY)
                 .with_context(|| format!("populate hprobe slot {key}"))?;
         }
         // Publish the BPF globals: enable send_op's liveness gate (the fuller path)

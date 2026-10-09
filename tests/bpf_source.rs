@@ -85,6 +85,10 @@ fn event_layout_is_asserted_at_compile_time_on_both_sides() {
     assert!(
         DWARF_JSON_RS.contains("assert!(size_of::<VarFieldKernel>() == RGWTRACE_VAR_FIELD_SIZE);")
     );
+    // hprobe values are serialized field by field: viewing the struct as bytes
+    // would read its uninitialized padding, which is undefined behavior.
+    assert!(!LIVE_LINUX.contains("from_raw_parts(ptr, size_of::<VarFieldKernel>())"));
+    assert!(LIVE_LINUX.contains("entry.field.to_bytes()"));
     // The diagnostics indices now live next to the rest of the mirror, not in the
     // Linux-only runner.
     assert!(!LIVE_LINUX.contains("const BPF_DIAG_"));

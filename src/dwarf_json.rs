@@ -107,6 +107,57 @@ pub struct VarFieldKernel {
 /// `sizeof(struct VarField)` in bpf/ceph_abi.h, which asserts the same number.
 pub const RGWTRACE_VAR_FIELD_SIZE: usize = 96;
 
+impl VarFieldKernel {
+    /// The exact bytes of `struct VarField`, written field by field into a
+    /// zeroed buffer. The struct has implicit padding after every `bool`, so
+    /// viewing it as `&[u8]` would read uninitialized bytes (undefined behavior)
+    /// and ship them to the kernel.
+    pub fn to_bytes(&self) -> [u8; RGWTRACE_VAR_FIELD_SIZE] {
+        use std::mem::{offset_of, size_of};
+
+        fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+
+        let mut out = [0_u8; RGWTRACE_VAR_FIELD_SIZE];
+        let varloc = offset_of!(VarFieldKernel, varloc);
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, reg),
+            &self.varloc.reg.to_ne_bytes(),
+        );
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, offset),
+            &self.varloc.offset.to_ne_bytes(),
+        );
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, stack),
+            &[u8::from(self.varloc.stack)],
+        );
+        for (idx, field) in self.fields.iter().enumerate() {
+            let base = offset_of!(VarFieldKernel, fields) + idx * size_of::<FieldKernel>();
+            put(
+                &mut out,
+                base + offset_of!(FieldKernel, offset),
+                &field.offset.to_ne_bytes(),
+            );
+            put(
+                &mut out,
+                base + offset_of!(FieldKernel, pointer),
+                &[u8::from(field.pointer)],
+            );
+        }
+        put(
+            &mut out,
+            offset_of!(VarFieldKernel, size),
+            &self.size.to_ne_bytes(),
+        );
+        out
+    }
+}
+
 const _: () = {
     use std::mem::{offset_of, size_of};
 
@@ -1251,6 +1302,42 @@ fn arch_max_reg(arch: Option<&str>) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn var_field_kernel_bytes_follow_the_c_layout_with_zeroed_padding() {
+        let mut field = VarFieldKernel {
+            varloc: VarLocationKernel {
+                reg: 5,
+                offset: -8,
+                stack: true,
+            },
+            fields: [FieldKernel::default(); MAX_VAR_FIELD_CHAIN],
+            size: 3,
+        };
+        field.fields[1] = FieldKernel {
+            offset: 0x40,
+            pointer: true,
+        };
+        field.fields[9] = FieldKernel {
+            offset: 7,
+            pointer: false,
+        };
+
+        let bytes = field.to_bytes();
+
+        assert_eq!(bytes.len(), RGWTRACE_VAR_FIELD_SIZE);
+        let mut expected = [0_u8; RGWTRACE_VAR_FIELD_SIZE];
+        expected[0..4].copy_from_slice(&5_i32.to_ne_bytes());
+        expected[4..8].copy_from_slice(&(-8_i32).to_ne_bytes());
+        expected[8] = 1;
+        // struct Field fields[10] starts at 12, 8 bytes per {int offset; bool pointer;}.
+        expected[20..24].copy_from_slice(&0x40_i32.to_ne_bytes());
+        expected[24] = 1;
+        expected[84..88].copy_from_slice(&7_i32.to_ne_bytes());
+        expected[92..96].copy_from_slice(&3_i32.to_ne_bytes());
+        // Every padding byte (9..12 and 3 per Field) is zero, never uninitialized.
+        assert_eq!(bytes, expected);
+    }
+
     use super::*;
 
     #[test]

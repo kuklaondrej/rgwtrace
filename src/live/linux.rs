@@ -24,8 +24,7 @@ use crate::{
     collector::{BpfDiagnostics, Collector, TraceDocument},
     dwarf_json::{
         module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
-        VarFieldKernel, REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
-        RGW_RADOS_OPERATE_WRITE,
+        REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE,
     },
     events::*,
     otel, preflight, targets,
@@ -557,8 +556,8 @@ fn page_size() -> Result<u64> {
 fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
     for entry in dwarf.hprobe_entries() {
         let key = entry.key.to_ne_bytes();
-        let value = bytes_of(&entry.field);
-        map.update(&key, value, MapFlags::ANY).with_context(|| {
+        let value = entry.field.to_bytes();
+        map.update(&key, &value, MapFlags::ANY).with_context(|| {
             format!("failed to populate hprobe {}:{}", entry.function, entry.key)
         })?;
     }
@@ -1259,11 +1258,6 @@ fn clock_time_ns(clock_id: libc::clockid_t) -> Result<u64> {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-fn bytes_of(value: &VarFieldKernel) -> &[u8] {
-    let ptr = value as *const VarFieldKernel as *const u8;
-    unsafe { std::slice::from_raw_parts(ptr, size_of::<VarFieldKernel>()) }
 }
 
 fn is_squid_or_newer(version: &str) -> Option<bool> {

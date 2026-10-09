@@ -59,12 +59,22 @@ pub struct VarFieldK {
 }
 
 impl VarFieldK {
-    /// Raw bytes for `bpf_map_update_elem` into `hprobes` (value = `struct VarField`).
-    pub fn as_bytes(&self) -> &[u8] {
-        let ptr = self as *const VarFieldK as *const u8;
-        // SAFETY: `VarFieldK` is `#[repr(C)]`, `Copy`, and contains no padding
-        // that matters (the kernel side reads the same struct layout).
-        unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<VarFieldK>()) }
+    /// Bytes for `bpf_map_update_elem` into `hprobes` (value = `struct VarField`),
+    /// written field by field into a zeroed buffer: the struct has implicit
+    /// padding after each `bool`, and viewing it as `&[u8]` would read those
+    /// uninitialized bytes (undefined behavior).
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0_u8; std::mem::size_of::<VarFieldK>()];
+        out[0..4].copy_from_slice(&self.varloc.reg.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.varloc.offset.to_ne_bytes());
+        out[8] = u8::from(self.varloc.stack);
+        for (idx, field) in self.fields.iter().enumerate() {
+            let base = 12 + idx * 8;
+            out[base..base + 4].copy_from_slice(&field.offset.to_ne_bytes());
+            out[base + 4] = u8::from(field.pointer);
+        }
+        out[92..96].copy_from_slice(&self.size.to_ne_bytes());
+        out
     }
 }
 
