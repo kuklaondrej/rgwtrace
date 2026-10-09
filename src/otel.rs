@@ -244,7 +244,7 @@ fn export(
                 compression = ?config.compression,
                 "exporting OTLP traces"
             );
-            match send_once(&client, &endpoint, headers.clone(), body.bytes.clone()) {
+            match send_once(client, &endpoint, headers.clone(), body.bytes.clone()) {
                 Ok(()) => {
                     info!(
                         spans = span_count,
