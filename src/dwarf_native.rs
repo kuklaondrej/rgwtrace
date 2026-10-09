@@ -1301,12 +1301,18 @@ fn dpp_base_offset<R: Reader>(
         // DWARF 5 5.7.3: a member (here, a base class) whose location coincides with
         // the start of the containing entity may omit DW_AT_data_member_location, so
         // an absent attribute means offset 0. A virtual base encodes its location as
-        // an expression rather than a constant; `member_offset` yields None for those
-        // shapes too, and we must not read that as "0" -- so distinguish explicitly.
-        let Some(attr) = entry.attr(gimli::DW_AT_data_member_location)? else {
-            return Ok(Some(0));
-        };
-        return Ok(attr_offset(unit, attr.value())?.map(i64::from));
+        // a runtime expression that cannot be evaluated here; that is "unproven"
+        // (None), never "0", and costs only the key this offset would have proven.
+        return Ok(match inheritance_offset(unit, entry) {
+            Ok(offset) => Some(offset),
+            Err(err) => {
+                warn!(
+                    error = %format_args!("{err:#}"),
+                    "cannot evaluate the DoutPrefixProvider base location; its offset is unproven"
+                );
+                None
+            }
+        });
     }
     Ok(None)
 }
@@ -1943,7 +1949,7 @@ fn translate_field_path_from<R: Reader>(
                 typedie = next_type;
             }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
-                let Some(member) = find_member_entry(dwarf, index, typedie, path[field_index])?
+                let Some(found) = find_member_entry(dwarf, index, typedie, path[field_index])?
                 else {
                     if let Some(fields) = translate_declared_type_field_path(
                         dwarf,
@@ -1958,10 +1964,26 @@ fn translate_field_path_from<R: Reader>(
                     }
                     return Ok(None);
                 };
+                let member = found.member;
+                let member_name = path[field_index];
                 let member_unit = index.unit(member.unit);
                 let member_entry = member_unit.entry(member.offset)?;
-                fields[field_index].offset =
-                    member_offset(member_unit, &member_entry)?.unwrap_or_default();
+                let offset = member_offset(member_unit, &member_entry, member_name)?;
+                // The member's location is relative to the class that declares it;
+                // when it was found through a base class, that base's own location
+                // inside `typedie` must be added, not assumed to be zero.
+                let base_offset = found.base_offset.with_context(|| {
+                    format!(
+                        "member `{member_name}` is inherited through a base class whose \
+                         location cannot be evaluated"
+                    )
+                })?;
+                fields[field_index].offset = base_offset
+                    .checked_add(i64::from(offset))
+                    .and_then(|offset| i32::try_from(offset).ok())
+                    .with_context(|| {
+                        format!("offset of member `{member_name}` does not fit an i32")
+                    })?;
                 let Some(next_type) = die_type(index, member)? else {
                     return Ok(None);
                 };
@@ -2111,7 +2133,7 @@ fn variable_location<R: Reader>(
         });
 
     if let AttributeValue::Exprloc(expression) = attr.value() {
-        return decode_location_expression(unit, frame_base, expression);
+        return decode_location_expression(unit.encoding(), frame_base, expression);
     }
 
     let Some(mut locations) = dwarf.attr_locations(unit, attr.value())? else {
@@ -2119,15 +2141,19 @@ fn variable_location<R: Reader>(
     };
     while let Some(location) = locations.next()? {
         if pc >= location.range.begin && pc < location.range.end {
-            return decode_location_expression(unit, frame_base, location.data);
+            return decode_location_expression(unit.encoding(), frame_base, location.data);
         }
     }
 
     Ok(None)
 }
 
+/// Decode a variable location into the `reg + offset (+ stack)` shape the BPF
+/// side reads. An operation outside that shape yields NO location (the probe's
+/// descriptor is then rejected) -- skipping it would describe a different place
+/// than the one DWARF names.
 fn decode_location_expression<R: Reader>(
-    unit: &gimli::Unit<R>,
+    encoding: gimli::Encoding,
     frame_base: Option<gimli::Expression<R>>,
     expression: gimli::Expression<R>,
 ) -> Result<Option<VarLocationJson>> {
@@ -2137,9 +2163,13 @@ fn decode_location_expression<R: Reader>(
         stack: false,
     };
     let mut seen_location = false;
-    let mut operations = expression.operations(unit.encoding());
+    let mut operations = expression.clone().operations(encoding);
 
-    while let Some(operation) = operations.next()? {
+    loop {
+        let op_offset = operations.offset_from(&expression);
+        let Some(operation) = operations.next()? else {
+            break;
+        };
         match operation {
             Operation::Register { register } => {
                 location.reg = register.0 as i32;
@@ -2156,7 +2186,8 @@ fn decode_location_expression<R: Reader>(
                 let Some(frame_base) = frame_base else {
                     return Ok(None);
                 };
-                let Some(mut frame_location) = decode_location_expression(unit, None, frame_base)?
+                let Some(mut frame_location) =
+                    decode_location_expression(encoding, None, frame_base)?
                 else {
                     return Ok(None);
                 };
@@ -2172,7 +2203,13 @@ fn decode_location_expression<R: Reader>(
             }
             Operation::Nop => {}
             Operation::CallFrameCFA => return Ok(None),
-            _ => {}
+            _ => {
+                debug!(
+                    op = %operation_name(&expression, op_offset),
+                    "unsupported DWARF operation in a variable location; no location decoded"
+                );
+                return Ok(None);
+            }
         }
     }
 
@@ -2207,14 +2244,25 @@ fn peel_type_qualifiers<R: Reader>(
     Ok(typedie)
 }
 
+/// A `DW_TAG_member` found by [`find_member_entry`], plus the offset of the
+/// (possibly inherited) class that declares it inside the searched type.
+struct MemberMatch<O> {
+    member: DieRef<O>,
+    /// `Err` when the member was reached through a base class whose location
+    /// cannot be evaluated (a virtual base's location is a runtime expression).
+    /// Kept lazy so an unrelated virtual base elsewhere in the hierarchy does not
+    /// fail a lookup that never goes through it.
+    base_offset: Result<i64>,
+}
+
 fn find_member_entry<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     typedie: DieRef<R::Offset>,
     member_name: &str,
-) -> Result<Option<DieRef<R::Offset>>> {
-    let mut queue = vec![typedie];
-    while let Some(parent) = queue.pop() {
+) -> Result<Option<MemberMatch<R::Offset>>> {
+    let mut queue: Vec<(DieRef<R::Offset>, Result<i64>)> = vec![(typedie, Ok(0))];
+    while let Some((parent, parent_offset)) = queue.pop() {
         let unit = index.unit(parent.unit);
         // A member's owning struct may live in the DWZ supplementary file
         // (reached via `DW_FORM_GNU_ref_alt` on `DW_AT_type`); its member names
@@ -2232,12 +2280,23 @@ fn find_member_entry<R: Reader>(
             match entry.tag() {
                 gimli::DW_TAG_member => {
                     if die_name(parent_dwarf, unit, entry)?.as_deref() == Some(member_name) {
-                        return Ok(Some(child_ref));
+                        return Ok(Some(MemberMatch {
+                            member: child_ref,
+                            base_offset: parent_offset,
+                        }));
                     }
                 }
                 gimli::DW_TAG_inheritance => {
                     if let Some(parent_type) = die_type(index, child_ref)? {
-                        queue.push(parent_type);
+                        let base_offset = match &parent_offset {
+                            Ok(outer) => inheritance_offset(unit, entry)
+                                .map(|inner| outer + inner)
+                                .with_context(|| {
+                                    format!("cannot locate a base class while searching for `{member_name}`")
+                                }),
+                            Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                        };
+                        queue.push((parent_type, base_offset));
                     }
                 }
                 _ => {}
@@ -2425,28 +2484,92 @@ fn die_type<R: Reader>(
     Ok(None)
 }
 
+/// The facts about a `DW_TAG_member` that decide whether an ABSENT location
+/// attribute may be read as offset 0.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemberShape {
+    /// A static data member (`DW_AT_external`/`DW_AT_declaration`): it has no
+    /// location inside the object at all.
+    is_static: bool,
+    /// A bit-field located by `DW_AT_data_bit_offset`: its start is a BIT offset.
+    has_data_bit_offset: bool,
+}
+
+/// Byte offset of `member` inside the class that declares it.
+///
+/// Every shape this cannot evaluate is an ERROR naming the member, never a
+/// default: an offset of 0 that is not really 0 makes the BPF side read the wrong
+/// bytes of every request, silently.
 fn member_offset<R: Reader>(
     unit: &gimli::Unit<R>,
     member: &DebuggingInformationEntry<R>,
-) -> Result<Option<i32>> {
-    let Some(attr) = member.attr(gimli::DW_AT_data_member_location)? else {
-        return Ok(None);
+    member_name: &str,
+) -> Result<i32> {
+    let shape = MemberShape {
+        is_static: entry_flag(member, gimli::DW_AT_external)?
+            || entry_flag(member, gimli::DW_AT_declaration)?,
+        has_data_bit_offset: member.attr(gimli::DW_AT_data_bit_offset)?.is_some(),
     };
-    attr_offset(unit, attr.value())
+    let location = member
+        .attr(gimli::DW_AT_data_member_location)?
+        .map(|attr| attr.value());
+    resolve_member_offset(unit.encoding(), member_name, location, shape)
 }
 
-fn attr_offset<R: Reader>(unit: &gimli::Unit<R>, value: AttributeValue<R>) -> Result<Option<i32>> {
-    let offset = match value {
+fn resolve_member_offset<R: Reader>(
+    encoding: gimli::Encoding,
+    member_name: &str,
+    location: Option<AttributeValue<R>>,
+    shape: MemberShape,
+) -> Result<i32> {
+    let Some(location) = location else {
+        // DWARF 5 5.7.6: a data member that starts at the beginning of its
+        // containing entity may omit both location attributes. That reading is only
+        // valid for an ordinary, non-static, byte-addressed member.
+        if shape.is_static {
+            anyhow::bail!("member `{member_name}` is a static data member and has no offset");
+        }
+        if shape.has_data_bit_offset {
+            anyhow::bail!(
+                "member `{member_name}` is located by DW_AT_data_bit_offset, which is not supported"
+            );
+        }
+        return Ok(0);
+    };
+    let offset = attr_offset(encoding, location)
+        .with_context(|| format!("cannot evaluate the location of member `{member_name}`"))?;
+    i32::try_from(offset)
+        .with_context(|| format!("offset {offset} of member `{member_name}` does not fit an i32"))
+}
+
+/// Offset of a base class (`DW_TAG_inheritance`) inside the derived class.
+fn inheritance_offset<R: Reader>(
+    unit: &gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+) -> Result<i64> {
+    // Same DWARF 5 rule as for members: a base at the start of the derived class
+    // may omit its location.
+    let Some(attr) = entry.attr(gimli::DW_AT_data_member_location)? else {
+        return Ok(0);
+    };
+    attr_offset(unit.encoding(), attr.value())
+}
+
+/// Evaluate a constant-class or simple-expression `DW_AT_data_member_location`.
+/// Any other form is an error: callers must never mistake "unsupported" for 0.
+fn attr_offset<R: Reader>(encoding: gimli::Encoding, value: AttributeValue<R>) -> Result<i64> {
+    Ok(match value {
         AttributeValue::Data1(value) => value as i64,
         AttributeValue::Data2(value) => value as i64,
         AttributeValue::Data4(value) => value as i64,
         AttributeValue::Data8(value) => value as i64,
         AttributeValue::Sdata(value) => value,
-        AttributeValue::Udata(value) => value as i64,
-        AttributeValue::Exprloc(expression) => expression_offset(unit, expression)?,
-        _ => return Ok(None),
-    };
-    Ok(i32::try_from(offset).ok())
+        AttributeValue::Udata(value) => {
+            i64::try_from(value).context("DW_AT_data_member_location does not fit an i64")?
+        }
+        AttributeValue::Exprloc(expression) => expression_offset(encoding, expression)?,
+        other => anyhow::bail!("unsupported DW_AT_data_member_location form {other:?}"),
+    })
 }
 
 fn entry_flag<R: Reader>(entry: &DebuggingInformationEntry<R>, attr: gimli::DwAt) -> Result<bool> {
@@ -2465,24 +2588,43 @@ fn entry_flag<R: Reader>(entry: &DebuggingInformationEntry<R>, attr: gimli::DwAt
 }
 
 fn expression_offset<R: Reader>(
-    unit: &gimli::Unit<R>,
+    encoding: gimli::Encoding,
     expression: gimli::Expression<R>,
 ) -> Result<i64> {
-    let mut offset = 0;
-    let mut operations = expression.operations(unit.encoding());
-    while let Some(operation) = operations.next()? {
-        match operation {
+    let mut offset: i64 = 0;
+    let mut operations = expression.clone().operations(encoding);
+    loop {
+        let op_offset = operations.offset_from(&expression);
+        let Some(operation) = operations.next()? else {
+            break;
+        };
+        let value = match operation {
             Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
-                offset += value as i64;
+                i64::try_from(value).context("DWARF member location constant does not fit i64")?
             }
-            Operation::SignedConstant { value } | Operation::FrameOffset { offset: value } => {
-                offset += value;
-            }
-            Operation::Nop => {}
-            _ => return Ok(0),
-        }
+            Operation::SignedConstant { value } | Operation::FrameOffset { offset: value } => value,
+            Operation::Nop => continue,
+            _ => anyhow::bail!(
+                "unsupported DWARF operation {} in a member location expression",
+                operation_name(&expression, op_offset)
+            ),
+        };
+        offset = offset
+            .checked_add(value)
+            .context("DWARF member location offset overflow")?;
     }
     Ok(offset)
+}
+
+/// The `DW_OP_*` name of the operation at `op_offset` in `expression`, for error
+/// messages an operator can act on.
+fn operation_name<R: Reader>(expression: &gimli::Expression<R>, op_offset: R::Offset) -> String {
+    let mut reader = expression.0.clone();
+    reader
+        .skip(op_offset)
+        .and_then(|()| reader.read_u8())
+        .map(|opcode| gimli::DwOp(opcode).to_string())
+        .unwrap_or_else(|_| "<unreadable DW_OP>".to_string())
 }
 
 fn scope_name<R: Reader>(
@@ -2864,6 +3006,152 @@ mod tests {
     use crate::dwarf_json::{
         DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
     };
+
+    fn test_encoding() -> gimli::Encoding {
+        gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        }
+    }
+
+    fn expression(bytes: &[u8]) -> gimli::Expression<EndianSlice<'_, gimli::LittleEndian>> {
+        gimli::Expression(EndianSlice::new(bytes, gimli::LittleEndian))
+    }
+
+    #[test]
+    fn member_location_expression_evaluates_supported_constant_ops() {
+        let bytes = [gimli::DW_OP_plus_uconst.0, 0x18];
+        let offset = expression_offset(test_encoding(), expression(&bytes)).unwrap();
+        assert_eq!(offset, 0x18);
+    }
+
+    #[test]
+    fn member_location_expression_with_an_unsupported_op_is_an_error_not_offset_zero() {
+        // A virtual base's location: `DW_OP_dup; DW_OP_deref; ...`. It used to
+        // evaluate to offset 0, so the BPF side read the wrong bytes silently.
+        let bytes = [gimli::DW_OP_dup.0, gimli::DW_OP_deref.0];
+        let err = expression_offset(test_encoding(), expression(&bytes)).unwrap_err();
+        assert!(format!("{err:#}").contains("DW_OP_dup"), "message: {err:#}");
+    }
+
+    #[test]
+    fn member_offset_names_the_member_and_the_unsupported_op() {
+        let bytes = [gimli::DW_OP_dup.0, gimli::DW_OP_deref.0];
+        let err = resolve_member_offset(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::Exprloc(expression(&bytes))),
+            MemberShape::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`target`"), "message: {msg}");
+        assert!(msg.contains("DW_OP_dup"), "message: {msg}");
+    }
+
+    #[test]
+    fn member_offset_refuses_unsupported_forms_and_out_of_range_values() {
+        let loclist = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::LocationListsRef(
+                gimli::LocationListsOffset(0),
+            )),
+            MemberShape::default(),
+        );
+        assert!(loclist.is_err());
+
+        // Used to be `i32::try_from(..).ok()` -> None -> `unwrap_or_default()` = 0.
+        let huge = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::Udata(1 << 40)),
+            MemberShape::default(),
+        );
+        let msg = format!("{:#}", huge.unwrap_err());
+        assert!(msg.contains("`target`"), "message: {msg}");
+    }
+
+    #[test]
+    fn absent_member_location_is_offset_zero_only_for_a_plain_data_member() {
+        // DWARF 5 5.7.6: a member that starts at the beginning of its container may
+        // omit both location attributes.
+        let plain = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "first",
+            None,
+            MemberShape::default(),
+        )
+        .unwrap();
+        assert_eq!(plain, 0);
+
+        // A static data member has no in-object location at all, and a bit-field
+        // located by DW_AT_data_bit_offset is not at "offset 0" either.
+        for shape in [
+            MemberShape {
+                is_static: true,
+                has_data_bit_offset: false,
+            },
+            MemberShape {
+                is_static: false,
+                has_data_bit_offset: true,
+            },
+        ] {
+            let err = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+                test_encoding(),
+                "counter",
+                None,
+                shape,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("`counter`"), "message: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_location_expression_with_an_unsupported_op_yields_no_location() {
+        // `DW_OP_reg5; DW_OP_deref`: ignoring the deref would hand the BPF side the
+        // register itself -- a wrong location, not a missing one.
+        let bytes = [gimli::DW_OP_reg5.0, gimli::DW_OP_deref.0];
+        let location =
+            decode_location_expression(test_encoding(), None, expression(&bytes)).unwrap();
+        assert!(location.is_none());
+
+        let bytes = [gimli::DW_OP_reg5.0];
+        let location =
+            decode_location_expression(test_encoding(), None, expression(&bytes)).unwrap();
+        assert_eq!(location.map(|location| location.reg), Some(5));
+    }
+
+    #[test]
+    fn inherited_member_offsets_include_the_base_class_offset() {
+        // `struct Derived : A, B` and the probed member lives in `B`, which sits at
+        // offset 16 inside `Derived`. The member's own location (8) is relative to
+        // `B`, so the real offset is 24 -- not 8, which is what dropping the
+        // inheritance edge's location produced.
+        let Some(binary) = compile_cpp_source(
+            "inherited-member-fixture",
+            r#"
+            struct A { long a0; long a1; };
+            struct B { long b0; long target; };
+            struct Derived : A, B { long own; };
+            long inspect(Derived* outer) { return outer->target; }
+            int main() { Derived d{}; return (int)inspect(&d); }
+            "#,
+        ) else {
+            return;
+        };
+        let Some(fields) =
+            fixture_field_path(&binary, "inspect", "outer", &["outer", "target"]).unwrap()
+        else {
+            // No DWARF in the linked binary (macOS keeps it in a .dSYM); the Linux
+            // CI build runs this for real.
+            return;
+        };
+        assert!(fields[1].pointer || fields[0].pointer);
+        assert_eq!(fields[1].offset, 24);
+    }
 
     #[test]
     fn parses_probe_function_pcs_from_cpp_fixture_when_compiler_is_available() {
@@ -4108,7 +4396,8 @@ mod tests {
             if let Some(mut locations) = dwarf.attr_locations(unit, attr.value()).ok()? {
                 while let Some(location) = locations.next().ok()? {
                     loclist_entries += 1;
-                    let decoded = decode_location_expression(unit, None, location.data).ok()?;
+                    let decoded =
+                        decode_location_expression(unit.encoding(), None, location.data).ok()?;
                     let Some(decoded) = decoded.filter(|decoded| !decoded.stack) else {
                         continue;
                     };
@@ -5635,6 +5924,15 @@ mod tests {
     }
 
     fn field_offsets_from_fixture(binary: &Path) -> Result<Option<Vec<FieldJson>>> {
+        fixture_field_path(binary, "inspect", "outer", &["outer", "leaf", "value"])
+    }
+
+    fn fixture_field_path(
+        binary: &Path,
+        function_name: &str,
+        param_name: &str,
+        path: &[&str],
+    ) -> Result<Option<Vec<FieldJson>>> {
         let data = std::fs::read(binary)?;
         let file = object::File::parse(data.as_slice())?;
         let endian = if file.is_little_endian() {
@@ -5649,7 +5947,8 @@ mod tests {
         let index = DwarfUnitIndex::load(&dwarf)?;
         for unit_index in 0..index.len() {
             let unit = index.unit(unit_index);
-            let Some(function) = find_subprogram_by_name(&dwarf, &index, unit_index, "inspect")?
+            let Some(function) =
+                find_subprogram_by_name(&dwarf, &index, unit_index, function_name)?
             else {
                 continue;
             };
@@ -5658,7 +5957,7 @@ mod tests {
                 unit,
                 function.offset(),
                 &[gimli::DW_TAG_formal_parameter],
-                "outer",
+                param_name,
             )?
             else {
                 continue;
@@ -5670,7 +5969,7 @@ mod tests {
                     unit: unit_index,
                     offset: param.offset(),
                 },
-                &["outer", "leaf", "value"],
+                path,
             );
         }
 
