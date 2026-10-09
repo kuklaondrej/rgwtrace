@@ -26,11 +26,19 @@ use crate::{
 
 const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExportDiagnostics {
     pub batches: u64,
     pub attempts: u64,
+    /// Failed ATTEMPTS, including ones a retry recovered from.
     pub failures: u64,
+    /// Batches that were never delivered (retries exhausted, a non-retryable
+    /// response, or abandoned after an earlier batch exhausted its retries).
+    pub failed_batches: u64,
+    /// Real spans (not the synthetic run summary) in those batches: LOST.
+    pub failed_spans: u64,
+    /// The error that lost the most recent failed batch, for the log.
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,6 +65,13 @@ pub struct ExportConfig<'a> {
 /// One periodic drain of expired spans, mid-run. Sends nothing when the drain is
 /// empty; the run summary rides along on the resource of whatever batches it does
 /// send, and is superseded by the final export.
+///
+/// A batch that cannot be delivered does NOT make this return `Err`: the batch is
+/// counted in `failed_batches`/`failed_spans` and the caller keeps exporting later
+/// drains. `Err` is reserved for failures to even build the request (an invalid
+/// endpoint, a span that cannot be encoded), which lose the whole document --
+/// the caller counts that too. See [`export`] for which failures move on to the
+/// next batch and which abandon the rest of the document.
 pub fn export_otlp_http(
     config: ExportConfig<'_>,
     document: &TraceDocument,
@@ -119,12 +134,18 @@ fn export(
     }
 
     let resource_attributes = resource_attributes(document, config.diagnostics);
-    let mut batches = otlp_batches(
+    let mut batches: Vec<(Vec<Span>, usize)> = otlp_batches(
         document,
         config.max_spans_per_batch,
         config.max_bytes_per_batch,
         config.diagnostics,
-    )?;
+    )?
+    .into_iter()
+    .map(|batch| {
+        let real_spans = batch.len();
+        (batch, real_spans)
+    })
+    .collect();
     if kind == Export::Final && config.diagnostics {
         // Its OWN batch, appended last: it is therefore the final batch on the
         // wire (so a consumer reading "the last batch's resource" reads the final
@@ -136,7 +157,7 @@ fn export(
         // diagnostics off there is nothing to deliver, so an empty final drain
         // sends nothing -- the pre-diagnostics behavior -- and a non-empty final
         // drain still exports its spans below.
-        batches.push(vec![run_summary_span(document)?]);
+        batches.push((vec![run_summary_span(document)?], 0));
     }
     let client = Client::builder()
         .timeout(config.timeout)
@@ -149,7 +170,20 @@ fn export(
         batches: batch_count as u64,
         ..ExportDiagnostics::default()
     };
-    for (batch_idx, batch) in batches.into_iter().enumerate() {
+    // FAILURE POLICY, per batch (none of it stops the exporter -- see
+    // `export_otlp_http`):
+    //
+    // * a NON-RETRYABLE response (a 4xx other than 429: bad auth, wrong path, a
+    //   payload the collector refuses) is about THIS batch, and the endpoint
+    //   answered promptly, so the batch is counted lost and the next batch is
+    //   tried;
+    // * RETRIES EXHAUSTED (connection refused, timeouts, 5xx, 429) means the
+    //   endpoint is unhealthy right now, so the rest of this document is counted
+    //   lost without being tried -- otherwise one drain of N batches would block
+    //   the exporter for N x (retries + 1) x timeout while drains pile up behind
+    //   it. The next drain starts fresh and recovers as soon as the endpoint does.
+    let mut batches = batches.into_iter().enumerate();
+    while let Some((batch_idx, (batch, real_spans))) = batches.next() {
         let span_count = batch.len();
         let protobuf_body = spans_to_otlp_protobuf(&resource_attributes, batch);
         let body = encode_body(protobuf_body, config.compression)?;
@@ -192,16 +226,35 @@ fn export(
                 }
                 Err(err) => {
                     diagnostics.failures += 1;
-                    bail!(
-                        "{}; export batches: {}, export attempts: {}, export failures: {}",
-                        err.message,
-                        diagnostics.batches,
-                        diagnostics.attempts,
-                        diagnostics.failures
-                    )
+                    diagnostics.failed_batches += 1;
+                    diagnostics.failed_spans += real_spans as u64;
+                    if err.retryable {
+                        for (_, (_, abandoned_spans)) in batches.by_ref() {
+                            diagnostics.failed_batches += 1;
+                            diagnostics.failed_spans += abandoned_spans as u64;
+                        }
+                    }
+                    diagnostics.last_error = Some(err.message);
+                    break;
                 }
             }
         }
+    }
+
+    if kind == Export::Final && diagnostics.failed_batches > 0 {
+        // The final export keeps failing loudly: its caller dumps the whole trace
+        // to stdout instead, so nothing here is lost.
+        bail!(
+            "{}; export batches: {}, export attempts: {}, export failures: {}, failed batches: {}",
+            diagnostics
+                .last_error
+                .as_deref()
+                .unwrap_or("OTLP export failed"),
+            diagnostics.batches,
+            diagnostics.attempts,
+            diagnostics.failures,
+            diagnostics.failed_batches
+        );
     }
 
     Ok(diagnostics)
@@ -1187,10 +1240,10 @@ mod tests {
         trace.diagnostics.bpf_operate_seed_hits_rgwop = 7;
         trace.diagnostics.rados_ops = 128;
         assert!(trace.spans.is_empty(), "this is the empty-final-trace case");
-        let document = serde_json::json!({ "trace": &trace });
+        let dwarf = crate::dwarf_json::DwarfInfo::default().summary();
         let mut out = Vec::new();
 
-        crate::export_trace_otlp(export_config(&endpoint, 2), &trace, &document, &mut out).unwrap();
+        crate::export_trace_otlp(export_config(&endpoint, 2), &dwarf, &trace, &mut out).unwrap();
 
         let bodies = handle.join().unwrap();
         assert_eq!(
@@ -1439,35 +1492,109 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_non_retryable_otlp_error() {
+    fn a_non_retryable_periodic_failure_is_counted_not_fatal() {
+        // REGRESSION (F15): a failed batch used to be an `Err` that ended the
+        // exporter thread, so one bad response disabled OTLP export for the rest
+        // of the run and lost the spans uncounted. It is now counted and returned
+        // as data; the caller keeps exporting.
         let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
         let document = trace_document(1);
 
-        let err = export_otlp_http(export_config(&endpoint, 3), &document).unwrap_err();
+        let export = export_otlp_http(export_config(&endpoint, 3), &document)
+            .expect("an undeliverable batch must not fail the periodic export");
 
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1);
         assert!(
-            err.to_string().contains("400"),
-            "error should surface status: {err}"
+            export.last_error.as_deref().unwrap().contains("400"),
+            "the failure must surface the status: {:?}",
+            export.last_error
         );
         assert_eq!(handle.join().unwrap().len(), 1, "must not retry a 4xx");
     }
 
     #[test]
-    fn surfaces_exhausted_retries_otlp_error() {
+    fn exhausted_retries_are_counted_not_fatal() {
         let (endpoint, handle) = spawn_mock_server(vec![http_response(503), http_response(503)]);
         let document = trace_document(1);
 
-        let err = export_otlp_http(export_config(&endpoint, 1), &document).unwrap_err();
+        let export = export_otlp_http(export_config(&endpoint, 1), &document).unwrap();
 
-        assert!(
-            err.to_string().contains("503"),
-            "error should surface status: {err}"
-        );
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1);
+        assert!(export.last_error.as_deref().unwrap().contains("503"));
         assert_eq!(
             handle.join().unwrap().len(),
             2,
             "should exhaust both attempts"
         );
+    }
+
+    #[test]
+    fn a_rejected_batch_does_not_stop_the_next_batch() {
+        // A 4xx is about one batch, and the endpoint answered: try the rest.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400), http_response(200)]);
+        let document = trace_document(2);
+        let config = ExportConfig {
+            max_spans_per_batch: 1,
+            ..export_config(&endpoint, 0)
+        };
+
+        let export = export_otlp_http(config, &document).unwrap();
+
+        assert_eq!(export.batches, 2);
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1, "only the rejected batch is lost");
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exhausted_retries_abandon_the_rest_of_the_document_and_count_it() {
+        // An unhealthy endpoint: do not block the exporter retrying every batch of
+        // this drain; count them all lost and let the next drain try again.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(503)]);
+        let document = trace_document(3);
+        let config = ExportConfig {
+            max_spans_per_batch: 1,
+            ..export_config(&endpoint, 0)
+        };
+
+        let export = export_otlp_http(config, &document).unwrap();
+
+        assert_eq!(export.failed_batches, 3);
+        assert_eq!(export.failed_spans, 3);
+        assert_eq!(
+            handle.join().unwrap().len(),
+            1,
+            "later batches are not tried"
+        );
+    }
+
+    #[test]
+    fn the_final_export_still_fails_loudly_so_the_trace_is_dumped() {
+        // The final export's caller dumps the trace to stdout on `Err`; that
+        // contract is unchanged.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
+        let document = trace_document(1);
+
+        let err = export_final_otlp_http(export_config_no_diagnostics(&endpoint, 3), &document)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("400"), "{err}");
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_lost_run_summary_batch_fails_the_final_export_without_counting_spans() {
+        // The synthetic run-summary span is not request telemetry: it is never
+        // counted as a lost span, but losing it still fails the final export.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
+        let document = trace_document(0);
+
+        let err = export_final_otlp_http(export_config(&endpoint, 0), &document).unwrap_err();
+
+        assert!(err.to_string().contains("failed batches: 1"), "{err}");
+        assert_eq!(handle.join().unwrap().len(), 1);
     }
 
     /// A config with OTLP diagnostics ON -- the flag-on behavior the run-summary
