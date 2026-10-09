@@ -232,12 +232,27 @@ struct {
   __uint(max_entries, 16384);
 } rgw_op_keys SEC(".maps");
 
+/*
+ * Probe descriptors, keyed by `function base id + var_field index` -- a dense
+ * index space of RGWTRACE_HPROBE_SLOTS keys, written once by userspace before
+ * any probe attaches. An ARRAY, not a HASH: the verifier inlines an ARRAY
+ * lookup into a bounds check plus an add, and _send_op does a dozen of them
+ * per op while RGW holds the Objecter lock.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, int);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, __u32);
   __type(value, struct VarField);
-  __uint(max_entries, 8192);
+  __uint(max_entries, RGWTRACE_HPROBE_SLOTS);
 } hprobes SEC(".maps");
+
+/* The descriptor in slot `varid`, or 0 when userspace did not populate it. */
+static __always_inline struct VarField *hprobe_lookup(__u32 varid) {
+  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  if (vf == 0 || vf->present == 0)
+    return 0;
+  return vf;
+}
 
 /*
  * Sized at runtime from --ringbuf-size (bpf_map__set_max_entries on the open
@@ -513,7 +528,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
     }
   }
 
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   int trans_id_len = 0;
   if (vf == 0)
     return 0;
@@ -531,7 +546,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   rgwtrace_probe_read_user(&trans_id_len, sizeof(trans_id_len), (void *)len_addr);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -628,7 +643,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
 SEC("uprobe")
 int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
   int varid = 50;
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -775,7 +790,7 @@ int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
 SEC("uprobe")
 int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
   int varid = 40;
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -823,7 +838,7 @@ int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
   __u64 op_ptr = 0;
   if (RGW_OP_BRIDGE_KEY_ENABLED != 0) {
     int varid_op = 41;
-    struct VarField *op_vf = bpf_map_lookup_elem(&hprobes, &varid_op);
+    struct VarField *op_vf = hprobe_lookup(varid_op);
     op_ptr = fetch_param_ptr_ref(ctx, op_vf);
   }
 
@@ -1068,7 +1083,7 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
    * (Userspace additionally refuses to attach these probes at all without a proven
    * descriptor, so the descriptor-shaped causes should be unreachable in practice.)
    */
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0) {
     count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);
     operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
@@ -1149,7 +1164,7 @@ SEC("uprobe")
 int uprobe_send_op(struct pt_regs *ctx) {
   int varid = 0;
   struct client_op_key key = {};
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1158,7 +1173,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);
@@ -1198,7 +1213,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 osd_addr = fetch_var_member_addr(v, vf);
@@ -1207,7 +1222,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   int name_len = 0;
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1216,7 +1231,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   __u64 name_base = 0;
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1240,7 +1255,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
     rgwtrace_probe_read_user(event->object_name, read_len, (void *)name_base);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 flags_addr = fetch_var_member_addr(v, vf);
@@ -1248,7 +1263,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 pool_addr = fetch_var_member_addr(v, vf);
@@ -1256,7 +1271,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 seed_addr = fetch_var_member_addr(v, vf);
@@ -1269,7 +1284,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 acting_start = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1279,7 +1294,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 acting_finish = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1309,7 +1324,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 ops_start = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1318,7 +1333,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
                            (void *)ops_start_addr);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1398,7 +1413,7 @@ SEC("uprobe")
 int uprobe_finish_op(struct pt_regs *ctx) {
   int varid = 20;
   struct client_op_key key = {};
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1407,7 +1422,7 @@ int uprobe_finish_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);

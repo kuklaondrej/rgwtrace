@@ -65,10 +65,22 @@ struct VarField {
   struct VarLocation varloc;
   struct Field fields[10];
   int size;
+  /*
+   * Nonzero for a slot userspace populated. `hprobes` is an ARRAY, whose
+   * lookups never miss for an in-range key: an unpopulated slot reads as all
+   * zeroes, which would otherwise pass for a "register 0" descriptor.
+   */
+  __u32 present;
 };
 
 /* Mirrored by VarFieldKernel in src/dwarf_json.rs, which asserts the same size. */
-#define RGWTRACE_VAR_FIELD_SIZE 96
+#define RGWTRACE_VAR_FIELD_SIZE 100
+/*
+ * Number of `hprobes` slots. Keys are `function base id + var_field index`
+ * (FUNCTION_BASE_IDS in src/dwarf_json.rs: 0, 20, 30, 40, 50, 60, 70), so the
+ * highest base, 70, gets 10 slots.
+ */
+#define RGWTRACE_HPROBE_SLOTS 80
 _Static_assert(sizeof(struct VarField) == RGWTRACE_VAR_FIELD_SIZE,
                "struct VarField layout drifted from VarFieldKernel in src/dwarf_json.rs");
 

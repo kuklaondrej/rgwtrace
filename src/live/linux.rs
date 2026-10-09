@@ -24,7 +24,8 @@ use crate::{
     collector::{BpfDiagnostics, Collector, TraceDocument},
     dwarf_json::{
         module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
-        REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE,
+        REQ_STATE_DTOR, RGWTRACE_HPROBE_SLOTS, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
+        RGW_RADOS_OPERATE_WRITE,
     },
     events::*,
     otel, preflight, targets,
@@ -555,7 +556,18 @@ fn page_size() -> Result<u64> {
 
 fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
     for entry in dwarf.hprobe_entries() {
-        let key = entry.key.to_ne_bytes();
+        // hprobes is a dense ARRAY; DwarfInfo::validate already bounds every
+        // key, so an out-of-range one here is a bug, not bad input.
+        let key = u32::try_from(entry.key)
+            .ok()
+            .filter(|key| *key < RGWTRACE_HPROBE_SLOTS as u32)
+            .with_context(|| {
+                format!(
+                    "hprobe key {} for {} is outside the {RGWTRACE_HPROBE_SLOTS}-slot map",
+                    entry.key, entry.function
+                )
+            })?
+            .to_ne_bytes();
         let value = entry.field.to_bytes();
         map.update(&key, &value, MapFlags::ANY).with_context(|| {
             format!("failed to populate hprobe {}:{}", entry.function, entry.key)

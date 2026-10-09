@@ -725,7 +725,7 @@ fn an_unresolved_or_null_dpp_fails_closed_exactly_like_a_foreign_one() {
     // and both clear a SEEDED context only, leaving a HOME one alone.
     let seed = phase_b_seed_body();
     assert!(seed.contains(concat!(
-        "  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);\n",
+        "  struct VarField *vf = hprobe_lookup(varid);\n",
         "  if (vf == 0) {\n",
         "    count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);\n",
         "    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,\n",
@@ -1065,4 +1065,31 @@ fn ring_buffer_size_is_configured_before_load() {
     ));
     assert!(LIVE_LINUX.contains(".events\n        .set_max_entries(cli.ringbuf_size)"));
     assert!(CLI.contains("pub ringbuf_size: u32,"));
+}
+
+#[test]
+fn hprobes_is_a_dense_array_and_every_lookup_checks_presence() {
+    // hprobes holds < 80 small integer keys but was an 8192-entry HASH, and
+    // _send_op does ~12 lookups on it while RGW holds the Objecter lock. An ARRAY
+    // lookup is a bounds check plus an add (the verifier inlines it).
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_ARRAY);\n",
+        "  __type(key, __u32);\n",
+        "  __type(value, struct VarField);\n",
+        "  __uint(max_entries, RGWTRACE_HPROBE_SLOTS);\n",
+        "} hprobes SEC(\".maps\");"
+    )));
+    // An ARRAY lookup never misses for an in-range key: an unpopulated slot reads
+    // as all zeroes, i.e. as a "register 0" descriptor. So every lookup goes
+    // through the presence-checking helper and nothing reads the map directly.
+    assert!(RGWTRACE_BPF.contains("if (vf == 0 || vf->present == 0)\n    return 0;"));
+    assert_eq!(
+        RGWTRACE_BPF
+            .matches("bpf_map_lookup_elem(&hprobes,")
+            .count(),
+        1,
+        "only hprobe_lookup may read the hprobes map"
+    );
+    assert!(CEPH_ABI.contains("  __u32 present;\n};"));
+    assert!(CEPH_ABI.contains("#define RGWTRACE_HPROBE_SLOTS 80"));
 }

@@ -49,13 +49,16 @@ pub struct FieldK {
     pub pointer: bool,
 }
 
-/// Mirror of `struct VarField`: `{ VarLocation varloc; Field fields[10]; int size; }`.
+/// Mirror of `struct VarField`:
+/// `{ VarLocation varloc; Field fields[10]; int size; __u32 present; }`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VarFieldK {
     pub varloc: VarLocationK,
     pub fields: [FieldK; 10],
     pub size: i32,
+    /// `hprobes` is an ARRAY; the BPF side ignores a slot whose `present` is 0.
+    pub present: u32,
 }
 
 impl VarFieldK {
@@ -74,6 +77,7 @@ impl VarFieldK {
             out[base + 4] = u8::from(field.pointer);
         }
         out[92..96].copy_from_slice(&self.size.to_ne_bytes());
+        out[96..100].copy_from_slice(&self.present.to_ne_bytes());
         out
     }
 }
@@ -93,6 +97,7 @@ pub fn reg_member(reg: i32, member_offset: i32) -> VarFieldK {
         },
         fields: [FieldK::default(); 10],
         size: 2,
+        present: 1,
     };
     vf.fields[1].offset = member_offset;
     vf
@@ -110,6 +115,7 @@ pub fn raw_pointer(reg: i32) -> VarFieldK {
         },
         fields: [FieldK::default(); 10],
         size: 1,
+        present: 1,
     }
 }
 
@@ -119,12 +125,12 @@ mod tests {
 
     #[test]
     fn varfield_matches_kernel_struct_size() {
-        // struct VarField = VarLocation(12) + Field[10](8*10) + int(4) = 96.
+        // struct VarField = VarLocation(12) + Field[10](8*10) + int(4) + u32(4) = 100.
         // A mismatch here means the hprobes value size disagrees with the BPF
         // map and every descriptor write would be rejected or misread.
         assert_eq!(std::mem::size_of::<VarLocationK>(), 12);
         assert_eq!(std::mem::size_of::<FieldK>(), 8);
-        assert_eq!(std::mem::size_of::<VarFieldK>(), 96);
+        assert_eq!(std::mem::size_of::<VarFieldK>(), 100);
     }
 
     #[test]
@@ -134,7 +140,8 @@ mod tests {
         assert!(!vf.varloc.stack);
         assert_eq!(vf.fields[1].offset, 40);
         assert_eq!(vf.size, 2);
-        assert_eq!(vf.as_bytes().len(), 96);
+        assert_eq!(vf.as_bytes().len(), 100);
+        assert_eq!(vf.as_bytes()[96..100], 1_u32.to_ne_bytes());
     }
 
     #[test]
