@@ -50,6 +50,10 @@ pub struct ExportClient {
     /// request, `Content-Type` and (when compressing) `Content-Encoding` are
     /// added on a copy.
     headers: HeaderMap,
+    /// The header VALUES, kept so that anything the far end echoes back -- a
+    /// proxy that repeats the request's `Authorization` in its error page --
+    /// can be scrubbed out of the error text before it is logged.
+    secret_values: Vec<String>,
     timeout: Duration,
 }
 
@@ -76,6 +80,7 @@ impl ExportClient {
         headers: &[(String, String)],
         ca_cert_pem: Option<&[u8]>,
     ) -> Result<Self> {
+        let secret_values = headers.iter().map(|(_, value)| value.clone()).collect();
         let headers = validated_headers(headers)?;
         let mut builder = Client::builder()
             .timeout(timeout)
@@ -101,6 +106,7 @@ impl ExportClient {
         Ok(Self {
             client,
             headers,
+            secret_values,
             timeout,
         })
     }
@@ -216,8 +222,6 @@ fn export(
         // drain still exports its spans below.
         batches.push(vec![run_summary_span(document)?]);
     }
-    let client = &config.client.client;
-
     let max_attempts = config.retries.saturating_add(1);
     let batch_count = batches.len();
     let mut diagnostics = ExportDiagnostics {
@@ -244,7 +248,12 @@ fn export(
                 compression = ?config.compression,
                 "exporting OTLP traces"
             );
-            match send_once(client, &endpoint, headers.clone(), body.bytes.clone()) {
+            match send_once(
+                config.client,
+                &endpoint,
+                headers.clone(),
+                body.bytes.clone(),
+            ) {
                 Ok(()) => {
                     info!(
                         spans = span_count,
@@ -425,12 +434,18 @@ fn spans_to_otlp_protobuf(resource_attributes: &[KeyValue], spans: Vec<Span>) ->
 }
 
 fn send_once(
-    client: &Client,
+    client: &ExportClient,
     endpoint: &Url,
     headers: HeaderMap,
     body: Vec<u8>,
 ) -> Result<(), ExportError> {
+    // Everything that originates on the far end or in reqwest -- never our own
+    // words -- passes through this before it can reach a log line.
+    let scrub = |text: String| {
+        scrub_header_values(scrub_url_secrets(text, endpoint), &client.secret_values)
+    };
     let response = client
+        .client
         .post(endpoint.clone())
         .headers(headers)
         .body(body)
@@ -439,7 +454,7 @@ fn send_once(
             ExportError::retryable(format!(
                 "failed to send OTLP request to {}: {}",
                 redact_url(endpoint),
-                scrub_url_secrets(error_chain(&err), endpoint)
+                scrub(error_chain(&err))
             ))
         })?;
     let status = response.status();
@@ -459,7 +474,9 @@ fn send_once(
         )));
     }
 
-    let body = read_error_body(response);
+    // The body is the collector's (or an intermediary's) to write, and some
+    // echo the request they rejected -- URL, query string, auth header and all.
+    let body = scrub(read_error_body(response));
     let message = format!("OTLP endpoint returned {status}: {body}");
     if is_retryable_status(status) {
         Err(ExportError::retryable(message))
@@ -532,6 +549,16 @@ fn scrub_url_secrets(text: String, url: &Url) -> String {
     }
     if let Some(password) = url.password().filter(|password| !password.is_empty()) {
         text = text.replace(password, "<redacted>");
+    }
+    text
+}
+
+/// Replace every configured header value found in `text` with a marker. The
+/// values are the credentials; an error page that echoes the request's headers
+/// would otherwise carry them into the log on every retry.
+fn scrub_header_values(mut text: String, values: &[String]) -> String {
+    for value in values.iter().filter(|value| !value.is_empty()) {
+        text = text.replace(value.as_str(), "<redacted>");
     }
     text
 }
@@ -1778,6 +1805,60 @@ mod tests {
             message.len()
         );
         assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    /// An error body is written by the far end, and a proxy that rejects a
+    /// request may echo it back -- URL, query string and auth header included.
+    /// Such a body must reach the log and the error with the secrets removed.
+    #[test]
+    fn error_bodies_that_echo_secrets_are_scrubbed() {
+        const HEADER_SECRET: &str = "hunter2-echoed-apikey";
+        const QUERY_SECRET: &str = "query-key-echoed";
+        let headers = vec![("X-Api-Key".to_string(), HEADER_SECRET.to_string())];
+        let (endpoint, _handle) = {
+            let page = format!(
+                "400 Bad Request: rejected POST /v1/traces?api-key={QUERY_SECRET} \
+                 with X-Api-Key: {HEADER_SECRET}"
+            );
+            let response = Box::leak(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                )
+                .into_boxed_str(),
+            );
+            spawn_mock_server(vec![response])
+        };
+        let secret_endpoint = format!("{endpoint}?api-key={QUERY_SECRET}");
+        let client = ExportClient::new(Duration::from_secs(5), &headers, None).unwrap();
+        let config = ExportConfig {
+            client: &client,
+            ..export_config(&secret_endpoint, 0)
+        };
+
+        let mut error = String::new();
+        let logged = capture_log(|| {
+            error = format!(
+                "{:#}",
+                export_otlp_http(config, &trace_document(1)).unwrap_err()
+            );
+        });
+
+        assert!(error.contains("400"), "{error}");
+        assert!(
+            error.contains("<redacted>"),
+            "the echo is marked, not dropped: {error}"
+        );
+        for secret in [HEADER_SECRET, QUERY_SECRET] {
+            assert!(
+                !error.contains(secret),
+                "{secret:?} leaked into the error: {error}"
+            );
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
     }
 
     /// NOTHING SECRET REACHES THE LOG. The operator's header values (API keys,
