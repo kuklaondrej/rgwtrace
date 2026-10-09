@@ -71,6 +71,33 @@ For fallback validation, rerun with `--import-json 18.2.8-1jammy_dwarf_traceid.j
 
 Check `trace.diagnostics` for decoded events, RADOS op counts, correlation counts, truncation counters, decode errors, expired spans, and BPF-side drop/failure counters.
 
+`--output json` holds the whole session in memory and prints one document at exit, so it is meant for **bounded runs** (`--timeout`). Its memory is capped by `--max-buffered-events` (default 100000 buffered request groups and RADOS ops, roughly 100 MB). When the cap is reached, the tracer warns once and drops new requests and ops, counted in `buffer_full_dropped_markers` and `buffer_full_dropped_rados_ops`. Without `--timeout` it warns at startup. A nonzero drop counter means the output is incomplete: shorten the window, or stream instead.
+
+---
+
+## Long Sessions: JSONL Streaming
+
+For a session of any length, stream with `--output jsonl`:
+
+```sh
+sudo rgwtrace \
+  --dwarf-source native \
+  --pid "$(pidof radosgw | awk '{print $1}')" \
+  --output jsonl \
+  --flush-interval 30 \
+  --correlation-ttl 120 > trace.jsonl 2> run.log
+```
+
+Every `--flush-interval` seconds, the requests and background ops that have expired are drained out of memory and written to stdout as one compact `{dwarf, trace}` line, flushed immediately. At exit, a final line carries whatever was still in flight and the final counters, even if it has no spans. Memory is bounded by request rate x (`--correlation-ttl` + flush interval), not by session length.
+
+Each line's `trace.diagnostics` holds the **cumulative** counters at that moment, and `spans_produced` counts that line's spans only. So read the run totals from the **last** line, and count spans by summing lines. `tests/e2e/verify-rgwtrace-json.py --trace trace.jsonl` merges the lines before verifying (`--trace-format jsonl` to force it). `--max-buffered-events` is rejected with `jsonl` and `otlp`.
+
+```sh
+# Spans per drain, then the final totals.
+jq -c '[.trace.diagnostics.spans_produced]' trace.jsonl
+tail -n 1 trace.jsonl | jq '.trace.diagnostics | {rados_ops, correlated_rados_ops, tombstone_horizon_rejections}'
+```
+
 ---
 
 ## Tempo Export
@@ -105,12 +132,23 @@ over HTTP or HTTPS. `--service-name` sets the `service.name` resource attribute.
 Use `--otlp-timeout` and `--otlp-retries` to tune delivery, and repeat
 `--otlp-header 'Name:Value'` for any required headers.
 
-In live OTLP mode, `--otlp-flush-interval` controls how often eligible spans are
+In live OTLP mode, `--otlp-flush-interval` (alias `--flush-interval`) controls how often eligible spans are
 queued for the background exporter. `--correlation-ttl` governs retention of
 correlation state; open requests awaiting an END marker have a separate lifetime
 backstop. `--inference-window` governs optional inferred correlation and is
 independent of the retention setting. See `rgwtrace --help` for all options and
 defaults.
+
+A batch that cannot be delivered does not stop the exporter. A non-retryable
+response (4xx other than 429) loses that batch and the next batch is tried.
+Exhausted retries lose that batch and the rest of the same drain. Either way the
+loss is counted in `otlp_export_failed_batches` / `otlp_export_failed_spans`,
+a warning is logged, and the next drain is exported normally, so the tracer
+recovers on its own when the endpoint does. A nonzero `otlp_export_failed_spans`
+means those spans are gone: fix the endpoint (check the logged status), or use
+`--output jsonl` when the backend is unreliable. The final export still dumps
+the end-of-run trace to stdout if it fails. `otlp_queue_dropped_*` is a
+different loss: drains dropped because the exporter fell two drains behind.
 
 ---
 
@@ -213,7 +251,7 @@ So the key's fate is a **measurement**, not an argument. Run with it ON (the def
 The counters above are **run totals, read at the end of the run**. Three places carry the same numbers:
 
 1. **The log**, on either output mode, **always** (no flag required): the `finished live tracing` and `rgwtrace shutdown summary` lines carry every counter in a `diagnostics=` field of `key=value` pairs. Logs go to stderr, so `2> run.log` keeps them even with `--output json` on stdout. **This is the recommended way to read the go/no-go numbers -- it needs no OTLP and no backend.**
-2. **The JSON document**, under `trace.diagnostics` (`--output json`), always.
+2. **The JSON document**, under `trace.diagnostics` (`--output json`), always; with `--output jsonl`, on the **last** line.
 3. **The final OTLP batch** (`--output otlp`), **only when you pass `--otlp-diagnostics`** (default off). With the flag, the final batch is always sent -- even when the run's last drain left no spans, which is the normal ending, because the periodic drains have already exported everything by then while the final BPF counters are merged only after the poll loop exits -- and it carries the totals on its Resource as `rgwtrace.diag.*` attributes **and** on a synthetic zero-duration span named **`rgwtrace.run_summary`** with the same `rgwtrace.diag.*` attribute names. **Without the flag, the OTLP resource carries only `service.name`, no `rgwtrace.run_summary` span is emitted, and an empty final drain sends nothing** -- so the debug counters never pollute your tracing backend.
 
 For a validation run you have two choices. The simplest is to **read the counters straight off the shutdown log** (`grep 'shutdown summary' run.log`): `bpf_operate_seed_hits_reqstate` and `bpf_operate_seed_hits_rgwop` are there as `key=value` pairs, no flag and no backend needed. If you want them in your trace backend instead, **run with `--otlp-diagnostics`**, then search the backend for the `rgwtrace.run_summary` span and read `rgwtrace.diag.bpf_operate_seed_hits_reqstate` and `rgwtrace.diag.bpf_operate_seed_hits_rgwop` off its attributes. Prefer the span over the Resource attributes: a batch with no spans carries nothing most trace backends will store, so on a run whose final drain was empty the Resource copy can reach the collector and be dropped there. With the flag on and the endpoint unreachable, the final export fails loudly and the whole trace (including `trace.diagnostics`) is dumped to stdout as JSON rather than lost.
@@ -247,7 +285,7 @@ The request-END probe (`req_state::~req_state`) is ON by default and needs no fl
 
 **`expired_open_requests` is nonzero.** Requests whose END marker never arrived within 10x `--correlation-ttl` of the request's start, so they were force-expired with a derived end. This means END markers are being lost (ring-buffer drops — check `bpf_ringbuf_request_drops` — or destructor bridge misses, `bpf_request_end_misses`), not that requests are slow. `late_request_markers_dropped` counts markers that arrived for a request whose span had already been exported; they are dropped rather than emitting a second span with the same span id, and a nonzero count means the expiry bounds are too tight for the workload.
 
-**"the no-duplicate tombstone filter is past its design capacity".** Every exported request key is remembered for the life of the run so a straggler can never resurrect an already-exported group and emit a second span with the same span id. That memory is a fixed 8 MiB Bloom filter (`emitted_request_keys` counts the keys in it), which **never** produces a false negative — so the no-duplicate guarantee holds no matter how long the run — but past ~2M exported requests its false-**positive** rate starts to climb. A false positive can only cause a DROP: a late straggler discarded, or a fresh request whose key collides dropped (`late_request_markers_dropped`) with its ops demoted to background (`request_already_emitted`). It can never duplicate a span. **Fix:** restart the tracer, or run with `--timeout` for bounded windows.
+**`tombstone_horizon_rejections` is nonzero.** Every exported request key is remembered so a straggler can never resurrect an already-exported group and emit a second span with the same span id. The memory is fixed (two 8 MiB Bloom generations, rotated every 2M exported requests, `emitted_tombstone_rotations`, plus an exact set for force-expired open requests), so its false-positive rate never climbs with session length. Forgetting old keys is made safe by a horizon: an event for a request the tracer does not hold and no longer remembers, whose request **started** before the oldest remembered generation, is rejected rather than re-grouped. Markers are dropped; RADOS ops become background spans with `rgw.correlation_reason = "request_outside_tombstone_horizon"`. Expect ~0. A steady count means requests, or stale request contexts on RGW threads (only without the END probe), outlive a whole generation of exported requests. That traffic is surfaced as background spans, never duplicated. `emitted_open_tombstone_overflows` > 0 means more than 65,536 force-expired open requests were remembered at once: END markers are being lost at a high rate (see `expired_open_requests`).
 
 ---
 

@@ -38,7 +38,9 @@ sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 
 ```
 
 Wait for `starting live tracing` before generating S3 traffic. JSON is written
-to stdout when the capture finishes; logs go to stderr.
+to stdout when the capture finishes; logs go to stderr. For long sessions, use
+`--output jsonl` to stream one document per flush interval instead of holding
+the whole capture in memory (see [long sessions](RUNBOOK.md#long-sessions-jsonl-streaming)).
 
 Continue in the runbook for [preflight and metadata setup](RUNBOOK.md#preflight),
 [OTLP export](RUNBOOK.md#tempo-export), and

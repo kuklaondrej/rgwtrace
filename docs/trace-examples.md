@@ -36,6 +36,24 @@ rgw.request  DELETE my-bucket/report.pdf   trans_id=tx…a1c7f-zone  tid=T0  qua
 Without `--correlate-cross-thread`, that same DELETE keeps only the `same_thread` head `stat`; `index prepare_op` and `obj_remove` fall out as standalone `rgw.background.rados_op` spans with `rgw.correlation_reason = "missing_trans_id"`, If the request-END marker is also absent, the request duration is derived from its children and can end at ~1 ms instead of 41 ms. With the END marker present, losing those children does not shorten the measured request interval.
 
 
+## A streamed (`--output jsonl`) capture
+
+A long session streamed with `--output jsonl` is one `{dwarf, trace}` document
+per line: one line per flush interval with the requests that expired since the
+previous one, then a final line at exit. Abbreviated:
+
+```text
+{"dwarf":{...},"trace":{"diagnostics":{"rados_ops":1843,"spans_produced":912,...},"service_name":"rgwtrace","spans":[...912 spans...]}}
+{"dwarf":{...},"trace":{"diagnostics":{"rados_ops":3710,"spans_produced":955,...},"service_name":"rgwtrace","spans":[...955 spans...]}}
+{"dwarf":{...},"trace":{"diagnostics":{"rados_ops":3762,"spans_produced":31,...},"service_name":"rgwtrace","spans":[...31 spans...]}}
+```
+
+`rados_ops` grows line by line because every counter is cumulative; read run
+totals from the last line. `spans_produced` is per line, so the run produced
+912 + 955 + 31 spans. A request and all its children are always on the same line,
+because a request group is drained as a whole, and no span id ever appears on two
+lines.
+
 For the span model and captured attributes, see
 [Architecture](../ARCHITECTURE.md#shape). To distinguish measured request durations
 from bounds derived from RADOS children, see

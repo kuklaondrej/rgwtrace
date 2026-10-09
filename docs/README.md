@@ -37,3 +37,6 @@ superseded by later sections in the same document.
   imported metadata must resolve symlinked libraries correctly.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Long-session data integrity](bugfix-long-session-data-integrity.md): bounded
+  collector memory, the rotating no-duplicate tombstone, OTLP loss accounting,
+  and the expiry clock.
