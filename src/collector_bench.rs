@@ -250,14 +250,24 @@ fn drain_bench(groups: u64, expired: u64) {
     // Group i's last activity is ~SEC + i*MS + 5ms; expire exactly the first
     // `expired` of them.
     let now = SEC + expired * MS + TTL;
+    // The part that runs under the collector lock on the ring-buffer thread.
     let before = allocations();
     let started = Instant::now();
-    let document = collector.drain_expired("rgwtrace", now, TTL);
-    let elapsed = started.elapsed().as_nanos();
-    let spans = document.map(|document| document.spans.len()).unwrap_or(0);
+    let batch = collector.drain_expired_batch(now, TTL);
+    let locked = started.elapsed().as_nanos();
+    let locked_allocs = allocations() - before;
+    // The part the OTLP exporter thread now does, outside the lock.
+    let before = allocations();
+    let started = Instant::now();
+    let spans = batch
+        .map(|batch| batch.into_trace_document("rgwtrace").spans.len())
+        .unwrap_or(0);
+    let render = started.elapsed().as_nanos();
     println!(
-        "BENCH drain_expired groups={groups} expired={expired}: {:.3} ms total ({spans} spans), {} allocs",
-        elapsed as f64 / 1e6,
+        "BENCH drain groups={groups} expired={expired}: locked {:.3} ms ({locked_allocs} allocs), \
+         render {:.3} ms ({} allocs), {spans} spans",
+        locked as f64 / 1e6,
+        render as f64 / 1e6,
         allocations() - before
     );
     black_box(collector);

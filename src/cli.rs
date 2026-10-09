@@ -123,6 +123,22 @@ pub struct Cli {
     #[arg(long, default_value = "1", value_parser = parse_duration_secs)]
     pub inference_window: Duration,
 
+    /// Cap on untagged RADOS ops waiting for a `--correlate-inferred` decision.
+    /// Past it the oldest is decided immediately (usually as an ambiguous or
+    /// no-candidate background op) and counted in
+    /// `inference_pending_overflow_rados_ops`.
+    #[arg(long, default_value_t = crate::collector::DEFAULT_INFERENCE_MAX_PENDING, value_parser = parse_positive_usize)]
+    pub inference_max_pending: usize,
+
+    /// How long a request whose END marker (`req_state::~req_state`) arrived is
+    /// kept for late RADOS completions before it is exported, instead of the full
+    /// `--correlation-ttl`. A straggler past it becomes a background op with
+    /// reason `request_already_emitted`; it is never lost or duplicated. Capped
+    /// at `--correlation-ttl`, and never shorter than `--inference-window` when
+    /// `--correlate-inferred` is on.
+    #[arg(long, default_value = "5", value_parser = parse_duration_secs)]
+    pub closed_request_grace: Duration,
+
     #[arg(long, default_value = "rgwtrace")]
     pub service_name: String,
 

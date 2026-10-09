@@ -300,6 +300,8 @@ mod tests {
             correlate_cross_thread: false,
             disable_rgw_op_bridge_key: false,
             inference_window: std::time::Duration::from_secs(1),
+            inference_max_pending: crate::collector::DEFAULT_INFERENCE_MAX_PENDING,
+            closed_request_grace: std::time::Duration::from_secs(5),
             service_name: "rgwtrace".to_string(),
             log_level: "warn".to_string(),
             pid: None,
