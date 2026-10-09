@@ -1,0 +1,21 @@
+src/live/linux.rs
+  s_4d990597f39574::t_6e49a4efd060f4 4,133,165-173,601-655,1838-1877
+tests/bpf_source.rs
+  s_4d990597f39574::t_6bf89675dfb3c8 1119-1128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6db75ddcd6492751b52ef6c4b49f05b7ef9807e3",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
