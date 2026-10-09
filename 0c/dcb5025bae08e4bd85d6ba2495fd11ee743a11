@@ -1,0 +1,21 @@
+src/dwarf_native.rs
+  s_4d990597f39574::t_dd37ab2617d733 87-121,1988-1990,2236-2241
+src/dwarf_native_robustness_tests.rs
+  s_4d990597f39574::t_422d596c40e150 551-652
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0cdcb5025bae08e4bd85d6ba2495fd11ee743a11",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
