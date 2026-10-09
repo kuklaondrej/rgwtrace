@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, io::Write, thread, time::Duration};
+use std::{error::Error as StdError, io::Write, path::Path, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression as GzipCompression};
@@ -17,7 +17,7 @@ use reqwest::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    cli::OtlpCompression,
+    cli::{Cli, OtlpCompression},
     collector::{
         span_id, trace_id, Attribute, AttributeValue, SpanDocument, SpanEvent, TraceDiagnostics,
         TraceDocument,
@@ -33,14 +33,88 @@ pub struct ExportDiagnostics {
     pub failures: u64,
 }
 
+/// The HTTP half of an exporter: the reqwest client (connection pool, TLS
+/// configuration, timeout, redirect policy) and the operator's headers, built
+/// ONCE and reused for every document and batch the exporter sends.
+///
+/// It used to be built per exported document. Each build is a new connection
+/// pool, so every periodic drain paid a TCP connect and, over https, a full TLS
+/// handshake, and an operator's misconfigured header or CA file surfaced only
+/// when the first export ran -- after DWARF extraction and probe attach. Now
+/// one client lives as long as its exporter, and the configuration is
+/// validated when the client is built, at startup.
+#[derive(Clone, Debug)]
+pub struct ExportClient {
+    client: Client,
+    /// The operator's headers, validated as HTTP header names/values. Per
+    /// request, `Content-Type` and (when compressing) `Content-Encoding` are
+    /// added on a copy.
+    headers: HeaderMap,
+    timeout: Duration,
+}
+
+impl ExportClient {
+    /// The client for a `--output otlp` run, from the CLI: the configured
+    /// headers and the optional `--otlp-ca-cert` PEM bundle. Reads the files it
+    /// names, so a missing or malformed one fails here, at startup.
+    pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let ca_cert_pem = cli
+            .otlp_ca_cert
+            .as_deref()
+            .map(read_ca_cert_file)
+            .transpose()?;
+        Self::new(cli.otlp_timeout, &cli.otlp_header, ca_cert_pem.as_deref())
+    }
+
+    /// Build the client. `ca_cert_pem` is a PEM bundle of extra root
+    /// certificates to trust, for collectors behind a private PKI; the bundled
+    /// web roots stay trusted alongside it.
+    pub fn new(
+        timeout: Duration,
+        headers: &[(String, String)],
+        ca_cert_pem: Option<&[u8]>,
+    ) -> Result<Self> {
+        let headers = validated_headers(headers)?;
+        let mut builder = Client::builder()
+            .timeout(timeout)
+            // Never follow a redirect. reqwest's default (up to ten) would re-send
+            // the request -- the operator's auth headers AND the trace body -- to
+            // whatever host `Location` names, including an https -> http
+            // downgrade. A moved collector is an `--otlp-endpoint` change, made
+            // by the operator; see `send_once` for the error a 3xx turns into.
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = ca_cert_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(pem)
+                .context("OTLP CA certificate is not a PEM certificate bundle")?;
+            if certificates.is_empty() {
+                bail!("OTLP CA certificate file contains no PEM certificate");
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder
+            .build()
+            .context("failed to build OTLP HTTP client")?;
+        Ok(Self {
+            client,
+            headers,
+            timeout,
+        })
+    }
+}
+
+fn read_ca_cert_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read --otlp-ca-cert {}", path.display()))
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ExportConfig<'a> {
     pub endpoint: &'a str,
-    pub headers: &'a [(String, String)],
+    pub client: &'a ExportClient,
     pub compression: OtlpCompression,
     pub max_spans_per_batch: usize,
     pub max_bytes_per_batch: usize,
-    pub timeout: Duration,
     pub retries: u32,
     /// Opt-in: carry the run-summary counters into the OTLP stream.
     ///
@@ -140,16 +214,7 @@ fn export(
         // drain still exports its spans below.
         batches.push(vec![run_summary_span(document)?]);
     }
-    let client = Client::builder()
-        .timeout(config.timeout)
-        // Never follow a redirect. reqwest's default (up to ten) would re-send the
-        // request -- the operator's auth headers AND the trace body -- to whatever
-        // host `Location` names, including an https -> http downgrade. A moved
-        // collector is an `--otlp-endpoint` change, made by the operator; see
-        // `send_once` for the error a 3xx turns into.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build OTLP HTTP client")?;
+    let client = &config.client.client;
 
     let max_attempts = config.retries.saturating_add(1);
     let batch_count = batches.len();
@@ -161,7 +226,7 @@ fn export(
         let span_count = batch.len();
         let protobuf_body = spans_to_otlp_protobuf(&resource_attributes, batch);
         let body = encode_body(protobuf_body, config.compression)?;
-        let headers = otlp_headers(config.headers, body.content_encoding)?;
+        let headers = request_headers(&config.client.headers, body.content_encoding);
         for attempt in 1..=max_attempts {
             diagnostics.attempts += 1;
             debug!(
@@ -170,7 +235,7 @@ fn export(
                 batch = batch_idx + 1,
                 batches = batch_count,
                 endpoint = %logged_endpoint,
-                timeout_ms = config.timeout.as_millis(),
+                timeout_ms = config.client.timeout.as_millis(),
                 spans = span_count,
                 body_bytes = body.bytes.len(),
                 uncompressed_body_bytes = body.uncompressed_len,
@@ -548,10 +613,9 @@ fn string_key_value(key: &str, value: &str) -> KeyValue {
     }
 }
 
-fn otlp_headers(
-    headers: &[(String, String)],
-    content_encoding: Option<&'static str>,
-) -> Result<HeaderMap> {
+/// The operator's headers as a validated `HeaderMap`. The error names the
+/// header, never its value: values are where the secrets are.
+fn validated_headers(headers: &[(String, String)]) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -560,6 +624,13 @@ fn otlp_headers(
             .with_context(|| format!("invalid OTLP header value for {name}"))?;
         map.insert(name, value);
     }
+    Ok(map)
+}
+
+/// The headers of one request: the operator's, plus the content headers the
+/// body's encoding dictates.
+fn request_headers(base: &HeaderMap, content_encoding: Option<&'static str>) -> HeaderMap {
+    let mut map = base.clone();
     map.insert(
         CONTENT_TYPE,
         HeaderValue::from_static(OTLP_PROTOBUF_CONTENT_TYPE),
@@ -567,7 +638,7 @@ fn otlp_headers(
     if let Some(content_encoding) = content_encoding {
         map.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
     }
-    Ok(map)
+    map
 }
 
 fn encode_body(bytes: Vec<u8>, compression: OtlpCompression) -> Result<EncodedBody> {
@@ -1085,13 +1156,76 @@ mod tests {
 
     #[test]
     fn sets_otlp_content_headers() {
-        let headers = otlp_headers(&[], Some("gzip")).unwrap();
+        let base =
+            validated_headers(&[("X-Scope-OrgID".to_string(), "tenant".to_string())]).unwrap();
+        let headers = request_headers(&base, Some("gzip"));
 
         assert_eq!(
             headers.get(CONTENT_TYPE).unwrap(),
             OTLP_PROTOBUF_CONTENT_TYPE
         );
         assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(headers.get("x-scope-orgid").unwrap(), "tenant");
+        assert!(
+            base.get(CONTENT_TYPE).is_none(),
+            "the base map is not mutated"
+        );
+    }
+
+    /// Configuration errors surface when the client is BUILT (at startup), not
+    /// on the first export minutes later.
+    #[test]
+    fn export_client_validates_headers_when_built() {
+        let err = ExportClient::new(
+            Duration::from_secs(1),
+            &[("not a header".to_string(), "x".to_string())],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid OTLP header name"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn export_client_rejects_a_bad_ca_certificate() {
+        let err = ExportClient::new(Duration::from_secs(1), &[], Some(b"not a pem")).unwrap_err();
+        assert!(err.to_string().contains("PEM"), "{err:#}");
+
+        // A PEM file with no CERTIFICATE block is just as wrong: the operator
+        // pointed the flag at a key or an empty file.
+        let err = ExportClient::new(Duration::from_secs(1), &[], Some(b"")).unwrap_err();
+        assert!(err.to_string().contains("PEM"), "{err:#}");
+    }
+
+    #[test]
+    fn export_client_accepts_a_pem_ca_certificate() {
+        let pem = include_bytes!("../tests/fixtures/otlp_test_ca.pem");
+        ExportClient::new(Duration::from_secs(1), &[], Some(pem)).unwrap();
+    }
+
+    /// ONE connection pool per exporter. Two documents exported through the same
+    /// client reuse the same keep-alive connection; a client built per document
+    /// (the old shape) would open a second connection -- and, over https, pay a
+    /// second TLS handshake -- for every periodic drain.
+    #[test]
+    fn one_client_is_reused_across_documents() {
+        let (endpoint, handle) = spawn_keepalive_mock_server(2);
+        let client = ExportClient::new(Duration::from_secs(5), &[], None).unwrap();
+        let config = ExportConfig {
+            client: &client,
+            ..export_config(&endpoint, 0)
+        };
+
+        export_otlp_http(config, &trace_document(1)).unwrap();
+        export_otlp_http(config, &trace_document(1)).unwrap();
+
+        assert_eq!(
+            handle.join().unwrap().len(),
+            2,
+            "both documents must arrive on the ONE accepted connection"
+        );
     }
 
     #[test]
@@ -1667,8 +1801,9 @@ mod tests {
         let secret_endpoint = endpoint
             .replace("http://", &format!("http://alice:{USERINFO_SECRET}@"))
             + &format!("?api-key={QUERY_SECRET}");
+        let client = ExportClient::new(Duration::from_secs(5), &headers, None).unwrap();
         let config = ExportConfig {
-            headers: &headers,
+            client: &client,
             ..export_config(&secret_endpoint, 3)
         };
         let logged = capture_log(|| {
@@ -1704,7 +1839,7 @@ mod tests {
         );
         drop(closed);
         let config = ExportConfig {
-            headers: &headers,
+            client: &client,
             ..export_config(&closed_endpoint, 0)
         };
         let mut error = String::new();
@@ -1819,14 +1954,55 @@ mod tests {
     fn export_config(endpoint: &str, retries: u32) -> ExportConfig<'_> {
         ExportConfig {
             endpoint,
-            headers: &[],
+            client: test_client(),
             compression: OtlpCompression::None,
             max_spans_per_batch: 512,
             max_bytes_per_batch: 0,
-            timeout: Duration::from_secs(5),
             retries,
             diagnostics: true,
         }
+    }
+
+    /// One plain client (no headers, no CA, 5 s timeout) shared by the tests
+    /// that do not care about the client's configuration.
+    fn test_client() -> &'static ExportClient {
+        static CLIENT: std::sync::OnceLock<ExportClient> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| ExportClient::new(Duration::from_secs(5), &[], None).unwrap())
+    }
+
+    /// A mock server that accepts ONE connection and serves `requests` requests
+    /// on it, keep-alive, replying 200 to each. Returns the bodies it read off
+    /// that single connection: a client that opened a second connection for its
+    /// second request leaves this server waiting on the first until its read
+    /// timeout, and the count comes back short.
+    fn spawn_keepalive_mock_server(requests: usize) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}/v1/traces");
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let mut served: Vec<Vec<u8>> = Vec::new();
+            let deadline = std::time::Instant::now() + MOCK_SERVER_ACCEPT_TIMEOUT;
+            let Some(mut stream) = accept_before(&listener, deadline) else {
+                return served;
+            };
+            // Short: a second connection is the failure being tested for, and it
+            // must fail fast rather than after the full accept timeout.
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            for _ in 0..requests {
+                let body = read_http_request(&stream);
+                if body.is_empty() {
+                    break;
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                stream.flush().ok();
+                served.push(body);
+            }
+            served
+        });
+        (endpoint, handle)
     }
 
     /// The same config with OTLP diagnostics OFF -- the default -- so the flag-off

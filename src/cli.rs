@@ -23,6 +23,12 @@ pub struct Cli {
     #[arg(long, value_parser = parse_http_header)]
     pub otlp_header: Vec<(String, String)>,
 
+    /// PEM bundle of extra root certificates to trust for an https
+    /// `--otlp-endpoint`, for a collector behind a private PKI. The bundled web
+    /// roots stay trusted alongside it. Read and validated at startup.
+    #[arg(long, value_name = "PEM")]
+    pub otlp_ca_cert: Option<PathBuf>,
+
     #[arg(long, default_value = "5", value_parser = parse_duration_secs)]
     pub otlp_timeout: Duration,
 

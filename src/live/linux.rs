@@ -84,11 +84,13 @@ struct OtlpExporter {
 
 struct OtlpExporterConfig {
     endpoint: String,
-    headers: Vec<(String, String)>,
+    /// One HTTP client for the exporter's lifetime: its connection pool (and
+    /// TLS session) is reused across every drain, instead of a fresh client --
+    /// and handshake -- per exported document.
+    client: otel::ExportClient,
     compression: crate::cli::OtlpCompression,
     max_spans_per_batch: usize,
     max_bytes_per_batch: usize,
-    timeout: Duration,
     retries: u32,
     diagnostics: bool,
 }
@@ -131,7 +133,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // ever coming and the plain idle TTL is correct.
     collector_state.set_end_probe_attached(attached.request_end_probe);
     let collector = Arc::new(Mutex::new(collector_state));
-    let otlp_exporter = matches!(cli.output, OutputMode::Otlp).then(|| OtlpExporter::spawn(cli));
+    let otlp_exporter = matches!(cli.output, OutputMode::Otlp)
+        .then(|| OtlpExporter::spawn(cli))
+        .transpose()?;
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);
@@ -379,20 +383,19 @@ fn read_bpf_counter(map: &impl MapCore, counter: u32) -> Result<u64> {
 }
 
 impl OtlpExporter {
-    fn spawn(cli: &Cli) -> Self {
+    fn spawn(cli: &Cli) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
         let config = OtlpExporterConfig {
             endpoint: cli.otlp_endpoint.clone(),
-            headers: cli.otlp_header.clone(),
+            client: otel::ExportClient::from_cli(cli)?,
             compression: cli.otlp_compression,
             max_spans_per_batch: cli.otlp_max_spans_per_batch,
             max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
-            timeout: cli.otlp_timeout,
             retries: cli.otlp_retries,
             diagnostics: cli.otlp_diagnostics,
         };
         let handle = thread::spawn(move || run_otlp_exporter(receiver, config));
-        Self { sender, handle }
+        Ok(Self { sender, handle })
     }
 
     fn finish(self) -> Result<otel::ExportDiagnostics> {
@@ -413,11 +416,10 @@ fn run_otlp_exporter(
         let export = otel::export_otlp_http(
             otel::ExportConfig {
                 endpoint: &config.endpoint,
-                headers: &config.headers,
+                client: &config.client,
                 compression: config.compression,
                 max_spans_per_batch: config.max_spans_per_batch,
                 max_bytes_per_batch: config.max_bytes_per_batch,
-                timeout: config.timeout,
                 retries: config.retries,
                 diagnostics: config.diagnostics,
             },
