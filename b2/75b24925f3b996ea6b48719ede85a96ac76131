@@ -1,0 +1,35 @@
+bpf/ceph_abi.h
+  s_4d990597f39574::t_b3b7c72781a011 41-47,51-52
+bpf/rgwtrace.bpf.c
+  s_4d990597f39574::t_b5e1164d62d955 306-326,507-508,644-645,793-794,1148-1149,1165-1166,1172-1173,1176,1417-1418,1421
+src/cli.rs
+  s_4d990597f39574::t_dcf6769214b5d9 137-139,143-151
+src/live/linux.rs
+  s_4d990597f39574::t_d03077de6ea816 98-102,107-111,536-605,1693-1734,1739,1748,1758,1789
+src/main.rs
+  s_4d990597f39574::t_a6059c748772b9 67-75
+src/preflight.rs
+  s_4d990597f39574::t_dcf8ba29823a52 93-106,924-939
+src/targets.rs
+  s_4d990597f39574::t_0428eafa43a1bb 306
+tests/bpf_source.rs
+  s_4d990597f39574::t_a5dd69f030ee9d 783-786,788,926-1014
+tests/cli_dry_run.rs
+  s_4d990597f39574::t_fc2a2644230430 69-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b275b24925f3b996ea6b48719ede85a96ac76131",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
