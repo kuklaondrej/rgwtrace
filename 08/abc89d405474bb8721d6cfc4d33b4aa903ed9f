@@ -1,0 +1,19 @@
+tests/e2e/verify-rgwtrace-json.py
+  s_4d990597f39574::t_6c88b928a96c85 62-66,176-182,231-293,736-740,1895-1965,2095-2097,2107,2111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "08abc89d405474bb8721d6cfc4d33b4aa903ed9f",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
