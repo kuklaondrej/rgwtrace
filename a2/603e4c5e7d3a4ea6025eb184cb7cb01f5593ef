@@ -1,0 +1,27 @@
+docs/bench-rgw-ab.md
+  s_4d990597f39574::t_d2627305a596a3 23-32,98-99
+docs/stage0-runbook.md
+  s_4d990597f39574::t_5d0b8015879bac 71-77,83-84,89-101,110-111,121,123-124,138,140,291
+scripts/bench-rgw-ab.sh
+  s_4d990597f39574::t_068eb2176f628c 51,54-58,99-101,128,240-241,256-257,261-273,830-837
+tests/e2e/functional-test-microceph-rgw.sh
+  s_4d990597f39574::t_90a1e9f4e55fb5 7-9,12-19,32-36,84-86,88-89,92,372-385,388-414,499-501,534
+tests/e2e/s3-workload.py
+  s_4d990597f39574::t_6ed928efa476ad 7-8,20-26,97-120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a2603e4c5e7d3a4ea6025eb184cb7cb01f5593ef",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
