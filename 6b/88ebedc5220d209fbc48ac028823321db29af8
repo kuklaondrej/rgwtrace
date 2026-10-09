@@ -1,0 +1,21 @@
+scripts/lib/private-dir.sh
+  s_4d990597f39574::t_7f0c40004ab7b8 1-89
+scripts/stage0-crossthread-probe.sh
+  s_4d990597f39574::t_e0a4e824e923b9 44-47,73-75,78-81,85,454-457
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6b88ebedc5220d209fbc48ac028823321db29af8",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
