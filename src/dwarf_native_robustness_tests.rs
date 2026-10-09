@@ -7,6 +7,7 @@ use std::{sync::mpsc, thread, time::Duration};
 use gimli::{write, EndianSlice, LittleEndian, RunTimeEndian};
 
 use super::*;
+use crate::test_elf::tiny_elf;
 
 /// Run `f` on a worker thread and fail the test if it does not finish in time. A
 /// reference cycle without a guard spins forever; this turns that hang into a
@@ -313,4 +314,173 @@ fn moderate_scope_nesting_is_still_walked() {
     assert!(function_pcs(&dwarf, &index, PROBE_FUNCTIONS)
         .unwrap()
         .is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Bounded reads and decompression.
+// ---------------------------------------------------------------------------
+
+const SHT_PROGBITS: u32 = 1;
+const SHF_COMPRESSED: u64 = 0x800;
+const ELFCOMPRESS_ZLIB: u32 = 1;
+const ELFCOMPRESS_ZSTD: u32 = 2;
+
+/// An `SHF_COMPRESSED` section body: `Elf64_Chdr` declaring `declared_size`
+/// uncompressed bytes, followed by `payload`.
+fn compressed_section(kind: u32, declared_size: u64, payload: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&kind.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&declared_size.to_le_bytes());
+    data.extend_from_slice(&1u64.to_le_bytes());
+    data.extend_from_slice(payload);
+    data
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "rgwtrace-dwarf-limits-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+fn bounded_read_refuses_a_file_over_the_limit_and_names_it() {
+    let path = temp_file("radosgw", &[0u8; 4096]);
+
+    assert_eq!(
+        read_file_bounded(&path, 4096, "target").unwrap().len(),
+        4096
+    );
+    let err = format!(
+        "{:#}",
+        read_file_bounded(&path, 4095, "target").unwrap_err()
+    );
+    assert!(err.contains(&path.display().to_string()), "{err}");
+    assert!(err.contains("4096 bytes"), "{err}");
+    assert!(err.contains("4095"), "{err}");
+    assert!(err.contains("--max-debug-file-bytes"), "{err}");
+}
+
+#[test]
+fn native_extraction_refuses_a_target_over_the_limit() {
+    let path = temp_file("radosgw", &tiny_elf(&[]));
+    let options = NativeOptions {
+        max_debug_file_bytes: 64,
+        ..NativeOptions::default()
+    };
+
+    let err = format!(
+        "{:#}",
+        from_paths_with_options(&[&path], &options).unwrap_err()
+    );
+    assert!(err.contains("--max-debug-file-bytes"), "{err}");
+    assert!(err.contains(&path.display().to_string()), "{err}");
+}
+
+#[test]
+fn compressed_section_declaring_more_than_the_limit_is_refused_before_inflating() {
+    for kind in [ELFCOMPRESS_ZLIB, ELFCOMPRESS_ZSTD] {
+        // 64 GiB declared: inflating it (or even reserving it) is the bomb.
+        let elf = tiny_elf(&[(
+            ".debug_info",
+            SHT_PROGBITS,
+            SHF_COMPRESSED,
+            compressed_section(kind, 64 << 30, &zlib(b"tiny")),
+        )]);
+        let file = object::File::parse(elf.as_slice()).unwrap();
+        let mut budget = SectionBudget::new(Path::new("/x/radosgw.debug"), 1 << 20);
+
+        let err = format!(
+            "{:#}",
+            load_section(&file, gimli::SectionId::DebugInfo, &mut budget).unwrap_err()
+        );
+        assert!(err.contains(".debug_info"), "{err}");
+        assert!(err.contains("/x/radosgw.debug"), "{err}");
+        assert!(err.contains("68719476736"), "{err}");
+        assert!(err.contains("--max-debug-file-bytes"), "{err}");
+    }
+}
+
+#[test]
+fn decompressed_sections_share_one_budget_per_file() {
+    let contents = vec![7u8; 1000];
+    let section = compressed_section(ELFCOMPRESS_ZLIB, 1000, &zlib(&contents));
+    let elf = tiny_elf(&[
+        (".debug_info", SHT_PROGBITS, SHF_COMPRESSED, section.clone()),
+        (".debug_abbrev", SHT_PROGBITS, SHF_COMPRESSED, section),
+    ]);
+    let file = object::File::parse(elf.as_slice()).unwrap();
+
+    // Each section alone fits; both together do not.
+    let mut budget = SectionBudget::new(Path::new("radosgw"), 1500);
+    let info = load_section(&file, gimli::SectionId::DebugInfo, &mut budget).unwrap();
+    assert_eq!(&*info, contents.as_slice());
+    let err = format!(
+        "{:#}",
+        load_section(&file, gimli::SectionId::DebugAbbrev, &mut budget).unwrap_err()
+    );
+    assert!(err.contains(".debug_abbrev"), "{err}");
+}
+
+#[test]
+fn uncompressed_sections_are_borrowed_not_copied() {
+    let elf = tiny_elf(&[(".debug_info", SHT_PROGBITS, 0, vec![1, 2, 3])]);
+    let file = object::File::parse(elf.as_slice()).unwrap();
+    let mut budget = SectionBudget::new(Path::new("radosgw"), 0);
+
+    let info = load_section(&file, gimli::SectionId::DebugInfo, &mut budget).unwrap();
+    assert!(matches!(info, Cow::Borrowed(_)));
+    assert_eq!(&*info, &[1, 2, 3]);
+}
+
+#[test]
+fn embedded_version_comes_from_the_single_parsed_buffer() {
+    let path = temp_file(
+        "radosgw",
+        &tiny_elf(&[(
+            ".rodata",
+            SHT_PROGBITS,
+            0,
+            b"\0ceph versio\0ceph version 18.2.8 (abc) reef (stable)\0".to_vec(),
+        )]),
+    );
+
+    let info = from_paths_with_options(&[&path], &NativeOptions::default()).unwrap();
+    assert_eq!(info.version.as_deref(), Some("18.2.8"));
+}
+
+#[test]
+fn version_search_handles_needle_edges() {
+    assert_eq!(
+        ceph_version_from_bytes(b"ceph version 17.2.7 (x)").as_deref(),
+        Some("17.2.7")
+    );
+    assert_eq!(
+        ceph_version_from_bytes(b"ccceph versionceph version 19.2.1").as_deref(),
+        Some("19.2.1")
+    );
+    assert_eq!(ceph_version_from_bytes(b"ceph version "), None);
+    assert_eq!(ceph_version_from_bytes(b"ceph versio"), None);
+    assert_eq!(ceph_version_from_bytes(b""), None);
+    // The first occurrence wins even when it is not a version (unchanged behavior).
+    assert_eq!(
+        ceph_version_from_bytes(b"ceph version x\0ceph version 18.2.0").as_deref(),
+        None
+    );
 }

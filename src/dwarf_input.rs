@@ -2,12 +2,15 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::{dwarf_json::DwarfInfo, dwarf_native};
+use crate::{
+    dwarf_json::DwarfInfo,
+    dwarf_native::{self, NativeOptions},
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DwarfInput {
     Json(PathBuf),
-    Native(Vec<PathBuf>, Option<String>),
+    Native(Vec<PathBuf>, NativeOptions),
 }
 
 impl DwarfInput {
@@ -15,8 +18,8 @@ impl DwarfInput {
         Self::Json(path.into())
     }
 
-    pub fn native(paths: Vec<PathBuf>, ceph_version: Option<String>) -> Self {
-        Self::Native(paths, ceph_version)
+    pub fn native(paths: Vec<PathBuf>, options: NativeOptions) -> Self {
+        Self::Native(paths, options)
     }
 
     pub fn description(&self) -> String {
@@ -33,9 +36,7 @@ impl DwarfInput {
     pub fn load(&self) -> Result<DwarfInfo> {
         match self {
             Self::Json(path) => DwarfInfo::from_path(path),
-            Self::Native(paths, ceph_version) => {
-                dwarf_native::from_paths_with_version(paths, ceph_version.as_deref())
-            }
+            Self::Native(paths, options) => dwarf_native::from_paths_with_options(paths, options),
         }
     }
 }
@@ -53,7 +54,7 @@ mod tests {
 
     #[test]
     fn describes_native_input_paths() {
-        let input = DwarfInput::native(vec!["a".into(), "b".into()], None);
+        let input = DwarfInput::native(vec!["a".into(), "b".into()], NativeOptions::default());
 
         assert_eq!(input.description(), "a,b");
     }

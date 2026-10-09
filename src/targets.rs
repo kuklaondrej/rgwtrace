@@ -285,6 +285,7 @@ mod tests {
             import_json: Some("x.json".into()),
             dwarf_source: crate::cli::DwarfSource::Json,
             ceph_version: None,
+            max_debug_file_bytes: crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),

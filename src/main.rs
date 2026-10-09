@@ -10,6 +10,8 @@ mod live;
 mod otel;
 mod preflight;
 mod targets;
+#[cfg(test)]
+mod test_elf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,7 +43,13 @@ fn main() -> Result<()> {
             }
             paths.push(targets.libceph_common);
             paths.push(targets.radosgw);
-            DwarfInput::native(paths, cli.ceph_version.clone())
+            DwarfInput::native(
+                paths,
+                dwarf_native::NativeOptions {
+                    ceph_version: cli.ceph_version.clone(),
+                    max_debug_file_bytes: cli.max_debug_file_bytes,
+                },
+            )
         }
     };
     info!(source = %dwarf_input.description(), "loading DWARF probe data");

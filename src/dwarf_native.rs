@@ -2,16 +2,17 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use gimli::{
     AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Dwarf, EndianSlice,
     EntriesTreeNode, Operation, Reader, ReaderOffset, RunTimeEndian, UnitOffset,
 };
-use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::{Architecture, CompressionFormat, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -219,30 +220,66 @@ const FIRST_PARAM_PROBE_FUNCTIONS: &[&str] = &[
     REQ_STATE_DTOR,
 ];
 
-#[allow(dead_code)]
-pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
-    from_paths_with_version(paths, None)
+/// Default for `--max-debug-file-bytes`: 4 GiB. See [`NativeOptions`].
+pub const DEFAULT_MAX_DEBUG_FILE_BYTES: u64 = 4 << 30;
+
+/// Inputs to native DWARF extraction beyond the target paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeOptions {
+    /// Explicit Ceph version (`--ceph-version`); wins over every probe of the
+    /// target.
+    pub ceph_version: Option<String>,
+    /// Upper bound, in bytes, on (a) the on-disk size of every file read whole --
+    /// a target, its separate debug file, its DWZ supplementary file -- and (b)
+    /// the total bytes DECOMPRESSED out of one such file's compressed DWARF
+    /// sections. Together they bound extraction's peak memory at a small multiple
+    /// of this value per module, whatever a sparse file or a compressed-section
+    /// bomb declares.
+    pub max_debug_file_bytes: u64,
 }
 
-pub fn from_paths_with_version(
+impl Default for NativeOptions {
+    fn default() -> Self {
+        Self {
+            ceph_version: None,
+            max_debug_file_bytes: DEFAULT_MAX_DEBUG_FILE_BYTES,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
+    from_paths_with_options(paths, &NativeOptions::default())
+}
+
+pub fn from_paths_with_options(
     paths: &[impl AsRef<Path>],
-    version_override: Option<&str>,
+    options: &NativeOptions,
 ) -> Result<DwarfInfo> {
     let mut modules = BTreeMap::new();
     let mut arch = None;
+    let mut embedded_version = None;
 
     for path in paths {
         let path = path.as_ref();
         let module_name = basename(path)
             .with_context(|| format!("native DWARF target {} has no file name", path.display()))?
             .to_string();
-        let module = parse_module(path, &module_name, &mut arch)
+        let parsed = parse_module(path, &module_name, &mut arch, options)
             .with_context(|| format!("failed to parse native DWARF from {}", path.display()))?;
-        modules.insert(module_name, module);
+        // First target (in path order) that embeds a version string wins -- the
+        // order the old per-path re-read scanned them in.
+        if embedded_version.is_none() {
+            embedded_version = parsed.embedded_version;
+        }
+        modules.insert(module_name, parsed.module);
     }
 
-    let version = version_override
+    let version = options
+        .ceph_version
+        .as_deref()
         .and_then(clean_version)
+        .or(embedded_version)
         .or_else(|| resolve_ceph_version(paths));
 
     Ok(DwarfInfo {
@@ -252,25 +289,35 @@ pub fn from_paths_with_version(
     })
 }
 
+/// Version sources beyond the targets' own bytes (which [`parse_module`]
+/// already scanned).
 fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
-    embedded_ceph_version(paths)
-        .or_else(|| microceph_ceph_version(paths))
-        .or_else(package_manager_ceph_version)
+    microceph_ceph_version(paths).or_else(package_manager_ceph_version)
 }
 
-fn embedded_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
-    paths
-        .iter()
-        .filter_map(|path| fs::read(path).ok())
-        .find_map(|data| ceph_version_from_bytes(&data))
+/// Offset of the first `needle` in `haystack`. Jumps between occurrences of the
+/// needle's first byte (a tight single-byte scan) instead of comparing a whole
+/// window at every offset; no extra dependency.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let mut from = 0;
+    while from <= last_start {
+        let candidate = from
+            + haystack[from..=last_start]
+                .iter()
+                .position(|&byte| byte == first)?;
+        if haystack[candidate + 1..candidate + needle.len()] == *rest {
+            return Some(candidate);
+        }
+        from = candidate + 1;
+    }
+    None
 }
 
 fn ceph_version_from_bytes(bytes: &[u8]) -> Option<String> {
     let needle = b"ceph version ";
-    let start = bytes
-        .windows(needle.len())
-        .position(|window| window == needle)?
-        + needle.len();
+    let start = find_bytes(bytes, needle)? + needle.len();
     let len = bytes[start..]
         .iter()
         .position(|byte| byte.is_ascii_whitespace() || *byte == 0)
@@ -366,8 +413,95 @@ fn command_output_version(command: &str, args: &[&str]) -> Option<String> {
         .and_then(|stdout| first_version_token(&stdout))
 }
 
-fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Result<DwarfModule> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+/// Read all of `path`, refusing a file larger than `limit` bytes. `what` names
+/// the file's role in the error ("target", "debuglink file", ...).
+///
+/// The size is checked BEFORE reading (a sparse multi-GB file costs nothing to
+/// stat), and the read itself is capped too, so a file that grows between the
+/// two -- or one whose `stat` size understates it -- cannot exceed the limit.
+pub(crate) fn read_file_bounded(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open {what} {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("failed to stat {what} {}", path.display()))?
+        .len();
+    if size > limit {
+        bail!(
+            "{what} {} is {size} bytes, over the {limit}-byte limit \
+             (raise it with --max-debug-file-bytes)",
+            path.display()
+        );
+    }
+    let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut data)
+        .with_context(|| format!("failed to read {what} {}", path.display()))?;
+    if data.len() as u64 > limit {
+        bail!(
+            "{what} {} grew past the {limit}-byte limit while being read \
+             (raise it with --max-debug-file-bytes)",
+            path.display()
+        );
+    }
+    Ok(data)
+}
+
+/// Remaining decompression allowance for ONE object file's DWARF sections.
+///
+/// A compressed section's header declares its uncompressed size, and that
+/// declaration is attacker-controlled: inflating it on trust lets a few KiB on
+/// disk demand tens of GB. Every compressed section is charged against what is
+/// left of its file's budget BEFORE it is inflated.
+struct SectionBudget<'a> {
+    file: &'a Path,
+    limit: u64,
+    used: u64,
+}
+
+impl<'a> SectionBudget<'a> {
+    fn new(file: &'a Path, limit: u64) -> Self {
+        Self {
+            file,
+            limit,
+            used: 0,
+        }
+    }
+
+    fn reserve(&mut self, section: &str, size: u64) -> Result<()> {
+        let total = self.used.saturating_add(size);
+        if total > self.limit {
+            bail!(
+                "compressed DWARF section {section} of {} declares {size} uncompressed \
+                 bytes; with the {} bytes already decompressed from this file that exceeds \
+                 the {}-byte limit (raise it with --max-debug-file-bytes)",
+                self.file.display(),
+                self.used,
+                self.limit
+            );
+        }
+        self.used = total;
+        Ok(())
+    }
+}
+
+/// What [`parse_module`] learns from one target.
+struct ParsedModule {
+    module: DwarfModule,
+    /// Version from an embedded `ceph version X` string, scanned from the buffer
+    /// the module was parsed from (the target is read once, not once per use).
+    embedded_version: Option<String>,
+}
+
+fn parse_module(
+    path: &Path,
+    module_name: &str,
+    arch: &mut Option<String>,
+    options: &NativeOptions,
+) -> Result<ParsedModule> {
+    let limit = options.max_debug_file_bytes;
+    let data = read_file_bounded(path, limit, "target")?;
+    let embedded_version = ceph_version_from_bytes(&data);
     let file = object::File::parse(data.as_slice())
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
 
@@ -377,7 +511,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
 
     let build_id = file.build_id()?.map(hex_string);
     let (debug_data, debug_file_path) =
-        debug_data(path, &file, data.as_slice(), build_id.as_deref())?;
+        debug_data(path, &file, data.as_slice(), build_id.as_deref(), limit)?;
     let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
         format!(
             "debug info for {} is not a supported object file",
@@ -395,7 +529,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     // strings reference it via `DW_FORM_GNU_ref_alt`/`DW_FORM_GNU_strp_alt`.
     // Read the supplementary object's bytes up front so they outlive the `Dwarf`
     // built below; missing/mismatched sup degrades to what resolves locally.
-    let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+    let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path, limit);
     let sup_file = match &sup_data {
         Some(bytes) => Some(object::File::parse(bytes.as_slice()).with_context(|| {
             format!(
@@ -406,17 +540,22 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
         None => None,
     };
 
-    // Load into owned `Vec<u8>` sections (not borrowed `Cow`s) so the main and
-    // supplementary section data share one owned type and no self-referential
-    // borrow is needed to attach the sup file.
-    let mut dwarf_owned =
-        Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))?;
+    // Sections stay BORROWED from the file buffers when stored uncompressed
+    // (`Cow::Borrowed`): copying them, as this used to, doubled peak memory for
+    // nothing. Only a compressed section allocates, against its file's
+    // decompression budget. The main and supplementary buffers both outlive
+    // `dwarf_sections`, so the two `Cow` lifetimes unify without any
+    // self-referential borrow.
+    let mut budget = SectionBudget::new(&debug_file_path, limit);
+    let mut dwarf_sections =
+        Dwarf::load(|section| load_section(&debug_file, section, &mut budget))?;
     if let Some(sup_file) = &sup_file {
-        dwarf_owned
-            .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))?;
+        let sup_label = debug_file_path.with_extension("dwz-supplementary");
+        let mut sup_budget = SectionBudget::new(&sup_label, limit);
+        dwarf_sections.load_sup(|section| load_section(sup_file, section, &mut sup_budget))?;
     }
     #[allow(deprecated)]
-    let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
     let mut resolved = symbol_function_pcs(&debug_file, wanted);
     for (function, ranked) in symbol_function_pcs(&file, wanted) {
@@ -453,11 +592,14 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     let func2linkage = provenance_linkage_names(&resolved);
     let func2pc = ranked_pcs_into_pcs(resolved);
 
-    Ok(DwarfModule {
-        build_id,
-        func2pc,
-        func2vf,
-        func2linkage,
+    Ok(ParsedModule {
+        module: DwarfModule {
+            build_id,
+            func2pc,
+            func2vf,
+            func2linkage,
+        },
+        embedded_version,
     })
 }
 
@@ -2748,6 +2890,7 @@ fn entry_pc<R: Reader>(
 fn load_section<'data>(
     file: &object::File<'data>,
     section: gimli::SectionId,
+    budget: &mut SectionBudget<'_>,
 ) -> Result<Cow<'data, [u8]>> {
     let Some(section) = file
         .section_by_name(section.name())
@@ -2755,9 +2898,29 @@ fn load_section<'data>(
     else {
         return Ok(Cow::Borrowed(&[]));
     };
-    section
-        .uncompressed_data()
-        .with_context(|| format!("failed to read {}", section.name().unwrap_or("<unknown>")))
+    let name = section.name().unwrap_or("<unknown>");
+    let compressed = section
+        .compressed_data()
+        .with_context(|| format!("failed to read {name}"))?;
+    if compressed.format != CompressionFormat::None {
+        // Charge the DECLARED size before `decompress` reserves and fills it.
+        budget.reserve(name, compressed.uncompressed_size)?;
+    }
+    compressed
+        .decompress()
+        .with_context(|| format!("failed to decompress {name}"))
+}
+
+#[cfg(test)]
+fn load_section_unbounded<'data>(
+    file: &object::File<'data>,
+    section: gimli::SectionId,
+) -> Result<Cow<'data, [u8]>> {
+    load_section(
+        file,
+        section,
+        &mut SectionBudget::new(Path::new("<test>"), u64::MAX),
+    )
 }
 
 /// Returns the DWARF-bearing object bytes and the on-disk path they came from.
@@ -2769,25 +2932,20 @@ fn debug_data<'data>(
     file: &object::File<'data>,
     data: &'data [u8],
     build_id: Option<&str>,
+    limit: u64,
 ) -> Result<(Cow<'data, [u8]>, PathBuf)> {
     if file.has_debug_symbols() {
         return Ok((Cow::Borrowed(data), path.to_path_buf()));
     }
 
     if let Some(debug_path) = debuglink_file(path, file)? {
-        let bytes = fs::read(&debug_path)
-            .with_context(|| format!("failed to read debuglink file {}", debug_path.display()))?;
+        let bytes = read_file_bounded(&debug_path, limit, "debuglink file")?;
         return Ok((Cow::Owned(bytes), debug_path));
     }
 
     if let Some(build_id) = build_id {
         if let Some(debug_path) = build_id_debug_file(path, build_id) {
-            let bytes = fs::read(&debug_path).with_context(|| {
-                format!(
-                    "failed to read build-id debug file {}",
-                    debug_path.display()
-                )
-            })?;
+            let bytes = read_file_bounded(&debug_path, limit, "build-id debug file")?;
             return Ok((Cow::Owned(bytes), debug_path));
         }
     }
@@ -2800,7 +2958,11 @@ fn debug_data<'data>(
 /// bytes when the file is found and its build-id matches the link; otherwise
 /// warns and returns `None` so extraction continues with whatever resolves
 /// without it (consistent with tolerating missing supplementary string refs).
-fn load_sup_object_bytes(debug_file: &object::File<'_>, debug_file_path: &Path) -> Option<Vec<u8>> {
+fn load_sup_object_bytes(
+    debug_file: &object::File<'_>,
+    debug_file_path: &Path,
+    limit: u64,
+) -> Option<Vec<u8>> {
     let section = debug_file.section_by_name(".gnu_debugaltlink")?;
     let data = match section.data() {
         Ok(data) => data,
@@ -2821,10 +2983,10 @@ fn load_sup_object_bytes(debug_file: &object::File<'_>, debug_file_path: &Path) 
         );
         return None;
     };
-    let bytes = match fs::read(&sup_path) {
+    let bytes = match read_file_bounded(&sup_path, limit, "DWZ supplementary file") {
         Ok(bytes) => bytes,
         Err(err) => {
-            warn!(path = %sup_path.display(), error = %err, "failed to read DWZ supplementary file; ignoring it");
+            warn!(path = %sup_path.display(), error = format!("{err:#}"), "failed to read DWZ supplementary file; ignoring it");
             return None;
         }
     };
@@ -3271,7 +3433,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section)).unwrap();
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section)).unwrap();
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
         let index = DwarfUnitIndex::load(&dwarf).unwrap();
@@ -4150,9 +4312,10 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_owned =
-            Dwarf::load(|section| load_section(&file, section).map(|data| data.into_owned()))
-                .ok()?;
+        let dwarf_owned = Dwarf::load(|section| {
+            load_section_unbounded(&file, section).map(|data| data.into_owned())
+        })
+        .ok()?;
         #[allow(deprecated)]
         let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
         let index = DwarfUnitIndex::load(&dwarf).ok()?;
@@ -5382,24 +5545,33 @@ mod tests {
         let data = std::fs::read(binary).unwrap();
         let file = object::File::parse(data.as_slice()).unwrap();
         let build_id = file.build_id().unwrap().map(hex_string);
-        let (debug_data, debug_file_path) =
-            debug_data(binary, &file, data.as_slice(), build_id.as_deref()).unwrap();
+        let (debug_data, debug_file_path) = debug_data(
+            binary,
+            &file,
+            data.as_slice(),
+            build_id.as_deref(),
+            u64::MAX,
+        )
+        .unwrap();
         let debug_file = object::File::parse(debug_data.as_ref()).unwrap();
         let endian = if debug_file.is_little_endian() {
             RunTimeEndian::Little
         } else {
             RunTimeEndian::Big
         };
-        let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+        let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path, u64::MAX);
         let sup_file = sup_data
             .as_ref()
             .map(|bytes| object::File::parse(bytes.as_slice()).unwrap());
-        let mut dwarf_owned =
-            Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))
-                .unwrap();
+        let mut dwarf_owned = Dwarf::load(|section| {
+            load_section_unbounded(&debug_file, section).map(|data| data.into_owned())
+        })
+        .unwrap();
         if let Some(sup_file) = &sup_file {
             dwarf_owned
-                .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))
+                .load_sup(|section| {
+                    load_section_unbounded(sup_file, section).map(|data| data.into_owned())
+                })
                 .unwrap();
         }
         #[allow(deprecated)]
@@ -5712,7 +5884,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section)).unwrap();
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section)).unwrap();
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
@@ -5774,7 +5946,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section))?;
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
@@ -5817,7 +5989,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section))?;
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
