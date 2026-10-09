@@ -113,7 +113,8 @@ pub struct VarFieldKernel {
 pub const RGWTRACE_VAR_FIELD_SIZE: usize = 100;
 
 /// Number of `hprobes` ARRAY slots (bpf/ceph_abi.h). Every key is
-/// `function base id + var_field index` and must be below this.
+/// `function base id + var_field index`, so the highest base's var_fields must
+/// stay below this (enforced by `DwarfInfo::validate`).
 pub const RGWTRACE_HPROBE_SLOTS: i32 = 80;
 
 impl VarFieldKernel {
@@ -121,7 +122,9 @@ impl VarFieldKernel {
     /// zeroed buffer. The struct has implicit padding after every `bool`, so
     /// viewing it as `&[u8]` would read uninitialized bytes (undefined behavior)
     /// and ship them to the kernel.
-    pub fn to_bytes(&self) -> [u8; RGWTRACE_VAR_FIELD_SIZE] {
+    // Only the Linux runner writes hprobes; elsewhere this is exercised by tests.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn to_bytes(self) -> [u8; RGWTRACE_VAR_FIELD_SIZE] {
         use std::mem::{offset_of, size_of};
 
         fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
@@ -646,10 +649,6 @@ pub fn is_raw_pointer_descriptor(var_field: &VarFieldJson) -> bool {
         && var_field.fields[0].offset == 0
         && !var_field.fields[0].pointer
 }
-
-/// Number of slots in the kernel `hprobes` map. Mirrors `max_entries, 8192` on
-/// the `hprobes` BPF_MAP_TYPE_HASH in `bpf/rgwtrace.bpf.c`. hprobe keys are
-/// `base_id + idx`, so the highest base's var_fields must stay below this.
 
 /// Maximum length of a nested field-deref chain per var_field. Bounded by the
 /// fixed kernel array `struct Field fields[10]` in `bpf/ceph_abi.h`, walked by

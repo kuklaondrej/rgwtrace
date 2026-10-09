@@ -69,7 +69,7 @@ fn event_layout_is_asserted_at_compile_time_on_both_sides() {
         "_Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,",
         "_Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,",
         "_Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,",
-        "_Static_assert(offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,",
+        "_Static_assert(__builtin_offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,",
     ] {
         assert!(RGWTRACE_EVENTS.contains(assertion), "missing: {assertion}");
     }
@@ -1040,7 +1040,7 @@ fn request_records_are_reserved_at_their_own_size() {
         "_Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,"
     ));
     assert!(RGWTRACE_EVENTS.contains(
-        "_Static_assert(offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,"
+        "_Static_assert(__builtin_offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,"
     ));
     let emit = &RGWTRACE_BPF[RGWTRACE_BPF
         .find("static __always_inline void emit_request_event(")

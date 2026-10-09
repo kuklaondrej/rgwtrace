@@ -6,10 +6,6 @@
 
 #include "ceph_abi.h"
 
-#ifndef offsetof
-#define offsetof(type, member) __builtin_offsetof(type, member)
-#endif
-
 enum rgwtrace_event_type {
   RGWTRACE_EVENT_REQUEST_START = 1,
   RGWTRACE_EVENT_REQUEST_END = 2,
@@ -299,13 +295,15 @@ struct rgwtrace_event {
 #define RGWTRACE_RADOS_EVENT_SIZE 560
 #define RGWTRACE_EVENT_SIZE 568
 
+/* __builtin_offsetof, not offsetof: libbpf's bpf_helpers.h defines offsetof as
+ * a pointer cast, which is not an integer constant expression. */
 _Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,
                "rgwtrace_request_event layout drifted from src/events.rs");
 _Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,
                "rgwtrace_rados_event layout drifted from src/events.rs");
 _Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,
                "rgwtrace_event layout drifted from src/events.rs");
-_Static_assert(offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,
+_Static_assert(__builtin_offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,
                "rgwtrace_event data offset drifted from src/events.rs");
 
 /*
@@ -324,7 +322,7 @@ struct rgwtrace_request_record {
 
 _Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,
                "rgwtrace_request_record layout drifted from src/events.rs");
-_Static_assert(offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,
+_Static_assert(__builtin_offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,
                "rgwtrace_request_record payload offset drifted from struct rgwtrace_event");
 
 #endif
