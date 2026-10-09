@@ -918,7 +918,8 @@ impl Collector {
                 self.diagnostics.rados_ops += 1;
                 record_truncation(&mut self.diagnostics, rados.truncation);
                 // Every path below buffers the op somewhere (a group, background,
-                // or pending inference), so a full buffer drops it here.
+                // or pending inference), so a full buffer drops it here. The one
+                // path that needs a SECOND slot is checked where it is taken.
                 if self.buffer_full() {
                     self.diagnostics.buffer_full_dropped_rados_ops += 1;
                     return;
@@ -960,6 +961,12 @@ impl Collector {
                     };
                     self.record_background_rados(rados, reason);
                 } else {
+                    // An op whose request has no group yet (its START is missing
+                    // or still in flight) opens one: two buffered items, not one.
+                    if !self.requests.contains_key(&rados.trans_id) && self.buffer_lacks_room(2) {
+                        self.diagnostics.buffer_full_dropped_rados_ops += 1;
+                        return;
+                    }
                     // A non-empty `trans_id` correlates the op to its request,
                     // but the same_thread/cross_thread split is derived late in
                     // `request_spans` (the marker's `tid` may not be known yet).
@@ -1100,10 +1107,15 @@ impl Collector {
     }
 
     fn buffer_full(&mut self) -> bool {
+        self.buffer_lacks_room(1)
+    }
+
+    /// Whether adding `needed` buffered items would pass the cap (warns once).
+    fn buffer_lacks_room(&mut self, needed: usize) -> bool {
         let Some(max) = self.max_buffered_events else {
             return false;
         };
-        if self.buffered_events() < max {
+        if self.buffered_events() + needed <= max {
             return false;
         }
         if !self.buffer_full_warned {
@@ -3225,6 +3237,33 @@ mod tests {
                 + document.diagnostics.background_rados_ops
                 + document.diagnostics.buffer_full_dropped_rados_ops
         );
+    }
+
+    #[test]
+    fn an_op_that_opens_a_new_group_needs_room_for_both_items() {
+        // A RADOS op whose trans_id has no group yet (its START is missing or
+        // still in flight) creates TWO buffered items: the group and the op. With
+        // one slot left it must be dropped, not squeezed in one over the cap.
+        let mut collector = Collector::default();
+        collector.set_max_buffered_events(Some(1));
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-no-start")));
+        assert_eq!(
+            collector.buffered_events(),
+            0,
+            "two items do not fit in one slot"
+        );
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 1);
+
+        let mut collector = Collector::default();
+        collector.set_max_buffered_events(Some(3));
+        collector.push(start("tx-a", 100));
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-a")));
+        // One slot left: a child of the held group fits, a new group's op does not.
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-no-start")));
+        assert_eq!(collector.buffered_events(), 2);
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-a")));
+        assert_eq!(collector.buffered_events(), 3);
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 1);
     }
 
     #[test]
