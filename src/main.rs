@@ -8,6 +8,7 @@ mod dwarf_json;
 mod dwarf_native;
 mod live;
 mod otel;
+mod otlp_headers;
 mod preflight;
 mod targets;
 

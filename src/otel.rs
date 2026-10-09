@@ -54,16 +54,18 @@ pub struct ExportClient {
 }
 
 impl ExportClient {
-    /// The client for a `--output otlp` run, from the CLI: the configured
-    /// headers and the optional `--otlp-ca-cert` PEM bundle. Reads the files it
-    /// names, so a missing or malformed one fails here, at startup.
+    /// The client for a `--output otlp` run, from the CLI: the headers from
+    /// every source (`crate::otlp_headers`) and the optional `--otlp-ca-cert`
+    /// PEM bundle. Reads the files and environment they name, so a missing,
+    /// malformed or exposed one fails here, at startup.
     pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let headers = crate::otlp_headers::load(cli)?;
         let ca_cert_pem = cli
             .otlp_ca_cert
             .as_deref()
             .map(read_ca_cert_file)
             .transpose()?;
-        Self::new(cli.otlp_timeout, &cli.otlp_header, ca_cert_pem.as_deref())
+        Self::new(cli.otlp_timeout, &headers, ca_cert_pem.as_deref())
     }
 
     /// Build the client. `ca_cert_pem` is a PEM bundle of extra root

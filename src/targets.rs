@@ -288,6 +288,7 @@ mod tests {
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),
+            otlp_header_file: None,
             otlp_ca_cert: None,
             otlp_timeout: std::time::Duration::from_secs(5),
             otlp_retries: 2,

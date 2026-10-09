@@ -20,8 +20,20 @@ pub struct Cli {
     #[arg(long, default_value = "http://localhost:4318/v1/traces")]
     pub otlp_endpoint: String,
 
+    /// Extra request header, `Name:Value`, repeatable. Argv is readable by
+    /// every local user (`/proc/<pid>/cmdline`), so this is for non-secret
+    /// headers such as a tenant id; put credentials in `--otlp-header-file`
+    /// or `OTEL_EXPORTER_OTLP_HEADERS` instead. Those sources override a header
+    /// of the same name given here.
     #[arg(long, value_parser = parse_http_header)]
     pub otlp_header: Vec<(String, String)>,
+
+    /// File of request headers, one `Name: Value` per line (`#` comments and
+    /// blank lines ignored), for credentials that must stay off argv. Refused
+    /// if world-readable. Overrides the same header from the environment or
+    /// `--otlp-header`.
+    #[arg(long, value_name = "PATH")]
+    pub otlp_header_file: Option<PathBuf>,
 
     /// PEM bundle of extra root certificates to trust for an https
     /// `--otlp-endpoint`, for a collector behind a private PKI. The bundled web
