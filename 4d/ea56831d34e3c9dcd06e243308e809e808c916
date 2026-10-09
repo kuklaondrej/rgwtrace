@@ -1,0 +1,27 @@
+ARCHITECTURE.md
+  s_4d990597f39574::t_ab49163e80ef4b 106,114-118,124
+docs/perf-collector-hot-path.md
+  s_4d990597f39574::t_970a04e8794bd9 58-60,63-65,69-80,130-135,166
+src/collector.rs
+  s_4d990597f39574::t_3532be2a88bc48 383-501,532,539-542,544,551-553,591-601,616-617,625,629-630,632,637-643,646-655,669,675,690,696-699,708-709,712,718,721-723,767-791,794-795,797,1715-1726
+src/collector/hot_path_tests.rs
+  s_4d990597f39574::t_f43c1c98f5d445 817-881
+src/collector_bench.rs
+  s_4d990597f39574::t_1597f80101caa3 282-322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4dea56831d34e3c9dcd06e243308e809e808c916",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
