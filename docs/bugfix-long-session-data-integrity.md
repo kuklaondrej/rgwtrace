@@ -141,8 +141,10 @@ then on the collector grew exactly as in finding 1.
 - No error class latches export off. A misconfiguration 4xx (bad auth, wrong
   path) costs one prompt request per drain, every loss is counted and warned,
   and a fix on the backend side takes effect without restarting the tracer.
-- If the worker thread dies anyway (a panic), drained batches are counted as
-  lost and draining continues, so memory stays bounded. The old "retain the
+- If the worker thread dies anyway (a panic), the documents it had accepted but
+  not settled (the one in flight and any still queued) are counted as lost at
+  shutdown from a queued/settled ledger, later drains are counted as they
+  happen, and draining continues, so memory stays bounded. The old "retain the
   batch" path is gone.
 - The final export is unchanged: any failed batch fails it, and the end-of-run
   trace is dumped to stdout.

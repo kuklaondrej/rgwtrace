@@ -5,7 +5,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -81,6 +81,40 @@ const BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
 struct OtlpExporter {
     sender: SyncSender<TraceDocument>,
     handle: JoinHandle<Result<otel::ExportDiagnostics>>,
+    ledger: Arc<ExportLedger>,
+}
+
+/// Documents (and their spans) handed to the OTLP worker vs. ones it finished
+/// with -- exported, or counted as lost. The difference is what a worker panic
+/// destroyed: the document in flight plus everything still queued. Those spans
+/// already left the collector, so `OtlpExporter::finish` counts them as lost.
+#[derive(Debug, Default)]
+struct ExportLedger {
+    queued_documents: AtomicU64,
+    queued_spans: AtomicU64,
+    settled_documents: AtomicU64,
+    settled_spans: AtomicU64,
+}
+
+impl ExportLedger {
+    fn queued(&self, spans: usize) {
+        self.queued_documents.fetch_add(1, Ordering::SeqCst);
+        self.queued_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    fn settled(&self, spans: usize) {
+        self.settled_documents.fetch_add(1, Ordering::SeqCst);
+        self.settled_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    /// (documents, spans) accepted by the worker but never settled.
+    fn unsettled(&self) -> (u64, u64) {
+        let load = |counter: &AtomicU64| counter.load(Ordering::SeqCst);
+        (
+            load(&self.queued_documents).saturating_sub(load(&self.settled_documents)),
+            load(&self.queued_spans).saturating_sub(load(&self.settled_spans)),
+        )
+    }
 }
 
 struct OtlpExporterConfig {
@@ -219,6 +253,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                     dispatch_expired_otlp(
                         &collector,
                         &exporter.sender,
+                        &exporter.ledger,
                         trace,
                         &mut otlp_worker_gone,
                     );
@@ -236,7 +271,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         // The worker never exits on a failed export, so `Err` here means it
         // panicked. Never let that abort the session: the end-of-run trace below
         // still goes through the final export (or the stdout dump).
-        match exporter.finish() {
+        match exporter.finish(&collector) {
             Ok(export) => info!(
                 export_batches = export.batches,
                 export_attempts = export.attempts,
@@ -407,15 +442,41 @@ impl OtlpExporter {
             retries: cli.otlp_retries,
             diagnostics: cli.otlp_diagnostics,
         };
-        let handle = thread::spawn(move || Ok(run_otlp_exporter(receiver, config, &collector)));
-        Self { sender, handle }
+        let ledger = Arc::new(ExportLedger::default());
+        let worker_ledger = Arc::clone(&ledger);
+        let handle = thread::spawn(move || {
+            Ok(run_otlp_exporter(
+                receiver,
+                config,
+                &collector,
+                &worker_ledger,
+            ))
+        });
+        Self {
+            sender,
+            handle,
+            ledger,
+        }
     }
 
-    fn finish(self) -> Result<otel::ExportDiagnostics> {
+    /// Close the queue and wait for the worker. If it panicked, every document it
+    /// had accepted but not settled is counted as lost before the error is
+    /// returned, so the final counters still measure all missing spans.
+    fn finish(self, collector: &Mutex<Collector>) -> Result<otel::ExportDiagnostics> {
         drop(self.sender);
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("OTLP exporter thread panicked"))?
+        match self.handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                let (documents, spans) = self.ledger.unsettled();
+                if let Ok(mut collector) = collector.lock() {
+                    collector.record_otlp_export_failure(documents, spans);
+                }
+                anyhow::bail!(
+                    "OTLP exporter thread panicked; {documents} queued document(s) with \
+                     {spans} span(s) were lost and counted in otlp_export_failed_spans"
+                )
+            }
+        }
     }
 }
 
@@ -439,6 +500,7 @@ fn run_otlp_exporter(
     receiver: Receiver<TraceDocument>,
     config: OtlpExporterConfig,
     collector: &Mutex<Collector>,
+    ledger: &ExportLedger,
 ) -> otel::ExportDiagnostics {
     let mut total = otel::ExportDiagnostics::default();
     for trace in receiver {
@@ -491,6 +553,9 @@ fn run_otlp_exporter(
                 "exported expired OTLP spans"
             );
         }
+        // Settled only once its outcome is recorded: a panic before this point
+        // leaves the document to `OtlpExporter::finish` to count.
+        ledger.settled(spans);
     }
     total
 }
@@ -522,12 +587,16 @@ fn drain_expired(
 fn dispatch_expired_otlp(
     collector: &Mutex<Collector>,
     sender: &SyncSender<TraceDocument>,
+    ledger: &ExportLedger,
     trace: TraceDocument,
     worker_gone: &mut bool,
 ) {
     let spans = trace.spans.len();
     match sender.try_send(trace) {
-        Ok(()) => info!(spans, "queued expired OTLP spans"),
+        Ok(()) => {
+            ledger.queued(spans);
+            info!(spans, "queued expired OTLP spans");
+        }
         Err(TrySendError::Full(trace)) => {
             collector
                 .lock()
@@ -1468,10 +1537,12 @@ mod tests {
         drop(receiver);
         let collector = Mutex::new(Collector::default());
         let mut worker_gone = false;
+        let ledger = ExportLedger::default();
 
         dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(3),
             &mut worker_gone,
         );
@@ -1479,6 +1550,7 @@ mod tests {
         dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(2),
             &mut worker_gone,
         );
@@ -1494,14 +1566,70 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_successful_otlp_send_queues_the_batch() {
+    fn a_panicked_worker_counts_the_documents_it_accepted_but_never_settled() {
+        // A worker panic drops the document it was exporting and every document
+        // still queued behind it. Those spans already left the collector, so they
+        // must be counted as lost at finish -- not only the ones dispatched after
+        // the channel was found disconnected.
         let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let (go, wait) = mpsc::channel::<()>();
+        let ledger = Arc::new(ExportLedger::default());
+        let handle = thread::spawn(move || -> Result<otel::ExportDiagnostics> {
+            wait.recv().unwrap();
+            let _in_flight = receiver.recv().unwrap();
+            panic!("simulated exporter crash mid-export");
+        });
+        let exporter = OtlpExporter {
+            sender,
+            handle,
+            ledger: Arc::clone(&ledger),
+        };
         let collector = Mutex::new(Collector::default());
         let mut worker_gone = false;
 
         dispatch_expired_otlp(
             &collector,
+            &exporter.sender,
+            &ledger,
+            trace_document_with_spans(3),
+            &mut worker_gone,
+        );
+        dispatch_expired_otlp(
+            &collector,
+            &exporter.sender,
+            &ledger,
+            trace_document_with_spans(2),
+            &mut worker_gone,
+        );
+        go.send(()).unwrap();
+
+        assert!(
+            exporter.finish(&collector).is_err(),
+            "the panic is still surfaced"
+        );
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_export_failed_batches, 2);
+        assert_eq!(
+            diagnostics.otlp_export_failed_spans, 5,
+            "the in-flight document AND the queued one are lost"
+        );
+    }
+
+    #[test]
+    fn dispatch_successful_otlp_send_queues_the_batch() {
+        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
+        let ledger = ExportLedger::default();
+
+        dispatch_expired_otlp(
+            &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(4),
             &mut worker_gone,
         );
@@ -1574,6 +1702,9 @@ mod tests {
         sender.send(trace_document_with_spans(2)).unwrap();
         drop(sender);
 
+        let ledger = ExportLedger::default();
+        ledger.queued(3);
+        ledger.queued(2);
         let total = run_otlp_exporter(
             receiver,
             OtlpExporterConfig {
@@ -1587,8 +1718,10 @@ mod tests {
                 diagnostics: false,
             },
             &collector,
+            &ledger,
         );
 
+        assert_eq!(ledger.unsettled(), (0, 0), "every document is settled");
         assert_eq!(
             server.join().unwrap(),
             2,
