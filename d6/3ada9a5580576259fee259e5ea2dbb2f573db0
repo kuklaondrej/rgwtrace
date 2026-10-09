@@ -1,0 +1,23 @@
+Cargo.toml
+  s_4d990597f39574::t_aa119c95593826 17
+src/live/linux.rs
+  s_4d990597f39574::t_cfa26a551129ed 102-104,106
+tests/bpf_source.rs
+  s_4d990597f39574::t_e5910104240bf5 1109-1118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d63ada9a5580576259fee259e5ea2dbb2f573db0",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
