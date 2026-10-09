@@ -1,0 +1,21 @@
+.dockerignore
+  s_4d990597f39574::t_08c8f0ddf40405 1-22
+docker/Dockerfile
+  s_4d990597f39574::t_71cd0564197735 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3571a1637479705f2eef5a04982e6b2292a4a7ce",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
