@@ -8,6 +8,13 @@
 #define MAX_TRANS_ID 128
 #define MAX_OBJECT_NAME 128
 #define MAX_RADOS_OPS 3
+/*
+ * Object class name buffer. 16 holds every in-tree Ceph object class name
+ * (the longest, `timeindex` / `2pc_queue`, is 9 bytes) plus the NUL; longer
+ * names are copied as 15 bytes and flagged RGWTRACE_TRUNC_CLS_NAME.
+ */
+#define MAX_CLS_NAME 16
+#define MAX_METHOD_NAME 32
 
 #define CEPH_OSD_FLAG_WRITE 0x0020
 
@@ -34,8 +41,8 @@
 #define CEPH_OSD_OP_CALL __CEPH_OSD_OP(RD, EXEC, 1)
 
 struct cls_op {
-  char cls_name[8];
-  char method_name[32];
+  char cls_name[MAX_CLS_NAME];
+  char method_name[MAX_METHOD_NAME];
 };
 
 struct client_op_key {

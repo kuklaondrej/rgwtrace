@@ -1352,24 +1352,31 @@ int uprobe_send_op(struct pt_regs *ctx) {
       rgwtrace_probe_read_user(&data, sizeof(data),
                                (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
 
+      /*
+       * The call indata is `class || method || payload`, so the method starts
+       * at the class name's FULL wire length. Only the COPY lengths are
+       * clamped; cls_len itself is never rewritten, because clamping it used to
+       * move the method read into the middle of a long class name (`refcount`,
+       * `timeindex`) and garble the method with no truncation flag.
+       */
+      __u32 cls_read_len = cls_len;
       if (cls_len >= sizeof(event->cls_ops[i].cls_name)) {
         event->flags |= RGWTRACE_TRUNC_CLS_NAME;
-        cls_len = sizeof(event->cls_ops[i].cls_name) - 1;
+        cls_read_len = sizeof(event->cls_ops[i].cls_name) - 1;
       }
+      __u32 method_read_len = method_len;
       if (method_len >= sizeof(event->cls_ops[i].method_name)) {
         event->flags |= RGWTRACE_TRUNC_METHOD_NAME;
-        method_len = sizeof(event->cls_ops[i].method_name) - 1;
+        method_read_len = sizeof(event->cls_ops[i].method_name) - 1;
       }
-      __u32 cls_read_len = cls_len;
       cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;
-      asm volatile("%0 &= 7" : "+r"(cls_read_len));
-      __u32 method_read_len = method_len;
+      asm volatile("%0 &= 15" : "+r"(cls_read_len));
       method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;
       asm volatile("%0 &= 31" : "+r"(method_read_len));
       rgwtrace_probe_read_user(event->cls_ops[i].cls_name, cls_read_len,
                                (void *)data);
       rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_read_len,
-                               (void *)data + cls_len);
+                               (void *)(data + cls_len));
     }
 
     ops_start += CEPH_OSD_OP_SIZE;

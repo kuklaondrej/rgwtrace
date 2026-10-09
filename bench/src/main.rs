@@ -103,8 +103,8 @@ mod linux {
     const OFF_RADOS_OPS_SIZE: usize = EVENT_DATA_OFFSET + 76; // struct +76
     const OFF_RADOS_ACTING: usize = EVENT_DATA_OFFSET + 84; // struct +84 (int[16])
     const OFF_RADOS_OPS: usize = EVENT_DATA_OFFSET + 148; // struct +148 (u16[3])
-    const OFF_RADOS_TRANS_ID: usize = EVENT_DATA_OFFSET + 274; // struct +274 (char[128])
-    const OFF_RADOS_OBJECT_NAME: usize = EVENT_DATA_OFFSET + 402; // struct +402 (char[128])
+    const OFF_RADOS_TRANS_ID: usize = EVENT_DATA_OFFSET + 298; // struct +298 (char[128])
+    const OFF_RADOS_OBJECT_NAME: usize = EVENT_DATA_OFFSET + 426; // struct +426 (char[128])
 
     struct Config {
         baseline_iters: u64,

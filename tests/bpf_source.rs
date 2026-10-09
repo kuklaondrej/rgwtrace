@@ -1,6 +1,7 @@
 const RGWTRACE_BPF: &str = include_str!("../bpf/rgwtrace.bpf.c");
 const RGWTRACE_EVENTS: &str = include_str!("../bpf/rgwtrace_events.h");
 const BPF_UTILS: &str = include_str!("../bpf/bpf_utils.h");
+const CEPH_ABI: &str = include_str!("../bpf/ceph_abi.h");
 const DWARF_NATIVE: &str = include_str!("../src/dwarf_native.rs");
 const LIVE_LINUX: &str = include_str!("../src/live/linux.rs");
 const CLI: &str = include_str!("../src/cli.rs");
@@ -899,12 +900,33 @@ fn get_handler_populates_reqstate_bridge() {
 fn cls_and_method_reads_use_verifier_bounded_lengths() {
     assert!(RGWTRACE_BPF.contains("__u32 cls_read_len = cls_len;"));
     assert!(RGWTRACE_BPF.contains("cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;"));
-    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 7\" : \"+r\"(cls_read_len));"));
+    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 15\" : \"+r\"(cls_read_len));"));
     assert!(RGWTRACE_BPF.contains("__u32 method_read_len = method_len;"));
     assert!(RGWTRACE_BPF.contains("method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;"));
     assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 31\" : \"+r\"(method_read_len));"));
     assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].cls_name, cls_len"));
     assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].method_name, method_len"));
+}
+
+#[test]
+fn cls_method_is_read_at_the_unclamped_class_length() {
+    // The OSD call indata is `class || method || payload`, so the method name
+    // starts at the class name's FULL wire length. The class length used to be
+    // clamped to the buffer size and then reused as the method offset, so every
+    // class name longer than the buffer (`refcount`, `timeindex`, `2pc_queue`)
+    // produced a garbled method name with no truncation flag on it.
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "      rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_read_len,\n",
+        "                               (void *)(data + cls_len));"
+    )));
+    // Only the COPY lengths are clamped; cls_len / method_len are never rewritten.
+    assert!(!RGWTRACE_BPF.contains("cls_len = sizeof(event->cls_ops[i].cls_name) - 1;"));
+    assert!(!RGWTRACE_BPF.contains("method_len = sizeof(event->cls_ops[i].method_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("cls_read_len = sizeof(event->cls_ops[i].cls_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("method_read_len = sizeof(event->cls_ops[i].method_name) - 1;"));
+    // Wide enough for every in-tree Ceph object class name (longest: 9 bytes).
+    assert!(CEPH_ABI.contains("#define MAX_CLS_NAME 16"));
+    assert!(CEPH_ABI.contains("char cls_name[MAX_CLS_NAME];"));
 }
 
 #[test]

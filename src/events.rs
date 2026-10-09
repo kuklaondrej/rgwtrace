@@ -6,6 +6,8 @@ pub const MAX_ACTING: usize = 16;
 pub const MAX_TRANS_ID: usize = 128;
 pub const MAX_OBJECT_NAME: usize = 128;
 pub const MAX_RADOS_OPS: usize = 3;
+pub const MAX_CLS_NAME: usize = 16;
+pub const MAX_METHOD_NAME: usize = 32;
 
 // Two-marker model (mirrored in bpf/rgwtrace_events.h).
 // START is emitted at `RGWREST::get_handler` entry (the earliest point the
@@ -29,8 +31,8 @@ pub const RGWTRACE_TRUNC_METHOD_NAME: u32 = 1 << 5;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawClsOp {
-    pub cls_name: [u8; 8],
-    pub method_name: [u8; 32],
+    pub cls_name: [u8; MAX_CLS_NAME],
+    pub method_name: [u8; MAX_METHOD_NAME],
 }
 
 #[repr(C)]
@@ -367,8 +369,8 @@ mod tests {
         acting[1] = 2;
 
         let empty_cls_op = RawClsOp {
-            cls_name: [0; 8],
-            method_name: [0; 32],
+            cls_name: [0; MAX_CLS_NAME],
+            method_name: [0; MAX_METHOD_NAME],
         };
         let raw = RawRadosEvent {
             cid: 9,
@@ -428,6 +430,89 @@ mod tests {
         assert!(event.truncation.rados_ops);
         assert!(event.truncation.cls_name);
         assert!(event.truncation.method_name);
+    }
+
+    #[test]
+    fn decodes_class_names_longer_than_the_old_eight_byte_buffer() {
+        // Real Ceph object classes longer than 7 bytes (`refcount`, `timeindex`,
+        // `2pc_queue`) used to be truncated AND shift the method read; the class
+        // buffer is now 16 bytes, so they arrive whole and untruncated.
+        let mut ops = [RawClsOp {
+            cls_name: [0; MAX_CLS_NAME],
+            method_name: [0; MAX_METHOD_NAME],
+        }; MAX_RADOS_OPS];
+        ops[0] = RawClsOp {
+            cls_name: bytes("timeindex"),
+            method_name: bytes("list"),
+        };
+        ops[1] = RawClsOp {
+            cls_name: bytes("2pc_queue"),
+            method_name: bytes("2pc_queue_list_entries"),
+        };
+        ops[2] = RawClsOp {
+            cls_name: bytes("refcount"),
+            method_name: bytes("put"),
+        };
+        let mut raw = zeroed_rados_event();
+        raw.ops_size = 3;
+        raw.ops = [0x1401; MAX_RADOS_OPS];
+        raw.cls_ops = ops;
+
+        let event = RadosEvent::from(raw);
+        let calls: Vec<_> = event
+            .ops
+            .iter()
+            .map(|op| (op.class.as_deref(), op.method.as_deref()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (Some("timeindex"), Some("list")),
+                (Some("2pc_queue"), Some("2pc_queue_list_entries")),
+                (Some("refcount"), Some("put")),
+            ]
+        );
+        assert!(!event.truncation.cls_name);
+        assert!(!event.truncation.method_name);
+    }
+
+    #[test]
+    fn decodes_a_class_name_that_fills_the_buffer_without_a_nul() {
+        // Defensive: the BPF side copies at most MAX_CLS_NAME - 1 bytes, but a
+        // full, unterminated buffer must still decode rather than overrun.
+        let mut raw = zeroed_rados_event();
+        raw.ops_size = 1;
+        raw.ops[0] = 0x1401;
+        raw.cls_ops[0].cls_name = [b'x'; MAX_CLS_NAME];
+        let event = RadosEvent::from(raw);
+        assert_eq!(event.ops[0].class.as_deref(), Some("xxxxxxxxxxxxxxxx"));
+    }
+
+    fn zeroed_rados_event() -> RawRadosEvent {
+        RawRadosEvent {
+            cid: 0,
+            tid: 0,
+            sent_ns: 0,
+            finish_ns: 0,
+            pool: 0,
+            offset: 0,
+            length: 0,
+            pid: 0,
+            send_tid: 0,
+            target_osd: 0,
+            pg_seed: 0,
+            rw: 0,
+            ops_size: 0,
+            flags: 0,
+            acting: [-1; MAX_ACTING],
+            ops: [0; MAX_RADOS_OPS],
+            cls_ops: [RawClsOp {
+                cls_name: [0; MAX_CLS_NAME],
+                method_name: [0; MAX_METHOD_NAME],
+            }; MAX_RADOS_OPS],
+            trans_id: [0; MAX_TRANS_ID],
+            object_name: [0; MAX_OBJECT_NAME],
+        }
     }
 
     fn bytes<const N: usize>(value: &str) -> [u8; N] {

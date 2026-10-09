@@ -1279,7 +1279,7 @@ const _: () = {
 mod tests {
     use super::*;
     use crate::collector::{SpanDocument, TraceDiagnostics};
-    use crate::events::{RawClsOp, MAX_ACTING, MAX_RADOS_OPS};
+    use crate::events::{RawClsOp, MAX_ACTING, MAX_CLS_NAME, MAX_METHOD_NAME, MAX_RADOS_OPS};
 
     fn trace_document_with_spans(span_count: usize) -> TraceDocument {
         TraceDocument {
@@ -1564,8 +1564,8 @@ mod tests {
             acting,
             ops: [0x1201, 0, 0],
             cls_ops: [RawClsOp {
-                cls_name: [0; 8],
-                method_name: [0; 32],
+                cls_name: [0; MAX_CLS_NAME],
+                method_name: [0; MAX_METHOD_NAME],
             }; MAX_RADOS_OPS],
             trans_id: bytes("tx0002"),
             object_name: bytes("bucket-object"),
