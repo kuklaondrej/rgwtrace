@@ -49,7 +49,13 @@ Validate an imported artifact without attaching probes:
 rgwtrace --import-json /path/to/dwarf.json --dry-run --output json
 ```
 
-If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout.
+If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout. For a containerized RGW (targets under `/proc/<pid>/root`), rgwtrace never falls back to the host's `dpkg-query`/`rpm`, because the host package says nothing about the image. Without an embedded version string, extraction fails and asks for `--ceph-version`.
+
+Native extraction refuses any file larger than `--max-debug-file-bytes` (default `4G`; accepts `K`/`M`/`G`/`T`), and refuses to decompress more than that from one file's compressed DWARF sections. This protects the node from a sparse or crafted debug file. Raise the limit only for a debug file that is genuinely larger:
+
+```sh
+sudo rgwtrace --dwarf-source native --pid <pid> --max-debug-file-bytes 8G --preflight
+```
 
 Build ID mismatches fail preflight and live attach by default. Use `--allow-build-id-mismatch` only when the mismatch is understood.
 
@@ -121,6 +127,9 @@ defaults.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
 - `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun with `--allow-build-id-mismatch` only if the mismatch is understood.
+- `... is N bytes, over the M-byte limit` or `compressed DWARF section ... exceeds the M-byte limit`: the named file or section is larger than `--max-debug-file-bytes`. Check that the file is the expected debug file. Then raise the limit, or export JSON on a host with more memory.
+- `the host package database cannot describe ... pass --ceph-version`: the target is in a container and has no embedded version string. Pass the version the RGW process runs, for example `--ceph-version 18.2.8`.
+- `type qualifier chain ...`, `... pointer/reference indirections ...`, `DWARF scope nesting deeper than ...`: the debug info is malformed (a reference cycle or absurd nesting). Use a debug file from the distribution's debuginfo package, or `--import-json`.
 
 ---
 
