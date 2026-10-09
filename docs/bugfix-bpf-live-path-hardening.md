@@ -46,6 +46,14 @@ never swept. An op that really is blocked past the threshold (an inactive PG) is
 evicted; its late `_finish_op` shows up as `bpf_rados_finish_misses` and emits no
 event. `0` turns the sweep off.
 
+The scan and the delete are not atomic with BPF. If Ceph resends a candidate op
+in between (same `cid`/`tid` key), `_send_op` replaces the entry with a fresh
+`sent_ns`, and a blind delete by key would remove a live op. Each candidate is
+therefore removed with an atomic lookup-and-delete and judged on the value
+actually removed; a refreshed one is put back with `NO_EXIST` (a still newer
+submit wins). On kernels before 5.14 the sweep re-reads and deletes only if
+still stale.
+
 ## 3. Ring buffer too small, request records oversized
 
 **What happened.** The ring buffer was a fixed 256 KiB and every record
@@ -114,7 +122,9 @@ polling after its target exited, capturing nothing.
 **Fix.** `ctrlc` is built with `termination`, so SIGTERM and SIGHUP take the
 Ctrl-C path. The poll loop watches the target with `pidfd_open` (falling back to
 `/proc/<pid>/stat` when the syscall is unavailable) and, once it has exited,
-logs a warning and finalizes output normally.
+drains the ring buffer one last time (records written between the last poll and
+the exit would otherwise be dropped with the ring), logs a warning, and
+finalizes output normally.
 
 ## Verification limits
 

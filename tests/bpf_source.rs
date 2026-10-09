@@ -1126,3 +1126,15 @@ fn a_pid_session_ends_when_the_target_exits() {
     assert!(LIVE_LINUX.contains("fn proc_stat_says_exited("));
     assert!(LIVE_LINUX.contains("if watch.exited() {"));
 }
+
+#[test]
+fn target_exit_drains_the_ring_before_finalizing() {
+    // Greptile on #9: records the target wrote between the last poll and its
+    // exit were dropped with the ring buffer. Once the target is gone nothing
+    // new can arrive, so the exit branch drains the ring completely first.
+    let exit = &LIVE_LINUX[LIVE_LINUX
+        .find("if watch.exited() {")
+        .expect("target exit branch")..];
+    let exit = &exit[..exit.find("break;").expect("exit branch breaks")];
+    assert!(exit.contains("ringbuf.consume_raw()"), "{exit}");
+}

@@ -164,6 +164,16 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         }
         if let Some(watch) = &target_watch {
             if watch.exited() {
+                // The target can no longer write, so whatever it wrote between
+                // the last poll and its exit is all that is left: drain it, or
+                // its final completions and request ENDs are lost with the ring.
+                let drained = ringbuf.consume_raw();
+                if drained < 0 {
+                    warn!(
+                        errno = -drained,
+                        "failed to drain the ring buffer after target exit"
+                    );
+                }
                 warn!(
                     pid,
                     "target process exited; stopping the trace and writing what was collected"
@@ -674,12 +684,59 @@ fn rados_op_is_stale(value: &[u8], now_ns: u64, stale_after_ns: u64) -> bool {
     sent_ns != 0 && now_ns.saturating_sub(sent_ns) > stale_after_ns
 }
 
+/// What happened to one sweep candidate.
+#[derive(Debug, Eq, PartialEq)]
+enum Reclaim {
+    /// The entry removed was stale: a leaked op, reclaimed.
+    Swept,
+    /// The entry removed had been refreshed (Ceph resent the op, so `_send_op`
+    /// re-stamped the same key) after the scan judged it stale; it was put back.
+    Restored,
+    /// As `Restored`, but a newer `_send_op` re-inserted the key first; that
+    /// newer entry stands.
+    Superseded,
+    /// `_finish_op` deleted the entry first.
+    Gone,
+}
+
+/// Take one candidate out of `rados_ops` and judge what was ACTUALLY removed,
+/// not what the earlier scan saw. `take` must remove and return the entry
+/// atomically; `restore` must insert only if the key is absent.
+fn reclaim_stale_rados_op(
+    take: impl FnOnce() -> Result<Option<Vec<u8>>>,
+    restore: impl FnOnce(&[u8]) -> Result<()>,
+    now_ns: u64,
+    stale_after_ns: u64,
+) -> Reclaim {
+    let taken = match take() {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return Reclaim::Gone,
+    };
+    if rados_op_is_stale(&taken, now_ns, stale_after_ns) {
+        return Reclaim::Swept;
+    }
+    match restore(&taken) {
+        Ok(()) => Reclaim::Restored,
+        Err(_) => Reclaim::Superseded,
+    }
+}
+
 /// Delete `rados_ops` entries older than `stale_after`. Returns how many were
 /// deleted.
 ///
 /// Keys are collected first and deleted afterwards: deleting the key a hash
-/// iteration is positioned on restarts the iteration. An entry that
-/// `_finish_op` deletes in between simply fails to delete and is not counted.
+/// iteration is positioned on restarts the iteration. Between the scan and the
+/// delete, Ceph may RESEND a candidate op (same `cid`/`tid` key), and
+/// `_send_op` then replaces the entry with a fresh `sent_ns`; a blind delete by
+/// key would remove that live op. So each candidate is removed with an atomic
+/// lookup-and-delete and judged on the value actually removed; a refreshed one
+/// is re-inserted with `NO_EXIST` (a still newer submit wins). The only
+/// remaining window is a refreshed op completing in the microseconds between
+/// that removal and its re-insert, which counts as a finish miss.
+///
+/// Kernels before 5.14 lack lookup-and-delete on hash maps; there a candidate
+/// is re-read and deleted only if still stale, which narrows the window to the
+/// re-read-to-delete gap instead of closing it.
 /// `sent_ns` is CLOCK_BOOTTIME (`bpf_ktime_get_boot_ns`), so `now` is too.
 fn sweep_stale_rados_ops(map: &impl MapCore, stale_after: Duration) -> Result<u64> {
     let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
@@ -698,9 +755,32 @@ fn sweep_stale_rados_ops(map: &impl MapCore, stale_after: Duration) -> Result<u6
     }
     let mut swept = 0;
     for key in stale {
-        match map.delete(&key) {
-            Ok(()) => swept += 1,
-            Err(err) => debug!(error = %err, "stale rados_ops entry was already gone"),
+        let outcome = match map.lookup_and_delete(&key) {
+            Ok(taken) => reclaim_stale_rados_op(
+                || Ok(taken),
+                |value| {
+                    map.update(&key, value, MapFlags::NO_EXIST)
+                        .map_err(Into::into)
+                },
+                now_ns,
+                stale_after_ns,
+            ),
+            // Pre-5.14 kernels refuse lookup-and-delete on hash maps (ENOTSUPP,
+            // which has no portable errno kind); fall back to re-read + delete.
+            Err(_) => match map.lookup(&key, MapFlags::ANY) {
+                Ok(Some(value)) if rados_op_is_stale(&value, now_ns, stale_after_ns) => {
+                    match map.delete(&key) {
+                        Ok(()) => Reclaim::Swept,
+                        Err(_) => Reclaim::Gone,
+                    }
+                }
+                Ok(Some(_)) => Reclaim::Restored,
+                _ => Reclaim::Gone,
+            },
+        };
+        match outcome {
+            Reclaim::Swept => swept += 1,
+            other => debug!(outcome = ?other, "rados_ops sweep candidate was not stale any more"),
         }
     }
     Ok(swept)
@@ -1873,6 +1953,62 @@ mod tests {
         assert!(pidfd_watch.exited());
         assert!(proc_watch.exited());
         assert!(TargetWatch::new(pid).exited());
+    }
+
+    #[test]
+    fn a_resent_op_refreshed_after_the_scan_survives_the_sweep() {
+        // Greptile on #9: the scan saw a stale entry, then Ceph resent the op
+        // (same cid/tid key), so _send_op replaced it with a fresh sent_ns. A
+        // blind delete by key removed the refreshed op and its completion became
+        // a finish miss. The entry is now taken atomically and judged on what was
+        // actually removed; a fresh one is put back.
+        const MIN: u64 = 60_000_000_000;
+        let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+        let value = |sent_ns: u64| {
+            let mut value = vec![0_u8; RGWTRACE_RADOS_EVENT_SIZE];
+            value[at..at + 8].copy_from_slice(&sent_ns.to_ne_bytes());
+            value
+        };
+        let now = 10 * MIN;
+        let stale_after = 5 * MIN;
+
+        let mut restored = None;
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |fresh| {
+                restored = Some(fresh.to_vec());
+                Ok(())
+            },
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome, Reclaim::Restored);
+        assert_eq!(restored, Some(value(now - 1)));
+
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 6 * MIN))),
+            |_| panic!("a stale entry must not be restored"),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome, Reclaim::Swept);
+
+        let outcome = reclaim_stale_rados_op(
+            || Ok(None),
+            |_| panic!("nothing to restore"),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome, Reclaim::Gone);
+
+        // A newer submit re-inserted the key before we could restore: it wins.
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |_| Err(anyhow::anyhow!("EEXIST")),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome, Reclaim::Superseded);
     }
 
     #[test]
