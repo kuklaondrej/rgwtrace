@@ -1,0 +1,29 @@
+AGENTS.md
+  s_4d990597f39574::t_7ac28435150b5a 12,56-57,86-88
+ARCHITECTURE.md
+  s_4d990597f39574::t_8cf36da099d008 22,25-52,70
+README.md
+  s_4d990597f39574::t_887ef4e84827d5 40-43
+RUNBOOK.md
+  s_4d990597f39574::t_cfcfddc72e9dc5 56-72,141-145
+docs/README.md
+  s_4d990597f39574::t_c1174c24b86a2e 40-43
+docs/bugfix-uprobe-address-validation.md
+  s_4d990597f39574::t_cc8ee60d923234 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6820bd17af5a0029ce570c1930781935b19b299e",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
