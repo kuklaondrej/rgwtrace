@@ -68,36 +68,47 @@ It prints the resolved mangled symbols, the **demangled signatures**, and the
 **arg index it chose** for each `req_state*` — eyeball these (see "Verifying the
 arg indices"). It then traces for `STAGE0_DURATION` seconds (default 60; Ctrl-C
 also stops it and prints the summary). The generated bpftrace program and the
-full log are written to `STAGE0_OUTDIR` (default `/tmp/rgwtrace-stage0/`).
+full log are written to `STAGE0_OUTDIR`. By default that is a fresh private
+`mktemp -d` directory (mode 0700; the path is printed). If you set
+`STAGE0_OUTDIR` yourself, it is created 0700 when missing; an existing
+directory must be owned by you, must not be a symlink, and must not be
+group/other writable. The script refuses anything else, because the generated
+program is executed by a privileged `bpftrace` and a directory another local
+user controls would let them choose what it runs.
 
 To just resolve symbols and generate the program without attaching (e.g. on a
 host without a live RGW):
 
 ```sh
-STAGE0_DRY_RUN=1 ./scripts/stage0-crossthread-probe.sh
-cat /tmp/rgwtrace-stage0/stage0.bt
+STAGE0_DRY_RUN=1 STAGE0_OUTDIR="$HOME/stage0" ./scripts/stage0-crossthread-probe.sh
+cat "$HOME/stage0/stage0.bt"
 ```
 
 ### Terminal 2 — the workload
 
-Use the same endpoint/keys the reference e2e uses (defaults from
-`tests/e2e/functional-test-microceph-rgw.sh`: user `rgwtrace-e2e`, access key
-`RGWTRACEACCESSKEY001`, secret `rgwtrace-secret-key-rgwtrace-secret-key`,
-endpoint `http://127.0.0.1:8080`). Adjust to your cluster.
+Use an S3 user on the target RGW. The reference e2e test
+(`tests/e2e/functional-test-microceph-rgw.sh`) generates a random key pair per
+run and deletes the user on exit; to reuse it, run the e2e with
+`KEEP_E2E_RESOURCES=1` and read the keys from the RGW admin API (the persisted
+`rgw-user.json` has the secret redacted). Any other user works the same way.
+Export the keys as the standard `AWS_*` variables; do not pass `--secret-key`
+on the command line, it is visible to every local user in `ps`.
+
+```sh
+ENDPOINT=http://127.0.0.1:8080
+export AWS_ACCESS_KEY_ID="$(sudo microceph.radosgw-admin user info --uid=rgwtrace-e2e | jq -r '.keys[0].access_key')"
+export AWS_SECRET_ACCESS_KEY="$(sudo microceph.radosgw-admin user info --uid=rgwtrace-e2e | jq -r '.keys[0].secret_key')"
+```
 
 **Single-stream GET/PUT (the coverage-≥90% case):** the workload does a
 deterministic PUT → HEAD → GET → LIST → COPY → multipart → deletes sequence.
 Run it a few times back-to-back so the 60s window sees plenty of ops:
 
 ```sh
-ENDPOINT=http://127.0.0.1:8080
-AK=RGWTRACEACCESSKEY001
-SK=rgwtrace-secret-key-rgwtrace-secret-key
-
 for i in 1 2 3 4 5; do
   python3 tests/e2e/s3-workload.py \
-    --endpoint "$ENDPOINT" --access-key "$AK" --secret-key "$SK" \
-    --output "/tmp/stage0-workload-single-$i.jsonl"
+    --endpoint "$ENDPOINT" \
+    --output "$HOME/stage0/workload-single-$i.jsonl"
 done
 ```
 
@@ -107,10 +118,10 @@ e2e gate):
 
 ```sh
 python3 tests/e2e/s3-workload.py \
-  --endpoint "$ENDPOINT" --access-key "$AK" --secret-key "$SK" \
+  --endpoint "$ENDPOINT" \
   --concurrent-requests 4 --unique-keys \
-  --output "/tmp/stage0-workload-concurrent.jsonl" \
-  --manifest "/tmp/stage0-manifest-concurrent.json"
+  --output "$HOME/stage0/workload-concurrent.jsonl" \
+  --manifest "$HOME/stage0/manifest-concurrent.json"
 ```
 
 (`--unique-keys` and `--manifest` are not needed for the Stage 0 metrics
@@ -124,9 +135,9 @@ concurrent pass, judge coverage against the 80% gate, not 90%.
 
 ### Output to capture
 
-- The full probe log: `/tmp/rgwtrace-stage0/stage0.log` (contains the resolved
+- The full probe log: `$STAGE0_OUTDIR/stage0.log` (contains the resolved
   symbols, chosen arg indices, and the `STAGE 0 SUMMARY` block).
-- The generated program: `/tmp/rgwtrace-stage0/stage0.bt`.
+- The generated program: `$STAGE0_OUTDIR/stage0.bt`.
 - The workload JSONL files (they record `x_amz_request_id` per op).
 
 ---
@@ -277,7 +288,7 @@ measure.
 | `LIBCEPH_COMMON_PATH` | `libceph-common.so.*` (auto). |
 | `STAGE0_DURATION` | run seconds (default 60). |
 | `STAGE0_STALE_MS` | stale-seed threshold for metric (e), ms (default 50). |
-| `STAGE0_OUTDIR` | output dir (default `/tmp/rgwtrace-stage0`). |
+| `STAGE0_OUTDIR` | output dir (default: fresh private `mktemp -d`; a supplied dir must be yours, 0700-style, not a symlink). |
 | `RGW_GET_HANDLER_SYM` / `RGW_PROC_AUTH_SYM` / `RGW_SEND_OP_SYM` | override the mangled symbol (skip discovery). |
 | `RGW_GET_HANDLER_ARG` / `RGW_PROC_AUTH_ARG` | override the derived `argN` index. |
 | `STAGE0_COVERAGE_GATE` / `STAGE0_KEYMATCH_GATE` / `STAGE0_A3_GATE` | PASS thresholds (default 90 / 99 / 99). Set coverage to 80 for the concurrent pass. |

@@ -48,10 +48,14 @@ INFERENCE_WINDOW="${INFERENCE_WINDOW:-2}"
 ATTACH_DELAY="${ATTACH_DELAY:-6}"
 TRACE_SAFETY_TIMEOUT="${TRACE_SAFETY_TIMEOUT:-900}"
 DRY_RUN=0
+SECRET_ON_ARGV=0
 
 ENDPOINT="${RGW_ENDPOINT:-http://127.0.0.1:8080}"
-ACCESS_KEY="${RGW_ACCESS_KEY:-RGWTRACEACCESSKEY001}"
-SECRET_KEY="${RGW_SECRET_KEY:-rgwtrace-secret-key-rgwtrace-secret-key}"
+# No well-known default credentials. Read from the environment (RGW_* first
+# for symmetry with the e2e test, then the standard AWS_* names); they are
+# handed to s3-workload.py through AWS_* env vars, never on its argv.
+ACCESS_KEY="${RGW_ACCESS_KEY:-${AWS_ACCESS_KEY_ID:-}}"
+SECRET_KEY="${RGW_SECRET_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
 
 RGWTRACE_BIN="${RGWTRACE_BIN:-${PROJECT_ROOT}/target/release/rgwtrace}"
 RGWTRACE_DWARF_JSON="${RGWTRACE_DWARF_JSON:-}"
@@ -92,8 +96,9 @@ Arms / scheduling:
 
 Target / tracing:
   --endpoint URL       S3 endpoint            (default http://127.0.0.1:8080)
-  --access-key KEY     S3 access key
-  --secret-key KEY     S3 secret key
+  --access-key KEY     S3 access key    (prefer env RGW_ACCESS_KEY / AWS_ACCESS_KEY_ID)
+  --secret-key KEY     S3 secret key    (prefer env RGW_SECRET_KEY / AWS_SECRET_ACCESS_KEY;
+                       a flag value is visible to every local user via ps)
   --rgwtrace-bin PATH  rgwtrace binary        (default target/release/rgwtrace)
   --dwarf-json PATH    use imported DWARF JSON instead of native extraction
   --ceph-version V     pass --ceph-version to rgwtrace (native mode)
@@ -120,7 +125,7 @@ parse_args() {
             --inference-window) INFERENCE_WINDOW="$2"; shift 2 ;;
             --endpoint)         ENDPOINT="$2"; shift 2 ;;
             --access-key)       ACCESS_KEY="$2"; shift 2 ;;
-            --secret-key)       SECRET_KEY="$2"; shift 2 ;;
+            --secret-key)       SECRET_KEY="$2"; SECRET_ON_ARGV=1; shift 2 ;;
             --rgwtrace-bin)     RGWTRACE_BIN="$2"; shift 2 ;;
             --dwarf-json)       RGWTRACE_DWARF_JSON="$2"; shift 2 ;;
             --ceph-version)     CEPH_VERSION="$2"; shift 2 ;;
@@ -232,10 +237,10 @@ build_trace_cmd() {
 #   phase = all|prepare|run|cleanup
 build_workload_cmd() {
     local phase="$1" requests="$2" jsonl="$3" summary="$4" state="$5"
+    # Credentials reach the workload via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY
+    # (exported in main), so they never appear in this argv or in --dry-run.
     WORKLOAD_CMD=(python3 "${WORKLOAD_PY}"
         --endpoint "${ENDPOINT}"
-        --access-key "${ACCESS_KEY}"
-        --secret-key "${SECRET_KEY}"
         --requests "${requests}"
         --concurrent-requests "${CONCURRENCY}"
         --object-size "${OBJECT_SIZE}"
@@ -248,10 +253,24 @@ build_workload_cmd() {
     esac
 }
 
+# Print an argv for --dry-run. Credential flag values are redacted so a plan
+# pasted into a ticket or log never carries a key, whatever the argv holds.
 print_cmd() {
     local prefix="$1"; shift
     printf '%s' "${prefix}"
-    printf ' %q' "$@"
+    local arg redact_next=0
+    for arg in "$@"; do
+        if [[ "${redact_next}" -eq 1 ]]; then
+            printf ' %q' "<redacted>"
+            redact_next=0
+            continue
+        fi
+        case "${arg}" in
+            --secret-key|--access-key) printf ' %q' "${arg}"; redact_next=1 ;;
+            --secret-key=*|--access-key=*) printf ' %q' "${arg%%=*}=<redacted>" ;;
+            *) printf ' %q' "${arg}" ;;
+        esac
+    done
     printf '\n'
 }
 
@@ -807,6 +826,14 @@ PY
 main() {
     parse_args "$@"
     CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+
+    if [[ "${SECRET_ON_ARGV}" -eq 1 ]]; then
+        warn "--secret-key puts the secret on this process's argv (visible in ps); prefer RGW_SECRET_KEY / AWS_SECRET_ACCESS_KEY"
+    fi
+    if [[ "${DRY_RUN}" -ne 1 && ( -z "${ACCESS_KEY}" || -z "${SECRET_KEY}" ) ]]; then
+        die "S3 credentials missing: set RGW_ACCESS_KEY/RGW_SECRET_KEY (or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); the e2e test prints how to read its generated keys"
+    fi
+    export AWS_ACCESS_KEY_ID="${ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${SECRET_KEY}"
 
     preflight_env
 
