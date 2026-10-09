@@ -37,7 +37,10 @@ sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --prefligh
 sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 30 --output json
 ```
 
-Wait for `starting live tracing` before generating S3 traffic. JSON is written
+Preflight refuses any probe address that is not a function entry in the
+target binary, and any separate debug info that does not match it, so a wrong
+artifact fails before a uprobe is placed. Wait for `starting live tracing`
+before generating S3 traffic. JSON is written
 to stdout when the capture finishes; logs go to stderr.
 
 Continue in the runbook for [preflight and metadata setup](RUNBOOK.md#preflight),

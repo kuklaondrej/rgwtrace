@@ -37,3 +37,7 @@ superseded by later sections in the same document.
   imported metadata must resolve symlinked libraries correctly.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Uprobe address validation](bugfix-uprobe-address-validation.md): why probe
+  addresses are translated to file offsets and checked as function entries, why
+  separate debug info must match the binary, and why member offsets are never
+  defaulted to 0.

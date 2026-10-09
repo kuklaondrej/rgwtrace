@@ -9,7 +9,7 @@ Guidance for AI coding agents working in this repo. Keep it accurate as the code
 Pipeline:
 
 ```
-native DWARF or cephtrace JSON  ->  hprobes map  ->  eBPF uprobes  ->  ring buffer  ->  Rust events  ->  spans  ->  JSON or OTLP protobuf
+native DWARF or cephtrace JSON  ->  address validation  ->  hprobes map  ->  eBPF uprobes  ->  ring buffer  ->  Rust events  ->  spans  ->  JSON or OTLP protobuf
 ```
 
 Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostrace`). For depth, read `ARCHITECTURE.md` (stage-by-stage internals) and `RUNBOOK.md` (operations/troubleshooting); `README.md` has the overview.
@@ -53,7 +53,8 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - `src/events.rs` — BPF↔Rust ABI: `Raw*` on-wire structs decoded into owned Rust forms
 - `src/dwarf_{input,json,native}.rs` — probe-metadata sources (`native` = gimli/object ELF+DWARF; `json` = cephtrace import); shared `DwarfInfo` model
 - `src/targets.rs` — locate `librados`/`librbd`/`libceph-common`/`radosgw` (via `/proc/<pid>/root`)
-- `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs)
+- `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs, probe addresses)
+- `src/probe_sites.rs` — probe address validation and vaddr → file-offset translation (platform independent)
 - `src/otel.rs` — OTLP/HTTP protobuf export
 - `src/live.rs` → `src/live/linux.rs` — Linux-only BPF load/attach/ring-buffer poll
 - `bpf/*.c`, `bpf/*.h` — eBPF program + C ABI mirror (`rgwtrace_events.h`, `ceph_abi.h`)
@@ -82,6 +83,9 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - **The per-submit re-seed must not attach without the request-END probe** — the END probe is the only thing that revokes bridge entries; without it, a recycled `req_state`/`RGWOp` address hits a dead request's entry and the (disabled) liveness gate fails open. Phase B degrades to Phase A, loudly.
 - **The `dpp` is an opaque identity token — never dereference it, never apply an inheritance offset** — and the offset-0 claim it rests on (`req_state`/`RGWOp` inherit `DoutPrefixProvider` at 0) is **verified in DWARF per build** (`dpp_base_offset`, `src/dwarf_native.rs`), never assumed. A build that cannot prove it loses the key — or the whole per-submit re-seed — rather than keying on a guess.
 - **A request must never be emitted twice under the same span id** — request-group expiry is open/closed aware (open = END still expected; never idle-expired, only lifetime-bounded), and every exported request key is remembered **for the whole session** in a never-reset Bloom filter so a straggler cannot resurrect it. Do not "bound" it with a FIFO: at production rates the memory turns over in seconds and a force-expired long request's late END then re-emits the same span id. A Bloom false positive is safe (it drops), a false negative is not (it duplicates) — and Bloom filters have none.
+- **uprobes attach at FILE OFFSETS, never at `func2pc` virtual addresses** — `func2pc` stays a vaddr (artifact/cephtrace contract), and preflight's `validated_probe_sites` translates it through the target's executable `PT_LOAD` and proves it is a function entry (FUNC symbol, verified debug-file symbol, or DWARF `low_pc`). Every `attach_uprobe` call takes its offset from `ProbeSites::file_offset`; never pass or translate a raw address in the attach path. An absent optional probe fails soft; a present address that fails validation is a hard error, even for the END probe.
+- **Separate debug info is trusted only once proven to match the binary** — equal `NT_GNU_BUILD_ID`, else the `.gnu_debuglink` CRC. The preflight build-ID check compares the binary with itself and cannot catch a stale debuginfo package.
+- **Never default an unevaluable DWARF offset to 0** — an unsupported member location is an error naming the member and `DW_OP`; an inherited member adds its base's offset.
 - Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`.
 - Fixed capture caps (`MAX_TRANS_ID=128`, `MAX_OBJECT_NAME=128`, `MAX_ACTING=16`, `MAX_RADOS_OPS=3`, …). Overflow is surfaced via `RGWTRACE_TRUNC_*` flags (→ `rgwtrace.truncated` attr + counters), never silently dropped.
 - `dwarf_native.rs` hardcodes libstdc++ `std::string`/`std::vector` member names (`_M_dataplus`, `_M_string_length`, `_M_impl._M_start`) — ABI-coupled; touch with care.

@@ -19,8 +19,36 @@ A probe-metadata artifact maps, per module, `func2pc` (function -> address), `fu
 Pipeline:
 
 ```text
-native DWARF or cephtrace JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
+native DWARF or cephtrace JSON -> address validation -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
+
+### Address validation and translation
+
+`func2pc` holds ELF **virtual** addresses: that is what DWARF and the symbol tables record, and what the cephtrace JSON contract carries. The uprobe API (`bpf_program__attach_uprobe(func_offset)`) takes a **file offset** into the probed file. The two coincide only when the executable `PT_LOAD` has `p_vaddr == p_offset`, which GNU ld happens to produce for PIE text. A non-PIE (`ET_EXEC`, linked at `0x400000`) or lld-linked binary breaks that, and an `int3` at the wrong offset usually lands mid-instruction in a production RGW.
+
+Preflight (`validated_probe_sites`, `src/probe_sites.rs`) therefore checks every address the artifact carries for a probed function in a discovered target before anything attaches:
+
+```text
+func2pc vaddr
+  |-- inside the file-backed bytes of an executable PT_LOAD of the target?   no -> hard error
+  |     file_offset = vaddr - p_vaddr + p_offset
+  `-- a function ENTRY?                                                       no -> hard error
+        1. st_value of a defined FUNC symbol in the target's .symtab/.dynsym
+        2. ... in its separate debug file (only once proven to match, see below)
+        3. DW_AT_low_pc of a DW_TAG_subprogram in its DWARF
+```
+
+The result, a list of `ProbeSite { module, path, function, vaddr, file_offset, evidence }`, is printed in the `--preflight` report as `probe_sites`, and it is the **only** source of offsets the Linux attach path uses: every `attach_uprobe` call takes `ProbeSites::file_offset(path, function, vaddr)` and refuses an address preflight did not validate. Native and imported artifacts are checked the same way.
+
+Optional probes keep failing soft when their address is **absent** (the request-END destructor, the `rgw_rados_operate` overloads). An address that is **present** and fails validation is a hard error even for them: a breakpoint in the wrong place corrupts the traced process, which no amount of degraded output is worth. `--allow-build-id-mismatch` does not relax this check.
+
+### Separate debug info must belong to the binary
+
+Native extraction reads DWARF from a separate debug file when the binary is stripped (`.gnu_debuglink`, then `/usr/lib/debug/.build-id/xx/yyyy.debug`). The preflight build-ID check cannot vouch for that file, because the artifact's `build_id` comes from the binary itself. So a candidate debug file is used only when its `NT_GNU_BUILD_ID` equals the binary's, or, when either lacks a build ID, when the debuglink CRC-32 matches the whole file. The build ID wins when both are available, because dwz can rewrite a debug file after its CRC was recorded. Candidates that fail are skipped; if none passes, extraction fails and names each rejected file. Probe addresses prefer the binary's own symbols over the debug file's.
+
+### Member offsets are evaluated or refused
+
+A `DW_AT_data_member_location` the extractor cannot evaluate (an unsupported `DW_OP`, a location list, a value outside `i32`), a static data member, or a `DW_AT_data_bit_offset` bit-field is an error naming the member. It is never read as offset 0. An absent location is offset 0 only where DWARF 5 allows it (a plain member at the start of its container). A member found through a base class adds that base's own offset; a base whose location is a runtime expression (a virtual base) fails the lookup when a probed member is reached through it. A variable location with an operation outside the `reg + offset` shape yields no location, so that descriptor is rejected instead of describing the wrong place.
 
 ---
 
@@ -39,7 +67,7 @@ There is still **no return probe anywhere** in the BPF program: a `process_reque
 
 **Destructor variant.** The Itanium C++ ABI emits up to three destructors -- `D0` (deleting), `D1` (complete object), `D2` (base object) -- and all three demangle to the same name, `req_state::~req_state`. The extractor therefore ranks candidates by their *mangled* linkage name: it binds only to `D1`/`D2` (preferring `D1`, the one `process_request` calls) and **rejects `D0` outright**, in both the symbol-table and DWARF-DIE resolution paths. This matters because g++ lists `D0` first in both. See `docs/design-request-end-probe.md`.
 
-**The END probe is optional and fails soft.** When the destructor address or its `this` descriptor cannot be resolved (stripped binary, unexpected mangling, older RGW), the probe is not attached, no `REQUEST_END` arrives, and the collector falls back to deriving each request's end from its correlated RADOS child bounds -- the pre-end-probe behavior. Preflight reports this as an advisory `request_end_probe` `warn`, never a hard error.
+**The END probe is optional and fails soft.** When the destructor address or its `this` descriptor cannot be resolved (stripped binary, unexpected mangling, older RGW), the probe is not attached, no `REQUEST_END` arrives, and the collector falls back to deriving each request's end from its correlated RADOS child bounds -- the pre-end-probe behavior. Preflight reports this as an advisory `request_end_probe` `warn`, never a hard error. The one exception is an address that is present but fails [address validation](#address-validation-and-translation): that stops the run.
 
 Captured request data:
 
