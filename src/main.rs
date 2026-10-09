@@ -70,7 +70,9 @@ fn main() -> Result<()> {
 
     preflight::validate_cli(&cli)?;
     let trace = if cli.dry_run {
-        Collector::default().into_trace_document(cli.service_name.clone())
+        let mut collector = Collector::default();
+        collector.set_redact_object_names(cli.redact_object_names);
+        collector.into_trace_document(cli.service_name.clone())
     } else {
         warn_if_import_unusable(&dwarf);
         live::run(&cli, &dwarf)?

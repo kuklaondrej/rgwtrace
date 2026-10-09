@@ -132,6 +132,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // under its pending END (which would export it twice). Without it, no END is
     // ever coming and the plain idle TTL is correct.
     collector_state.set_end_probe_attached(attached.request_end_probe);
+    collector_state.set_redact_object_names(cli.redact_object_names);
     let collector = Arc::new(Mutex::new(collector_state));
     let otlp_exporter = matches!(cli.output, OutputMode::Otlp)
         .then(|| OtlpExporter::spawn(cli))

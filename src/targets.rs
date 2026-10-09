@@ -297,6 +297,7 @@ mod tests {
             otlp_max_bytes_per_batch: 0,
             otlp_flush_interval: std::time::Duration::from_secs(30),
             otlp_diagnostics: false,
+            redact_object_names: false,
             correlation_ttl: std::time::Duration::from_secs(120),
             correlate_inferred: false,
             correlate_cross_thread: false,

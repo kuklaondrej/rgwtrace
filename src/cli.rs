@@ -78,6 +78,18 @@ pub struct Cli {
     #[arg(long)]
     pub otlp_diagnostics: bool,
 
+    /// Export every `ceph.rados.object` as a stable FNV-1a 64 hash (16 hex
+    /// digits) instead of the name, and mark each such span with
+    /// `rgwtrace.redacted = "ceph.rados.object"` (default off).
+    ///
+    /// RADOS object names carry S3 object keys, `<uid>.buckets` user names,
+    /// tenant names and access-key ids, and the default endpoint is plain
+    /// http. The hash keeps ops of one object grouped and joinable while the
+    /// name stays on the host. Roles (`rgw.rados_role`) are still classified
+    /// from the raw name. Applies to JSON and OTLP output alike.
+    #[arg(long)]
+    pub redact_object_names: bool,
+
     #[arg(long, default_value = "120", value_parser = parse_duration_secs)]
     pub correlation_ttl: Duration,
 
