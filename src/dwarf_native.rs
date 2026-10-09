@@ -84,6 +84,41 @@ fn probe_keys<'w>(demangled: &str, wanted: &[&'w str]) -> Vec<&'w str> {
         .collect()
 }
 
+/// The source identifier a definition of probe `key` must spell out in its
+/// MANGLED name: the key's last `::` component without a destructor's `~`
+/// (`req_state::~req_state` -> `req_state`, mangled `_ZN9req_stateD2Ev`), and the
+/// real function name for the synthetic `rgw_rados_operate` overload keys.
+///
+/// Derived from the probe keys themselves so the prefilter cannot drift from
+/// the probe table.
+fn probe_leaf_identifier(key: &str) -> &str {
+    let key = if RGW_RADOS_OPERATE_OVERLOADS.contains(&key) {
+        RGW_RADOS_OPERATE
+    } else {
+        key
+    };
+    key.rsplit("::")
+        .next()
+        .unwrap_or(key)
+        .trim_start_matches('~')
+}
+
+/// Cheap prefilter run before demangling `mangled`: can it name any of `wanted`?
+///
+/// Demangling every global text symbol and every subprogram linkage name was
+/// the dominant cost of native extraction. An Itanium-mangled name spells each
+/// source identifier of its own nested name out as `<length><identifier>` --
+/// substitutions (`S_`, `S0_`) only abbreviate a prefix or type seen EARLIER in
+/// the same name -- so a name whose demangled form ends in a probe's leaf must
+/// contain that identifier verbatim. A substring miss therefore proves the name
+/// can never match, and skipping it changes no result; a hit is just demangled
+/// as before.
+fn may_name_probe(mangled: &str, wanted: &[&str]) -> bool {
+    wanted
+        .iter()
+        .any(|key| mangled.contains(probe_leaf_identifier(key)))
+}
+
 /// Whether `name` is a DEMANGLED name that could belong to a probe function.
 /// Distinct from `PROBE_FUNCTIONS.contains(..)`, which since Phase B also holds
 /// the two SYNTHETIC `rgw_rados_operate` overload keys -- names that never appear
@@ -1950,6 +1985,9 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
         let Ok(name) = symbol.name() else {
             continue;
         };
+        if !may_name_probe(name, wanted) {
+            continue;
+        }
         let Some(function) = demangle_function_name(name) else {
             continue;
         };
@@ -2195,8 +2233,12 @@ fn add_entry_function_names<R: Reader>(
         });
     }
     if let Some(linkage_name) = linkage_name(dwarf, unit, entry)? {
-        if let Some(demangled) = demangle_function_name(&linkage_name) {
-            names.push(demangled);
+        // Every caller only matches these names against probe keys, so a name
+        // that cannot spell any probe's identifier is not worth demangling.
+        if may_name_probe(&linkage_name, PROBE_FUNCTIONS) {
+            if let Some(demangled) = demangle_function_name(&linkage_name) {
+                names.push(demangled);
+            }
         }
     }
     Ok(())

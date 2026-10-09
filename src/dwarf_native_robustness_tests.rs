@@ -548,3 +548,105 @@ fn explicit_version_needs_no_lookup_for_a_containerized_target() {
     let info = from_paths_with_options(&[&path], &options).unwrap();
     assert_eq!(info.version.as_deref(), Some("18.2.8"));
 }
+
+// ---------------------------------------------------------------------------
+// Demangling prefilter.
+// ---------------------------------------------------------------------------
+
+/// Probe-relevant and unrelated mangled names, including the variants the
+/// linkage-name gate must still see (D0/D1/D2 destructors, both
+/// `rgw_rados_operate` overloads) and a Mach-O style leading underscore.
+const MANGLED_SAMPLES: &[&str] = &[
+    "_ZN8Objecter8_send_opEPNS_2OpE",
+    "_ZN8Objecter10_finish_opEPNS_2OpEi",
+    "_ZN7RGWREST11get_handlerEPN3rgw3sal6DriverEP9req_stateRKNS0_4auth16StrategyRegistryERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEERi",
+    "_Z25rgw_process_authenticatedP15RGWHandler_RESTRP5RGWOpP10RGWRequestP9req_stateoN5boost4asio...",
+    "_ZN9req_stateD0Ev",
+    "_ZN9req_stateD1Ev",
+    "_ZN9req_stateD2Ev",
+    "__ZN9req_stateD2Ev",
+    "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_09IoCtxEERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_16ObjectReadOperationEPN4ceph6buffer7v15_2_04listEN5boost4asio...",
+    "_Z17rgw_rados_operatePK18DoutPrefixProviderRN8librados7v14_2_09IoCtxEERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPNS3_17ObjectWriteOperationEN5boost4asio...",
+    "_ZN8Objecter9op_submitEPNS_2OpEPmPi",
+    "_ZNSt6vectorIiSaIiEE9push_backERKi",
+    "_ZN5boost4asio6detail9scheduler3runERNS_6system10error_codeE",
+    "main",
+    "_ZN3foo3barEv",
+];
+
+/// The prefilter may only skip names that could never yield a probe key: for
+/// every name it rejects, demangling must produce nothing the matchers accept.
+fn assert_prefilter_is_sound(names: impl IntoIterator<Item = String>) -> usize {
+    let mut checked = 0;
+    for name in names {
+        if may_name_probe(&name, PROBE_FUNCTIONS) {
+            continue;
+        }
+        if let Some(demangled) = demangle_function_name(&name) {
+            assert!(
+                probe_keys(&demangled, PROBE_FUNCTIONS).is_empty()
+                    && !is_probe_demangled_name(&demangled),
+                "prefilter skipped {name}, which demangles to probe name {demangled}"
+            );
+        }
+        checked += 1;
+    }
+    checked
+}
+
+#[test]
+fn prefilter_keeps_every_probe_definition() {
+    for name in MANGLED_SAMPLES {
+        let Some(demangled) = demangle_function_name(name) else {
+            continue;
+        };
+        if !probe_keys(&demangled, PROBE_FUNCTIONS).is_empty() {
+            assert!(may_name_probe(name, PROBE_FUNCTIONS), "{name}");
+        }
+    }
+    assert!(!may_name_probe(
+        "_ZN5boost4asio6detail9scheduler3runERNS_6system10error_codeE",
+        PROBE_FUNCTIONS
+    ));
+    assert!(!may_name_probe(
+        "_ZN8Objecter9op_submitEPNS_2OpEPmPi",
+        PROBE_FUNCTIONS
+    ));
+    assert_prefilter_is_sound(MANGLED_SAMPLES.iter().map(|name| name.to_string()));
+}
+
+#[test]
+fn prefilter_is_sound_over_a_real_symbol_table() {
+    // This test binary's own symbol table: thousands of real mangled Rust/C++
+    // names the prefilter must not mis-skip.
+    let data = fs::read(std::env::current_exe().unwrap()).unwrap();
+    let file = object::File::parse(data.as_slice()).unwrap();
+    let names: Vec<String> = file
+        .symbols()
+        .chain(file.dynamic_symbols())
+        .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+        .collect();
+    assert!(assert_prefilter_is_sound(names) > 1000);
+}
+
+#[test]
+fn leaf_identifier_table_covers_every_probe_function() {
+    for key in PROBE_FUNCTIONS {
+        let identifier = probe_leaf_identifier(key);
+        assert!(
+            !identifier.is_empty() && !identifier.contains("::"),
+            "{key}"
+        );
+        assert!(
+            PROBE_FUNCTION_LEAF_NAMES
+                .iter()
+                .any(|leaf| leaf.trim_start_matches('~') == identifier),
+            "{key}: leaf {identifier} missing from PROBE_FUNCTION_LEAF_NAMES"
+        );
+    }
+    assert_eq!(probe_leaf_identifier(REQ_STATE_DTOR), "req_state");
+    assert_eq!(
+        probe_leaf_identifier(RGW_RADOS_OPERATE_READ),
+        RGW_RADOS_OPERATE
+    );
+}
