@@ -1,6 +1,7 @@
 use std::{
     ffi::CString,
     mem::{align_of, size_of},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::Path,
     ptr::NonNull,
     sync::{
@@ -129,6 +130,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let started = Instant::now();
     let mut last_flush = Instant::now();
+    let target_watch = cli.pid.map(TargetWatch::new);
     let rados_ops_sweep_every = rados_ops_sweep_interval(cli.rados_ops_stale_after);
     let mut last_rados_ops_sweep = Instant::now();
     // Latches once the OTLP exporter thread dies so a single fatal/misconfig
@@ -157,6 +159,15 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         if let Some(timeout) = cli.timeout {
             if started.elapsed() >= Duration::from_secs(timeout) {
                 debug!(timeout_seconds = timeout, "trace timeout reached");
+                break;
+            }
+        }
+        if let Some(watch) = &target_watch {
+            if watch.exited() {
+                warn!(
+                    pid,
+                    "target process exited; stopping the trace and writing what was collected"
+                );
                 break;
             }
         }
@@ -585,6 +596,61 @@ fn configure_map_sizes(open: &mut OpenRgwtraceSkel<'_>, cli: &Cli) -> Result<()>
         "configured BPF map sizes"
     );
     Ok(())
+}
+
+/// Notices when the `--pid` target exits, so a session does not keep polling
+/// probes that can no longer fire.
+enum TargetWatch {
+    /// A pidfd: it polls readable once the process has exited (Linux >= 5.3).
+    Pidfd(OwnedFd),
+    /// No pidfd_open (older kernel, seccomp): check `/proc/<pid>/stat` instead.
+    Proc(i32),
+    /// The process was already gone when the watch was created.
+    Exited,
+}
+
+impl TargetWatch {
+    fn new(pid: i32) -> Self {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd >= 0 {
+            // SAFETY: pidfd_open returned a fresh descriptor that nothing else owns.
+            return Self::Pidfd(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Self::Exited;
+        }
+        debug!(pid, error = %err, "pidfd_open unavailable; watching /proc for target exit");
+        Self::Proc(pid)
+    }
+
+    fn exited(&self) -> bool {
+        match self {
+            Self::Pidfd(fd) => {
+                let mut pollfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+                ready > 0 && pollfd.revents != 0
+            }
+            Self::Proc(pid) => match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => proc_stat_says_exited(&stat),
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+            },
+            Self::Exited => true,
+        }
+    }
+}
+
+/// Whether a `/proc/<pid>/stat` line describes a process that has exited
+/// (zombie `Z` or dead `X`/`x`). The state is the first field after the
+/// command name, which is parenthesized and may itself contain `)`.
+fn proc_stat_says_exited(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
 }
 
 /// How often the poll loop sweeps `rados_ops` for stale entries: often enough
@@ -1767,6 +1833,46 @@ mod tests {
         assert!(!rados_op_is_stale(&value(0), now, 5 * MIN));
         // A truncated value cannot be judged, so it is left alone.
         assert!(!rados_op_is_stale(&value(1)[..at + 4], now, 5 * MIN));
+    }
+
+    #[test]
+    fn proc_stat_state_parsing_handles_odd_command_names() {
+        assert!(!proc_stat_says_exited("42 (radosgw) S 1 42 42 0"));
+        assert!(!proc_stat_says_exited("42 (rgw) (x) R 1 42"));
+        assert!(proc_stat_says_exited("42 (radosgw) Z 1 42 42 0"));
+        assert!(proc_stat_says_exited("42 (a) b) X 1"));
+        assert!(!proc_stat_says_exited("garbage"));
+    }
+
+    #[test]
+    fn target_watch_sees_a_running_process_as_alive() {
+        let me = std::process::id() as i32;
+        assert!(!TargetWatch::new(me).exited());
+        assert!(!TargetWatch::Proc(me).exited());
+    }
+
+    #[test]
+    fn target_watch_notices_a_child_exiting() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        let pidfd_watch = TargetWatch::new(pid);
+        let proc_watch = TargetWatch::Proc(pid);
+        assert!(!pidfd_watch.exited());
+        assert!(!proc_watch.exited());
+
+        // Unreaped (zombie) is already "exited" for both mechanisms.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(pidfd_watch.exited() && proc_watch.exited()) {
+            assert!(Instant::now() < deadline, "child exit was never observed");
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.wait().expect("reap child");
+        assert!(pidfd_watch.exited());
+        assert!(proc_watch.exited());
+        assert!(TargetWatch::new(pid).exited());
     }
 
     #[test]

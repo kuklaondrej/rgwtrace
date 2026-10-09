@@ -1116,3 +1116,13 @@ fn sigterm_and_sighup_stop_the_trace_like_ctrl_c() {
     assert!(CARGO_TOML.contains(r#"ctrlc = { version = "3.5", features = ["termination"] }"#));
     assert!(LIVE_LINUX.contains("failed to install the SIGINT/SIGTERM/SIGHUP handler"));
 }
+
+#[test]
+fn a_pid_session_ends_when_the_target_exits() {
+    // The poll loop never noticed the target exiting, so a --pid session ran on
+    // capturing nothing until a timeout or a signal. It now watches the target
+    // (pidfd, falling back to /proc) and finalizes output when it is gone.
+    assert!(LIVE_LINUX.contains("libc::SYS_pidfd_open"));
+    assert!(LIVE_LINUX.contains("fn proc_stat_says_exited("));
+    assert!(LIVE_LINUX.contains("if watch.exited() {"));
+}
