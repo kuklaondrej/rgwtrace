@@ -376,8 +376,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     }
 
     let build_id = file.build_id()?.map(hex_string);
-    let (debug_data, debug_file_path) =
-        debug_data(path, &file, data.as_slice(), build_id.as_deref())?;
+    let (debug_data, debug_file_path) = debug_data(path, &file, data.as_slice())?;
     let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
         format!(
             "debug info for {} is not a supported object file",
@@ -418,8 +417,11 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     #[allow(deprecated)]
     let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
-    let mut resolved = symbol_function_pcs(&debug_file, wanted);
-    for (function, ranked) in symbol_function_pcs(&file, wanted) {
+    // The probed binary's own symbols first: they describe the very file the
+    // uprobe attaches to. A separate debug file's `.symtab` only fills the gaps a
+    // stripped binary leaves (and it was proven to belong to this binary above).
+    let mut resolved = symbol_function_pcs(&file, wanted);
+    for (function, ranked) in symbol_function_pcs(&debug_file, wanted) {
         resolved.entry(function).or_insert(ranked);
     }
     // Load every compilation unit once and share it across both extraction
@@ -2778,31 +2780,129 @@ fn debug_data<'data>(
     path: &Path,
     file: &object::File<'data>,
     data: &'data [u8],
-    build_id: Option<&str>,
 ) -> Result<(Cow<'data, [u8]>, PathBuf)> {
     if file.has_debug_symbols() {
         return Ok((Cow::Borrowed(data), path.to_path_buf()));
     }
 
-    if let Some(debug_path) = debuglink_file(path, file)? {
-        let bytes = fs::read(&debug_path)
-            .with_context(|| format!("failed to read debuglink file {}", debug_path.display()))?;
+    if let Some((bytes, debug_path)) = separate_debug_file(path, file)? {
         return Ok((Cow::Owned(bytes), debug_path));
     }
 
-    if let Some(build_id) = build_id {
-        if let Some(debug_path) = build_id_debug_file(path, build_id) {
-            let bytes = fs::read(&debug_path).with_context(|| {
-                format!(
-                    "failed to read build-id debug file {}",
-                    debug_path.display()
-                )
-            })?;
-            return Ok((Cow::Owned(bytes), debug_path));
+    Ok((Cow::Borrowed(data), path.to_path_buf()))
+}
+
+/// Locate `path`'s separate debug file (`.gnu_debuglink`, then the
+/// `.build-id/xx/yyyy.debug` tree) and PROVE it belongs to this binary before
+/// any of its DWARF or symbols are trusted. Returns `Ok(None)` when no candidate
+/// exists, and an error when candidates exist but none of them matches: a debug
+/// file from another build yields wrong field offsets and wrong addresses with no
+/// other symptom, and the build-ID preflight check cannot see it (it compares
+/// the binary with itself).
+///
+/// The proof is the NT_GNU_BUILD_ID when both files carry one (equality
+/// required), otherwise the `.gnu_debuglink` CRC-32 over the whole debug file.
+/// The build ID wins when both are available because post-processing such as
+/// dwz can rewrite a debug file after its CRC was recorded.
+pub(crate) fn separate_debug_file(
+    path: &Path,
+    file: &object::File<'_>,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    let binary_build_id = file.build_id()?;
+    let mut rejected = Vec::new();
+
+    if let Some((filename, crc)) = file.gnu_debuglink()? {
+        let filename =
+            std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
+        let candidates = debuglink_candidates(path, filename);
+        if let Some(found) =
+            first_matching_debug_file(candidates, binary_build_id, Some(crc), &mut rejected)?
+        {
+            return Ok(Some(found));
         }
     }
 
-    Ok((Cow::Borrowed(data), path.to_path_buf()))
+    if let Some(build_id) = binary_build_id {
+        let candidates = build_id_debug_candidates(path, &hex_string(build_id));
+        if let Some(found) =
+            first_matching_debug_file(candidates, binary_build_id, None, &mut rejected)?
+        {
+            return Ok(Some(found));
+        }
+    }
+
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "refusing separate debug info for {}: {}. Install the debuginfo that matches the \
+             probed binary (or point --dwarf-source at a binary with embedded DWARF)",
+            path.display(),
+            rejected.join("; ")
+        );
+    }
+    Ok(None)
+}
+
+fn first_matching_debug_file(
+    candidates: Vec<PathBuf>,
+    binary_build_id: Option<&[u8]>,
+    debuglink_crc: Option<u32>,
+    rejected: &mut Vec<String>,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    for candidate in candidates.into_iter().filter(|path| path.is_file()) {
+        let bytes = fs::read(&candidate)
+            .with_context(|| format!("failed to read debug file {}", candidate.display()))?;
+        match debug_file_mismatch(binary_build_id, debuglink_crc, &bytes) {
+            None => return Ok(Some((bytes, candidate))),
+            Some(reason) => {
+                warn!(
+                    path = %candidate.display(),
+                    reason = %reason,
+                    "ignoring a separate debug file that does not belong to the probed binary"
+                );
+                rejected.push(format!("{} ({reason})", candidate.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Why `debug_bytes` cannot be proven to be this binary's debug file, or `None`
+/// when it is proven.
+fn debug_file_mismatch(
+    binary_build_id: Option<&[u8]>,
+    debuglink_crc: Option<u32>,
+    debug_bytes: &[u8],
+) -> Option<String> {
+    let debug_build_id = match object::File::parse(debug_bytes) {
+        Ok(debug_file) => match debug_file.build_id() {
+            Ok(build_id) => build_id,
+            Err(err) => return Some(format!("unreadable build ID: {err}")),
+        },
+        Err(err) => return Some(format!("not a supported object file: {err}")),
+    };
+    if let (Some(expected), Some(actual)) = (binary_build_id, debug_build_id) {
+        return (expected != actual).then(|| {
+            format!(
+                "build ID {} does not match the binary's {}",
+                hex_string(actual),
+                hex_string(expected)
+            )
+        });
+    }
+    let Some(expected_crc) = debuglink_crc else {
+        return Some(
+            "the debug file carries no build ID, so nothing proves it belongs to the binary"
+                .to_string(),
+        );
+    };
+    let mut crc = flate2::Crc::new();
+    crc.update(debug_bytes);
+    let actual_crc = crc.sum();
+    (actual_crc != expected_crc).then(|| {
+        format!(
+            ".gnu_debuglink CRC {expected_crc:#010x} does not match the file's {actual_crc:#010x}"
+        )
+    })
 }
 
 /// Best-effort location and validation of the DWZ supplementary object named by
@@ -2904,18 +3004,6 @@ fn debugaltlink_candidates(debug_file: &Path, alt_path: &Path) -> Vec<PathBuf> {
         );
     }
     candidates
-}
-
-fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf>> {
-    let Some((filename, _crc)) = file.gnu_debuglink()? else {
-        return Ok(None);
-    };
-    let filename = std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
-    Ok(first_existing(debuglink_candidates(path, filename)))
-}
-
-fn build_id_debug_file(path: &Path, build_id: &str) -> Option<PathBuf> {
-    first_existing(build_id_debug_candidates(path, build_id))
 }
 
 fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
@@ -3167,27 +3255,23 @@ mod tests {
         assert!(module.function_addr("RGWREST::get_handler").is_some());
     }
 
-    #[test]
-    fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
-        let Some(binary) = compile_cpp_fixture() else {
-            return;
-        };
+    /// Split `binary` into a stripped copy carrying a `.gnu_debuglink` and its
+    /// `--only-keep-debug` file. `None` when objcopy is unavailable (macOS).
+    fn objcopy_debuglink_pair(binary: &Path) -> Option<(PathBuf, PathBuf)> {
         let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
         let debug_file = binary.with_extension("debug");
         let stripped = binary.with_file_name("fixture-stripped");
 
         if !std::process::Command::new(&objcopy)
             .args(["--only-keep-debug"])
-            .arg(&binary)
+            .arg(binary)
             .arg(&debug_file)
             .status()
             .is_ok_and(|status| status.success())
         {
-            return;
+            return None;
         }
-        if std::fs::copy(&binary, &stripped).is_err() {
-            return;
-        }
+        std::fs::copy(binary, &stripped).ok()?;
         if !std::process::Command::new(&objcopy)
             .args(["--strip-all"])
             .arg(format!(
@@ -3198,8 +3282,19 @@ mod tests {
             .status()
             .is_ok_and(|status| status.success())
         {
-            return;
+            return None;
         }
+        Some((stripped, debug_file))
+    }
+
+    #[test]
+    fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
+        let Some(binary) = compile_cpp_fixture() else {
+            return;
+        };
+        let Some((stripped, _)) = objcopy_debuglink_pair(&binary) else {
+            return;
+        };
 
         let info = from_paths(&[stripped.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
@@ -3207,6 +3302,168 @@ mod tests {
         assert!(module.function_addr("Objecter::_send_op").is_some());
         assert!(module.function_addr("Objecter::_finish_op").is_some());
         assert!(module.function_addr("RGWREST::get_handler").is_some());
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+
+    /// Write `binary` (linking to `radosgw.debug`) and `debug` side by side and
+    /// return the binary's path.
+    fn write_debuglink_pair(name: &str, binary: &[u8], debug: &[u8]) -> PathBuf {
+        let dir = crate::test_elf::temp_dir(name);
+        std::fs::write(dir.join("radosgw.debug"), debug).unwrap();
+        let path = dir.join("radosgw");
+        std::fs::write(&path, binary).unwrap();
+        path
+    }
+
+    fn lookup_debug_file(path: &Path) -> Result<Option<(Vec<u8>, PathBuf)>> {
+        let data = std::fs::read(path).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        separate_debug_file(path, &file)
+    }
+
+    #[test]
+    fn a_debuglink_file_with_a_different_build_id_is_refused() {
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xbb; 20]))
+            .build();
+        // The CRC even matches: a build-ID disagreement still wins.
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .build();
+        let path = write_debuglink_pair("debuglink-build-id-mismatch", &binary, &debug);
+
+        let err = lookup_debug_file(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("build ID"), "message: {msg}");
+        assert!(msg.contains(&"bb".repeat(20)), "message: {msg}");
+    }
+
+    #[test]
+    fn a_debuglink_file_with_the_same_build_id_is_accepted_even_with_a_stale_crc() {
+        // dwz rewrites the debug file after the debuglink CRC was computed; the
+        // build ID is the stronger identity and is what gdb trusts first too.
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .build();
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug) ^ 1))
+            .build();
+        let path = write_debuglink_pair("debuglink-build-id-match", &binary, &debug);
+
+        let (bytes, found) = lookup_debug_file(&path).unwrap().unwrap();
+        assert_eq!(bytes, debug);
+        assert_eq!(found, path.with_file_name("radosgw.debug"));
+    }
+
+    #[test]
+    fn without_build_ids_the_debuglink_crc_must_match() {
+        use crate::test_elf::{debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100).build();
+
+        let corrupted = TestElf::pie(0x1000, 0x100)
+            .section(debuglink("radosgw.debug", crc32(&debug) ^ 0xdead_beef))
+            .build();
+        let path = write_debuglink_pair("debuglink-crc-mismatch", &corrupted, &debug);
+        let msg = format!("{:#}", lookup_debug_file(&path).unwrap_err());
+        assert!(msg.contains("CRC"), "message: {msg}");
+
+        let intact = TestElf::pie(0x1000, 0x100)
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .build();
+        let path = write_debuglink_pair("debuglink-crc-match", &intact, &debug);
+        assert!(lookup_debug_file(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_build_id_tree_debug_file_must_carry_the_same_build_id() {
+        use crate::test_elf::{build_id_note, TestElf};
+        let id = [0x0a; 20];
+        let dir = crate::test_elf::temp_dir("build-id-tree");
+        let debug_dir = dir.join("usr/lib/debug/.build-id/0a");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        let debug_path = debug_dir.join(format!("{}.debug", "0a".repeat(19)));
+        let path = dir.join("radosgw");
+        std::fs::write(
+            &path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&id))
+                .build(),
+        )
+        .unwrap();
+
+        // No build ID in the debug file: nothing proves it belongs to the binary.
+        std::fs::write(&debug_path, TestElf::pie(0x1000, 0x100).build()).unwrap();
+        assert!(lookup_debug_file(&path).is_err());
+
+        std::fs::write(
+            &debug_path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&[0x0b; 20]))
+                .build(),
+        )
+        .unwrap();
+        assert!(lookup_debug_file(&path).is_err());
+
+        std::fs::write(
+            &debug_path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&id))
+                .build(),
+        )
+        .unwrap();
+        let (_, found) = lookup_debug_file(&path).unwrap().unwrap();
+        assert_eq!(found, debug_path);
+    }
+
+    #[test]
+    fn the_probed_binarys_own_symbol_wins_over_the_debug_files() {
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        const GET_HANDLER: &str = "_ZN7RGWREST11get_handlerEv";
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xcc; 20]))
+            .function(GET_HANDLER, 0x1080)
+            .build();
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xcc; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .function(GET_HANDLER, 0x1040)
+            .build();
+        let path = write_debuglink_pair("own-symbols-win", &binary, &debug);
+
+        let module = parse_module(&path, "radosgw", &mut None).unwrap();
+        assert_eq!(module.func2pc.get(RGWREST_GET_HANDLER), Some(&0x1040));
+    }
+
+    #[test]
+    fn refuses_a_gnu_debuglink_file_from_another_build_when_objcopy_is_available() {
+        let (Some(binary), Some(other)) = (compile_cpp_fixture(), compile_field_fixture()) else {
+            return;
+        };
+        let Some((stripped, debug_file)) = objcopy_debuglink_pair(&binary) else {
+            return;
+        };
+        // Replace the linked debug file with ANOTHER build's, under the same name:
+        // the stale-debuginfo-package situation. Its DWARF describes other code.
+        let Some((_, other_debug)) = objcopy_debuglink_pair(&other) else {
+            return;
+        };
+        std::fs::copy(&other_debug, &debug_file).unwrap();
+
+        let err = from_paths(&[stripped.as_path()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing separate debug info"),
+            "message: {msg}"
+        );
     }
 
     #[test]
@@ -5538,9 +5795,7 @@ mod tests {
     fn dwz_binary_uses_sup_refs(binary: &Path) -> bool {
         let data = std::fs::read(binary).unwrap();
         let file = object::File::parse(data.as_slice()).unwrap();
-        let build_id = file.build_id().unwrap().map(hex_string);
-        let (debug_data, debug_file_path) =
-            debug_data(binary, &file, data.as_slice(), build_id.as_deref()).unwrap();
+        let (debug_data, debug_file_path) = debug_data(binary, &file, data.as_slice()).unwrap();
         let debug_file = object::File::parse(debug_data.as_ref()).unwrap();
         let endian = if debug_file.is_little_endian() {
             RunTimeEndian::Little

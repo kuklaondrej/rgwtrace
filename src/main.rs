@@ -10,6 +10,8 @@ mod live;
 mod otel;
 mod preflight;
 mod targets;
+#[cfg(test)]
+mod test_elf;
 
 use anyhow::{Context, Result};
 use clap::Parser;
