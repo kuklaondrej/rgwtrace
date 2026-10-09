@@ -14,7 +14,7 @@ build = "build.rs"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.5"
+ctrlc = { version = "3.5", features = ["termination"] }
 cpp_demangle = "0.4"
 flate2 = "1.0"
 gimli = "0.31"

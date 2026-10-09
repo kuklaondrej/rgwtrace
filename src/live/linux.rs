@@ -99,8 +99,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);
+    // With ctrlc's `termination` feature this also catches SIGTERM and SIGHUP,
+    // so `systemctl stop` ends the run through the same path as Ctrl-C and the
+    // collected spans are still emitted.
     ctrlc::set_handler(move || stop_handler.store(true, Ordering::SeqCst))
-        .context("failed to install Ctrl-C handler")?;
+        .context("failed to install the SIGINT/SIGTERM/SIGHUP handler")?;
 
     let mut ringbuf_builder = RingBufferBuilder::new();
     ringbuf_builder.add(&skel.maps.events, move |data| {

@@ -1106,3 +1106,13 @@ fn rados_ops_is_sized_at_load_and_swept_from_userspace() {
     assert!(CLI.contains("pub bpf_rados_ops_entries: u32,"));
     assert!(CLI.contains("pub rados_ops_stale_after: Duration,"));
 }
+
+#[test]
+fn sigterm_and_sighup_stop_the_trace_like_ctrl_c() {
+    // `systemctl stop` sends SIGTERM. Without ctrlc's `termination` feature only
+    // SIGINT was handled, so SIGTERM killed the process and every collected span
+    // that had not been exported yet was lost.
+    const CARGO_TOML: &str = include_str!("../Cargo.toml");
+    assert!(CARGO_TOML.contains(r#"ctrlc = { version = "3.5", features = ["termination"] }"#));
+    assert!(LIVE_LINUX.contains("failed to install the SIGINT/SIGTERM/SIGHUP handler"));
+}
