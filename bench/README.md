@@ -56,8 +56,9 @@ neither root nor a Ceph install.
   optimized away, and the functions read through their pointer argument and return
   a distinct value so identical-code-folding cannot merge two probe targets onto
   one address.
-* **Enlarged ring for timed phases (16 MiB).** The production events ring is
-  256 KiB (~474 records, ~3.7 ms of horizon at ~125k events/s). That cannot
+* **Enlarged ring for timed phases (16 MiB).** The events ring used to be
+  256 KiB (~474 records, ~3.7 ms of horizon at ~125k events/s); rgwtrace now
+  defaults to 16 MiB (`--ringbuf-size`), and the bench pins sizes explicitly. That cannot
   survive a multi-ms consumer deschedule (hypervisor steal / guest preemption),
   and no consumer busy-spin can prevent one. For the **timed** phases only, the
   bench resizes the events map to **16 MiB** (`bpf_map__set_max_entries` before
@@ -65,8 +66,8 @@ neither root nor a Ceph install.
   cost is **capacity-independent** (a ringbuf is a fixed-stride producer/consumer
   queue; reserve just advances the producer position modulo capacity), so the
   measured probe path is byte-for-byte unchanged. The size used is recorded in the
-  JSON `config.timed_events_ring_bytes`. (The `ringbuf_saturation` phase keeps the
-  256 KiB production size — see below.)
+  JSON `config.timed_events_ring_bytes`. (The `ringbuf_saturation` phase pins a
+  256 KiB ring — see below.)
 * **Busy-drain, ready handshake, drain barriers.** The drainer spins on
   `consume_raw()` (with a `spin_loop()` hint on the empty path) on its dedicated
   CPU. It sets a ready flag only after pinning itself; the timed body waits for it
@@ -135,14 +136,15 @@ an `OPERATE_SEED_HITS == k·iterations` witness.
 
 ## Ring-buffer saturation
 
-The `ringbuf_saturation` phase measures the **production** 256 KiB ring's real
-capacity, so — unlike the timed phases — it runs against a **second skeleton
-instance loaded WITHOUT the 16 MiB resize** (the first skeleton's uprobe links are
+The `ringbuf_saturation` phase measures a 256 KiB ring's real capacity (the size
+rgwtrace shipped with before `--ringbuf-size`), so — unlike the timed phases — it
+runs against a **second skeleton instance resized to 256 KiB** (the first skeleton's uprobe links are
 all dropped by then, so attaching the saturation skeleton to the same symbols is
 conflict-free). It fires `--flood` `RADOS_OP` events as fast as possible, first
 with the consumer **not** draining and then **draining**:
 
-* undrained: the 256 KiB buffer fills after ~474 records of ~544 B and the
+* undrained: the 256 KiB buffer fills after ~455 records of 576 ring bytes
+  (568 B record + 8 B header; it was ~474 of 552 before `cls_name` widened) and the
   remainder fail to reserve. The witness asserts `RGWTRACE_DIAG_RINGBUF_RADOS_DROPS
   > 0` **and** that the measured capacity (`flood − drops`) lands in `400..=600`.
 * drained: with the busy-drainer running, `received + dropped == flood` and drops

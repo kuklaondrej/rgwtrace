@@ -10,7 +10,19 @@ Live tracing pipeline for RGW and RADOS.
 
 `rgwtrace` starts by loading probe metadata from native DWARF or `cephtrace` JSON.
 
-The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
+The Linux runner opens the BPF skeleton, configures Ceph ABI offsets and map sizes, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
+
+### BPF maps that are sized or maintained from userspace
+
+| Map | Type | Size | Why |
+|---|---|---|---|
+| `hprobes` | `ARRAY` | `RGWTRACE_HPROBE_SLOTS` = 80 | Probe descriptors keyed by `function base id + var_field index` (bases 0, 20, 30, 40, 50, 60, 70). An array lookup is a bounds check plus an add, which matters because `_send_op` does about a dozen of them per op while RGW holds the Objecter lock. Array lookups never miss for an in-range key, so every `struct VarField` carries a `present` word and `hprobe_lookup()` treats `present == 0` as "no descriptor". |
+| `events` | `RINGBUF` | `--ringbuf-size`, default 16 MiB | Set on the open object before load. A RADOS record takes 576 ring bytes (568 + 8-byte header), a request record 176 (168 + 8), so 16 MiB holds ~29k RADOS records: ~1.4 s of reader stall at 20k RADOS ops/s. The old fixed 256 KiB held ~470 (~25 ms). |
+| `rados_ops` | `HASH` (preallocated) | `--bpf-rados-ops-entries`, default 32768 | In-flight ops between `_send_op` and `_finish_op`. The default is above Ceph's `objecter_inflight_ops` (24576). ~600 bytes per entry, so ~20 MiB of kernel memory. |
+
+**Stale `rados_ops` sweep.** An op whose client exits before `_finish_op` is never deleted by BPF. Every `min(30 s, threshold / 10)` (at least 1 s) the poll loop collects the keys whose `sent_ns` (`CLOCK_BOOTTIME`) is older than `--rados-ops-stale-after` (default 300 s), then deletes them and adds the count to `stale_rados_ops_swept`. Keys are collected before any delete because deleting the key a hash iteration sits on restarts the iteration. An entry with `sent_ns == 0` was just inserted and is never swept. The threshold floor is 60 s (twice Ceph's 30 s slow-op complaint time): the sweep must never evict a live op. An op still blocked past the threshold (an inactive PG, for example) is evicted anyway; its later `_finish_op` counts as `bpf_rados_finish_misses` and emits no event. `0` disables the sweep.
+
+**Ending the run.** The loop stops on `--timeout`, on SIGINT/SIGTERM/SIGHUP (ctrlc with its `termination` feature), or, with `--pid`, when the target exits: a pidfd (`pidfd_open`) polls readable once the process has exited, with a `/proc/<pid>/stat` state check (`Z`/`X`, or the file gone) as the fallback when `pidfd_open` is unavailable. All three paths finalize output the same way.
 
 Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, minimum variable-field counts for the probes used by the BPF program, and ELF build IDs.
 
@@ -69,8 +81,22 @@ Fixed capture limits:
 - `MAX_OBJECT_NAME = 128`.
 - `MAX_ACTING = 16`.
 - `MAX_RADOS_OPS = 3`.
-- Class names are 8 bytes.
-- Method names are 32 bytes.
+- Class names are 16 bytes (`MAX_CLS_NAME`; every in-tree Ceph class fits).
+- Method names are 32 bytes (`MAX_METHOD_NAME`).
+
+For an OSD `call` op the indata is `class || method || payload`, so the method is read at the class name's full wire length. Only the copy lengths are clamped; a truncated class name does not move the method read.
+
+Wire layout (asserted at compile time on both sides: `_Static_assert` in `bpf/rgwtrace_events.h` and `bpf/ceph_abi.h`, `const` `size_of`/`offset_of!` assertions in `src/events.rs` and `src/dwarf_json.rs`):
+
+| Struct | Bytes |
+|---|---|
+| `struct rgwtrace_request_event` | 160 |
+| `struct rgwtrace_rados_event` | 560 |
+| `struct rgwtrace_event` (payload at offset 8) | 568 |
+| `struct rgwtrace_request_record` (what a request marker reserves) | 168 |
+| `struct VarField` (`hprobes` value) | 100 |
+
+RADOS records reserve the full `struct rgwtrace_event`; request markers reserve only `struct rgwtrace_request_record`. The decoder accepts any record at least as long as header + payload for its `type`. A test checks that every `RGWTRACE_*` constant in the headers, including the diagnostics indices, appears in Rust with the same value.
 
 BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans. A BPF diagnostics map also counts ring-buffer reservation failures, RADOS state-map failures, missing finish state, request-context map failures, and probe-read failures.
 
