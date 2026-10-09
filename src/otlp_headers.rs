@@ -141,7 +141,14 @@ pub fn parse_header_file(contents: &str) -> Result<Vec<(String, String)>> {
 /// refused outright rather than warned about: a warning scrolls past, and the
 /// secret is already exposed by the time it does.
 fn read_header_file(path: &Path) -> Result<Vec<(String, String)>> {
-    let metadata = std::fs::metadata(path)
+    use std::io::Read as _;
+    // Open once and check THAT handle: checking a pathname and then opening
+    // the pathname again would let a file (or symlink) swapped in between be
+    // the one that is read, unchecked.
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read --otlp-header-file {}", path.display()))?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("failed to read --otlp-header-file {}", path.display()))?;
     if !metadata.is_file() {
         bail!(
@@ -150,7 +157,8 @@ fn read_header_file(path: &Path) -> Result<Vec<(String, String)>> {
         );
     }
     refuse_world_readable(path, &metadata)?;
-    let contents = std::fs::read_to_string(path)
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
         .with_context(|| format!("failed to read --otlp-header-file {}", path.display()))?;
     parse_header_file(&contents)
         .with_context(|| format!("invalid --otlp-header-file {}", path.display()))
