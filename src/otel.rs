@@ -140,6 +140,12 @@ fn export(
     }
     let client = Client::builder()
         .timeout(config.timeout)
+        // Never follow a redirect. reqwest's default (up to ten) would re-send the
+        // request -- the operator's auth headers AND the trace body -- to whatever
+        // host `Location` names, including an https -> http downgrade. A moved
+        // collector is an `--otlp-endpoint` change, made by the operator; see
+        // `send_once` for the error a 3xx turns into.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("failed to build OTLP HTTP client")?;
 
@@ -375,6 +381,17 @@ fn send_once(
 
     if status.is_success() {
         return Ok(());
+    }
+
+    if status.is_redirection() {
+        // Fatal, not retried: the same endpoint answers the same way again, and
+        // following it ourselves is exactly what the no-redirect client policy
+        // exists to prevent (credentials and payload re-sent to another host).
+        return Err(ExportError::fatal(format!(
+            "OTLP endpoint returned {status}: redirects are not followed because they would \
+             re-send the configured headers and the trace body to another location; point \
+             --otlp-endpoint at the final URL"
+        )));
     }
 
     let body = response
@@ -1467,6 +1484,47 @@ mod tests {
             handle.join().unwrap().len(),
             2,
             "should exhaust both attempts"
+        );
+    }
+
+    /// A 3xx is an ERROR, never followed. reqwest's default policy follows up to
+    /// ten redirects and re-sends the request -- the custom auth headers
+    /// (`X-Api-Key`, `X-Scope-OrgID`, ...) AND the trace body -- to wherever
+    /// `Location` points: another host, or https down to plain http. A collector
+    /// that moved is an operator decision (`--otlp-endpoint`), not something the
+    /// exporter resolves on its own with the credentials in hand.
+    #[test]
+    fn refuses_to_follow_otlp_redirects() {
+        // The redirect target. Nothing ever answers it; the test only checks
+        // whether anyone CONNECTED to it.
+        let decoy = TcpListener::bind("127.0.0.1:0").unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let decoy_endpoint = format!("http://{}/v1/traces", decoy.local_addr().unwrap());
+        let redirect = Box::leak(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {decoy_endpoint}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let (endpoint, handle) = spawn_mock_server(vec![redirect]);
+        let document = trace_document(1);
+
+        let err = export_otlp_http(export_config(&endpoint, 3), &document).unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("307"),
+            "must surface the status: {message}"
+        );
+        assert!(
+            message.contains("redirect"),
+            "must name the cause: {message}"
+        );
+        assert_eq!(handle.join().unwrap().len(), 1, "a redirect is not retried");
+        assert!(
+            matches!(decoy.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "the exporter must never connect to the redirect target"
         );
     }
 
