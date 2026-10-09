@@ -1,0 +1,23 @@
+bpf/rgwtrace_events.h
+  s_4d990597f39574::t_12a944876a1c0f 298-299,306,325
+src/dwarf_json.rs
+  s_4d990597f39574::t_131ebd8f06089e 116-117,125-127
+tests/bpf_source.rs
+  s_4d990597f39574::t_4dcf18573aba1f 72,1043
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f6428719a6e179faaf9274c4f25ee2832d3f78d8",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
