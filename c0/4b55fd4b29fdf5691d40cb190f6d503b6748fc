@@ -1,0 +1,29 @@
+AGENTS.md
+  s_4d990597f39574::t_0e3bd07a8b7383 87
+ARCHITECTURE.md
+  s_4d990597f39574::t_a0b9d7949e9c9f 244-256
+RUNBOOK.md
+  s_4d990597f39574::t_bd7538179c56fe 52-58,130-132
+docs/README.md
+  s_4d990597f39574::t_419f98f7a21f77 38-40
+docs/bugfix-dwarf-parser-limits.md
+  s_4d990597f39574::t_897e1c608b9bb0 1-144
+docs/development.md
+  s_4d990597f39574::t_182132dff8ba8d 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c04b55fd4b29fdf5691d40cb190f6d503b6748fc",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
