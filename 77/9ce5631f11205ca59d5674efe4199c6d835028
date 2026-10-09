@@ -1,0 +1,30 @@
+src/output.rs
+  s_4d990597f39574::t_2040485e8f162f 1-232
+  s_4d990597f39574::t_c696888ef75559 233
+src/cli.rs
+  s_4d990597f39574::t_24aa5389e0842b 17-18,22-34,56-64,196-197,199-202,206-213
+src/main.rs
+  s_4d990597f39574::t_ebae6f551f369d 11,24,72,75-81,95,129,134,149,181,320,325,351,356,379-381,397,402,417-418,423
+src/preflight.rs
+  s_4d990597f39574::t_358b5893b1cf24 86-92
+src/targets.rs
+  s_4d990597f39574::t_b705fe350c504c 297
+tests/cli_dry_run.rs
+  s_4d990597f39574::t_cf73a48b6f9d86 69-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "779ce5631f11205ca59d5674efe4199c6d835028",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
