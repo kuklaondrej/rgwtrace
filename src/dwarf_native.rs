@@ -2788,7 +2788,8 @@ fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
 /// join onto those directories and reach an arbitrary file, so it is an error,
 /// not a skipped candidate. Candidates under `/proc/<pid>/root` are resolved
 /// inside that root (`targets::confine_to_proc_root`), so a symlink in the
-/// container's debug tree cannot redirect the read onto the host.
+/// container's debug tree cannot redirect the read onto the host; a candidate
+/// that cannot be resolved there is skipped.
 fn debuglink_candidates(path: &Path, filename: &str) -> Result<Vec<PathBuf>> {
     if filename.is_empty()
         || filename == "."
@@ -2823,10 +2824,25 @@ fn debuglink_candidates(path: &Path, filename: &str) -> Result<Vec<PathBuf>> {
         }
     }
 
-    candidates
+    // A location that cannot be resolved inside the root (a symlink loop, an
+    // unreadable directory) cannot hold the debug file; skip it rather than
+    // fail when another location may.
+    Ok(candidates
         .iter()
-        .map(|candidate| crate::targets::confine_to_proc_root(candidate))
-        .collect()
+        .filter_map(
+            |candidate| match crate::targets::confine_to_proc_root(candidate) {
+                Ok(confined) => Some(confined),
+                Err(err) => {
+                    debug!(
+                        candidate = %candidate.display(),
+                        error = %format_args!("{err:#}"),
+                        "skipping an unresolvable .gnu_debuglink location"
+                    );
+                    None
+                }
+            },
+        )
+        .collect())
 }
 
 fn build_id_debug_candidates(path: &Path, build_id: &str) -> Vec<PathBuf> {
@@ -2990,6 +3006,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Greptile #1 on PR #10: a debug-file location that cannot be resolved
+    /// (a symlink loop in `.debug`) is skipped, so a usable debug file next to
+    /// the binary is still found. Linux-only: it needs a real `/proc/<pid>/root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unresolvable_debuglink_location_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("rgwtrace-dbgloop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        fs::write(dir.join("usr/bin/radosgw.debug"), b"x").unwrap();
+        std::os::unix::fs::symlink(".debug", dir.join("usr/bin/.debug")).unwrap();
+        let binary = Path::new("/proc")
+            .join(std::process::id().to_string())
+            .join("root")
+            .join(dir.strip_prefix("/").unwrap())
+            .join("usr/bin/radosgw");
+
+        let candidates = debuglink_candidates(&binary, "radosgw.debug").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            candidates.first(),
+            Some(&binary.with_file_name("radosgw.debug"))
+        );
     }
 
     #[test]

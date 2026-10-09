@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::Serialize;
+use tracing::debug;
 
 use crate::cli::Cli;
 
@@ -87,11 +88,8 @@ fn discover_library(
     }
 
     if let Some(pid) = pid {
-        for path in common_library_paths(soname) {
-            let path = pid_root_path(pid, &path)?;
-            if path.exists() {
-                return Ok(path);
-            }
+        if let Some(path) = first_existing_in_pid_root(pid, common_library_paths(soname)) {
+            return Ok(path);
         }
     }
 
@@ -125,11 +123,8 @@ fn discover_optional_library(
     }
 
     if let Some(pid) = pid {
-        for path in common_library_paths(soname) {
-            let path = pid_root_path(pid, &path)?;
-            if path.exists() {
-                return Ok(Some(path));
-            }
+        if let Some(path) = first_existing_in_pid_root(pid, common_library_paths(soname)) {
+            return Ok(Some(path));
         }
         return Ok(None);
     }
@@ -304,6 +299,31 @@ fn pid_root_path(pid: i32, path: &Path) -> Result<PathBuf> {
     resolve_in_root(&proc_root(pid), path)
 }
 
+/// The first of `candidates` (namespace paths) that exists inside the pid's
+/// root. These are guesses, not what the process maps, so a location that cannot
+/// be resolved (a symlink loop, an unreadable directory) is skipped rather than
+/// failing discovery.
+fn first_existing_in_pid_root(
+    pid: i32,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .filter_map(|candidate| match pid_root_path(pid, &candidate) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                debug!(
+                    pid,
+                    candidate = %candidate.display(),
+                    error = %format_args!("{err:#}"),
+                    "skipping an unresolvable fallback library location"
+                );
+                None
+            }
+        })
+        .find(|path| path.exists())
+}
+
 /// Bound on symlink expansions, matching the kernel's `MAXSYMLINKS`.
 const MAX_SYMLINK_HOPS: usize = 40;
 
@@ -320,9 +340,12 @@ const MAX_SYMLINK_HOPS: usize = 40;
 /// by hand: absolute targets restart from `root`, `..` never pops past it
 /// (the semantics of `openat2(RESOLVE_IN_ROOT)`).
 ///
-/// A component that does not exist is kept verbatim (there is nothing left to
-/// resolve; opening it later fails with a normal not-found error). The result
-/// is still re-checked against `root` before it is returned.
+/// A component that does not exist is kept verbatim, as is everything after it
+/// (there is nothing left to resolve; opening it later fails with a normal
+/// not-found error) -- except a later `..`, which is an error: popping the
+/// missing component would turn a path the kernel cannot open into another,
+/// existing file. The result is still re-checked against `root` before it is
+/// returned.
 ///
 /// Residual race: a component can be swapped for a symlink between this walk
 /// and the later open/attach. `openat2(RESOLVE_IN_ROOT)` on an fd, attached
@@ -332,12 +355,29 @@ pub fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf> {
     // Components still to walk; `None` is `..`.
     let mut queue: VecDeque<Option<OsString>> = path_components(path);
     let mut hops = 0;
+    // Set once a component does not exist (or is not a directory). From then on
+    // nothing is resolved: the kernel would already have failed the lookup.
+    let mut missing: Option<PathBuf> = None;
 
     while let Some(component) = queue.pop_front() {
         let Some(name) = component else {
+            // `..` must not pop a component that failed to resolve: that would
+            // turn a broken path (`missing/../x`) into a different, existing file.
+            if let Some(missing) = &missing {
+                bail!(
+                    "{} cannot be resolved inside {}: {} does not exist or is not a directory",
+                    path.display(),
+                    root.display(),
+                    missing.display()
+                );
+            }
             resolved.pop();
             continue;
         };
+        if missing.is_some() {
+            resolved.push(name);
+            continue;
+        }
         let candidate = join_under(root, &resolved).join(&name);
         match fs::symlink_metadata(&candidate) {
             Ok(meta) if meta.file_type().is_symlink() => {
@@ -358,13 +398,21 @@ pub fn resolve_in_root(root: &Path, path: &Path) -> Result<PathBuf> {
                     queue.push_front(component);
                 }
             }
-            Ok(_) => resolved.push(name),
+            Ok(meta) => {
+                // A non-directory ends the walk for any component after it,
+                // exactly as ENOTDIR would.
+                if !meta.is_dir() {
+                    missing = Some(candidate);
+                }
+                resolved.push(name)
+            }
             Err(err)
                 if matches!(
                     err.kind(),
                     io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
                 ) =>
             {
+                missing = Some(candidate);
                 resolved.push(name)
             }
             Err(err) => {
@@ -777,6 +825,59 @@ mod tests {
         let err = resolve_in_root(&root.0, Path::new("/usr/lib/a")).unwrap_err();
 
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    /// Greptile #2 on PR #10: `missing/../x` must not resolve to an existing `x`.
+    /// The kernel fails the lookup at `missing`; a walker that lets the later
+    /// `..` pop the missing component turns a broken path into another file.
+    #[test]
+    fn dot_dot_after_a_missing_component_does_not_resolve() {
+        let root = FakeRoot::new("missingdotdot");
+        std::os::unix::fs::symlink(
+            "missing/../librados.so.2.0.0",
+            root.0.join("usr/lib/broken"),
+        )
+        .unwrap();
+
+        assert!(resolve_in_root(&root.0, Path::new("/usr/lib/broken")).is_err());
+        assert!(
+            resolve_in_root(&root.0, Path::new("/usr/lib/missing/../librados.so.2.0.0")).is_err()
+        );
+        // A file used as a directory fails the same way.
+        assert!(resolve_in_root(
+            &root.0,
+            Path::new("/usr/lib/librados.so.2.0.0/../librados.so.2.0.0")
+        )
+        .is_err());
+    }
+
+    /// Greptile #1 on PR #10: one unresolvable FALLBACK location (here a symlink
+    /// loop) must be skipped, not abort discovery, when a later location holds
+    /// the file. Linux-only: it needs a real `/proc/<pid>/root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unresolvable_fallback_location_is_skipped() {
+        let root = FakeRoot::new("fallbackloop");
+        std::os::unix::fs::symlink("loop", root.0.join("usr/loop")).unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let inside = root.0.strip_prefix("/").unwrap();
+        let candidates = vec![
+            Path::new("/").join(inside).join("usr/loop/librados.so.2"),
+            Path::new("/")
+                .join(inside)
+                .join("usr/lib/librados.so.2.0.0"),
+        ];
+
+        let found = first_existing_in_pid_root(pid, candidates);
+
+        assert_eq!(
+            found,
+            Some(
+                proc_root(pid)
+                    .join(inside)
+                    .join("usr/lib/librados.so.2.0.0")
+            )
+        );
     }
 
     #[test]

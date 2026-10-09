@@ -122,7 +122,14 @@ directories without validation.
   `openat2(RESOLVE_IN_ROOT)`). It stops after 40 symlinks, and it checks that
   the result is still under `root`, with errors on failure. Every
   `/proc/<pid>/root` path from discovery (maps, exe, common library
-  directories) goes through it.
+  directories) goes through it. Once a component is missing or is not a
+  directory, the walk stops resolving. A later `..` is then an error, so a
+  broken path such as `missing/../x` cannot turn into a different, existing
+  `x`.
+- Locations that are only *guesses* are skipped when they cannot be resolved
+  (for example, a symlink loop): the common library directories used when the
+  process does not map a library, and the debug-file candidates. Paths taken
+  from `/proc/<pid>/maps` and `/proc/<pid>/exe` still fail hard.
 - `debuglink_candidates` rejects a name that is empty, `.`, `..`, or contains
   `/` or NUL. This is an error, not a skipped candidate. Candidates under
   `/proc/<pid>/root` are resolved with `targets::confine_to_proc_root`.
@@ -144,4 +151,4 @@ directories without validation.
 | F6 | `tests/cli_dry_run.rs`: `live_tracing_without_pid_is_refused`, `all_processes_conflicts_with_pid`; `preflight::tests::live_scope_requires_pid_or_an_explicit_all_processes_opt_in`; `tests/bpf_source.rs`: `every_uprobe_program_drops_foreign_processes_before_doing_anything`, `userspace_publishes_the_target_tgid_before_load`, `rados_op_key_is_scoped_by_process`; Linux-only `live::linux::tests::process_scope_*`, `publishes_the_target_tgid_into_rodata`, `recognises_only_the_init_pid_namespace` |
 | F7 | `dwarf_json::tests::hprobes_come_only_from_the_attach_target_modules`, `conflicting_hprobes_from_two_target_modules_are_refused`, `identical_hprobes_from_two_target_modules_are_deduplicated`, `hprobes_keep_the_cross_module_split_working`, `hprobe_target_keys_resolve_through_the_soname_fallback` |
 | F8 | `targets::tests::process_maps_flag_deleted_mappings`, `process_maps_keep_paths_with_spaces`, `a_deleted_library_mapping_is_a_hard_error_naming_the_file`, `a_deleted_radosgw_executable_is_a_hard_error`, `a_pid_that_is_not_radosgw_is_an_error_not_a_host_fallback` |
-| F20 | `targets::tests::absolute_symlinks_resolve_inside_the_root`, `dot_dot_cannot_climb_out_of_the_root`, `relative_symlinks_resolve_against_their_own_directory`, `symlink_loops_are_an_error`, `only_proc_root_paths_are_confined`; `dwarf_native::tests::debuglink_names_that_are_not_a_plain_filename_are_refused`, `debuglink_candidates_under_a_proc_root_stay_inside_it` |
+| F20 | `targets::tests::absolute_symlinks_resolve_inside_the_root`, `dot_dot_cannot_climb_out_of_the_root`, `relative_symlinks_resolve_against_their_own_directory`, `symlink_loops_are_an_error`, `dot_dot_after_a_missing_component_does_not_resolve`, `an_unresolvable_fallback_location_is_skipped` (Linux), `only_proc_root_paths_are_confined`; `dwarf_native::tests::debuglink_names_that_are_not_a_plain_filename_are_refused`, `debuglink_candidates_under_a_proc_root_stay_inside_it`, `an_unresolvable_debuglink_location_is_skipped` (Linux) |
