@@ -151,7 +151,7 @@ impl TestElf {
         ]);
 
         let mut append = |out: &mut Vec<u8>, data: &[u8]| {
-            while out.len() % 8 != 0 {
+            while !out.len().is_multiple_of(8) {
                 out.push(0);
             }
             let offset = out.len() as u64;
@@ -293,7 +293,7 @@ pub fn build_id_note(id: &[u8]) -> Section {
     data.extend_from_slice(&3u32.to_le_bytes()); // NT_GNU_BUILD_ID
     data.extend_from_slice(b"GNU\0");
     data.extend_from_slice(id);
-    while data.len() % 4 != 0 {
+    while !data.len().is_multiple_of(4) {
         data.push(0);
     }
     Section {
@@ -307,7 +307,7 @@ pub fn build_id_note(id: &[u8]) -> Section {
 pub fn debuglink(filename: &str, crc: u32) -> Section {
     let mut data = filename.as_bytes().to_vec();
     data.push(0);
-    while data.len() % 4 != 0 {
+    while !data.len().is_multiple_of(4) {
         data.push(0);
     }
     data.extend_from_slice(&crc.to_le_bytes());

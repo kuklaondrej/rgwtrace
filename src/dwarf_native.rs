@@ -2842,6 +2842,47 @@ pub(crate) fn separate_debug_file(
     Ok(None)
 }
 
+/// The subset of `wanted` that are `DW_AT_low_pc` of a `DW_TAG_subprogram` in
+/// `file`'s DWARF: a concrete, out-of-line function starts there. Only
+/// `low_pc` counts -- the first `DW_AT_ranges` entry of a hot/cold-split
+/// function is not guaranteed to be its entry.
+pub(crate) fn subprogram_low_pcs(
+    file: &object::File<'_>,
+    wanted: &std::collections::BTreeSet<u64>,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let endian = if file.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+    let dwarf_cow = Dwarf::load(|section| load_section(file, section))?;
+    #[allow(deprecated)]
+    let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+    let mut found = std::collections::BTreeSet::new();
+    let mut headers = dwarf.units();
+    while let Some(header) = headers.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+        while let Some((_, entry)) = entries.next_dfs()? {
+            if entry.tag() != gimli::DW_TAG_subprogram {
+                continue;
+            }
+            let Some(attr) = entry.attr(gimli::DW_AT_low_pc)? else {
+                continue;
+            };
+            if let Some(pc) = dwarf.attr_address(&unit, attr.value())? {
+                if wanted.contains(&pc) {
+                    found.insert(pc);
+                }
+            }
+        }
+        if found.len() == wanted.len() {
+            break;
+        }
+    }
+    Ok(found)
+}
+
 fn first_matching_debug_file(
     candidates: Vec<PathBuf>,
     binary_build_id: Option<&[u8]>,
@@ -3464,6 +3505,95 @@ mod tests {
             msg.contains("refusing separate debug info"),
             "message: {msg}"
         );
+    }
+
+    /// The artifact addresses native extraction produces for `binary`, as
+    /// `validate_target` requests. `None` off ELF (macOS Mach-O fixtures).
+    fn elf_probe_requests(binary: &Path) -> Option<Vec<(String, u64)>> {
+        let data = std::fs::read(binary).ok()?;
+        let file = object::File::parse(data.as_slice()).ok()?;
+        if file.format() != object::BinaryFormat::Elf {
+            return None;
+        }
+        let info = from_paths(&[binary]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let requests = module
+            .func2pc
+            .iter()
+            .map(|(function, addr)| (function.clone(), *addr))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3, "fixture resolves all three probes");
+        Some(requests)
+    }
+
+    fn as_requests(requests: &[(String, u64)]) -> Vec<(&str, u64)> {
+        requests
+            .iter()
+            .map(|(function, addr)| (function.as_str(), *addr))
+            .collect()
+    }
+
+    #[test]
+    fn real_probe_addresses_validate_as_function_entries() {
+        use crate::probe_sites::{validate_target, EntryEvidence};
+        let Some(binary) = compile_cpp_fixture() else {
+            return;
+        };
+        let Some(requests) = elf_probe_requests(&binary) else {
+            return;
+        };
+        let sites = validate_target(&binary, "fixture", &as_requests(&requests)).unwrap();
+        assert!(sites
+            .iter()
+            .all(|site| site.evidence == EntryEvidence::Symbol));
+
+        // One byte in is inside the function, not its entry.
+        let (function, addr) = &requests[0];
+        assert!(validate_target(&binary, "fixture", &[(function.as_str(), addr + 1)]).is_err());
+
+        // With no symbol table left, the DWARF subprogram low_pc still proves them.
+        let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
+        let no_symtab = binary.with_file_name("fixture-no-symtab");
+        if !std::process::Command::new(&objcopy)
+            .args(["--strip-all", "--keep-section=.debug_*"])
+            .arg(&binary)
+            .arg(&no_symtab)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let sites = validate_target(&no_symtab, "fixture", &as_requests(&requests)).unwrap();
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.evidence == EntryEvidence::DwarfLowPc),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn real_non_pie_probe_addresses_translate_to_file_offsets() {
+        let Some(binary) = compile_cpp_fixture_with_flags(&["-no-pie", "-fno-pie"]) else {
+            return;
+        };
+        let Some(requests) = elf_probe_requests(&binary) else {
+            return;
+        };
+        let sites =
+            crate::probe_sites::validate_target(&binary, "fixture", &as_requests(&requests))
+                .unwrap();
+        for site in sites {
+            // ET_EXEC text is linked at a base (0x400000 on x86_64/aarch64), so the
+            // vaddr the artifact carries is NOT the offset the uprobe API needs.
+            assert!(
+                site.file_offset < site.vaddr,
+                "{} vaddr {:#x} offset {:#x}",
+                site.function,
+                site.vaddr,
+                site.file_offset
+            );
+        }
     }
 
     #[test]
@@ -5489,9 +5619,14 @@ mod tests {
     }
 
     fn compile_cpp_fixture() -> Option<std::path::PathBuf> {
-        compile_cpp_source(
-            "fixture",
-            r#"
+        compile_cpp_fixture_with_flags(&[])
+    }
+
+    fn compile_cpp_fixture_with_flags(flags: &[&str]) -> Option<std::path::PathBuf> {
+        compile_cpp_sources_with_flags("fixture", &[("fixture", CPP_FIXTURE_SOURCE)], flags)
+    }
+
+    const CPP_FIXTURE_SOURCE: &str = r#"
             class Objecter {
             public:
               __attribute__((noinline)) void _send_op(int op);
@@ -5514,9 +5649,7 @@ mod tests {
               rest.get_handler(3);
               return 0;
             }
-            "#,
-        )
-    }
+            "#;
 
     fn compile_field_fixture() -> Option<std::path::PathBuf> {
         compile_cpp_source(

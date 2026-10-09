@@ -268,23 +268,75 @@ fn an_unbridged_context_fails_closed_when_the_end_probe_is_attached() {
     assert!(LIVE_LINUX.contains("dwarf.get_handler_req_state_is_register_resolvable(&module)"));
 }
 
+/// The Phase B attach call exactly as `attach_probes` makes it.
+const RADOS_OPERATE_ATTACH_CALL: &str = concat!(
+    "                        attach_rados_operate_probes(\n",
+    "                            &mut links,\n",
+    "                            skel,\n",
+    "                            dwarf,\n",
+    "                            sites,\n",
+    "                            &targets.radosgw,\n",
+    "                            pid,\n",
+    "                        )?;",
+);
+
+#[test]
+fn every_uprobe_attaches_at_a_validated_file_offset_never_a_raw_vaddr() {
+    // libbpf's `bpf_program__attach_uprobe(func_offset)` takes a FILE OFFSET; the
+    // artifact holds ELF VIRTUAL addresses. They coincide only for GNU-ld PIE
+    // text, so passing `addr` through planted the int3 in the wrong place on a
+    // non-PIE or lld-linked radosgw. Every attach must go through the offsets
+    // preflight validated (`ProbeSites::file_offset`), never translate or pass a
+    // raw address itself.
+    assert!(LIVE_LINUX
+        .contains("let probe_sites = preflight::validated_probe_sites(dwarf, &targets)?;"));
+    assert!(!LIVE_LINUX.contains("addr as usize"));
+    let attach_calls = LIVE_LINUX.matches("attach_uprobe(").count()
+        - LIVE_LINUX.matches("bpf_program__attach_uprobe(").count();
+    // One definition + three call sites (generic, END probe, operate overloads).
+    let offset_args = LIVE_LINUX.matches("file_offset as usize").count();
+    assert_eq!(
+        offset_args, 3,
+        "every attach_uprobe call passes a validated file_offset"
+    );
+    assert_eq!(
+        attach_calls, 4,
+        "update this test when adding an attach site"
+    );
+    assert_eq!(LIVE_LINUX.matches("sites.file_offset(").count(), 3);
+}
+
 #[test]
 fn request_end_probe_attach_is_optional_fails_soft_and_is_never_silent() {
     // Backward compatibility: a build whose destructor address, variant
     // provenance, or `this` descriptor cannot be resolved must keep working with
-    // derived durations. The attach failure is warned about, never propagated
-    // (contrast `attach_if_present(...)?` elsewhere) -- but it is also never
-    // SKIPPED SILENTLY: a missing end probe silently changes what every request
-    // duration in the output means, so the operator is told at attach time.
+    // derived durations. An unavailable or failed attach is warned about and
+    // returned as `Ok(AttachOutcome::Skipped)` -- but it is also never SKIPPED
+    // SILENTLY: a missing end probe silently changes what every request duration
+    // in the output means, so the operator is told at attach time.
+    //
+    // The ONLY error it propagates is an address that is PRESENT but was not
+    // validated by preflight: a wrong breakpoint is worse than no END probe.
     assert!(LIVE_LINUX.contains("fn attach_request_end_probe("));
-    assert!(LIVE_LINUX.contains(") -> AttachOutcome {"));
+    assert!(LIVE_LINUX.contains(") -> Result<AttachOutcome> {"));
     assert!(LIVE_LINUX.contains("RequestEndProbe::Unavailable(gap) => {"));
     assert!(LIVE_LINUX.contains(
         "request-END probe unavailable; request span durations will be DERIVED from RADOS \\"
     ));
-    assert!(LIVE_LINUX.contains(
-        "                    attach_request_end_probe(&mut links, skel, dwarf, &targets.radosgw, pid)\n                        == AttachOutcome::Attached;"
-    ));
+    assert!(LIVE_LINUX.contains("            return Ok(AttachOutcome::Skipped);"));
+    assert!(
+        LIVE_LINUX.contains("let file_offset = sites.file_offset(radosgw, REQ_STATE_DTOR, addr)?;")
+    );
+    assert!(LIVE_LINUX.contains(concat!(
+        "                request_end_probe = attach_request_end_probe(\n",
+        "                    &mut links,\n",
+        "                    skel,\n",
+        "                    dwarf,\n",
+        "                    sites,\n",
+        "                    &targets.radosgw,\n",
+        "                    pid,\n",
+        "                )? == AttachOutcome::Attached;",
+    )));
     // The end probe's address comes from the provenance-checked accessor, never
     // from the generic `function_addr` path that cannot prove the variant.
     assert!(LIVE_LINUX.contains("dwarf.request_end_probe(&module)"));
@@ -463,8 +515,7 @@ fn reseed_probe_attach_is_gated_behind_the_opt_in_flag() {
         "if correlate_cross_thread && reseed_var_field_present(dwarf, &targets.radosgw)"
     ));
     assert!(LIVE_LINUX.contains("&skel.progs.uprobe_rgw_process_authenticated"));
-    assert!(LIVE_LINUX
-        .contains("attach_rados_operate_probes(&mut links, skel, dwarf, &targets.radosgw, pid);"));
+    assert!(LIVE_LINUX.contains(RADOS_OPERATE_ATTACH_CALL));
 
     // Structural check that BOTH cross-thread attaches are behind the flag: each
     // sits inside its own `AttachStep` arm, and each arm's body is guarded by
@@ -473,7 +524,7 @@ fn reseed_probe_attach_is_gated_behind_the_opt_in_flag() {
         .find("AttachStep::RadosOperate => {")
         .expect("phase B attach step");
     let operate_attach = LIVE_LINUX
-        .find("attach_rados_operate_probes(&mut links,")
+        .find(RADOS_OPERATE_ATTACH_CALL)
         .expect("phase B attach");
     let gate = LIVE_LINUX[operate_arm..operate_attach]
         .find("if correlate_cross_thread {")
@@ -800,10 +851,8 @@ fn phase_b_is_not_attached_without_the_request_end_probe() {
     // either: with no revoker it is switched off and fails OPEN.
     //
     // So Phase B degrades to Phase A -- loudly.
-    assert!(LIVE_LINUX.contains(concat!(
-        "                    if request_end_probe {\n",
-        "                        attach_rados_operate_probes(&mut links, skel, dwarf, &targets.radosgw, pid);\n",
-        "                    } else {\n",
+    assert!(LIVE_LINUX.contains(&format!(
+        "                    if request_end_probe {{\n{RADOS_OPERATE_ATTACH_CALL}\n                    }} else {{\n"
     )));
     assert!(LIVE_LINUX.contains(
         "the per-submit re-seed (rgw_rados_operate) \\\n                             is DISABLED \

@@ -9,6 +9,7 @@ mod dwarf_native;
 mod live;
 mod otel;
 mod preflight;
+mod probe_sites;
 mod targets;
 #[cfg(test)]
 mod test_elf;

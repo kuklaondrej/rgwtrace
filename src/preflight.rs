@@ -11,8 +11,10 @@ use crate::{
     dwarf_json::{
         module_key_for_path, DwarfInfo, DwarfSummary, ModuleMatch, RadosOperateProbe,
         RequestEndProbe, REQ_STATE_DTOR, RGWREST_GET_HANDLER, RGW_PROCESS_AUTHENTICATED,
-        RGW_RADOS_OPERATE, RGW_RADOS_OPERATE_OVERLOADS,
+        RGW_RADOS_OPERATE, RGW_RADOS_OPERATE_OVERLOADS, RGW_RADOS_OPERATE_READ,
+        RGW_RADOS_OPERATE_WRITE,
     },
+    probe_sites::{self, ProbeSites},
     targets::{self, ProbeTargets},
 };
 
@@ -24,6 +26,20 @@ const SEND_OP_FIELDS: usize = 12;
 const FINISH_OP_FIELDS: usize = 3;
 const GET_HANDLER_FIELDS: usize = 2;
 
+/// Every function rgwtrace may attach a uprobe to. Each address the artifact
+/// carries for one of these, in a discovered target's module, is validated and
+/// translated before anything attaches -- including optional probes, because an
+/// address that is present but wrong would be probed, not skipped.
+const PROBED_FUNCTIONS: &[&str] = &[
+    SEND_OP,
+    FINISH_OP,
+    GET_HANDLER,
+    RGW_PROCESS_AUTHENTICATED,
+    REQ_STATE_DTOR,
+    RGW_RADOS_OPERATE_READ,
+    RGW_RADOS_OPERATE_WRITE,
+];
+
 #[derive(Debug, Serialize)]
 pub struct PreflightReport {
     pub ok: bool,
@@ -31,6 +47,7 @@ pub struct PreflightReport {
     pub targets: ProbeTargets,
     pub checks: Vec<PreflightCheck>,
     pub build_ids: Vec<BuildIdCheck>,
+    pub probe_sites: ProbeSites,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,13 +70,60 @@ pub struct BuildIdCheck {
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<PreflightReport> {
     let targets = validated_targets(cli, dwarf)?;
     let build_ids = build_id_checks(dwarf, &targets)?;
+    let probe_sites = validated_probe_sites(dwarf, &targets)?;
+    let mut checks = checks(dwarf, &targets);
+    checks.push(PreflightCheck {
+        name: "probe_addresses".to_string(),
+        status: "ok",
+        detail: format!(
+            "{} probe address(es) are function entries inside executable PT_LOAD segments; \
+             uprobes attach at the file offsets listed in probe_sites",
+            probe_sites.len()
+        ),
+    });
     Ok(PreflightReport {
         ok: true,
         dwarf: dwarf.summary(),
-        checks: checks(dwarf, &targets),
+        checks,
         build_ids,
         targets,
+        probe_sites,
     })
+}
+
+/// Validate every probe address the artifact supplies for a discovered target
+/// and translate it to the file offset the uprobe API takes. Any address that is
+/// not a function entry inside an executable PT_LOAD of that target is a hard
+/// error naming the function, module and address (see `probe_sites`).
+///
+/// An ABSENT address is not validated -- it simply does not attach, and the
+/// optional probes keep failing soft for it. A PRESENT address that fails is
+/// fatal even for an optional probe: a breakpoint in the wrong place corrupts
+/// the traced process, which no amount of degraded output is worth.
+///
+/// `--allow-build-id-mismatch` does not relax this: it vouches for the DWARF,
+/// it cannot make an address land on an instruction boundary.
+pub fn validated_probe_sites(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<ProbeSites> {
+    let mut sites = ProbeSites::default();
+    for path in targets.all_paths() {
+        let module = target_basename(path, "target")?;
+        let Some(artifact) = dwarf.resolve_module(&module) else {
+            continue;
+        };
+        let requests = PROBED_FUNCTIONS
+            .iter()
+            .filter_map(|function| {
+                artifact
+                    .func2pc
+                    .get(*function)
+                    .copied()
+                    .filter(|addr| *addr != 0)
+                    .map(|addr| (*function, addr))
+            })
+            .collect::<Vec<_>>();
+        sites.extend(probe_sites::validate_target(path, &module, &requests)?);
+    }
+    Ok(sites)
 }
 
 pub fn validated_targets(cli: &Cli, dwarf: &DwarfInfo) -> Result<ProbeTargets> {
@@ -520,6 +584,131 @@ fn target_basename(path: &Path, label: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::dwarf_json::{RGW_RADOS_OPERATE_READ, RGW_RADOS_OPERATE_WRITE};
+
+    /// Real ELF targets in a temp dir: a non-PIE `radosgw` (so a raw vaddr is
+    /// visibly NOT the file offset) with FUNC symbols at `functions`, plus empty
+    /// RADOS libraries the artifact carries no addresses for.
+    fn elf_targets(name: &str, functions: &[(&'static str, u64)]) -> ProbeTargets {
+        use crate::test_elf::{temp_dir, TestElf};
+        let dir = temp_dir(name);
+        let mut radosgw = TestElf::non_pie(0x1000, 0x1000);
+        for (function, vaddr) in functions {
+            radosgw = radosgw.function(function, *vaddr);
+        }
+        fs::write(dir.join("radosgw"), radosgw.build()).unwrap();
+        for library in ["librados.so.2", "libceph-common.so.2"] {
+            fs::write(dir.join(library), TestElf::pie(0x1000, 0x100).build()).unwrap();
+        }
+        ProbeTargets {
+            librados: dir.join("librados.so.2"),
+            librbd: None,
+            libceph_common: dir.join("libceph-common.so.2"),
+            radosgw: dir.join("radosgw"),
+        }
+    }
+
+    fn radosgw_artifact(func2pc: &[(&str, u64)]) -> DwarfInfo {
+        let module = crate::dwarf_json::DwarfModule {
+            build_id: None,
+            func2pc: func2pc
+                .iter()
+                .map(|(function, addr)| (function.to_string(), *addr))
+                .collect(),
+            func2vf: Default::default(),
+            func2linkage: Default::default(),
+        };
+        DwarfInfo {
+            version: Some("19.2.0".into()),
+            arch: Some("amd64".into()),
+            modules: [("radosgw".to_string(), module)].into(),
+        }
+    }
+
+    const HANDLER_VADDR: u64 = 0x40_0000 + 0x1040;
+    const DTOR_VADDR: u64 = 0x40_0000 + 0x1100;
+
+    #[test]
+    fn probe_sites_translate_artifact_vaddrs_to_target_file_offsets() {
+        let targets = elf_targets(
+            "preflight-translate",
+            &[
+                ("_ZN7RGWREST11get_handlerEv", HANDLER_VADDR),
+                ("_ZN9req_stateD1Ev", DTOR_VADDR),
+            ],
+        );
+        let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), (REQ_STATE_DTOR, DTOR_VADDR)]);
+
+        let sites = validated_probe_sites(&dwarf, &targets).unwrap();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(
+            sites
+                .file_offset(&targets.radosgw, GET_HANDLER, HANDLER_VADDR)
+                .unwrap(),
+            0x1040
+        );
+        assert_eq!(
+            sites
+                .file_offset(&targets.radosgw, REQ_STATE_DTOR, DTOR_VADDR)
+                .unwrap(),
+            0x1100
+        );
+    }
+
+    #[test]
+    fn an_artifact_address_that_is_not_a_function_entry_fails_preflight() {
+        // An imported (cephtrace-style) artifact is just names and numbers: its
+        // address is checked against the target exactly like a native one.
+        let targets = elf_targets(
+            "preflight-mid-function",
+            &[("_ZN7RGWREST11get_handlerEv", HANDLER_VADDR)],
+        );
+        let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR + 4)]);
+
+        let msg = format!("{:#}", validated_probe_sites(&dwarf, &targets).unwrap_err());
+        assert!(msg.contains(GET_HANDLER), "message: {msg}");
+        assert!(msg.contains("not the entry"), "message: {msg}");
+    }
+
+    #[test]
+    fn a_present_but_invalid_request_end_address_is_a_hard_error() {
+        // The END probe is optional when ABSENT, but a wrong breakpoint is worse
+        // than no probe: an address that is there and fails validation must stop
+        // the run, not quietly degrade to derived durations.
+        let targets = elf_targets(
+            "preflight-bad-dtor",
+            &[("_ZN7RGWREST11get_handlerEv", HANDLER_VADDR)],
+        );
+        let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), (REQ_STATE_DTOR, DTOR_VADDR)]);
+
+        let msg = format!("{:#}", validated_probe_sites(&dwarf, &targets).unwrap_err());
+        assert!(msg.contains(REQ_STATE_DTOR), "message: {msg}");
+    }
+
+    #[test]
+    fn an_absent_request_end_address_is_not_an_error() {
+        let targets = elf_targets(
+            "preflight-no-dtor",
+            &[("_ZN7RGWREST11get_handlerEv", HANDLER_VADDR)],
+        );
+        let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR)]);
+
+        let sites = validated_probe_sites(&dwarf, &targets).unwrap();
+        assert_eq!(sites.len(), 1);
+        assert!(sites
+            .file_offset(&targets.radosgw, REQ_STATE_DTOR, DTOR_VADDR)
+            .is_err());
+    }
+
+    #[test]
+    fn functions_rgwtrace_never_attaches_are_not_validated() {
+        let targets = elf_targets(
+            "preflight-unprobed",
+            &[("_ZN7RGWREST11get_handlerEv", HANDLER_VADDR)],
+        );
+        let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), ("Some::other", 1)]);
+
+        assert_eq!(validated_probe_sites(&dwarf, &targets).unwrap().len(), 1);
+    }
 
     #[test]
     fn validates_required_dwarf_targets() {
