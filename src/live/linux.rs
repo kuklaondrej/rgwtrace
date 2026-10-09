@@ -111,7 +111,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     )?;
     let mut skel = open.load()?;
 
-    populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
+    populate_hprobes(&mut skel.maps.hprobes, dwarf, &targets)?;
     // The BPF globals (`REQUEST_END_PROBE_ATTACHED`, `RGW_OP_BRIDGE_KEY_ENABLED`)
     // are published INSIDE attach_probes, between the destructor attach and the
     // first probe that can create or consume a bridge entry. Publishing them here,
@@ -627,8 +627,21 @@ fn configure_rodata(
     Ok(())
 }
 
-fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
-    for entry in dwarf.hprobe_entries() {
+/// Install the hprobe descriptors of the modules this run attaches to -- and only
+/// those (see `DwarfInfo::hprobe_entries_for_modules`): the map is keyed by a
+/// global function id, so a descriptor from any other artifact module would be
+/// read at the target's probe address.
+fn populate_hprobes(
+    map: &mut impl MapCore,
+    dwarf: &DwarfInfo,
+    targets: &targets::ProbeTargets,
+) -> Result<()> {
+    let target_keys: Vec<String> = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect();
+    for entry in dwarf.hprobe_entries_for_modules(&target_keys)? {
         let key = entry.key.to_ne_bytes();
         let value = bytes_of(&entry.field);
         map.update(&key, value, MapFlags::ANY).with_context(|| {

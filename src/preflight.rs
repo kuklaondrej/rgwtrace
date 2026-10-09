@@ -146,6 +146,15 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
 
     warn_on_silent_rados_skip(dwarf, targets);
 
+    // The same selection live attach installs: two target modules disagreeing
+    // on a shared hprobe slot fail here, before anything is attached.
+    let target_keys = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect::<Vec<_>>();
+    dwarf.hprobe_entries_for_modules(&target_keys)?;
+
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
     require_function(dwarf, &radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
     Ok(())
