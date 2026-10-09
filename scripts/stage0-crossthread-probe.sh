@@ -41,7 +41,10 @@
 #   STAGE0_DURATION         run duration in seconds (default 60; Ctrl-C also stops).
 #   STAGE0_STALE_MS         "stale seed" threshold in ms for metric (e) (default 50).
 #   STAGE0_OUTDIR           where to write the generated program + log
-#                           (default /tmp/rgwtrace-stage0).
+#                           (default: a fresh private mktemp -d directory).
+#                           A supplied directory must be owned by the current
+#                           user and not group/other writable (it is created
+#                           with mode 0700 if it does not exist yet).
 #
 #   RGW_GET_HANDLER_SYM     override the mangled symbol for RGWREST::get_handler.
 #   RGW_PROC_AUTH_SYM       override the mangled symbol for rgw_process_authenticated.
@@ -67,12 +70,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC2034
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=scripts/lib/private-dir.sh
+. "${SCRIPT_DIR}/lib/private-dir.sh"
+
 PATH="/snap/bin:${PATH}"
+
+# The generated program is executed by a privileged bpftrace; nothing this
+# script writes may be readable or plantable by other local users.
+umask 077
 
 # --- configuration ---------------------------------------------------------
 STAGE0_DURATION="${STAGE0_DURATION:-60}"
 STAGE0_STALE_MS="${STAGE0_STALE_MS:-50}"
-STAGE0_OUTDIR="${STAGE0_OUTDIR:-/tmp/rgwtrace-stage0}"
+STAGE0_OUTDIR="${STAGE0_OUTDIR:-$(rgwtrace_private_tmpdir rgwtrace-stage0)}"
 STAGE0_COVERAGE_GATE="${STAGE0_COVERAGE_GATE:-90}"
 STAGE0_KEYMATCH_GATE="${STAGE0_KEYMATCH_GATE:-99}"
 STAGE0_A3_GATE="${STAGE0_A3_GATE:-99}"
@@ -441,7 +451,10 @@ generate_program() {
     local gh_arg="$4" pa_arg="$5"
     local stale_ns=$(( STAGE0_STALE_MS * 1000000 ))
 
-    mkdir -p "${STAGE0_OUTDIR}"
+    # bpftrace runs this file as root: refuse an output directory another
+    # user could have pre-created or planted symlinks in.
+    rgwtrace_require_private_dir "${STAGE0_OUTDIR}" "STAGE0_OUTDIR" \
+        || die "STAGE0_OUTDIR=${STAGE0_OUTDIR} is not a private directory; unset it to use a fresh mktemp -d directory"
     BT_PROGRAM="${STAGE0_OUTDIR}/stage0.bt"
 
     # NOTE: this bpftrace program deliberately uses NO bpftrace scratch ($)
