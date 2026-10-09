@@ -14,8 +14,23 @@ pub struct Cli {
     #[arg(long)]
     pub ceph_version: Option<String>,
 
+    /// Where the trace goes: `json` (one document on stdout at exit), `jsonl`
+    /// (one document per drain on stdout, streamed), or `otlp`.
     #[arg(long, default_value = "json")]
     pub output: OutputMode,
+
+    /// Cap on events `--output json` buffers in memory (request groups plus RADOS
+    /// ops), default 100000 (roughly 100 MB).
+    ///
+    /// `--output json` prints ONE document at exit, so it holds the whole session
+    /// in memory; uncapped, a long session at production rates grows until it is
+    /// OOM-killed. Once the cap is reached, new requests and RADOS ops are dropped
+    /// and counted (`buffer_full_dropped_markers`, `buffer_full_dropped_rados_ops`)
+    /// and a warning is logged. For long sessions use `--output jsonl`, which
+    /// streams and needs no cap. Rejected with the other output modes, which drain
+    /// on `--flush-interval` instead.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub max_buffered_events: Option<usize>,
 
     #[arg(long, default_value = "http://localhost:4318/v1/traces")]
     pub otlp_endpoint: String,
@@ -38,7 +53,15 @@ pub struct Cli {
     #[arg(long, default_value_t = 0)]
     pub otlp_max_bytes_per_batch: usize,
 
-    #[arg(long, default_value = "30", value_parser = parse_duration_secs)]
+    /// How often (seconds) the streaming output modes (`--output jsonl` and
+    /// `--output otlp`) drain expired requests out of memory and emit them.
+    /// `--flush-interval` is an alias.
+    #[arg(
+        long,
+        visible_alias = "flush-interval",
+        default_value = "30",
+        value_parser = parse_duration_secs
+    )]
     pub otlp_flush_interval: Duration,
 
     /// Emit the run-summary diagnostic counters into the OTLP stream for live
@@ -170,8 +193,22 @@ pub struct Cli {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum OutputMode {
+    /// One pretty-printed `{dwarf, trace}` document on stdout at exit. Holds the
+    /// session in memory, capped by `--max-buffered-events`.
     Json,
+    /// One compact `{dwarf, trace}` document per line on stdout, written at every
+    /// flush interval with the requests that expired since the last one, plus a
+    /// final line at exit. Memory stays bounded for any session length.
+    Jsonl,
     Otlp,
+}
+
+impl OutputMode {
+    /// Whether this mode drains expired requests out of the collector during the
+    /// run (and so bounds memory by draining rather than by a buffer cap).
+    pub fn is_streaming(self) -> bool {
+        matches!(self, Self::Jsonl | Self::Otlp)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

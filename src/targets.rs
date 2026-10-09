@@ -294,6 +294,7 @@ mod tests {
             otlp_max_spans_per_batch: 512,
             otlp_max_bytes_per_batch: 0,
             otlp_flush_interval: std::time::Duration::from_secs(30),
+            max_buffered_events: None,
             otlp_diagnostics: false,
             correlation_ttl: std::time::Duration::from_secs(120),
             correlate_inferred: false,
