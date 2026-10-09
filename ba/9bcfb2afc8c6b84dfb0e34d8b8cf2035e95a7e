@@ -1,0 +1,21 @@
+.github/workflows/dwarf-artifact.yml
+  s_4d990597f39574::t_f2a39344a5e4b8 48-51,63-66
+scripts/export-upstream-ceph-dwarf.sh
+  s_4d990597f39574::t_d8fb997cf5577e 6-18,23-45,64-76,116-129,131-132,199-225,227-233,235,237-238,253-254,378,380-381
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ba9bcfb2afc8c6b84dfb0e34d8b8cf2035e95a7e",
+  "prompts": {},
+  "sessions": {
+    "s_4d990597f39574": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "22c7d3a2-467b-4713-a534-65b12e327343",
+        "model": "claude-mythos-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
