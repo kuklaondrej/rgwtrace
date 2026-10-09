@@ -10,6 +10,8 @@ Operational notes for running `rgwtrace` against live RGW hosts.
 
 - Linux host with eBPF and uprobes enabled.
 - `root` or equivalent BPF/perf privileges. Running with `sudo` is the expected path today.
+- The host pid namespace. In a container, start it with `--pid=host`. A `--pid` run from a nested pid namespace is refused, because the kernel's tgid would never match the namespace-local pid.
+- `--pid <radosgw pid>` for every live run. The probes fire only in that process. `--all-processes` probes every process that maps the target libraries (OSDs, qemu/librbd, other gateways, CLI tools); all of them then pay the probe cost and share the ring buffer. Use it only on lab hosts.
 - Ceph/RGW binaries with accessible native debug info, or matching `cephtrace` JSON fallback data.
 - Reachable OTLP/HTTP or OTLP/HTTPS endpoint when using `--output otlp`.
 - Linux `amd64` binary built with `./scripts/build-linux-container.sh` when building from macOS.
@@ -27,7 +29,9 @@ sudo rgwtrace \
   --preflight
 ```
 
-With `--pid`, discovered library and executable paths are opened through `/proc/<pid>/root` so the host attaches to the same inode the target process sees inside its mount namespace.
+With `--pid`, libraries come from `/proc/<pid>/maps` and the executable from `/proc/<pid>/exe`, and every path is opened through `/proc/<pid>/root`, so the host attaches to the same file the target process sees inside its mount namespace. Symlinks inside the container are resolved inside the container root, never against the host root. If the process maps a file that was deleted or replaced on disk (for example after a package upgrade), discovery stops with an error; restart the daemon and run again. With `--pid`, discovery never falls back to a host path such as `/usr/bin/radosgw`.
+
+Preflight, `--dry-run` and `--export-dwarf-json` attach nothing, so they do not require `--pid`.
 
 Use explicit paths when discovery is ambiguous:
 
@@ -117,6 +121,14 @@ defaults.
 ## Common Preflight Failures
 
 - `--pid must be a positive process id`: pass a single live RGW PID.
+- `live tracing requires --pid <radosgw pid>`: pass the RGW PID. Pass `--all-processes` only if you intend to probe every process on the host.
+- `the argument '--pid <PID>' cannot be used with '--all-processes'`: pass one or the other.
+- `rgwtrace is running in a nested pid namespace`: run the tracer in the host pid namespace (`docker run --pid=host`).
+- `... mapped by pid N (...) was deleted or replaced on disk` or `the radosgw executable of pid N (...) was deleted or replaced on disk`: the daemon still runs the old file after an upgrade. Restart it, then trace again. Probing the new file would capture nothing.
+- `pid N runs <exe>, not radosgw`: pass the radosgw PID, or `--radosgw-path` if the binary has another name.
+- `too many symlink levels resolving ...` or `... resolved to ..., outside /proc/<pid>/root`: the container image has a symlink loop or a path that cannot be resolved inside its root. Pass explicit `--*-path` flags.
+- `.gnu_debuglink names "...", which is not a plain filename`: the binary's debuglink is malformed or hostile. Use `--import-json` with an artifact exported from trusted binaries.
+- `modules A and B both provide hprobe slot N (...) with DIFFERENT variable descriptors`: two attach-target modules describe the same probe function differently, so one shared descriptor cannot be correct at both addresses. Re-export the artifact from the binaries the process maps, or remove the extra module.
 - `failed to discover ...`: pass the corresponding explicit path flag.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.

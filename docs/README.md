@@ -37,3 +37,6 @@ superseded by later sections in the same document.
   imported metadata must resolve symlinked libraries correctly.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Target scoping](bugfix-target-scoping.md): why live tracing requires `--pid`,
+  how targets bind to the files the process maps, and how `/proc/<pid>/root`
+  paths stay inside the container.
