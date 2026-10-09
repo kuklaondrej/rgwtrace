@@ -94,12 +94,21 @@ static struct rados_op_state zero_rados_op = {};
  * entries; when genuinely full (e.g. leaked entries) it only rejects NEW inserts
  * with E2BIG, which is counted via the existing drop counters. Rejecting new
  * inserts is strictly less harmful than silently killing op emission.
+ *
+ * SIZING AND LEAKS. max_entries is set at load from --bpf-rados-ops-entries;
+ * the default is above Ceph's objecter_inflight_ops default (24576), the most
+ * ops one Objecter keeps in flight. An op whose client exits before
+ * _finish_op is never deleted here, so userspace sweeps entries whose sent_ns
+ * is older than --rados-ops-stale-after (default 5 min, far above any real op
+ * latency) and counts them as stale_rados_ops_swept.
  */
+#define RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES 32768
+
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct client_op_key);
   __type(value, struct rados_op_state);
-  __uint(max_entries, 8192);
+  __uint(max_entries, RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES);
 } rados_ops SEC(".maps");
 
 /* Plain HASH for the same reason as rados_ops (see above): LRU per-CPU

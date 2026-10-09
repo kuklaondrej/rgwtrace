@@ -421,7 +421,7 @@ fn lifecycle_state_maps_use_plain_hash_not_lru() {
         "  __uint(type, BPF_MAP_TYPE_HASH);\n",
         "  __type(key, struct client_op_key);\n",
         "  __type(value, struct rados_op_state);\n",
-        "  __uint(max_entries, 8192);\n",
+        "  __uint(max_entries, RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES);\n",
         "} rados_ops SEC(\".maps\");"
     )));
     assert!(RGWTRACE_BPF.contains(concat!(
@@ -1092,4 +1092,17 @@ fn hprobes_is_a_dense_array_and_every_lookup_checks_presence() {
     );
     assert!(CEPH_ABI.contains("  __u32 present;\n};"));
     assert!(CEPH_ABI.contains("#define RGWTRACE_HPROBE_SLOTS 80"));
+}
+
+#[test]
+fn rados_ops_is_sized_at_load_and_swept_from_userspace() {
+    // 8192 entries was below Ceph's default objecter_inflight_ops (24576), and an
+    // op whose client exits before _finish_op is never deleted. The default is now
+    // above the Objecter cap, the size is a flag applied before load, and the poll
+    // loop deletes entries older than --rados-ops-stale-after.
+    assert!(RGWTRACE_BPF.contains("#define RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES 32768"));
+    assert!(LIVE_LINUX.contains(".rados_ops\n        .set_max_entries(cli.bpf_rados_ops_entries)"));
+    assert!(LIVE_LINUX.contains("sweep_stale_rados_ops(&skel.maps.rados_ops,"));
+    assert!(CLI.contains("pub bpf_rados_ops_entries: u32,"));
+    assert!(CLI.contains("pub rados_ops_stale_after: Duration,"));
 }

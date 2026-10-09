@@ -305,6 +305,8 @@ mod tests {
             pid: None,
             timeout: None,
             ringbuf_size: 16 * 1024 * 1024,
+            bpf_rados_ops_entries: 32768,
+            rados_ops_stale_after: std::time::Duration::from_secs(300),
             dry_run: false,
             preflight: false,
             export_dwarf_json: false,

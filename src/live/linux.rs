@@ -126,6 +126,8 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let started = Instant::now();
     let mut last_flush = Instant::now();
+    let rados_ops_sweep_every = rados_ops_sweep_interval(cli.rados_ops_stale_after);
+    let mut last_rados_ops_sweep = Instant::now();
     // Latches once the OTLP exporter thread dies so a single fatal/misconfig
     // OTLP response cannot tear down the session or spam the log.
     let mut otlp_export_disabled = false;
@@ -154,6 +156,29 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                 debug!(timeout_seconds = timeout, "trace timeout reached");
                 break;
             }
+        }
+        if !cli.rados_ops_stale_after.is_zero()
+            && last_rados_ops_sweep.elapsed() >= rados_ops_sweep_every
+        {
+            match sweep_stale_rados_ops(&skel.maps.rados_ops, cli.rados_ops_stale_after) {
+                Ok(0) => {}
+                Ok(swept) => {
+                    info!(
+                        swept,
+                        stale_after_secs = cli.rados_ops_stale_after.as_secs(),
+                        "deleted stale rados_ops entries"
+                    );
+                    collector
+                        .lock()
+                        .expect("collector lock poisoned")
+                        .record_stale_rados_ops_swept(swept);
+                }
+                Err(err) => warn!(
+                    error = %format_args!("{err:#}"),
+                    "failed to sweep stale rados_ops entries; retrying next interval"
+                ),
+            }
+            last_rados_ops_sweep = Instant::now();
         }
         if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
         {
@@ -542,8 +567,74 @@ fn configure_map_sizes(open: &mut OpenRgwtraceSkel<'_>, cli: &Cli) -> Result<()>
                 cli.ringbuf_size
             )
         })?;
-    info!(ringbuf_bytes = cli.ringbuf_size, "configured BPF map sizes");
+    open.maps
+        .rados_ops
+        .set_max_entries(cli.bpf_rados_ops_entries)
+        .with_context(|| {
+            format!(
+                "failed to size the rados_ops map to {} entries",
+                cli.bpf_rados_ops_entries
+            )
+        })?;
+    info!(
+        ringbuf_bytes = cli.ringbuf_size,
+        rados_ops_entries = cli.bpf_rados_ops_entries,
+        "configured BPF map sizes"
+    );
     Ok(())
+}
+
+/// How often the poll loop sweeps `rados_ops` for stale entries: often enough
+/// that a leak is reclaimed within a fraction of the threshold, rarely enough
+/// that iterating the map costs nothing measurable.
+fn rados_ops_sweep_interval(stale_after: Duration) -> Duration {
+    (stale_after / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
+}
+
+/// Whether a `rados_ops` value (a `struct rados_op_state`, i.e. a
+/// `RawRadosEvent`) was sent more than `stale_after_ns` before `now_ns`.
+///
+/// `sent_ns == 0` is an entry `_send_op` inserted but has not stamped yet; it
+/// is the youngest possible op, never a stale one.
+fn rados_op_is_stale(value: &[u8], now_ns: u64, stale_after_ns: u64) -> bool {
+    let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+    let Some(bytes) = value.get(at..at + size_of::<u64>()) else {
+        return false;
+    };
+    let sent_ns = u64::from_ne_bytes(bytes.try_into().expect("8-byte slice"));
+    sent_ns != 0 && now_ns.saturating_sub(sent_ns) > stale_after_ns
+}
+
+/// Delete `rados_ops` entries older than `stale_after`. Returns how many were
+/// deleted.
+///
+/// Keys are collected first and deleted afterwards: deleting the key a hash
+/// iteration is positioned on restarts the iteration. An entry that
+/// `_finish_op` deletes in between simply fails to delete and is not counted.
+/// `sent_ns` is CLOCK_BOOTTIME (`bpf_ktime_get_boot_ns`), so `now` is too.
+fn sweep_stale_rados_ops(map: &impl MapCore, stale_after: Duration) -> Result<u64> {
+    let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
+    let stale_after_ns = duration_ns(stale_after);
+    let mut stale = Vec::new();
+    for key in map.keys() {
+        let Some(value) = map
+            .lookup(&key, MapFlags::ANY)
+            .context("failed to read a rados_ops entry")?
+        else {
+            continue;
+        };
+        if rados_op_is_stale(&value, now_ns, stale_after_ns) {
+            stale.push(key);
+        }
+    }
+    let mut swept = 0;
+    for key in stale {
+        match map.delete(&key) {
+            Ok(()) => swept += 1,
+            Err(err) => debug!(error = %err, "stale rados_ops entry was already gone"),
+        }
+    }
+    Ok(swept)
 }
 
 fn page_size() -> Result<u64> {
@@ -1651,6 +1742,44 @@ mod tests {
 
         data.resize(RGWTRACE_EVENT_SIZE, 0);
         assert!(decode_event(&data).is_ok());
+    }
+
+    #[test]
+    fn a_rados_op_is_stale_only_past_the_threshold() {
+        const MIN: u64 = 60_000_000_000;
+        let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+        let value = |sent_ns: u64| {
+            let mut value = vec![0_u8; RGWTRACE_RADOS_EVENT_SIZE];
+            value[at..at + 8].copy_from_slice(&sent_ns.to_ne_bytes());
+            value
+        };
+        let now = 10 * MIN;
+        assert!(rados_op_is_stale(&value(now - 6 * MIN), now, 5 * MIN));
+        // Exactly at, or younger than, the threshold: a live op is never swept.
+        assert!(!rados_op_is_stale(&value(now - 5 * MIN), now, 5 * MIN));
+        assert!(!rados_op_is_stale(&value(now - 1), now, 5 * MIN));
+        // Clock skew between the BPF stamp and our read cannot underflow.
+        assert!(!rados_op_is_stale(&value(now + 1), now, 5 * MIN));
+        // Inserted but not yet stamped by _send_op: the youngest op, not the oldest.
+        assert!(!rados_op_is_stale(&value(0), now, 5 * MIN));
+        // A truncated value cannot be judged, so it is left alone.
+        assert!(!rados_op_is_stale(&value(1)[..at + 4], now, 5 * MIN));
+    }
+
+    #[test]
+    fn rados_ops_sweep_interval_tracks_the_threshold() {
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(60)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(86_400)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

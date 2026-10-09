@@ -152,6 +152,27 @@ pub struct Cli {
     #[arg(long, default_value = "16M", value_parser = parse_ringbuf_size)]
     pub ringbuf_size: u32,
 
+    /// Capacity of the BPF `rados_ops` map, which holds every RADOS op between
+    /// `_send_op` and `_finish_op` (minimum 1024).
+    ///
+    /// The default is above Ceph's `objecter_inflight_ops` default (24576), the
+    /// most ops one Objecter keeps in flight. The map is a preallocated HASH of
+    /// ~600-byte entries, so the default costs ~20 MiB of kernel memory. When
+    /// it is full, new ops are not traced and `bpf_rados_map_drops` counts them.
+    #[arg(long, default_value_t = 32768, value_parser = parse_rados_ops_entries)]
+    pub bpf_rados_ops_entries: u32,
+
+    /// Delete `rados_ops` entries older than this many seconds (0 disables;
+    /// otherwise at least 60).
+    ///
+    /// An op whose client exits before `_finish_op` stays in the map forever,
+    /// and a long session would eventually fill it. The poll loop sweeps such
+    /// entries and counts them in `stale_rados_ops_swept`. The threshold must be
+    /// far above any real op latency: an op still blocked when swept (for
+    /// example on an inactive PG) emits no event when it completes.
+    #[arg(long, default_value = "300", value_parser = parse_stale_after)]
+    pub rados_ops_stale_after: Duration,
+
     #[arg(long)]
     pub dry_run: bool,
 
@@ -255,6 +276,37 @@ fn parse_ringbuf_size(value: &str) -> Result<u32, String> {
     u32::try_from(bytes).map_err(|_| format!("ring buffer size {bytes} does not fit in u32"))
 }
 
+/// The smallest `rados_ops` capacity accepted.
+const MIN_RADOS_OPS_ENTRIES: u32 = 1024;
+/// The shortest stale-op threshold accepted. Ceph flags an op as slow after 30
+/// seconds (`osd_op_complaint_time`), so anything younger than twice that may
+/// still be a live op.
+const MIN_RADOS_OPS_STALE_AFTER_SECS: u64 = 60;
+
+fn parse_rados_ops_entries(value: &str) -> Result<u32, String> {
+    let entries = value
+        .parse::<u32>()
+        .map_err(|err| format!("invalid entry count {value:?}: {err}"))?;
+    if entries < MIN_RADOS_OPS_ENTRIES {
+        return Err(format!(
+            "rados_ops needs at least {MIN_RADOS_OPS_ENTRIES} entries"
+        ));
+    }
+    Ok(entries)
+}
+
+fn parse_stale_after(value: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid duration {value:?}: {err}"))?;
+    if seconds != 0 && seconds < MIN_RADOS_OPS_STALE_AFTER_SECS {
+        return Err(format!(
+            "stale threshold must be 0 (disabled) or at least {MIN_RADOS_OPS_STALE_AFTER_SECS} seconds"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn parse_http_header(value: &str) -> Result<(String, String), String> {
     let Some((name, header_value)) = value.split_once(':') else {
         return Err("header must use NAME:VALUE syntax".to_string());
@@ -288,6 +340,26 @@ mod tests {
         assert!(parse_ringbuf_size("2048").is_err());
         assert!(parse_ringbuf_size("2G").is_err());
         assert!(parse_ringbuf_size("lots").is_err());
+    }
+
+    #[test]
+    fn rados_ops_sizing_defaults_cover_the_objecter_inflight_cap() {
+        let cli = Cli::parse_from(["rgwtrace"]);
+        // Above Ceph's objecter_inflight_ops default (24576).
+        assert_eq!(cli.bpf_rados_ops_entries, 32768);
+        assert_eq!(cli.rados_ops_stale_after, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn rados_ops_stale_after_refuses_thresholds_near_real_op_latency() {
+        // 0 disables the sweep; anything else must be far above a real op's
+        // latency, because a swept op that later completes loses its event.
+        assert_eq!(parse_stale_after("0"), Ok(Duration::ZERO));
+        assert_eq!(parse_stale_after("600"), Ok(Duration::from_secs(600)));
+        assert!(parse_stale_after("59").is_err());
+        assert!(parse_stale_after("soon").is_err());
+        assert!(parse_rados_ops_entries("1023").is_err());
+        assert_eq!(parse_rados_ops_entries("65536"), Ok(65536));
     }
 
     #[test]
