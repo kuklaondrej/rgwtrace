@@ -3276,9 +3276,41 @@ mod tests {
         DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
     };
 
+    // CI must not count a missing compiler, DWZ tool, or expected DWARF shape
+    // as a passing regression test. Other platforms report the skip explicitly.
+    fn fixture_skip() {
+        let test = std::thread::current();
+        let name = test.name().unwrap_or("unknown fixture");
+        assert!(
+            std::env::var_os("RGWTRACE_REQUIRE_DWARF_FIXTURES").is_none(),
+            "required DWARF fixture did not execute: {name}"
+        );
+        eprintln!("SKIPPED DWARF fixture: {name}");
+    }
+
+    fn fixture_debug_path(binary: std::path::PathBuf) -> std::path::PathBuf {
+        if cfg!(target_os = "macos") {
+            // Apple clang puts linked debug information here, not in the executable.
+            let mut bundle = binary.as_os_str().to_os_string();
+            bundle.push(".dSYM");
+            let debug = std::path::PathBuf::from(bundle)
+                .join("Contents/Resources/DWARF")
+                .join(binary.file_name().unwrap());
+            assert!(
+                debug.is_file(),
+                "missing fixture debug object: {}",
+                debug.display()
+            );
+            debug
+        } else {
+            binary
+        }
+    }
+
     #[test]
     fn parses_probe_function_pcs_from_cpp_fixture_when_compiler_is_available() {
         let Some(binary) = compile_cpp_fixture() else {
+            fixture_skip();
             return;
         };
 
@@ -3293,6 +3325,7 @@ mod tests {
     #[test]
     fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
         let Some(binary) = compile_cpp_fixture() else {
+            fixture_skip();
             return;
         };
         let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
@@ -3306,9 +3339,11 @@ mod tests {
             .status()
             .is_ok_and(|status| status.success())
         {
+            fixture_skip();
             return;
         }
         if std::fs::copy(&binary, &stripped).is_err() {
+            fixture_skip();
             return;
         }
         if !std::process::Command::new(&objcopy)
@@ -3321,6 +3356,7 @@ mod tests {
             .status()
             .is_ok_and(|status| status.success())
         {
+            fixture_skip();
             return;
         }
 
@@ -3471,10 +3507,12 @@ mod tests {
     #[test]
     fn translates_nested_member_offsets_from_cpp_fixture() {
         let Some(binary) = compile_field_fixture() else {
+            fixture_skip();
             return;
         };
 
         let Some(fields) = field_offsets_from_fixture(&binary).unwrap() else {
+            fixture_skip();
             return;
         };
 
@@ -3490,10 +3528,12 @@ mod tests {
     #[test]
     fn resolves_declared_member_type_from_another_compilation_unit() {
         let Some(binary) = compile_declared_type_fixture() else {
+            fixture_skip();
             return;
         };
 
         let Some(fields) = field_offsets_from_fixture(&binary).unwrap() else {
+            fixture_skip();
             return;
         };
 
@@ -3506,11 +3546,22 @@ mod tests {
 
     #[test]
     fn decodes_parameter_location_from_cpp_fixture() {
-        let Some(binary) = compile_field_fixture() else {
+        // A by-value aggregate can span several registers (DW_OP_piece), which
+        // this pointer-location test is not intended to support or exercise.
+        let Some(binary) = compile_cpp_source(
+            "parameter-fixture",
+            r#"
+            struct Outer { int value; };
+            __attribute__((noinline)) int inspect(Outer* outer) { return outer->value; }
+            int main(int argc, char**) { Outer outer = {argc}; return inspect(&outer); }
+        "#,
+        ) else {
+            fixture_skip();
             return;
         };
 
         let Some(location) = parameter_location_from_fixture(&binary).unwrap() else {
+            fixture_skip();
             return;
         };
 
@@ -3520,12 +3571,14 @@ mod tests {
     #[test]
     fn extracts_rgw_get_handler_var_fields_from_cpp_fixture() {
         let Some(binary) = compile_rgw_fixture() else {
+            fixture_skip();
             return;
         };
 
         let info = from_paths(&[binary.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
         let Some(fields) = module.func2vf.get("RGWREST::get_handler") else {
+            fixture_skip();
             return;
         };
 
@@ -3540,6 +3593,7 @@ mod tests {
     #[test]
     fn extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture() {
         let Some(binary) = compile_rgw_optimized_fixture() else {
+            fixture_skip();
             return;
         };
 
@@ -3562,6 +3616,7 @@ mod tests {
                 "SKIPPED extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture: \
                  no concrete RGWREST::get_handler instance found"
             );
+            fixture_skip();
             return;
         };
 
@@ -3574,6 +3629,7 @@ mod tests {
                 "SKIPPED extracts_rgw_get_handler_var_fields_from_optimized_cpp_fixture: \
                  toolchain did not emit the abstract_origin/no-name/no-type parameter shape"
             );
+            fixture_skip();
             return;
         }
 
@@ -3817,6 +3873,7 @@ mod tests {
     #[test]
     fn extracts_rgw_process_authenticated_raw_pointer_descriptor_from_cpp_fixture() {
         let Some(binary) = compile_rgw_process_authenticated_fixture() else {
+            fixture_skip();
             return;
         };
 
@@ -3833,6 +3890,7 @@ mod tests {
                 "SKIPPED extracts_rgw_process_authenticated_raw_pointer_descriptor_from_cpp_fixture: \
                  toolchain did not emit a decodable register location for the req_state* parameter"
             );
+            fixture_skip();
             return;
         };
 
@@ -3861,6 +3919,7 @@ mod tests {
         // caller's pointer variable instead of the RGWOp would silently correlate
         // nothing.
         let Some(binary) = compile_rgw_process_authenticated_fixture() else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -3870,6 +3929,7 @@ mod tests {
                 "SKIPPED extracts_the_rgw_op_reference_descriptor_that_carries_the_alternate_bridge_key: \
                  toolchain did not emit a decodable register location"
             );
+            fixture_skip();
             return;
         };
 
@@ -3905,6 +3965,7 @@ mod tests {
         // The req_state descriptor SURVIVES: losing the alternate key costs coverage
         // (ops submitted under an RGWOp dpp), not correctness.
         let Some(binary) = compile_rgw_process_authenticated_offset_base_fixture() else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -3914,6 +3975,7 @@ mod tests {
                 "SKIPPED refuses_the_rgw_op_key_when_its_dpp_base_is_not_at_offset_zero: \
                  toolchain did not emit a decodable register location"
             );
+            fixture_skip();
             return;
         };
 
@@ -4028,6 +4090,7 @@ mod tests {
         let Some(binary) = compile_namespaced_decoy_rgw_op_fixture(
             ": public FirstBase, public DoutPrefixProvider",
         ) else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -4037,6 +4100,7 @@ mod tests {
                 "SKIPPED a_namespaced_same_named_type_cannot_supply_the_offset_zero_proof: \
                  toolchain did not emit a decodable register location"
             );
+            fixture_skip();
             return;
         };
 
@@ -4063,6 +4127,7 @@ mod tests {
         // it refuses to be satisfied by a same-named type in a namespace.
         let Some(binary) = compile_namespaced_decoy_rgw_op_fixture(": public DoutPrefixProvider")
         else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -4072,6 +4137,7 @@ mod tests {
                 "SKIPPED the_real_global_type_is_still_found_through_a_cross_unit_declaration: \
                  toolchain did not emit a decodable register location"
             );
+            fixture_skip();
             return;
         };
 
@@ -4154,6 +4220,7 @@ mod tests {
     #[test]
     fn binds_req_state_dtor_to_the_complete_object_destructor_not_the_deleting_one() {
         let Some(binary) = compile_req_state_dtor_fixture() else {
+            fixture_skip();
             return;
         };
         let symbols = dtor_symbol_addresses(&binary);
@@ -4167,6 +4234,7 @@ mod tests {
                 "SKIPPED binds_req_state_dtor_to_the_complete_object_destructor_not_the_deleting_one: \
                  toolchain did not emit both destructor variants ({symbols:?})"
             );
+            fixture_skip();
             return;
         };
         assert_ne!(
@@ -4200,6 +4268,7 @@ mod tests {
         // subprogram DIE BEFORE the complete/base one, so a first-DIE-wins match
         // would again take D0.
         let Some(binary) = compile_req_state_dtor_fixture() else {
+            fixture_skip();
             return;
         };
         let symbols = dtor_symbol_addresses(&binary);
@@ -4209,6 +4278,7 @@ mod tests {
                 .get("_ZN9req_stateD1Ev")
                 .or_else(|| symbols.get("_ZN9req_stateD2Ev")),
         ) else {
+            fixture_skip();
             return;
         };
 
@@ -4229,6 +4299,7 @@ mod tests {
                 "SKIPPED binds_req_state_dtor_from_dwarf_dies_when_the_symbol_table_is_gone: \
                  objcopy unavailable"
             );
+            fixture_skip();
             return;
         }
         assert!(
@@ -4251,6 +4322,7 @@ mod tests {
     #[test]
     fn extracts_req_state_dtor_this_raw_pointer_descriptor_from_cpp_fixture() {
         let Some(binary) = compile_req_state_dtor_fixture() else {
+            fixture_skip();
             return;
         };
 
@@ -4261,6 +4333,7 @@ mod tests {
                 "SKIPPED extracts_req_state_dtor_this_raw_pointer_descriptor_from_cpp_fixture: \
                  toolchain did not emit a decodable register location for `this`"
             );
+            fixture_skip();
             return;
         };
 
@@ -4440,7 +4513,8 @@ mod tests {
         // The CONCRETE destructor definition: a subprogram with code whose reachable
         // mangled names make it an accepted (D1/D2) destructor.
         let mut concrete = None;
-        'units: for unit_index in 0..index.main_len() {
+        let mut best_rank = u8::MAX;
+        for unit_index in 0..index.main_len() {
             let unit = index.unit(unit_index);
             let mut entries = unit.entries();
             while let Some((_, entry)) = entries.next_dfs().ok()? {
@@ -4451,9 +4525,11 @@ mod tests {
                     continue;
                 };
                 let names = entry_linkage_names(&dwarf, &index, unit_index, entry).ok()?;
-                if definition_rank(REQ_STATE_DTOR, &names).is_some() {
-                    concrete = Some((unit_index, entry.offset(), low_pc));
-                    break 'units;
+                if let Some(rank) = definition_rank(REQ_STATE_DTOR, &names) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        concrete = Some((unit_index, entry.offset(), low_pc));
+                    }
                 }
             }
         }
@@ -4517,6 +4593,14 @@ mod tests {
         let mut entry_reg = None;
         let mut later_regs = Vec::new();
         if let Some(attr) = param_entry.attr(gimli::DW_AT_location).ok()? {
+            // An expression is a location too. Ignoring it incorrectly classified
+            // Apple clang's register-resident `this` as a stack-only fixture.
+            if let AttributeValue::Exprloc(expression) = attr.value() {
+                entry_reg = decode_location_expression(unit, None, expression)
+                    .ok()?
+                    .filter(|location| !location.stack)
+                    .map(|location| location.reg);
+            }
             if let Some(mut locations) = dwarf.attr_locations(unit, attr.value()).ok()? {
                 while let Some(location) = locations.next().ok()? {
                     loclist_entries += 1;
@@ -4549,12 +4633,14 @@ mod tests {
                 "SKIPPED extracts_req_state_dtor_this_descriptor_from_an_lto_cdtor_clone_with_a_loclist_this: \
                  no working C++ compiler with -flto"
             );
+            fixture_skip();
             return;
         };
         let Some(shape) = req_state_dtor_this_shape(&binary) else {
             eprintln!(
                 "SKIPPED ...lto_cdtor_clone...: no concrete D1/D2 destructor DIE in the fixture"
             );
+            fixture_skip();
             return;
         };
 
@@ -4573,6 +4659,7 @@ mod tests {
                  through >=2 abstract_origin hops, loclist-located and migrating out of the entry \
                  register): {shape:?}"
             );
+            fixture_skip();
             return;
         }
         let entry_reg = shape.entry_reg.expect("checked above");
@@ -4669,9 +4756,11 @@ mod tests {
             ],
             &["-g", "-O0"],
         ) else {
+            fixture_skip();
             return;
         };
         let Some(shape) = req_state_dtor_this_shape(&binary) else {
+            fixture_skip();
             return;
         };
         if shape.entry_reg.is_some() {
@@ -4679,6 +4768,7 @@ mod tests {
                 "SKIPPED refuses_the_req_state_dtor_descriptor_when_this_is_not_register_resident_at_entry: \
                  this toolchain DOES keep `this` in a register at -O0 ({shape:?})"
             );
+            fixture_skip();
             return;
         }
 
@@ -4722,6 +4812,7 @@ mod tests {
         // of the accepted variants and (b) actually correspond to the exported
         // address -- i.e. it is the address's provenance, not decoration.
         let Some(binary) = compile_req_state_dtor_fixture() else {
+            fixture_skip();
             return;
         };
         let symbols = dtor_symbol_addresses(&binary);
@@ -4730,6 +4821,7 @@ mod tests {
                 "SKIPPED exports_the_variant_provenance_of_the_req_state_dtor_address: \
                  toolchain emitted no destructor symbols"
             );
+            fixture_skip();
             return;
         }
 
@@ -4906,10 +4998,21 @@ mod tests {
         binary: &std::path::Path,
         overload: crate::dwarf_json::RadosOperateOverload,
     ) -> Option<u64> {
-        let data = fs::read(binary).ok()?;
+        // dSYM objects need not retain the executable's symbol table.
+        let executable = if cfg!(target_os = "macos") {
+            binary.ancestors().nth(5)?.join(binary.file_name()?)
+        } else {
+            binary.to_path_buf()
+        };
+        let data = fs::read(executable).ok()?;
         let file = object::File::parse(data.as_slice()).ok()?;
         file.symbols().find_map(|symbol| {
             let name = symbol.name().ok()?;
+            let name = if file.format() == object::BinaryFormat::MachO {
+                name.strip_prefix('_').unwrap_or(name)
+            } else {
+                name
+            };
             (crate::dwarf_json::rados_operate_overload(name) == Some(overload))
                 .then(|| symbol.address())
         })
@@ -4922,6 +5025,7 @@ mod tests {
         // demangled name -- and the fixture defines the WRITE one first, so a
         // first-match binder would give the read key the write overload's address.
         let Some(binary) = compile_rgw_rados_operate_fixture() else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -4986,6 +5090,7 @@ mod tests {
         // `location.reg` and NOTHING else -- it never dereferences the dpp -- so any
         // other shape is refused at import (`is_raw_pointer_descriptor`).
         let Some(binary) = compile_rgw_rados_operate_fixture() else {
+            fixture_skip();
             return;
         };
         let info = from_paths(&[binary.as_path()]).unwrap();
@@ -5126,12 +5231,14 @@ mod tests {
     #[test]
     fn extracts_objecter_finish_op_var_fields_from_cpp_fixture() {
         let Some(binary) = compile_objecter_fixture() else {
+            fixture_skip();
             return;
         };
 
         let info = from_paths(&[binary.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
         let Some(fields) = module.func2vf.get("Objecter::_finish_op") else {
+            fixture_skip();
             return;
         };
 
@@ -5147,12 +5254,14 @@ mod tests {
     #[test]
     fn extracts_objecter_send_op_var_fields_from_cpp_fixture() {
         let Some(binary) = compile_objecter_fixture() else {
+            fixture_skip();
             return;
         };
 
         let info = from_paths(&[binary.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
         let Some(fields) = module.func2vf.get("Objecter::_send_op") else {
+            fixture_skip();
             return;
         };
 
@@ -5231,10 +5340,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires RGWTRACE_ORACLE_JSON and matching Ceph binaries; see docs/development.md"]
     fn compares_native_output_to_cephtrace_json_oracle_when_configured() {
-        let Some((oracle_json, target_paths, compare_var_fields)) = oracle_config() else {
-            return;
-        };
+        let (oracle_json, target_paths, compare_var_fields) =
+            oracle_config().expect("external Ceph oracle configuration is required");
 
         let expected = DwarfInfo::from_path(&oracle_json).unwrap();
         let actual = from_paths(&target_paths).unwrap();
@@ -5719,6 +5828,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  dwz tool not installed"
             );
+            fixture_skip();
             return;
         }
         let Some(binary) = compile_dwz_pair() else {
@@ -5726,6 +5836,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  could not build/dwz the fixture pair"
             );
+            fixture_skip();
             return;
         };
 
@@ -5737,6 +5848,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  dwz did not emit a .gnu_debugaltlink"
             );
+            fixture_skip();
             return;
         }
         // Shape guard 2: the main file genuinely references DIEs in the
@@ -5748,6 +5860,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  dwz did not move DIEs into the supplementary file"
             );
+            fixture_skip();
             return;
         }
 
@@ -5759,6 +5872,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  could not compile the -O1 oracle"
             );
+            fixture_skip();
             return;
         };
         let pinfo = from_paths(&[pristine.as_path()]).unwrap();
@@ -5768,6 +5882,7 @@ mod tests {
                 "SKIPPED extracts_objecter_var_fields_through_dwz_supplementary_file: \
                  toolchain did not emit decodable var fields even without dwz"
             );
+            fixture_skip();
             return;
         };
 
@@ -5926,7 +6041,11 @@ mod tests {
             command.arg(source);
         }
         let status = command.arg("-o").arg(&binary).status().ok()?;
-        status.success().then_some(binary)
+        assert!(
+            status.success() || std::env::var_os("RGWTRACE_REQUIRE_DWARF_FIXTURES").is_none(),
+            "C++ fixture compilation failed"
+        );
+        status.success().then(|| fixture_debug_path(binary))
     }
 
     fn compile_cpp_sources_with_flags(
@@ -5954,13 +6073,17 @@ mod tests {
             })
             .collect::<Option<Vec<_>>>()?;
         let mut command = std::process::Command::new(compiler);
-        command.args(["-g", "-O0", "-fno-inline"]);
+        command.args(["-g", "-O1", "-fno-inline"]);
         command.args(extra_flags);
         for source in &sources {
             command.arg(source);
         }
         let status = command.arg("-o").arg(&binary).status().ok()?;
-        status.success().then_some(binary)
+        assert!(
+            status.success() || std::env::var_os("RGWTRACE_REQUIRE_DWARF_FIXTURES").is_none(),
+            "C++ fixture compilation failed"
+        );
+        status.success().then(|| fixture_debug_path(binary))
     }
 
     /// Returns whether the DWARF contains at least one attribute encoded as a
@@ -5991,6 +6114,7 @@ mod tests {
     #[test]
     fn resolves_probe_function_across_units_via_debug_info_ref() {
         let Some(binary) = compile_cross_unit_probe_fixture() else {
+            fixture_skip();
             return;
         };
 
@@ -6013,6 +6137,7 @@ mod tests {
                 "SKIPPED resolves_probe_function_across_units_via_debug_info_ref: \
                  toolchain emitted no cross-CU DebugInfoRef"
             );
+            fixture_skip();
             return;
         }
 

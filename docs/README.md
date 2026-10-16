@@ -43,6 +43,10 @@ superseded by later sections in the same document.
   guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+
+- [Private privileged-test lab](lab/README.md)
+- [Publication controls](publication-checklist.md)
+- [Dependency audit review](dependency-audit.md)
 - [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
   why the privileged helper scripts use private directories, generated keys
   and pinned downloads.

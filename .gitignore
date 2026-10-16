@@ -7,3 +7,13 @@ trace-data/
 *.skel.rs
 *.tmp.bpf.o
 .claude/
+
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.codex-smoke-artifacts/
+.codex-smoke-worktrees/
+e2e-artifacts/
+dwarf-artifacts/

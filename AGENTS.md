@@ -23,13 +23,13 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 ## Build / test / lint
 
 - Build: `cargo build` / `cargo build --release` (→ `target/release/rgwtrace`)
-- Format: `cargo fmt --check` (fix with `cargo fmt`)
-- Lint: `cargo clippy --all-targets -- -D warnings` (warnings are errors)
-- Test: `cargo test` (inline unit tests + `tests/cli_dry_run.rs`, `tests/bpf_source.rs`; fixtures in `tests/fixtures/`)
+- Format: `cargo fmt --all --check` (fix with `cargo fmt`)
+- Lint: `cargo clippy --workspace --locked --all-targets -- -D warnings` (warnings are errors)
+- Test: `cargo test --workspace --locked` (inline unit tests + `tests/cli_dry_run.rs`, `tests/bpf_source.rs`; fixtures in `tests/fixtures/`)
 - JSON self-test, no cluster: `python3 tests/e2e/verify-rgwtrace-json.py --self-test`
 - BPF verifier load check (Linux + root): `sudo scripts/verify-bpf-load.sh`
 
-**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test`, clippy (deny warnings), the Python self-test, release packaging tests (`tests/test_release.py`), and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) mirrors this gate and adds `cargo audit` + a release build.
+**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test --workspace --locked`, clippy (deny warnings), the Python self-test and verifier regression tests, release packaging tests (`tests/test_release.py`), and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) runs this gate on Linux x86-64/ARM64 and macOS, with separate pinned audit and workflow/history scans, release builds, and hosted Linux BPF loads. Privileged live-test templates are in `docs/lab/workflows/` and must only be installed in a private lab repository.
 
 ## Running locally
 
@@ -123,4 +123,4 @@ For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` i
 - Work on feature branches and PR into `main`; **never force-push `main`**.
 - Do not commit generated or ignored paths: `target/`, `dist/`, `*.o`, `*.skel.rs`, `trace-data/`, local env files.
 - Release automation: `.github/workflows/release.yml` publishes stable `vX.Y.Z` binary releases; `dwarf-release.yml` publishes validated, immutable DWARF catalogs from `release/dwarf-matrix.json`. See `docs/development.md#publishing-releases`.
-- PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).
+- PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test --workspace --locked`, `cargo fmt --all --check`, and `cargo clippy --workspace --locked --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).

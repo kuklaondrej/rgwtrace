@@ -38,12 +38,24 @@ RGWTRACE_BIN="${RGWTRACE_BIN:-${PROJECT_ROOT}/target/release/rgwtrace}"
 RGWTRACE_DWARF_JSON="${RGWTRACE_DWARF_JSON:-}"
 KEEP_E2E_RESOURCES="${KEEP_E2E_RESOURCES:-0}"
 WORKLOAD_CONCURRENT_REQUESTS="${WORKLOAD_CONCURRENT_REQUESTS:-4}"
-# Baseline (pre-cross-thread-bridge) correlation-rate thresholds. The manifest
-# object->request cross-check enforces zero mis-correlation unconditionally;
-# these coverage-rate gates stay at 0 until Stage 3's bridge lands, then get
-# raised to 0.90 (0.80 concurrent) per design-cross-thread-correlation.md §1.
-REQUIRE_GET_READ_CORRELATION="${REQUIRE_GET_READ_CORRELATION:-0}"
-REQUIRE_PUT_WRITE_CORRELATION="${REQUIRE_PUT_WRITE_CORRELATION:-0}"
+# Explicit per-rig coverage requirements: a zero/default threshold proves nothing.
+E2E_PROFILE="${E2E_PROFILE:-baseline}"
+REQUIRE_GET_READ_CORRELATION="${REQUIRE_GET_READ_CORRELATION:?set a measured positive GET coverage threshold}"
+REQUIRE_PUT_WRITE_CORRELATION="${REQUIRE_PUT_WRITE_CORRELATION:?set a measured positive PUT coverage threshold}"
+REQUIRE_LIST_SHARDS="${REQUIRE_LIST_SHARDS:-3}"
+case "${E2E_PROFILE}" in
+    baseline|cross-thread|no-end) ;;
+    *) printf 'unknown E2E_PROFILE: %s\n' "${E2E_PROFILE}" >&2; exit 1 ;;
+esac
+python3 - "${REQUIRE_GET_READ_CORRELATION}" "${REQUIRE_PUT_WRITE_CORRELATION}" "${REQUIRE_LIST_SHARDS}" <<'CHECK'
+import math, sys
+for value in sys.argv[1:3]:
+    rate = float(value)
+    if not math.isfinite(rate) or not 0 < rate <= 1:
+        raise SystemExit("coverage thresholds must be finite and in (0, 1]")
+if int(sys.argv[3]) < 2:
+    raise SystemExit("REQUIRE_LIST_SHARDS must be at least 2")
+CHECK
 
 PREFLIGHT_JSON="${ARTIFACT_DIR}/preflight.json"
 PREFLIGHT_LOG="${ARTIFACT_DIR}/preflight.log"
@@ -480,12 +492,17 @@ start_trace() {
         dwarf_args=(--dwarf-source json --import-json "${RGWTRACE_DWARF_JSON}")
     fi
 
+    local profile_args=()
+    if [[ "${E2E_PROFILE}" != "baseline" ]]; then
+        profile_args+=(--correlate-cross-thread)
+    fi
     local trace_timeout=$((TRACE_SECONDS + TRACE_ATTACH_DELAY + TRACE_TIMEOUT_GRACE))
 
     info "starting rgwtrace capture for ${TRACE_SECONDS}s (process timeout ${trace_timeout}s)"
     timeout "${trace_timeout}" \
         "${RGWTRACE_BIN}" \
         "${dwarf_args[@]}" \
+        "${profile_args[@]}" \
         --pid "${rgw_pid}" \
         --timeout "${TRACE_SECONDS}" \
         --output json \
@@ -503,6 +520,8 @@ run_workload() {
         --output "${WORKLOAD_JSONL}" \
         --manifest "${WORKLOAD_MANIFEST}" \
         --unique-keys \
+        --bucket-shards "${REQUIRE_LIST_SHARDS}" \
+        --rgw-admin "${RGW_ADMIN}" \
         --concurrent-requests "${WORKLOAD_CONCURRENT_REQUESTS}" \
         >"${WORKLOAD_LOG}" 2>&1; then
         err "S3 workload failed; see ${WORKLOAD_LOG} and ${WORKLOAD_JSONL}"
@@ -512,8 +531,21 @@ run_workload() {
 
 verify_trace() {
     info "verifying rgwtrace JSON output"
+    local evidence_args=(--require-list-shards "${REQUIRE_LIST_SHARDS}" --request-end present)
+    if [[ "${E2E_PROFILE}" == "cross-thread" ]]; then
+        evidence_args+=(--require-cross-thread)
+    elif [[ "${E2E_PROFILE}" == "no-end" ]]; then
+        evidence_args=(--require-list-shards "${REQUIRE_LIST_SHARDS}" --request-end absent)
+        # The fallback must be visible to operators, not only to the JSON verifier.
+        if ! grep -Fq 'request-END probe unavailable' "${TRACE_LOG}" ||
+            ! grep -Fq 'is DISABLED because the request-END probe did not attach' "${TRACE_LOG}"; then
+            err "no-END profile did not report the missing end probe"
+            return 1
+        fi
+    fi
     if ! python3 "${SCRIPT_DIR}/verify-rgwtrace-json.py" \
         --trace "${TRACE_JSON}" \
+        "${evidence_args[@]}" \
         --workload "${WORKLOAD_JSONL}" \
         --workload-manifest "${WORKLOAD_MANIFEST}" \
         --require-get-read-correlation "${REQUIRE_GET_READ_CORRELATION}" \
@@ -544,6 +576,15 @@ main() {
         "${NATIVE_DWARF_JSON}" \
         "${NATIVE_DWARF_LOG}"
     : >"${WORKLOAD_JSONL}"
+    uname -a >"${ARTIFACT_DIR}/kernel.txt"
+    printf '%s\n' "${E2E_PROFILE}" >"${ARTIFACT_DIR}/profile.txt"
+    printf 'GET=%s PUT=%s SHARDS=%s\n' "${REQUIRE_GET_READ_CORRELATION}" \
+        "${REQUIRE_PUT_WRITE_CORRELATION}" "${REQUIRE_LIST_SHARDS}" >"${ARTIFACT_DIR}/requirements.txt"
+    if [[ -f "${PROJECT_ROOT}/revision.txt" ]]; then
+        cp "${PROJECT_ROOT}/revision.txt" "${ARTIFACT_DIR}/revision.txt"
+    else
+        git -C "${PROJECT_ROOT}" rev-parse HEAD >"${ARTIFACT_DIR}/revision.txt"
+    fi
 
     if [[ ! -x "${RGWTRACE_BIN}" ]]; then
         err "rgwtrace binary not found at ${RGWTRACE_BIN}; run 'cargo build --release' first"
@@ -563,6 +604,21 @@ main() {
     info "found radosgw PID ${rgw_pid}"
 
     prepare_dwarf_json "${rgw_pid}"
+    if [[ "${E2E_PROFILE}" == "no-end" ]]; then
+        local source_json="${RGWTRACE_DWARF_JSON:-${NATIVE_DWARF_JSON}}"
+        RGWTRACE_DWARF_JSON="${ARTIFACT_DIR}/no-end-dwarf.json"
+        python3 - "${source_json}" "${RGWTRACE_DWARF_JSON}" <<'NOEND'
+import json, sys
+with open(sys.argv[1]) as handle:
+    artifact = json.load(handle)
+for module in artifact.values():
+    if isinstance(module, dict):
+        for key in ("func2pc", "func2vf", "func2linkage"):
+            module.get(key, {}).pop("req_state::~req_state", None)
+with open(sys.argv[2], "w") as handle:
+    json.dump(artifact, handle)
+NOEND
+    fi
     run_preflight "${rgw_pid}"
     start_trace "${rgw_pid}"
     sleep "${TRACE_ATTACH_DELAY}"
