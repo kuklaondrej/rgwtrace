@@ -55,3 +55,5 @@ superseded by later sections in the same document.
 - [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
   why the privileged helper scripts use private directories, generated keys
   and pinned downloads.
+
+- [Stale sweep cooldown](bugfix-stale-sweep-cooldown.md): bounded scan cycles yield CPU between cycles.

@@ -205,10 +205,10 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                         .lock()
                         .expect("collector lock poisoned")
                         .record_stale_rados_ops_swept(std::mem::take(&mut sweep.swept_pending));
-                    sweep.restart(&skel.maps.rados_ops);
+                    sweep.pause(Instant::now(), cli.rados_ops_stale_after);
                     warn!(
                         error = %format_args!("{err:#}"),
-                        "failed to sweep stale rados_ops entries; restarted the bounded scan"
+                        "failed to sweep stale rados_ops entries; retrying after the sweep interval"
                     );
                 }
             }
@@ -672,6 +672,10 @@ fn proc_stat_says_exited(stat: &str) -> bool {
         .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
 }
 
+fn rados_ops_sweep_interval(stale_after: Duration) -> Duration {
+    (stale_after / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
+}
+
 /// Limit map work between ring-buffer polls so a busy hash-map iterator cannot
 /// starve event consumption.
 const RADOS_OPS_SWEEP_BATCH_KEYS: usize = 256;
@@ -763,6 +767,7 @@ struct StaleRadosOpsSweep<'a> {
     scan_limit: usize,
     scan_remaining: usize,
     swept_pending: u64,
+    next_scan_at: Option<Instant>,
 }
 
 impl<'a> StaleRadosOpsSweep<'a> {
@@ -776,6 +781,7 @@ impl<'a> StaleRadosOpsSweep<'a> {
             scan_limit,
             scan_remaining: scan_limit,
             swept_pending: 0,
+            next_scan_at: None,
         })
     }
 
@@ -783,11 +789,30 @@ impl<'a> StaleRadosOpsSweep<'a> {
         self.keys = Some(map.keys());
         self.stale_candidates.clear();
         self.scan_remaining = self.scan_limit;
+        self.next_scan_at = None;
+    }
+
+    fn pause(&mut self, now: Instant, stale_after: Duration) {
+        self.keys = None;
+        self.stale_candidates.clear();
+        self.next_scan_at = Some(now + rados_ops_sweep_interval(stale_after));
+    }
+
+    fn waiting(&self, now: Instant) -> bool {
+        self.next_scan_at.is_some_and(|deadline| now < deadline)
     }
 
     /// Do at most one bounded scan or delete batch and return this batch's
     /// reclaim count so diagnostics stay current even if a later batch fails.
     fn run_batch<M: MapCore>(&mut self, map: &'a M, stale_after: Duration) -> Result<u64> {
+        // Check before map access and the stale-age clock read: idle cycles leave
+        // the ring reader its CPU even when polls return immediately.
+        if self.waiting(Instant::now()) {
+            return Ok(0);
+        }
+        if self.next_scan_at.is_some() {
+            self.restart(map);
+        }
         let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
         let stale_after_ns = duration_ns(stale_after);
 
@@ -813,7 +838,7 @@ impl<'a> StaleRadosOpsSweep<'a> {
 
         for _ in 0..RADOS_OPS_SWEEP_BATCH_KEYS {
             let Some(key) = self.stale_candidates.pop() else {
-                self.restart(map);
+                self.pause(Instant::now(), stale_after);
                 return Ok(std::mem::take(&mut self.swept_pending));
             };
             let outcome = match map.lookup_and_delete(&key) {
@@ -847,7 +872,7 @@ impl<'a> StaleRadosOpsSweep<'a> {
             }
         }
         if self.stale_candidates.is_empty() {
-            self.restart(map);
+            self.pause(Instant::now(), stale_after);
         }
         Ok(std::mem::take(&mut self.swept_pending))
     }
@@ -2086,6 +2111,46 @@ mod tests {
             stale_after,
         );
         assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn stale_sweep_pauses_only_between_cycles_and_preserves_counts() {
+        let now = Instant::now();
+        let mut sweep = StaleRadosOpsSweep {
+            keys: None,
+            stale_candidates: vec![vec![1]],
+            scan_limit: 10,
+            scan_remaining: 5,
+            swept_pending: 3,
+            next_scan_at: None,
+        };
+        assert!(!sweep.waiting(now));
+        sweep.pause(now, Duration::from_secs(60));
+        assert!(sweep.keys.is_none());
+        assert!(sweep.stale_candidates.is_empty());
+        assert_eq!(sweep.swept_pending, 3);
+        assert!(sweep.waiting(now + Duration::from_secs(5)));
+        assert!(!sweep.waiting(now + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn stale_sweep_cycles_have_a_capped_idle_interval() {
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(60)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(86_400)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
