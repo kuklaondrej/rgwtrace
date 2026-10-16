@@ -29,7 +29,7 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - JSON self-test, no cluster: `python3 tests/e2e/verify-rgwtrace-json.py --self-test`
 - BPF verifier load check (Linux + root): `sudo scripts/verify-bpf-load.sh`
 
-**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test --workspace --locked`, clippy (deny warnings), the Python self-test and verifier regression tests, and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) runs this gate on Linux x86-64/ARM64 and macOS, with separate pinned audit and workflow/history scans, release builds, and hosted Linux BPF loads. Privileged live-test templates are in `docs/lab/workflows/` and must only be installed in a private lab repository.
+**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test --workspace --locked`, clippy (deny warnings), the Python self-test and verifier regression tests, release packaging tests (`tests/test_release.py`), and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) runs this gate on Linux x86-64/ARM64 and macOS, with separate pinned audit and workflow/history scans, release builds, and hosted Linux BPF loads. Privileged live-test templates are in `docs/lab/workflows/` and must only be installed in a private lab repository.
 
 ## Running locally
 
@@ -84,6 +84,7 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - **A request must never be emitted twice under the same span id** — request-group expiry is open/closed aware (open = END still expected; never idle-expired, only lifetime-bounded), and every exported request key is remembered **for the whole session** in a never-reset Bloom filter so a straggler cannot resurrect it. Do not "bound" it with a FIFO: at production rates the memory turns over in seconds and a force-expired long request's late END then re-emits the same span id. A Bloom false positive is safe (it drops), a false negative is not (it duplicates) — and Bloom filters have none.
 - Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`.
 - Fixed capture caps (`MAX_TRANS_ID=128`, `MAX_OBJECT_NAME=128`, `MAX_ACTING=16`, `MAX_RADOS_OPS=3`, …). Overflow is surfaced via `RGWTRACE_TRUNC_*` flags (→ `rgwtrace.truncated` attr + counters), never silently dropped.
+- **Native DWARF input is untrusted** — every reference-following loop needs a hop cap or visited set, and a new DIE walker must be iterative (`next_dfs`) or depth-capped, never unbounded recursion. Whole-file reads go through `read_file_bounded` and decompression through `load_section`'s budget (`--max-debug-file-bytes`). Never fall back to the HOST package database for a target under another root's `/proc/<pid>/root`, and run host tools only through `host_tools::system_command`. See `docs/bugfix-dwarf-parser-limits.md`.
 - `dwarf_native.rs` hardcodes libstdc++ `std::string`/`std::vector` member names (`_M_dataplus`, `_M_string_length`, `_M_impl._M_start`) — ABI-coupled; touch with care.
 - Build-ID mismatch fails preflight/attach by default (`--allow-build-id-mismatch` overrides). Wrong DWARF yields silently wrong field offsets.
 - Correlation is intentionally conservative: RADOS ops join a request only via same-thread `trans_id`. Inference (`--correlate-inferred`) joins only a *unique* candidate within `--inference-window`.
@@ -121,4 +122,5 @@ For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` i
 - Prefer smaller, focused commits over one bulky commit.
 - Work on feature branches and PR into `main`; **never force-push `main`**.
 - Do not commit generated or ignored paths: `target/`, `dist/`, `*.o`, `*.skel.rs`, `trace-data/`, local env files.
+- Release automation: `.github/workflows/release.yml` publishes stable `vX.Y.Z` binary releases; `dwarf-release.yml` publishes validated, immutable DWARF catalogs from `release/dwarf-matrix.json`. See `docs/development.md#publishing-releases`.
 - PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test --workspace --locked`, `cargo fmt --all --check`, and `cargo clippy --workspace --locked --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).

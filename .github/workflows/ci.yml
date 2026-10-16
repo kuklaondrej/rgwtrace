@@ -42,6 +42,8 @@ jobs:
         run: echo 'RGWTRACE_REQUIRE_DWARF_FIXTURES=1' >> "$GITHUB_ENV"
       - name: Verify workspace and JSON verifier
         run: scripts/verify.sh
+      - name: Release packaging tests
+        run: python3 -m unittest discover -s tests -p 'test_release.py'
       - name: Release build
         run: cargo build --workspace --locked --release
       - name: Load BPF programs on the hosted Linux kernel

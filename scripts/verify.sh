@@ -10,6 +10,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --locked --all-targets -- -D warnings
 python3 tests/e2e/verify-rgwtrace-json.py --self-test
 python3 -m unittest discover -s tests/e2e -p 'test_*.py'
+python3 -m unittest discover -s tests -p 'test_release.py'
 git diff --check
 git diff --cached --check
 
