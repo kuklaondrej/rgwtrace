@@ -772,7 +772,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "clap",
- "libbpf-rs",
+ "libbpf-rs 0.24.8",
  "memmap2",
  "regex",
  "semver",
@@ -786,6 +786,18 @@ name = "libbpf-rs"
 version = "0.24.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93edd9cd673087fa7518fd63ad6c87be2cd9b4e35034b1873f3e3258c018275b"
+dependencies = [
+ "bitflags",
+ "libbpf-sys",
+ "libc",
+ "vsprintf",
+]
+
+[[package]]
+name = "libbpf-rs"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffef943d6690772a293abe80412ca438c227867cac93448af2518166df1b1a7b"
 dependencies = [
  "bitflags",
  "libbpf-sys",
@@ -1274,7 +1286,7 @@ dependencies = [
  "flate2",
  "gimli",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.27.2",
  "libc",
  "object",
  "opentelemetry-proto",
@@ -1293,7 +1305,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libbpf-cargo",
- "libbpf-rs",
+ "libbpf-rs 0.27.2",
  "libc",
  "serde",
  "serde_json",
