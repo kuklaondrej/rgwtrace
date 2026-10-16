@@ -5,7 +5,6 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Component, Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, ensure, Context, Result};
@@ -88,9 +87,7 @@ fn discover_library(
     }
 
     if let Some(pid) = pid {
-        if let Some(path) = first_existing_in_pid_root(pid, common_library_paths(soname)) {
-            return Ok(path);
-        }
+        return required_library_in_pid_root(pid, soname, common_library_paths(soname));
     }
 
     for path in common_library_paths(soname) {
@@ -324,6 +321,21 @@ fn first_existing_in_pid_root(
         .find(|path| path.exists())
 }
 
+/// Resolve a required library only from the target's root. Once `--pid` is
+/// selected, a host library is never a safe fallback for an absent mapping.
+fn required_library_in_pid_root(
+    pid: i32,
+    soname: &str,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Result<PathBuf> {
+    first_existing_in_pid_root(pid, candidates).ok_or_else(|| {
+        anyhow::anyhow!(
+            "failed to discover {soname} inside pid {pid}'s root; pass --{}",
+            soname_flag(soname)
+        )
+    })
+}
+
 /// Bound on symlink expansions, matching the kernel's `MAXSYMLINKS`.
 const MAX_SYMLINK_HOPS: usize = 40;
 
@@ -511,7 +523,10 @@ fn common_library_paths(soname: &str) -> Vec<PathBuf> {
 }
 
 fn ldconfig_path(soname: &str) -> Option<PathBuf> {
-    let output = Command::new("ldconfig").arg("-p").output().ok()?;
+    let output = crate::host_tools::system_command(crate::host_tools::LDCONFIG)?
+        .arg("-p")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -547,6 +562,7 @@ mod tests {
             import_json: Some("x.json".into()),
             dwarf_source: crate::cli::DwarfSource::Json,
             ceph_version: None,
+            max_debug_file_bytes: crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),
@@ -699,6 +715,21 @@ mod tests {
             path,
             PathBuf::from(format!("/proc/{}/root/usr/lib/librados.so.2.0.0", i32::MAX))
         );
+    }
+
+    #[test]
+    fn missing_required_pid_root_library_is_an_error() {
+        let pid = i32::MAX;
+        let err = required_library_in_pid_root(
+            pid,
+            "librados.so.2",
+            [PathBuf::from("/definitely-not-present/librados.so.2")],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("inside pid"), "{err}");
+        assert!(err.contains("--librados-path"), "{err}");
     }
 
     /// F8: `/proc/<pid>/exe` of an upgraded daemon reads `.../radosgw (deleted)`.

@@ -272,6 +272,19 @@ Native DWARF parsing supports the current RGW/RADOS probe set: `Objecter::_send_
 
 It discovers debug data from embedded DWARF, `.gnu_debuglink`, and build-id paths, then extracts module build IDs, probe PCs, variable locations, and member field paths into the existing probe field model.
 
+Native extraction treats every input file as untrusted (see [DWARF parser limits](docs/bugfix-dwarf-parser-limits.md)):
+
+- Reference-following loops are bounded: 64 typedef/cv or pointer links per type walk, 4096 base classes per member lookup (with a visited set). The whole-unit type and scope searches are iterative `next_dfs` walks. The two function walkers stay recursive, because their `EntriesTree` skips subprogram bodies via `DW_AT_sibling`, and are capped at 256 scope levels. A limit that is hit is an error naming the DIE's `.debug_info` offset.
+- `--max-debug-file-bytes` (default 4 GiB) caps every whole-file read (target, debuglink/build-id debug file, DWZ supplementary file) and the total declared size of one file's compressed sections. The cap is checked before anything is read or inflated.
+- The Ceph version comes from `--ceph-version`, then an embedded `ceph version` string, then MicroCeph metadata, then the host package database. The host database is skipped, with an error that asks for `--ceph-version`, when a target is under a `/proc/<pid>/root` that is not the host root. Host tools run by absolute path with a cleared environment.
+
+Performance notes:
+
+- Each target is read once. The embedded version and the module build ID come from the buffer `parse_module` already holds. Preflight reads the build-ID note through `object::ReadCache`.
+- Uncompressed DWARF sections are borrowed from the file buffer, not copied.
+- Mangled names are demangled only if they contain a probe's leaf identifier, which is derived from the probe table.
+- Still open: type and scope lookups re-walk every unit per lookup, and zstd sections are bounded only after inflation (`object` 0.39). See the bugfix note.
+
 `cephtrace` JSON import remains supported as a stable fallback and oracle for native extraction.
 
 Build IDs are validated against discovered binaries. Mismatches fail by default and require `--allow-build-id-mismatch` to continue.
