@@ -394,15 +394,29 @@ pub const DEFAULT_INFERENCE_MAX_PENDING: usize = 65_536;
 #[derive(Debug)]
 pub(crate) struct IntervalSet<K> {
     by_length: BTreeMap<u32, BTreeSet<(u64, u64, K)>>,
-    by_end: BTreeSet<(u64, u64, K)>,
+    overlap_root: Option<Box<IntervalNode<K>>>,
+    next_priority: u64,
     pub(crate) scanned: std::cell::Cell<usize>,
+}
+
+#[derive(Debug)]
+struct IntervalNode<K> {
+    lower: u64,
+    upper: u64,
+    key: K,
+    priority: u64,
+    min_lower: u64,
+    max_upper: u64,
+    left: Option<Box<Self>>,
+    right: Option<Box<Self>>,
 }
 
 impl<K> Default for IntervalSet<K> {
     fn default() -> Self {
         Self {
             by_length: BTreeMap::new(),
-            by_end: BTreeSet::new(),
+            overlap_root: None,
+            next_priority: 0,
             scanned: std::cell::Cell::new(0),
         }
     }
@@ -414,22 +428,45 @@ impl<K: Ord + Clone> IntervalSet<K> {
     }
 
     pub(crate) fn insert(&mut self, lower: u64, upper: u64, key: K) {
-        self.by_length
+        let inserted = self
+            .by_length
             .entry(Self::length_class(lower, upper))
             .or_default()
             .insert((lower, upper, key.clone()));
-        self.by_end.insert((upper, lower, key));
+        if !inserted {
+            return;
+        }
+        let priority = splitmix64(self.next_priority);
+        self.next_priority = self.next_priority.wrapping_add(1);
+        self.overlap_root = Some(insert_interval(
+            self.overlap_root.take(),
+            Box::new(IntervalNode {
+                lower,
+                upper,
+                key,
+                priority,
+                min_lower: lower,
+                max_upper: upper,
+                left: None,
+                right: None,
+            }),
+        ));
     }
 
     fn remove(&mut self, lower: u64, upper: u64, key: K) {
         let class = Self::length_class(lower, upper);
-        if let Some(entries) = self.by_length.get_mut(&class) {
-            entries.remove(&(lower, upper, key.clone()));
+        let removed = if let Some(entries) = self.by_length.get_mut(&class) {
+            let removed = entries.remove(&(lower, upper, key.clone()));
             if entries.is_empty() {
                 self.by_length.remove(&class);
             }
+            removed
+        } else {
+            false
+        };
+        if removed {
+            self.overlap_root = remove_interval(self.overlap_root.take(), &(lower, upper, key));
         }
-        self.by_end.remove(&(upper, lower, key));
     }
 
     fn is_empty(&self) -> bool {
@@ -469,14 +506,130 @@ impl<K: Ord + Clone> IntervalSet<K> {
             .map(|(_, key)| key)
     }
 
-    /// Test whether any interval overlaps the query, using the end-ordered
-    /// index to skip intervals that have already ended before `lower`.
-    pub(crate) fn any_overlapping(&self, lower: u64, upper: u64, min_key: &K) -> bool {
-        self.by_end
-            .range((lower, 0, min_key.clone())..)
-            .inspect(|_| self.scanned.set(self.scanned.get() + 1))
-            .any(|(_, start, _)| *start <= upper)
+    /// Test whether any interval overlaps the query. Subtree bounds on both
+    /// interval endpoints skip ranges lying wholly before or after the query.
+    pub(crate) fn any_overlapping(&self, lower: u64, upper: u64) -> bool {
+        any_interval_overlapping(self.overlap_root.as_deref(), lower, upper, &self.scanned)
     }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn interval_key_cmp<K: Ord>(a: &IntervalNode<K>, b: &IntervalNode<K>) -> std::cmp::Ordering {
+    (&a.lower, &a.upper, &a.key).cmp(&(&b.lower, &b.upper, &b.key))
+}
+
+fn refresh_interval<K>(node: &mut IntervalNode<K>) {
+    node.min_lower = node.lower;
+    node.max_upper = node.upper;
+    for child in [&node.left, &node.right].into_iter().flatten() {
+        node.min_lower = node.min_lower.min(child.min_lower);
+        node.max_upper = node.max_upper.max(child.max_upper);
+    }
+}
+
+fn rotate_interval_right<K>(mut root: Box<IntervalNode<K>>) -> Box<IntervalNode<K>> {
+    let mut pivot = root.left.take().expect("right rotation needs left child");
+    root.left = pivot.right.take();
+    refresh_interval(&mut root);
+    pivot.right = Some(root);
+    refresh_interval(&mut pivot);
+    pivot
+}
+
+fn rotate_interval_left<K>(mut root: Box<IntervalNode<K>>) -> Box<IntervalNode<K>> {
+    let mut pivot = root.right.take().expect("left rotation needs right child");
+    root.right = pivot.left.take();
+    refresh_interval(&mut root);
+    pivot.left = Some(root);
+    refresh_interval(&mut pivot);
+    pivot
+}
+
+fn insert_interval<K: Ord>(
+    root: Option<Box<IntervalNode<K>>>,
+    inserted: Box<IntervalNode<K>>,
+) -> Box<IntervalNode<K>> {
+    let Some(mut root) = root else {
+        return inserted;
+    };
+    if interval_key_cmp(&inserted, &root).is_lt() {
+        root.left = Some(insert_interval(root.left.take(), inserted));
+        if root
+            .left
+            .as_ref()
+            .is_some_and(|left| left.priority > root.priority)
+        {
+            root = rotate_interval_right(root);
+        }
+    } else {
+        root.right = Some(insert_interval(root.right.take(), inserted));
+        if root
+            .right
+            .as_ref()
+            .is_some_and(|right| right.priority > root.priority)
+        {
+            root = rotate_interval_left(root);
+        }
+    }
+    refresh_interval(&mut root);
+    root
+}
+
+fn merge_intervals<K>(
+    left: Option<Box<IntervalNode<K>>>,
+    right: Option<Box<IntervalNode<K>>>,
+) -> Option<Box<IntervalNode<K>>> {
+    match (left, right) {
+        (None, tree) | (tree, None) => tree,
+        (Some(mut left), Some(right)) if left.priority >= right.priority => {
+            left.right = merge_intervals(left.right.take(), Some(right));
+            refresh_interval(&mut left);
+            Some(left)
+        }
+        (Some(left), Some(mut right)) => {
+            right.left = merge_intervals(Some(left), right.left.take());
+            refresh_interval(&mut right);
+            Some(right)
+        }
+    }
+}
+
+fn remove_interval<K: Ord>(
+    root: Option<Box<IntervalNode<K>>>,
+    key: &(u64, u64, K),
+) -> Option<Box<IntervalNode<K>>> {
+    let mut root = root?;
+    match (&root.lower, &root.upper, &root.key).cmp(&(&key.0, &key.1, &key.2)) {
+        std::cmp::Ordering::Less => root.right = remove_interval(root.right.take(), key),
+        std::cmp::Ordering::Greater => root.left = remove_interval(root.left.take(), key),
+        std::cmp::Ordering::Equal => return merge_intervals(root.left.take(), root.right.take()),
+    }
+    refresh_interval(&mut root);
+    Some(root)
+}
+
+fn any_interval_overlapping<K: Ord>(
+    root: Option<&IntervalNode<K>>,
+    lower: u64,
+    upper: u64,
+    scanned: &std::cell::Cell<usize>,
+) -> bool {
+    let Some(node) = root else { return false };
+    scanned.set(scanned.get() + 1);
+    if node.max_upper < lower || node.min_lower > upper {
+        return false;
+    }
+    if node.lower <= upper && node.upper >= lower {
+        return true;
+    }
+    any_interval_overlapping(node.left.as_deref(), lower, upper, scanned)
+        || any_interval_overlapping(node.right.as_deref(), lower, upper, scanned)
 }
 
 /// The candidate markers of one pid (or one thread).
@@ -665,7 +818,7 @@ impl Inference {
     fn is_candidate_of_pending(&self, slot: CandidateSlot) -> bool {
         self.pending_by_pid
             .get(&slot.pid)
-            .is_some_and(|ops| ops.any_overlapping(slot.lower_ns, slot.upper_ns, &0))
+            .is_some_and(|ops| ops.any_overlapping(slot.lower_ns, slot.upper_ns))
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -2458,13 +2611,95 @@ mod tests {
 
     #[test]
     fn pending_candidate_lookup_skips_ops_that_ended_before_request() {
-        let mut ops = IntervalSet::default();
+        let mut older = IntervalSet::default();
         for id in 0..10_000 {
-            ops.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+            older.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+        }
+        assert!(!older.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            older.scanned.get() <= 64,
+            "visited {} older ops",
+            older.scanned.get()
+        );
+
+        let mut newer = IntervalSet::default();
+        for id in 0..10_000 {
+            newer.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id);
+        }
+        assert!(!newer.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            newer.scanned.get() <= 64,
+            "visited {} newer ops",
+            newer.scanned.get()
+        );
+
+        let mut mixed = IntervalSet::default();
+        for id in 0..10_000 {
+            mixed.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+            mixed.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id + 10_000);
+        }
+        assert!(!mixed.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            mixed.scanned.get() <= 64,
+            "visited {} mixed ops",
+            mixed.scanned.get()
+        );
+    }
+
+    #[test]
+    fn interval_treap_matches_linear_overlap_oracle_across_updates() {
+        let mut index = IntervalSet::default();
+        let mut reference = Vec::<(u64, u64, u64)>::new();
+        for id in 0..32 {
+            let (lower, upper) = if id < 16 { (10, 20) } else { (100, 110) };
+            index.insert(lower, upper, id);
+            reference.push((lower, upper, id));
+        }
+        index.insert(u64::MAX - 5, u64::MAX, 32);
+        reference.push((u64::MAX - 5, u64::MAX, 32));
+        let mut duplicates = IntervalSet::default();
+        duplicates.insert(10, 20, 0);
+        duplicates.insert(10, 20, 0);
+        duplicates.insert(30, 40, 1);
+        duplicates.remove(10, 20, 0);
+        assert!(!duplicates.any_overlapping(10, 20));
+        assert!(duplicates.any_overlapping(30, 40));
+
+        let mut boundary = IntervalSet::default();
+        boundary.insert(10, 20, 1);
+        assert!(boundary.any_overlapping(20, 25));
+        assert!(!boundary.any_overlapping(21, 25));
+
+        let mut seed = 0x7a31_4c29_u64;
+        let mut next_key = 33;
+        for step in 0..2_000_u64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if step % 3 == 0 && !reference.is_empty() {
+                let slot = (seed as usize) % reference.len();
+                let (lower, upper, key) = reference.swap_remove(slot);
+                index.remove(lower, upper, key);
+            } else {
+                let lower = (seed >> 16) % 256;
+                let upper = lower + ((seed >> 40) % 32);
+                index.insert(lower, upper, next_key);
+                reference.push((lower, upper, next_key));
+                next_key += 1;
+            }
+
+            let query_lower = (seed >> 24) % 280;
+            let query_upper = query_lower + ((seed >> 48) % 24);
+            let expected = reference
+                .iter()
+                .any(|(lower, upper, _)| *lower <= query_upper && *upper >= query_lower);
+            assert_eq!(index.any_overlapping(query_lower, query_upper), expected);
         }
 
-        assert!(!ops.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000, &0));
-        assert_eq!(ops.scanned.get(), 0);
+        index.insert(u64::MAX - 5, u64::MAX, 32);
+        assert!(index.any_overlapping(u64::MAX, u64::MAX));
+        index.remove(u64::MAX - 5, u64::MAX, 32);
+        assert!(!index.any_overlapping(u64::MAX, u64::MAX));
+        let saturated = CandidateSlot::of(&request("saturation", u64::MAX - 2, u64::MAX - 1), 10);
+        assert_eq!(saturated.upper_ns, u64::MAX);
     }
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
