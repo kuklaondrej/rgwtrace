@@ -148,7 +148,7 @@ mod tests {
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
-            trans_id: trans_id.to_string(),
+            trans_id: trans_id.into(),
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,

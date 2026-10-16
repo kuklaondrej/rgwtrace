@@ -2,6 +2,7 @@
 import argparse
 from copy import deepcopy
 import json
+import math
 import sys
 from types import SimpleNamespace
 
@@ -169,6 +170,13 @@ RADOS_ATTRIBUTE_KEYS = [
 ]
 
 
+def correlation_rate(value):
+    rate = float(value)
+    if not math.isfinite(rate) or not 0 < rate <= 1:
+        raise argparse.ArgumentTypeError("correlation rate must be finite and in (0, 1]")
+    return rate
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Verify rgwtrace JSON from a live RGW e2e run")
     parser.add_argument("--trace")
@@ -199,7 +207,7 @@ def parse_args():
     )
     parser.add_argument(
         "--require-get-read-correlation",
-        type=float,
+        type=correlation_rate,
         default=None,
         metavar="RATE",
         help="fail if the fraction of manifest GET data ops with a correctly correlated "
@@ -207,13 +215,23 @@ def parse_args():
     )
     parser.add_argument(
         "--require-put-write-correlation",
-        type=float,
+        type=correlation_rate,
         default=None,
         metavar="RATE",
         help="fail if the fraction of manifest PUT data ops with a correctly correlated "
         "write RADOS span is below RATE (requires --workload-manifest)",
     )
+    parser.add_argument("--require-list-shards", type=int, default=None,
+                        help="require every manifest LIST to correlate at least this many distinct shard objects")
+    parser.add_argument("--require-cross-thread", action="store_true",
+                        help="require actual cross-thread children and per-submit bridge hits")
+    parser.add_argument("--request-end", choices=("present", "absent"),
+                        help="require measured END activity or verify the no-END fallback")
     args = parser.parse_args()
+    if args.require_list_shards is not None and args.require_list_shards < 2:
+        parser.error("--require-list-shards must be at least 2")
+    if args.require_list_shards and not (args.workload_manifest or args.self_test):
+        parser.error("--require-list-shards requires --workload-manifest")
     if (args.require_get_read_correlation is not None or args.require_put_write_correlation is not None) and not (
         args.workload_manifest or args.self_test
     ):
@@ -1005,6 +1023,35 @@ def verify_document(args, document, workload, manifest=None):
         list_shard_coverage = check_list_shard_correlation(
             errors, manifest, rados_spans, background_spans, request_by_id
         )
+
+    required_shards = getattr(args, "require_list_shards", 0)
+    if required_shards:
+        lists = [record for record in (manifest or [])
+                 if record.get("op") == "LIST" and record.get("status", "ok") == "ok"]
+        if not lists:
+            fail(errors, "required list shards: no successful LIST workload to evaluate")
+        for record in lists:
+            request_id = record.get("x_amz_request_id")
+            objects = {attr_map(span).get("ceph.rados.object") for span in rados_spans
+                       if is_bucket_list_span(span) and request_id
+                       and span_parent_trans_id(span, request_by_id) == request_id}
+            objects.discard(None)
+            objects.discard("")
+            if len(objects) < required_shards:
+                fail(errors, f"required list shards: {request_id!r} correlated {len(objects)} "
+                     f"distinct shards, expected at least {required_shards}")
+
+    if getattr(args, "require_cross_thread", False):
+        if diagnostics.get("cross_thread_correlations", 0) <= 0 or diagnostics.get("bpf_operate_seed_hits", 0) <= 0:
+            fail(errors, "required cross-thread coverage: need cross-thread children and per-submit seed hits")
+    request_end = getattr(args, "request_end", None)
+    if request_end == "present":
+        if diagnostics.get("request_end_markers", 0) <= 0 or measured_request_spans <= 0:
+            fail(errors, "required request-END coverage: no measured request ends")
+    elif request_end == "absent":
+        if (diagnostics.get("request_end_markers", 0) or measured_request_spans
+                or diagnostics.get("bpf_operate_seed_hits", 0)):
+            fail(errors, "absent request-END profile observed END markers, measured spans, or per-submit seeds")
 
     summary = {
         "spans": len(spans),

@@ -4,9 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# shellcheck source=scripts/lib/private-dir.sh
+. "${PROJECT_ROOT}/scripts/lib/private-dir.sh"
+
 PATH="/snap/bin:${PATH}"
 
-ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-e2e}"
+# Everything below runs as root and the artifacts include the exported
+# DWARF, the trace and the RGW user record: keep them private.
+umask 077
+
+# Default to a fresh private directory. A caller-supplied ARTIFACT_DIR is
+# created with mode 0700 if missing, otherwise it must already be ours and
+# not group/other writable (checked in main before anything is written).
+ARTIFACT_DIR="${ARTIFACT_DIR:-$(rgwtrace_private_tmpdir rgwtrace-e2e)}"
 TRACE_SECONDS="${TRACE_SECONDS:-60}"
 TRACE_ATTACH_DELAY="${TRACE_ATTACH_DELAY:-6}"
 TRACE_TIMEOUT_GRACE="${TRACE_TIMEOUT_GRACE:-180}"
@@ -19,18 +29,33 @@ MICROCEPH_ALLOW_CHANNEL_SWITCH="${MICROCEPH_ALLOW_CHANNEL_SWITCH:-0}"
 RGW_PORT="${RGW_PORT:-8080}"
 RGW_ENDPOINT="${RGW_ENDPOINT:-}"
 RGW_USER="${RGW_USER:-rgwtrace-e2e}"
-RGW_ACCESS_KEY="${RGW_ACCESS_KEY:-RGWTRACEACCESSKEY001}"
-RGW_SECRET_KEY="${RGW_SECRET_KEY:-rgwtrace-secret-key-rgwtrace-secret-key}"
+# Credentials are generated per run by radosgw-admin unless BOTH are supplied.
+# No well-known default: the user is reachable on the RGW port for the whole
+# run, and a fixed key pair would let anyone on the network use it.
+RGW_ACCESS_KEY="${RGW_ACCESS_KEY:-}"
+RGW_SECRET_KEY="${RGW_SECRET_KEY:-}"
 RGWTRACE_BIN="${RGWTRACE_BIN:-${PROJECT_ROOT}/target/release/rgwtrace}"
 RGWTRACE_DWARF_JSON="${RGWTRACE_DWARF_JSON:-}"
 KEEP_E2E_RESOURCES="${KEEP_E2E_RESOURCES:-0}"
 WORKLOAD_CONCURRENT_REQUESTS="${WORKLOAD_CONCURRENT_REQUESTS:-4}"
-# Baseline (pre-cross-thread-bridge) correlation-rate thresholds. The manifest
-# object->request cross-check enforces zero mis-correlation unconditionally;
-# these coverage-rate gates stay at 0 until Stage 3's bridge lands, then get
-# raised to 0.90 (0.80 concurrent) per design-cross-thread-correlation.md §1.
-REQUIRE_GET_READ_CORRELATION="${REQUIRE_GET_READ_CORRELATION:-0}"
-REQUIRE_PUT_WRITE_CORRELATION="${REQUIRE_PUT_WRITE_CORRELATION:-0}"
+# Explicit per-rig coverage requirements: a zero/default threshold proves nothing.
+E2E_PROFILE="${E2E_PROFILE:-baseline}"
+REQUIRE_GET_READ_CORRELATION="${REQUIRE_GET_READ_CORRELATION:?set a measured positive GET coverage threshold}"
+REQUIRE_PUT_WRITE_CORRELATION="${REQUIRE_PUT_WRITE_CORRELATION:?set a measured positive PUT coverage threshold}"
+REQUIRE_LIST_SHARDS="${REQUIRE_LIST_SHARDS:-3}"
+case "${E2E_PROFILE}" in
+    baseline|cross-thread|no-end) ;;
+    *) printf 'unknown E2E_PROFILE: %s\n' "${E2E_PROFILE}" >&2; exit 1 ;;
+esac
+python3 - "${REQUIRE_GET_READ_CORRELATION}" "${REQUIRE_PUT_WRITE_CORRELATION}" "${REQUIRE_LIST_SHARDS}" <<'CHECK'
+import math, sys
+for value in sys.argv[1:3]:
+    rate = float(value)
+    if not math.isfinite(rate) or not 0 < rate <= 1:
+        raise SystemExit("coverage thresholds must be finite and in (0, 1]")
+if int(sys.argv[3]) < 2:
+    raise SystemExit("REQUIRE_LIST_SHARDS must be at least 2")
+CHECK
 
 PREFLIGHT_JSON="${ARTIFACT_DIR}/preflight.json"
 PREFLIGHT_LOG="${ARTIFACT_DIR}/preflight.log"
@@ -68,11 +93,15 @@ cleanup() {
     fi
     pkill -f "${RGWTRACE_BIN}" 2>/dev/null || true
 
-    if [[ ${rc} -eq 0 && "${KEEP_E2E_RESOURCES}" != "1" && -n "${RGW_ADMIN}" ]]; then
+    # Purge the user on every exit path, not only on success: a failed run
+    # must not leave a credentialed S3 user behind on the host.
+    if [[ "${KEEP_E2E_RESOURCES}" != "1" && -n "${RGW_ADMIN}" ]]; then
         "${RGW_ADMIN}" user rm --uid="${RGW_USER}" --purge-data --purge-keys >/dev/null 2>&1 || true
+    elif [[ "${KEEP_E2E_RESOURCES}" == "1" && -n "${RGW_ADMIN}" ]]; then
+        info "KEEP_E2E_RESOURCES=1: RGW user ${RGW_USER} kept; read its keys with '${RGW_ADMIN} user info --uid=${RGW_USER}'"
     fi
 
-    info "artifacts preserved in ${ARTIFACT_DIR}"
+    info "artifacts preserved in ${ARTIFACT_DIR} (rc=${rc})"
 }
 trap cleanup EXIT
 
@@ -352,12 +381,49 @@ find_rgw_admin() {
 create_rgw_user() {
     find_rgw_admin
     "${RGW_ADMIN}" user rm --uid="${RGW_USER}" --purge-data --purge-keys >/dev/null 2>&1 || true
-    "${RGW_ADMIN}" user create \
+
+    local key_args=()
+    if [[ -n "${RGW_ACCESS_KEY}" && -n "${RGW_SECRET_KEY}" ]]; then
+        key_args=(--access-key="${RGW_ACCESS_KEY}" --secret-key="${RGW_SECRET_KEY}")
+    elif [[ -n "${RGW_ACCESS_KEY}" || -n "${RGW_SECRET_KEY}" ]]; then
+        err "set both RGW_ACCESS_KEY and RGW_SECRET_KEY, or neither (keys are then generated per run)"
+        return 1
+    fi
+
+    # With no key flags radosgw-admin generates a random S3 key pair itself,
+    # so the secret never appears on a command line. The JSON is kept in
+    # memory; the persisted copy has the secrets redacted.
+    local user_json
+    user_json="$("${RGW_ADMIN}" user create \
         --uid="${RGW_USER}" \
         --display-name="${RGW_USER}" \
-        --access-key="${RGW_ACCESS_KEY}" \
-        --secret-key="${RGW_SECRET_KEY}" \
-        --format=json >"${RGW_USER_JSON}"
+        "${key_args[@]}" \
+        --format=json)"
+
+    local creds
+    creds="$(printf '%s' "${user_json}" | python3 -c '
+import json, sys
+user = json.load(sys.stdin)
+keys = [k for k in user.get("keys", []) if k.get("access_key") and k.get("secret_key")]
+if not keys:
+    sys.exit("radosgw-admin user create returned no S3 key pair")
+print(keys[0]["access_key"])
+print(keys[0]["secret_key"])
+')" || return 1
+    RGW_ACCESS_KEY="$(printf '%s\n' "${creds}" | sed -n 1p)"
+    RGW_SECRET_KEY="$(printf '%s\n' "${creds}" | sed -n 2p)"
+
+    printf '%s' "${user_json}" | python3 -c '
+import json, sys
+user = json.load(sys.stdin)
+for field in ("keys", "swift_keys"):
+    for entry in user.get(field, []):
+        if "secret_key" in entry:
+            entry["secret_key"] = "<redacted>"
+json.dump(user, sys.stdout, indent=2)
+sys.stdout.write("\n")
+' >"${RGW_USER_JSON}"
+    info "created RGW user ${RGW_USER} (access key ${RGW_ACCESS_KEY}; secret redacted in ${RGW_USER_JSON})"
 }
 
 find_rgw_pid() {
@@ -426,12 +492,17 @@ start_trace() {
         dwarf_args=(--dwarf-source json --import-json "${RGWTRACE_DWARF_JSON}")
     fi
 
+    local profile_args=()
+    if [[ "${E2E_PROFILE}" != "baseline" ]]; then
+        profile_args+=(--correlate-cross-thread)
+    fi
     local trace_timeout=$((TRACE_SECONDS + TRACE_ATTACH_DELAY + TRACE_TIMEOUT_GRACE))
 
     info "starting rgwtrace capture for ${TRACE_SECONDS}s (process timeout ${trace_timeout}s)"
     timeout "${trace_timeout}" \
         "${RGWTRACE_BIN}" \
         "${dwarf_args[@]}" \
+        "${profile_args[@]}" \
         --pid "${rgw_pid}" \
         --timeout "${TRACE_SECONDS}" \
         --output json \
@@ -442,13 +513,15 @@ start_trace() {
 
 run_workload() {
     info "running S3 workload against ${RGW_ENDPOINT}"
-    if ! python3 "${SCRIPT_DIR}/s3-workload.py" \
+    # Credentials go through the environment, never argv (visible in ps).
+    if ! AWS_ACCESS_KEY_ID="${RGW_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${RGW_SECRET_KEY}" \
+        python3 "${SCRIPT_DIR}/s3-workload.py" \
         --endpoint "${RGW_ENDPOINT}" \
-        --access-key "${RGW_ACCESS_KEY}" \
-        --secret-key "${RGW_SECRET_KEY}" \
         --output "${WORKLOAD_JSONL}" \
         --manifest "${WORKLOAD_MANIFEST}" \
         --unique-keys \
+        --bucket-shards "${REQUIRE_LIST_SHARDS}" \
+        --rgw-admin "${RGW_ADMIN}" \
         --concurrent-requests "${WORKLOAD_CONCURRENT_REQUESTS}" \
         >"${WORKLOAD_LOG}" 2>&1; then
         err "S3 workload failed; see ${WORKLOAD_LOG} and ${WORKLOAD_JSONL}"
@@ -458,8 +531,21 @@ run_workload() {
 
 verify_trace() {
     info "verifying rgwtrace JSON output"
+    local evidence_args=(--require-list-shards "${REQUIRE_LIST_SHARDS}" --request-end present)
+    if [[ "${E2E_PROFILE}" == "cross-thread" ]]; then
+        evidence_args+=(--require-cross-thread)
+    elif [[ "${E2E_PROFILE}" == "no-end" ]]; then
+        evidence_args=(--require-list-shards "${REQUIRE_LIST_SHARDS}" --request-end absent)
+        # The fallback must be visible to operators, not only to the JSON verifier.
+        if ! grep -Fq 'request-END probe unavailable' "${TRACE_LOG}" ||
+            ! grep -Fq 'is DISABLED because the request-END probe did not attach' "${TRACE_LOG}"; then
+            err "no-END profile did not report the missing end probe"
+            return 1
+        fi
+    fi
     if ! python3 "${SCRIPT_DIR}/verify-rgwtrace-json.py" \
         --trace "${TRACE_JSON}" \
+        "${evidence_args[@]}" \
         --workload "${WORKLOAD_JSONL}" \
         --workload-manifest "${WORKLOAD_MANIFEST}" \
         --require-get-read-correlation "${REQUIRE_GET_READ_CORRELATION}" \
@@ -477,7 +563,7 @@ verify_trace() {
 
 main() {
     require_root
-    mkdir -p "${ARTIFACT_DIR}"
+    rgwtrace_require_private_dir "${ARTIFACT_DIR}" "ARTIFACT_DIR" || exit 1
     rm -f \
         "${PREFLIGHT_JSON}" \
         "${PREFLIGHT_LOG}" \
@@ -490,6 +576,15 @@ main() {
         "${NATIVE_DWARF_JSON}" \
         "${NATIVE_DWARF_LOG}"
     : >"${WORKLOAD_JSONL}"
+    uname -a >"${ARTIFACT_DIR}/kernel.txt"
+    printf '%s\n' "${E2E_PROFILE}" >"${ARTIFACT_DIR}/profile.txt"
+    printf 'GET=%s PUT=%s SHARDS=%s\n' "${REQUIRE_GET_READ_CORRELATION}" \
+        "${REQUIRE_PUT_WRITE_CORRELATION}" "${REQUIRE_LIST_SHARDS}" >"${ARTIFACT_DIR}/requirements.txt"
+    if [[ -f "${PROJECT_ROOT}/revision.txt" ]]; then
+        cp "${PROJECT_ROOT}/revision.txt" "${ARTIFACT_DIR}/revision.txt"
+    else
+        git -C "${PROJECT_ROOT}" rev-parse HEAD >"${ARTIFACT_DIR}/revision.txt"
+    fi
 
     if [[ ! -x "${RGWTRACE_BIN}" ]]; then
         err "rgwtrace binary not found at ${RGWTRACE_BIN}; run 'cargo build --release' first"
@@ -509,6 +604,21 @@ main() {
     info "found radosgw PID ${rgw_pid}"
 
     prepare_dwarf_json "${rgw_pid}"
+    if [[ "${E2E_PROFILE}" == "no-end" ]]; then
+        local source_json="${RGWTRACE_DWARF_JSON:-${NATIVE_DWARF_JSON}}"
+        RGWTRACE_DWARF_JSON="${ARTIFACT_DIR}/no-end-dwarf.json"
+        python3 - "${source_json}" "${RGWTRACE_DWARF_JSON}" <<'NOEND'
+import json, sys
+with open(sys.argv[1]) as handle:
+    artifact = json.load(handle)
+for module in artifact.values():
+    if isinstance(module, dict):
+        for key in ("func2pc", "func2vf", "func2linkage"):
+            module.get(key, {}).pop("req_state::~req_state", None)
+with open(sys.argv[2], "w") as handle:
+    json.dump(artifact, handle)
+NOEND
+    fi
     run_preflight "${rgw_pid}"
     start_trace "${rgw_pid}"
     sleep "${TRACE_ATTACH_DELAY}"

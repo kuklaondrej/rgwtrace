@@ -10,7 +10,20 @@ Live tracing pipeline for RGW and RADOS.
 
 `rgwtrace` starts by loading probe metadata from native DWARF or `cephtrace` JSON.
 
-The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
+The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, map sizes, and the target process, populates the `hprobes` map from the attach-target modules, attaches uprobes to that process, and polls the ring buffer.
+
+
+### BPF maps that are sized or maintained from userspace
+
+| Map | Type | Size | Why |
+|---|---|---|---|
+| `hprobes` | `ARRAY` | `RGWTRACE_HPROBE_SLOTS` = 80 | Probe descriptors keyed by `function base id + var_field index` (bases 0, 20, 30, 40, 50, 60, 70). An array lookup is a bounds check plus an add, which matters because `_send_op` does about a dozen of them per op while RGW holds the Objecter lock. Array lookups never miss for an in-range key, so every `struct VarField` carries a `present` word and `hprobe_lookup()` treats `present == 0` as "no descriptor". |
+| `events` | `RINGBUF` | `--ringbuf-size`, default 16 MiB | Set on the open object before load. A RADOS record takes 576 ring bytes (568 + 8-byte header), a request record 176 (168 + 8), so 16 MiB holds ~29k RADOS records: ~1.4 s of reader stall at 20k RADOS ops/s. The old fixed 256 KiB held ~470 (~25 ms). |
+| `rados_ops` | `HASH` (preallocated) | `--bpf-rados-ops-entries`, default 32768 | In-flight ops between `_send_op` and `_finish_op`. The default is above Ceph's `objecter_inflight_ops` (24576). ~600 bytes per entry, so ~20 MiB of kernel memory. |
+
+**Stale `rados_ops` sweep.** An op whose client exits before `_finish_op` is never deleted by BPF. When enabled, the poll loop walks the map in batches of at most 256 keys per poll turn and deletes entries whose `sent_ns` (`CLOCK_BOOTTIME`) is older than `--rados-ops-stale-after` (default 300 s). Complete cycles (including failed cycles) are separated by `clamp(threshold / 10, 1 s, 30 s)` of idle time; batches within a cycle still advance after each poll. The iterator stays across poll turns; a scan cycle is capped at twice the map's `max_entries` to bound restarts caused by concurrent `_finish_op` deletions. Stale candidates are collected before deletion because deleting a key a hash iteration sits on restarts the iteration. The count is added to `stale_rados_ops_swept` per delete batch. Ceph can resend a candidate op between the scan and the delete (same `cid`/`tid` key, fresh `sent_ns`), so each candidate is removed with an atomic lookup-and-delete and judged on the value actually removed; a refreshed entry is re-inserted with `NO_EXIST`. Only an `EEXIST` restore failure proves a newer submit already won. Other restore errors (such as a full map) fail the current batch with context instead of silently losing the removed entry. Kernels before 5.14 lack lookup-and-delete on hash maps and fall back to re-read-then-delete, which narrows the window without closing it. An entry with `sent_ns == 0` was just inserted and is never swept. The threshold floor is 60 s (twice Ceph's 30 s slow-op complaint time): the sweep must never evict a live op. An op still blocked past the threshold (an inactive PG, for example) is evicted anyway; its later `_finish_op` counts as `bpf_rados_finish_misses` and emits no event. `0` disables the sweep.
+
+**Ending the run.** The loop stops on `--timeout`, on SIGINT/SIGTERM/SIGHUP (ctrlc with its `termination` feature), or, with `--pid`, when the target exits: a pidfd (`pidfd_open`) polls readable once the process has exited, with a `/proc/<pid>/stat` state check (`Z`/`X`, or the file gone) as the fallback when `pidfd_open` is unavailable. All three paths finalize output the same way. On target exit the ring buffer is drained once more first: the target can no longer write, so its last completions and request ENDs are all still in the ring.
 
 Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, minimum variable-field counts for the probes used by the BPF program, and ELF build IDs.
 
@@ -21,6 +34,37 @@ Pipeline:
 ```text
 native DWARF or cephtrace JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
+
+### Process scoping
+
+Live tracing is scoped to one radosgw process. `--pid` is required unless the operator passes `--all-processes`, which logs a warning. The scope is enforced in two places from the same value:
+
+```text
+--pid N  ->  uprobe attach pid = N            (kernel only fires the probes in N)
+         ->  .rodata TARGET_TGID = N          (set on the OPEN skeleton, before load)
+
+every SEC("uprobe") program:
+    if (rgwtrace_foreign_process()) return 0;   // FIRST statement: before any map
+                                                // op, probe read or ring-buffer use
+--all-processes  ->  attach pid = -1, TARGET_TGID = 0 (gate disabled)
+```
+
+The BPF gate compares against `bpf_get_current_pid_tgid() >> 32`, which is the tgid in the **init** pid namespace. A `--pid` run from a nested pid namespace is therefore refused at startup (`/proc/self/ns/pid` must be `pid:[4026531836]`); run the tracer with the host pid namespace (`docker run --pid=host`). `tests/bpf_source.rs` asserts that every uprobe program opens with the gate. The `rados_ops` in-flight key is `(cid, tid, tgid)`, so two processes, or two failed probe reads that both leave `(0, 0)`, cannot share one entry.
+
+### Target discovery
+
+`src/targets.rs` resolves `librados`, `librbd` (optional), `libceph-common` and `radosgw`. An explicit `--*-path` always wins. With `--pid`, discovery reads what the process actually runs:
+
+- Libraries come from `/proc/<pid>/maps`. A mapping whose path ends in ` (deleted)` (the file was replaced on disk after the process started, typically by a package upgrade) is a **hard error** naming the file and telling the operator to restart the daemon. Before this, the line was skipped and discovery fell back to the new on-disk file, which the process does not map: attach succeeded and no event arrived.
+- The executable comes from `/proc/<pid>/exe`. A deleted executable is the same hard error, and an executable that is not `radosgw`/`ceph-radosgw` is an error asking for the right pid or `--radosgw-path`. There is no fallback to a host path such as `/usr/bin/radosgw` when `--pid` is given.
+
+Every path derived for a `--pid` target is opened through `/proc/<pid>/root`. Only the first hop through that magic link is special: the kernel resolves any symlink further down against the **caller's** root, so a container's absolute symlink (or `..`) would reach a host file. `resolve_in_root` therefore walks the path by hand, expanding each symlink inside `/proc/<pid>/root` (absolute targets restart at that root, `..` stops at it, the semantics of `openat2(RESOLVE_IN_ROOT)`), and re-checks that the result is still under the prefix. Debug-file lookups for a target under `/proc/<pid>/root` go through the same confinement, and a `.gnu_debuglink` name that is not a plain filename (`/`, `.`, `..`, absolute) is an error.
+
+A residual race remains: a path component can be swapped for a symlink between this walk and the later open or uprobe attach. The stronger follow-up is to open each target with `openat2(RESOLVE_IN_ROOT)` (or through `/proc/<pid>/map_files/<range>`, which pins the exact mapped inode) and parse and attach through `/proc/self/fd/N`.
+
+### hprobes come only from the attach targets
+
+The `hprobes` map is keyed by a **global** function id, not by module, so one slot serves every address where that function is probed. `DwarfInfo::hprobe_entries_for_modules` installs only the descriptors of the modules resolved for the discovered attach targets (exact key, then the soname fallback). Any other module in the artifact, such as a stale `radosgw.old`, is ignored. If two target modules both describe the same slot, they must describe it identically; otherwise preflight and attach fail with an error naming both modules. A module with no descriptors for a function never conflicts, so an artifact that carries addresses in `librados` and descriptors in `libceph-common` still works. In the Ubuntu jammy 18.2.7/18.2.8 cephtrace artifacts, `librados`, `libceph-common` and `librbd` carry identical `Objecter` descriptors, which are deduplicated.
 
 ---
 
@@ -69,8 +113,22 @@ Fixed capture limits:
 - `MAX_OBJECT_NAME = 128`.
 - `MAX_ACTING = 16`.
 - `MAX_RADOS_OPS = 3`.
-- Class names are 8 bytes.
-- Method names are 32 bytes.
+- Class names are 16 bytes (`MAX_CLS_NAME`; every in-tree Ceph class fits).
+- Method names are 32 bytes (`MAX_METHOD_NAME`).
+
+For an OSD `call` op the indata is `class || method || payload`, so the method is read at the class name's full wire length. Only the copy lengths are clamped; a truncated class name does not move the method read.
+
+Wire layout (asserted at compile time on both sides: `_Static_assert` in `bpf/rgwtrace_events.h` and `bpf/ceph_abi.h`, `const` `size_of`/`offset_of!` assertions in `src/events.rs` and `src/dwarf_json.rs`):
+
+| Struct | Bytes |
+|---|---|
+| `struct rgwtrace_request_event` | 160 |
+| `struct rgwtrace_rados_event` | 560 |
+| `struct rgwtrace_event` (payload at offset 8) | 568 |
+| `struct rgwtrace_request_record` (what a request marker reserves) | 168 |
+| `struct VarField` (`hprobes` value) | 100 |
+
+RADOS records reserve the full `struct rgwtrace_event`; request markers reserve only `struct rgwtrace_request_record`. The decoder accepts any record at least as long as header + payload for its `type`. A test checks that every `RGWTRACE_*` constant in the headers, including the diagnostics indices, appears in Rust with the same value.
 
 BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans. A BPF diagnostics map also counts ring-buffer reservation failures, RADOS state-map failures, missing finish state, request-context map failures, and probe-read failures.
 
@@ -103,7 +161,25 @@ The Rust collector groups request and RADOS events by `trans_id`. The START mark
 
 There is still no `"request_lifecycle"` value. Child RADOS spans are never clamped *into* their parent -- their bounds are measured facts and shrinking them would corrupt the reported op duration -- so when a child falls outside the request's real interval the **parent is stretched** and the span is labelled `measured_extended` rather than silently claiming a measured duration.
 
-**Request-group expiry is lifecycle-aware.** A group whose END is still expected (the END probe is attached and no END marker has arrived) is **open** and is never idle-expired: exporting it on idleness and then rebuilding it when its END arrived would emit a *second* span with the same trace/span id. Open groups are bounded by lifetime instead (10x `--correlation-ttl` since the request began), which caps a lost END (ring-buffer drop, destructor bridge miss) and is counted in `expired_open_requests`. Closed groups -- END received, or no END probe attached at all -- keep the plain idle `--correlation-ttl`.
+**Request-group expiry is lifecycle-aware.** A group whose END is still expected (the END probe is attached and no END marker has arrived) is **open** and is never idle-expired: exporting it on idleness and then rebuilding it when its END arrived would emit a *second* span with the same trace/span id. Open groups are bounded by lifetime instead (10x `--correlation-ttl` since the request began), which caps a lost END (ring-buffer drop, destructor bridge miss) and is counted in `expired_open_requests`. Closed groups with no END probe attached keep the plain idle `--correlation-ttl`. Groups whose END marker **has** arrived are complete except for RADOS completions still in flight at the destructor, so they are exported after the much shorter `--closed-request-grace` (default 5 s) of inactivity instead of the full TTL; holding them for 120 s kept every finished request of the last two minutes resident (~600k groups at 5k req/s). A completion landing after the grace is not lost or duplicated: the tombstone below turns it into a background op with `rgw.correlation_reason = "request_already_emitted"`. The grace is capped at the TTL and, under `--correlate-inferred`, never shorter than `--inference-window`; a group that is still a candidate of any pending inference (recorded or not) keeps the full TTL, so an op is never inferred onto a request merely because a rival candidate expired early.
+
+**Expiry and inference are indexed, not scanned.** The collector runs on the ring-buffer thread under one mutex and the BPF ring holds only a few hundred records, so nothing on that path may scale with the number of resident groups:
+
+```
+requests       BTreeMap<Arc<str>, RequestBuilder>   group key = trans_id (shared Arc)
+ExpiryIndex    idle / ended / open: BTreeSet<(clock_ns, key)>
+               drain walks each set oldest-first and stops at the first live entry
+Inference      candidates   (pid) and (pid, tid) -> START-only markers by upper
+                            + IntervalSet (power-of-two length classes, each by start)
+               pending      id -> op, plus (event_time, id); IntervalSets of all ops by pid,
+                            NoCandidate ops by pid, AmbiguousAll ops by (pid, send_tid);
+                            (witness key, id)
+background     seq -> op, plus (event_time, seq)
+```
+
+- A drain costs O(expired · log n). Index entries may lag *behind* a group's real clock (same class, older clock), which keeps ingest at a comparison per event; a drain that meets a lagging entry re-files it at the real clock instead of expiring it. A move to an earlier clock or another class is applied immediately, so nothing ever expires late.
+- `drain_expired_batch` only **detaches** expired groups (moves) and tallies their diagnostics under the lock; span rendering (ids, a dozen-plus attribute strings per span) happens in `ExpiredBatch::into_trace_document`, which the OTLP exporter thread runs. The exporter queue therefore carries detached batches, still two whole drains deep.
+- Inference decides an op against its candidates with per-length-class range scans that visit only intervals that can overlap it and stop at the second candidate, so a query with zero or one candidate does not walk the resident requests either. A pending op is re-decided only when its decision *can* change: a new overlapping candidate for a `NoCandidate` op, a new same-thread candidate for an op ambiguous only across the pid, or the loss of one of the two candidates recorded for an ambiguous op. Those ops are re-decided at the same points (each marker, each drain) and in the same order as the old exhaustive retry, so every decision is identical; `collector/hot_path_tests.rs` checks this differentially against a transcription of the old algorithm. The pending queue is capped (`--inference-max-pending`); overflow decides the oldest op early and counts it in `inference_pending_overflow_rados_ops`.
 
 Every exported request key is then **remembered for the whole session**, so a straggler can never re-open the group: a late marker is dropped (`late_request_markers_dropped`) and a late RADOS op becomes a background span with `rgw.correlation_reason = "request_already_emitted"`. **No request is ever emitted twice under one span id.**
 
@@ -250,6 +326,14 @@ OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
+**One `otel::ExportClient` per exporter.** The reqwest client (connection pool, TLS configuration, timeout, redirect policy) and the operator's validated header map are built once -- in `main` at startup, and once more for the live exporter thread -- and reused across every document and batch. A client per document meant a TCP connect and, over https, a TLS handshake per periodic drain, and configuration errors that surfaced only on the first export. The client is built before DWARF loading, so a bad `--otlp-ca-cert`, an unreadable or world-readable `--otlp-header-file`, or a malformed header fails in milliseconds. The redirect policy is `none`: a `3xx` is a fatal export error, because following it would re-send the headers and body to the `Location` host.
+
+**Headers come from three merged sources** (`src/otlp_headers.rs`): `--otlp-header-file` > `OTEL_EXPORTER_OTLP_TRACES_HEADERS`/`OTEL_EXPORTER_OTLP_HEADERS` > `--otlp-header`, by case-insensitive name, highest source winning; argv is public, so the secret-capable sources override it. No code path logs a header value or quotes a line of the file.
+
+**Logs never carry secrets.** The endpoint is parsed once and logged as scheme/host/port/path only; reqwest's own error text (which embeds the URL) is scrubbed of the userinfo and query string before it is logged; an error response body is read to at most 1 KiB and control characters are escaped so a hostile body cannot forge log lines.
+
+**Object-name redaction** (`--redact-object-names`) happens at the one place RADOS attributes are built (`rados_attributes` in `src/collector.rs`), after `classify_rados` has run on the raw name, so correlated children, background spans and their `rados.op` event, the final document and periodic drains, JSON and OTLP all see the same FNV-1a 64 hash (the one span ids already use) plus `rgwtrace.redacted = "ceph.rados.object"`. Detached expired batches retain the object-name redaction setting from drain time, so rendering on the exporter thread applies the same policy as final-document rendering.
+
 **The exporter thread never exits on a failed export.** It used to return on the first batch that failed after its retries. That lost the batch and up to two queued behind it without counting them, and the live loop then found the channel disconnected, latched export off, and stopped draining, so the collector grew without bound. Now, per batch:
 
 - a **non-retryable** response (4xx other than 429) loses that batch; the next batch is tried, since the endpoint answered promptly;
@@ -258,7 +342,7 @@ The exporter uses a bounded blocking HTTP client with configurable timeout, retr
 
 No error class latches export off, including a 4xx that signals misconfiguration: each drain costs one prompt request, every loss is counted, and a fix on the backend side (rotated token, restarted collector) takes effect without restarting the tracer. If the worker thread itself dies (a panic), the documents it had accepted but not finished (the one in flight and any still queued) are counted as lost when the run ends, later drains are counted as lost as they happen, and draining continues. The final export keeps its contract: any failed batch makes it fail, and the end-of-run trace is dumped to stdout as `--output json` would print it.
 
-Trace diagnostics count decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity, missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, lost OTLP export batches/spans (`otlp_export_failed_batches` / `otlp_export_failed_spans`), `--output json` buffer-cap drops (`buffer_full_dropped_markers` / `buffer_full_dropped_rados_ops`), the no-duplicate tombstone's state (`emitted_request_keys`, `emitted_tombstone_rotations`, `emitted_open_tombstone_overflows`, `tombstone_horizon_rejections`), and BPF-side drop/failure counters plus the informational re-seed (`bpf_reseed_*`), per-submit re-seed (`bpf_operate_seed_hits`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_unresolved`), request-end (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters.
+Trace diagnostics count decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity and pending-cap decisions (`inference_pending_overflow_rados_ops`), missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, lost OTLP export batches/spans (`otlp_export_failed_batches` / `otlp_export_failed_spans`), `--output json` buffer-cap drops (`buffer_full_dropped_markers` / `buffer_full_dropped_rados_ops`), the no-duplicate tombstone's state (`emitted_request_keys`, `emitted_tombstone_rotations`, `emitted_open_tombstone_overflows`, `tombstone_horizon_rejections`), and BPF-side drop/failure counters plus the informational re-seed (`bpf_reseed_*`), per-submit re-seed (`bpf_operate_seed_hits`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_unresolved`), request-end (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters.
 
 The run-summary counters are **always** surfaced two ways, regardless of any flag: the end-of-run `finished live tracing` / `rgwtrace shutdown summary` log lines carry them in a `diagnostics=` field of `key=value` pairs, and the JSON `trace.diagnostics` block carries them in full.
 

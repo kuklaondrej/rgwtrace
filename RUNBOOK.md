@@ -10,6 +10,8 @@ Operational notes for running `rgwtrace` against live RGW hosts.
 
 - Linux host with eBPF and uprobes enabled.
 - `root` or equivalent BPF/perf privileges. Running with `sudo` is the expected path today.
+- The host pid namespace. In a container, start it with `--pid=host`. A `--pid` run from a nested pid namespace is refused, because the kernel's tgid would never match the namespace-local pid.
+- `--pid <radosgw pid>` for every live run. The probes fire only in that process. `--all-processes` probes every process that maps the target libraries (OSDs, qemu/librbd, other gateways, CLI tools); all of them then pay the probe cost and share the ring buffer. Use it only on lab hosts.
 - Ceph/RGW binaries with accessible native debug info, or matching `cephtrace` JSON fallback data.
 - Reachable OTLP/HTTP or OTLP/HTTPS endpoint when using `--output otlp`.
 - Linux `amd64` binary built with `./scripts/build-linux-container.sh` when building from macOS.
@@ -27,7 +29,9 @@ sudo rgwtrace \
   --preflight
 ```
 
-With `--pid`, discovered library and executable paths are opened through `/proc/<pid>/root` so the host attaches to the same inode the target process sees inside its mount namespace.
+With `--pid`, libraries come from `/proc/<pid>/maps` and the executable from `/proc/<pid>/exe`, and every path is opened through `/proc/<pid>/root`, so the host attaches to the same file the target process sees inside its mount namespace. Symlinks inside the container are resolved inside the container root, never against the host root. If the process maps a file that was deleted or replaced on disk (for example after a package upgrade), discovery stops with an error; restart the daemon and run again. With `--pid`, discovery never falls back to a host path such as `/usr/bin/radosgw`.
+
+Preflight, `--dry-run` and `--export-dwarf-json` attach nothing, so they do not require `--pid`.
 
 Use explicit paths when discovery is ambiguous:
 
@@ -135,14 +139,76 @@ Use `--otlp-max-bytes-per-batch` when a collector or proxy rejects large protobu
 
 The exporter sends OTLP/HTTP protobuf (`Content-Type: application/x-protobuf`)
 over HTTP or HTTPS. `--service-name` sets the `service.name` resource attribute.
-Use `--otlp-timeout` and `--otlp-retries` to tune delivery, and repeat
-`--otlp-header 'Name:Value'` for any required headers.
+Use `--otlp-timeout` and `--otlp-retries` to tune delivery.
+
+### Request headers and credentials
+
+**Do not put secrets on argv.** `--otlp-header 'Name:Value'` is visible to every
+local user through `/proc/<pid>/cmdline` and `ps`; use it for non-secret headers
+(a tenant id such as `X-Scope-OrgID`) only. Credentials go in one of the two
+sources that are not on the command line:
+
+```sh
+# A header file: one `Name: Value` per line, `#` comments, blank lines ignored.
+# Refused if world-readable -- chmod 600 (or 640 for a group) first.
+sudo install -m 600 /dev/null /etc/rgwtrace/otlp-headers
+printf 'X-Api-Key: %s\n' "$API_KEY" | sudo tee /etc/rgwtrace/otlp-headers >/dev/null
+sudo rgwtrace ... --output otlp --otlp-header-file /etc/rgwtrace/otlp-headers
+
+# Or the OpenTelemetry environment variable: `k=v,k2=v2`, percent-encoded.
+# OTEL_EXPORTER_OTLP_TRACES_HEADERS, if set, replaces it (not merged), per the spec.
+sudo OTEL_EXPORTER_OTLP_HEADERS="X-Api-Key=$API_KEY" rgwtrace ... --output otlp
+```
+
+The three sources are merged by header name (case-insensitive); for a name
+present in more than one, **file > environment > `--otlp-header`**, the inverse
+of how exposed each source is. A parse or permission error names the source,
+the line or entry number and the header name, never a value. Header values are
+never logged at any log level.
+
+Credentials in the endpoint URL (`https://user:pass@...` or `?api-key=...`)
+work but are discouraged for the same argv reason; the URL is logged with its
+userinfo and query string removed, and error messages are scrubbed the same way.
+
+### TLS and private CAs
+
+```sh
+--otlp-endpoint https://tempo.internal:4318/v1/traces --otlp-ca-cert /etc/ssl/internal-ca.pem
+```
+
+`--otlp-ca-cert` adds a PEM bundle of root certificates to trust alongside the
+bundled web roots, so a collector behind an internal PKI no longer needs plain
+`http://`. The file is read and validated at startup; a missing or non-PEM file
+fails before DWARF loading.
+
+**Redirects are never followed.** A `3xx` from the endpoint is a fatal export
+error: following it would re-send the headers (credentials) and the trace body
+to whatever host `Location` names, possibly from https down to http. Point
+`--otlp-endpoint` at the final URL.
+
+### The default endpoint is plaintext
+
+The default `--otlp-endpoint` is `http://localhost:4318/v1/traces`: fine for a
+collector on the same host, but anything crossing a network should use
+`https://`. Traces carry `ceph.rados.object` values, which are S3 object keys,
+`<uid>.buckets` user names, tenant names and (for `AuthMeta` objects) access-key
+ids. If those must not reach the backend at all, pass **`--redact-object-names`**:
+every `ceph.rados.object` becomes the FNV-1a 64 hash of the name (16 hex
+digits), the span carries `rgwtrace.redacted = "ceph.rados.object"`, and
+`rgw.rados_role` is still classified from the raw name on the host. The hash is
+stable, so one object's ops still group together and can be joined with a hash
+computed elsewhere; it applies to JSON and OTLP output alike. The
+[end-to-end object correlation gate](#end-to-end-objectrequest-correlation-gate)
+matches raw S3 keys, so do not combine it with this flag.
 
 In live OTLP mode, `--otlp-flush-interval` (alias `--flush-interval`) controls how often eligible spans are
 queued for the background exporter. `--correlation-ttl` governs retention of
 correlation state; open requests awaiting an END marker have a separate lifetime
-backstop. `--inference-window` governs optional inferred correlation and is
-independent of the retention setting. See `rgwtrace --help` for all options and
+backstop, and requests whose END marker arrived are exported after
+`--closed-request-grace` (default 5 s; capped at the TTL). `--inference-window`
+governs optional inferred correlation and is independent of the retention
+setting; `--inference-max-pending` (default 65536) caps the untagged ops waiting
+for an inference decision. See `rgwtrace --help` for all options and
 defaults.
 
 A batch that cannot be delivered does not stop the exporter. A non-retryable
@@ -161,6 +227,14 @@ different loss: drains dropped because the exporter fell two drains behind.
 ## Common Preflight Failures
 
 - `--pid must be a positive process id`: pass a single live RGW PID.
+- `live tracing requires --pid <radosgw pid>`: pass the RGW PID. Pass `--all-processes` only if you intend to probe every process on the host.
+- `the argument '--pid <PID>' cannot be used with '--all-processes'`: pass one or the other.
+- `rgwtrace is running in a nested pid namespace`: run the tracer in the host pid namespace (`docker run --pid=host`).
+- `... mapped by pid N (...) was deleted or replaced on disk` or `the radosgw executable of pid N (...) was deleted or replaced on disk`: the daemon still runs the old file after an upgrade. Restart it, then trace again. Probing the new file would capture nothing.
+- `pid N runs <exe>, not radosgw`: pass the radosgw PID, or `--radosgw-path` if the binary has another name.
+- `too many symlink levels resolving ...` or `... resolved to ..., outside /proc/<pid>/root`: the container image has a symlink loop or a path that cannot be resolved inside its root. Pass explicit `--*-path` flags.
+- `.gnu_debuglink names "...", which is not a plain filename`: the binary's debuglink is malformed or hostile. Use `--import-json` with an artifact exported from trusted binaries.
+- `modules A and B both provide hprobe slot N (...) with DIFFERENT variable descriptors`: two attach-target modules describe the same probe function differently, so one shared descriptor cannot be correct at both addresses. Re-export the artifact from the binaries the process maps, or remove the extra module.
 - `failed to discover ...`: pass the corresponding explicit path flag.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
@@ -177,8 +251,11 @@ different loss: drains dropped because the exporter fell two drains behind.
 - `timed out`: firewall, routing, load balancer, or collector availability issue.
 - HTTP `404`: wrong path; OTLP/HTTP traces usually use `/v1/traces`.
 - HTTP `415`: receiver does not accept OTLP protobuf on that endpoint.
-- TLS/certificate errors: verify the endpoint certificate chain from the RGW host and use `http://` only for trusted local networks.
-- HTTP `4xx`: endpoint/auth/config issue; not retried.
+- TLS/certificate errors: verify the endpoint certificate chain from the RGW host; for an internal CA pass `--otlp-ca-cert <pem>`. Use `http://` only on the same host or a trusted local network.
+- HTTP `3xx`: the endpoint redirects and rgwtrace refuses to follow (it would re-send credentials and the trace elsewhere); set `--otlp-endpoint` to the final URL.
+- `is world-readable`: the `--otlp-header-file` must not be readable by others; `chmod 600` it.
+- `invalid OTEL_EXPORTER_OTLP_HEADERS`: the variable is `k=v,k2=v2` with percent-encoding; the error gives the entry number, never the value.
+- HTTP `4xx`: endpoint/auth/config issue; not retried. The response body is logged as a 1 KiB excerpt with control characters escaped.
 - HTTP `429` or `5xx`: retried according to `--otlp-retries`.
 
 ---
@@ -196,6 +273,7 @@ Inspect:
 - `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`; with `--correlate-inferred`, it can also be `no_inference_candidate` or `ambiguous_inference_candidates`.
 - `trace.diagnostics.missing_trans_id_background_ops` for volume.
 - `trace.diagnostics.inference_no_candidate_rados_ops` and `trace.diagnostics.inference_ambiguous_rados_ops` when inferred correlation is enabled.
+- `trace.diagnostics.inference_pending_overflow_rados_ops`: untagged ops decided early because the pending queue hit `--inference-max-pending`. They are decided against the candidates present at that moment, usually ending as ambiguous/no-candidate background ops instead of waiting for a candidate to appear or drop out. Nonzero means inference coverage is being traded for bounded memory and per-marker cost; raise the cap if memory allows (each pending op is a few hundred bytes).
 - `trace.diagnostics.background_rados_by_role` and `trace.diagnostics.background_rados_by_reason` for breakdowns.
 
 Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether `--correlate-inferred` is warranted.
@@ -294,6 +372,8 @@ The request-END probe (`req_state::~req_state`) is ON by default and needs no fl
 
 **`expired_open_requests` is nonzero.** Requests whose END marker never arrived within 10x `--correlation-ttl` of the request's start, so they were force-expired with a derived end. This means END markers are being lost (ring-buffer drops — check `bpf_ringbuf_request_drops` — or destructor bridge misses, `bpf_request_end_misses`), not that requests are slow. `late_request_markers_dropped` counts markers that arrived for a request whose span had already been exported; they are dropped rather than emitting a second span with the same span id, and a nonzero count means the expiry bounds are too tight for the workload.
 
+**Background ops with reason `request_already_emitted` rise after an upgrade.** Requests whose END marker arrived are now exported after `--closed-request-grace` (default 5 s) of inactivity instead of the full `--correlation-ttl`. A RADOS completion that lands later than that becomes a background op with this reason rather than a child span. RGW waits for its own ops before the request ends, so this should be rare; asynchronous completions (for example fire-and-forget bucket-index `complete` ops on a slow OSD) are the expected exception. If the count matters, raise `--closed-request-grace`; memory grows with it (one group per request finished within the grace).
+
 **`tombstone_horizon_rejections` is nonzero.** Every exported request key is remembered so a straggler can never resurrect an already-exported group and emit a second span with the same span id. The memory is fixed (two 8 MiB Bloom generations, rotated every 2M exported requests, `emitted_tombstone_rotations`, plus an exact set for force-expired open requests), so its false-positive rate never climbs with session length. Forgetting old keys is made safe by a horizon: an event for a request the tracer does not hold and no longer remembers, whose request **started** before the oldest remembered generation, is rejected rather than re-grouped. Markers are dropped; RADOS ops become background spans with `rgw.correlation_reason = "request_outside_tombstone_horizon"`. Expect ~0. A steady count means requests, or stale request contexts on RGW threads (only without the END probe), outlive a whole generation of exported requests. That traffic is surfaced as background spans, never duplicated. `emitted_open_tombstone_overflows` > 0 means more than 65,536 force-expired open requests were remembered at once: END markers are being lost at a high rate (see `expired_open_requests`).
 
 ---
@@ -313,9 +393,25 @@ To check end-probe coverage on a run, compare `measured_duration_requests` again
 
 RADOS child spans carry `ceph.rados.send_tid` and request spans carry `rgw.request.tid`. If they differ, the op was submitted on a different thread than the one that handled the request -- an asio coroutine migration.
 
-RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names.
+RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names. Class names hold 15 bytes, enough for every in-tree Ceph object class; before this was 7, and `refcount`, `timeindex` and `2pc_queue` calls came out with garbled method names.
 
 ---
+
+## BPF Sizing and Run Lifecycle
+
+| Flag | Default | What it sizes |
+|---|---|---|
+| `--ringbuf-size` | `16M` | Events ring buffer, bytes (K/M/G suffixes). Power of two, page multiple, at most 1 GiB. Locked kernel memory. |
+| `--bpf-rados-ops-entries` | `32768` | In-flight RADOS op map. ~600 bytes/entry preallocated (~20 MiB at the default). Minimum 1024. |
+| `--rados-ops-stale-after` | `300` | Seconds after which a `rados_ops` entry is swept. `0` disables; otherwise at least 60. |
+
+**`bpf_ringbuf_rados_drops` / `bpf_ringbuf_request_drops` are nonzero.** The reader fell behind the ring buffer. 16 MiB absorbs ~1.4 s of reader stall at 20k RADOS ops/s. Raise `--ringbuf-size` (for example `64M`) on very busy gateways or loaded hosts.
+
+**`bpf_rados_map_drops` is nonzero.** `rados_ops` was full when `_send_op` fired, so those ops were not traced. Check `stale_rados_ops_swept`: if it is also climbing, clients are exiting with ops in flight faster than the sweep reclaims them; otherwise in-flight load exceeds the map. Raise `--bpf-rados-ops-entries`.
+
+**`stale_rados_ops_swept` is nonzero.** The sweep deleted ops older than `--rados-ops-stale-after`. After a client restart this is expected and harmless. On a healthy cluster with no restarts it means ops are blocking longer than the threshold (inactive PGs, stuck OSDs); those ops emit no event when they complete and appear as `bpf_rados_finish_misses`. Raise the threshold rather than lower it.
+
+**Stopping a run.** SIGINT, SIGTERM (`systemctl stop`, `docker stop`), SIGHUP, `--timeout`, and, with `--pid`, the target process exiting all end the run the same way: diagnostics are read, pending spans are emitted (JSON on stdout, or the final OTLP export), and the process exits 0. A target exit is logged as `target process exited; stopping the trace and writing what was collected`. Before this change SIGTERM killed the process without output, and a `--pid` run outlived its target.
 
 ## Verification
 
@@ -370,13 +466,29 @@ op's time window. This drives two checks:
   `RATE`. A workload object landing as `background`/`inferred` is a coverage
   miss, not a mis-correlation.
 
-On the current baseline (no cross-thread bridge), cross-thread data ops are not
-correlated, so the coverage gates run at `0` — the functional test's
-`REQUIRE_GET_READ_CORRELATION` / `REQUIRE_PUT_WRITE_CORRELATION` env vars default
-to `0`, and the zero-mis-correlation check still holds. Raise those thresholds
-(0.90, and 0.80 with `WORKLOAD_CONCURRENT_REQUESTS`) once Stage 3's
-`--correlate-cross-thread` bridge is enabled. Use `--unique-keys` (already set by
-the functional test) so the object→request mapping stays unambiguous.
+The functional harness requires explicit `REQUIRE_GET_READ_CORRELATION` and
+`REQUIRE_PUT_WRITE_CORRELATION` values in `(0, 1]`. Calibrate and record these for
+each Ceph build and profile; there is no zero-coverage default. A regression is
+not a reason to lower an established threshold. The standalone verifier keeps
+rate checks optional when their flags are omitted.
+
+`E2E_PROFILE=baseline` requires measured request-END activity;
+`E2E_PROFILE=cross-thread` also enables `--correlate-cross-thread` and requires
+actual cross-thread children and per-submit bridge hits. `E2E_PROFILE=no-end`
+removes the destructor metadata from a copy of the exported artifact, requests
+cross-thread correlation, and verifies the warning and fail-soft fallback:
+no END markers, measured durations, or per-submit seeds. This does not test
+kernel-induced attach failure; that remains a separate failure-injection case.
+
+Every profile provisions a sharded test bucket (`REQUIRE_LIST_SHARDS=3` by
+default) and checks its configured shard count. The verifier's
+`--require-list-shards N` requires **every** manifest LIST to correlate at least
+N distinct bucket-index objects. No LIST, fewer observed shards, or lost shard
+coverage fails instead of skipping. `--unique-keys` keeps the object/request
+mapping unambiguous. The harness records the source revision, kernel, profile,
+thresholds, Ceph metadata, workload manifest, trace, and validation output.
+
+See [private lab setup](docs/lab/README.md) before running privileged tests.
 
 Without `--workload-manifest`, the verifier behaves exactly as before.
 

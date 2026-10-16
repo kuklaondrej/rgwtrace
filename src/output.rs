@@ -133,7 +133,7 @@ mod tests {
             end_ns,
             pid: 42,
             tid: 7,
-            trans_id: trans_id.to_string(),
+            trans_id: trans_id.into(),
             truncation: CaptureTruncation::default(),
         }
     }
@@ -153,11 +153,11 @@ mod tests {
             acting: vec![1, 2, 3],
             rw: RadosDirection::Write,
             object_name: object_name.to_string(),
-            trans_id: trans_id.to_string(),
+            trans_id: trans_id.into(),
             truncation: CaptureTruncation::default(),
             ops: vec![RadosOp {
                 code: 0x1401,
-                name: "call".to_string(),
+                name: "call".into(),
                 class: Some("cls".to_string()),
                 method: Some("method".to_string()),
             }],

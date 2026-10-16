@@ -13,7 +13,7 @@ On Debian/Ubuntu, install the host build dependencies:
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev
+sudo apt-get install -y clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev g++ dwz binutils
 ```
 
 Build the CLI:
@@ -35,6 +35,12 @@ Build a Linux `amd64` binary from macOS or Linux with Docker or Podman:
 ```
 
 The script builds `docker/Dockerfile` with `--platform linux/amd64` and copies the binary to `dist/rgwtrace-linux-amd64`.
+
+The base image is pinned by its multi-arch index digest (`rust:1.90-bookworm@sha256:...`), and `.dockerignore` is an allowlist: only `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `build.rs`, `src/`, `bpf/`, `bench/` and `tests/` enter the build context, so local benchmark results, traces, agent state and env files never land in an image layer. When bumping the toolchain, refresh the digest with `docker buildx imagetools inspect rust:1.90-bookworm` (the top-level `Digest:` line) and add any new build input to the allowlist.
+
+### Upstream Ceph DWARF export
+
+`scripts/export-upstream-ceph-dwarf.sh` builds the tracer against upstream Ceph debug packages and exports probe metadata (see `.github/workflows/dwarf-artifact.yml`). It rewrites APT sources and installs a toolchain system-wide, so it refuses to run outside a container (`/.dockerenv`, `/run/.containerenv` or `$container`) unless `RGWTRACE_ALLOW_HOST_EXPORT=1`. It verifies the Ceph release key fingerprint before trusting it, downloads a pinned `rustup-init` release and checks its published SHA-256 instead of piping `sh.rustup.rs` into `sh`, and keeps `ARTIFACT_DIR`, `CARGO_HOME`, `RUSTUP_HOME` and `CARGO_TARGET_DIR` in private `mktemp -d` directories unless you supply ones you own (mode 0700, not a symlink, no other-writable non-sticky parent). A `release.asc` carrying more than one primary key is refused outright, since `gpg --dearmor` would install every key in it. In the official `rust` image `CARGO_HOME` is world-writable by design; point it at a private directory there, the rustup proxies on `PATH` keep working.
 
 Override the runtime or output directory when needed:
 
@@ -66,51 +72,60 @@ On Linux, run a real verifier load check when changing BPF code:
 sudo scripts/verify-bpf-load.sh
 ```
 
-The repository also has a manual `BPF Verify Linux 5.8` workflow for a self-hosted runner labeled `kernel-5.8`.
+Hosted CI checks Linux x86-64, Linux ARM64, and macOS ARM64. All jobs run the
+workspace tests (including `bench`), fmt, Clippy, and Python verifier checks.
+Linux jobs also compile and load the BPF programs on the runner kernel. Audit
+and workflow/history scanning run separately; the stable `rust` check requires
+all jobs to succeed. Dependency auditing also runs weekly to catch advisories
+without waiting for a code change.
+
+Linux x86-64 CI sets `RGWTRACE_REQUIRE_DWARF_FIXTURES=1`: a missing tool or an
+unexercised fixture assertion fails the suite. Other platforms report fixture
+skip reasons (use `cargo test --workspace --locked -- --show-output` to display them); compiler-specific LTO/DWZ shapes are guaranteed by the x86-64 job.
+The external Ceph oracle is explicitly ignored unless requested:
+
+```sh
+RGWTRACE_ORACLE_JSON=/path/to/dwarf.json \
+RGWTRACE_ORACLE_TARGETS=/path/to/radosgw:/path/to/libceph-common.so.2 \
+RGWTRACE_ORACLE_COMPARE_FUNC2VF=1 \
+cargo test compares_native_output_to_cephtrace_json_oracle_when_configured -- --ignored
+```
 
 Use live RGW/Ceph testing only after the fast suite passes or when validating probe attachment against a real runtime.
 
 ## Live end-to-end testing
 
-The GitHub `E2E` workflow runs the privileged MicroCeph RGW test inside a fresh LXD VM sandbox on a self-hosted Linux runner. The runner host must have LXD installed and initialized ahead of time; CI does not install or initialize LXD.
+Privileged workflow templates live in [`lab/workflows/`](lab/workflows/), outside
+this repository's active workflows. Install them in a **private lab repository**
+after following [lab setup](lab/README.md). Do not register a persistent
+self-hosted runner with a public repository. E2E builds and runs inside a fresh
+LXD VM and selects an explicitly reviewed full source SHA.
 
-Prepare the self-hosted runner host once:
-
-```sh
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends snapd
-sudo snap install lxd
-sudo lxd init
-sudo usermod -aG lxd <runner-user>
-```
-
-When prompted by `lxd init`, create a local bridge and choose an IPv4 subnet that does not overlap host routes, such as `10.250.0.1/24`; enable IPv4 NAT and disable IPv6 if it is not needed.
-
-Restart the GitHub runner service so the `lxd` group membership applies.
-
-Verify as the runner user with `lxc info`; optionally smoke-test a VM:
+Run directly only on a disposable Linux test machine. Supply positive coverage
+thresholds established for that Ceph build and profile:
 
 ```sh
-lxc info
-lxc launch ubuntu:24.04 rgwtrace-smoke --vm
-lxc delete -f rgwtrace-smoke
+cargo build --release --locked
+sudo env E2E_PROFILE=baseline \
+  REQUIRE_GET_READ_CORRELATION="$BASELINE_GET_RATE" \
+  REQUIRE_PUT_WRITE_CORRELATION="$BASELINE_PUT_RATE" \
+  tests/e2e/functional-test-microceph-rgw.sh
 ```
 
-Run the privileged MicroCeph RGW e2e test directly on Linux when validating live request capture:
+Repeat with `E2E_PROFILE=cross-thread` and `E2E_PROFILE=no-end`, using the
+corresponding measured thresholds. A cross-thread run with no actual bridge
+activity fails; it does not silently become a baseline test.
 
-```sh
-cargo build --release
-sudo tests/e2e/functional-test-microceph-rgw.sh
-```
+The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `ARTIFACT_DIR`, a fresh private `mktemp -d` directory by default (the path is printed at the end). A caller-supplied `ARTIFACT_DIR` is created 0700 if missing; an existing one must be owned by root, not a symlink and not group/other writable, and every parent must be owned by root (or you) and not writable by others unless sticky. The S3 user gets a random key pair per run (`rgw-user.json` keeps the access key but redacts the secret) and is purged on every exit path unless `KEEP_E2E_RESOURCES=1`; set both `RGW_ACCESS_KEY` and `RGW_SECRET_KEY` to use fixed keys instead.
 
-The e2e test bootstraps MicroCeph, enables RGW, drives S3 traffic, captures `rgwtrace` JSON, and verifies request spans, RADOS child spans, diagnostics, correlation, and current role categories. It preserves `preflight.json`, `trace.json`, `workload.jsonl`, and logs under `/tmp/rgwtrace-e2e`.
-
-By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.4-0ubuntu1~cloud0`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `/tmp/rgwtrace-e2e` so the traced version is explicit.
+By default, the e2e test installs MicroCeph from `reef/stable` and fails early unless the snap resolves to Ceph package version `18.2.4-0ubuntu1~cloud0`. It writes `microceph-version.txt`, `microceph-metadata.yaml`, `microceph-manifest.yaml`, and `microceph-manifest-ceph.txt` under `ARTIFACT_DIR` so the traced version is explicit.
 
 Override the pin when needed:
 
 ```sh
-sudo MICROCEPH_CHANNEL=reef/stable \
+sudo env REQUIRE_GET_READ_CORRELATION="$BASELINE_GET_RATE" \
+  REQUIRE_PUT_WRITE_CORRELATION="$BASELINE_PUT_RATE" \
+  MICROCEPH_CHANNEL=reef/stable \
   MICROCEPH_EXPECTED_CEPH_VERSION=18.2.4-0ubuntu1~cloud0 \
   tests/e2e/functional-test-microceph-rgw.sh
 ```
@@ -120,7 +135,10 @@ If MicroCeph is already installed at a different version, the test fails rather 
 If native DWARF is unavailable for the MicroCeph snap, pass matching probe metadata explicitly:
 
 ```sh
-sudo RGWTRACE_DWARF_JSON=/path/to/rgwtrace_dwarf.json tests/e2e/functional-test-microceph-rgw.sh
+sudo env REQUIRE_GET_READ_CORRELATION="$BASELINE_GET_RATE" \
+  REQUIRE_PUT_WRITE_CORRELATION="$BASELINE_PUT_RATE" \
+  RGWTRACE_DWARF_JSON=/path/to/rgwtrace_dwarf.json \
+  tests/e2e/functional-test-microceph-rgw.sh
 ```
 
 See the [correlation gate](../RUNBOOK.md#end-to-end-objectrequest-correlation-gate)

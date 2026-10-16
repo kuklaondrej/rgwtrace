@@ -257,6 +257,7 @@
     "inferred_correlations": 0,
     "inference_no_candidate_rados_ops": 0,
     "inference_ambiguous_rados_ops": 0,
+    "inference_pending_overflow_rados_ops": 0,
     "missing_trans_id_background_ops": 1,
     "background_rados_by_role": {
       "notify": 1
@@ -289,6 +290,7 @@
     "bpf_ringbuf_rados_drops": 0,
     "bpf_rados_map_drops": 0,
     "bpf_rados_finish_misses": 0,
+    "stale_rados_ops_swept": 0,
     "bpf_request_context_drops": 0,
     "bpf_probe_read_failures": 0,
     "bpf_reqstate_map_drops": 0,

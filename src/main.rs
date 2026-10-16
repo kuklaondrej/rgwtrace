@@ -3,12 +3,15 @@ mod events;
 mod classify;
 mod cli;
 mod collector;
+#[cfg(test)]
+mod collector_bench;
 mod dwarf_input;
 mod dwarf_json;
 mod dwarf_native;
 mod host_tools;
 mod live;
 mod otel;
+mod otlp_headers;
 mod output;
 mod preflight;
 mod targets;
@@ -30,6 +33,13 @@ use crate::{
 fn main() -> Result<()> {
     let cli = Cli::parse();
     init_logging(&cli.log_level);
+
+    // Built first: a bad CA file or a malformed header must fail in
+    // milliseconds, not after DWARF extraction and probe attach.
+    let otlp_client = match cli.output {
+        OutputMode::Otlp => Some(otel::ExportClient::from_cli(&cli)?),
+        OutputMode::Json | OutputMode::Jsonl => None,
+    };
 
     let dwarf_input = match cli.dwarf_source {
         cli::DwarfSource::Json => DwarfInput::json(
@@ -72,8 +82,19 @@ fn main() -> Result<()> {
 
     preflight::validate_cli(&cli)?;
     let trace = if cli.dry_run {
-        Collector::default().into_trace_document(cli.service_name.clone())
+        let mut collector = Collector::default();
+        collector.set_redact_object_names(cli.redact_object_names);
+        collector.into_trace_document(cli.service_name.clone())
     } else {
+        preflight::validate_live_scope(&cli)?;
+        if cli.all_processes {
+            warn!(
+                "--all-processes: uprobes are attached SYSTEM-WIDE. Every process mapping the \
+                 target libraries (OSDs, qemu/librbd, other gateways, CLI tools) pays the probe \
+                 cost, shares the ring buffer and BPF maps, and is inside the tracer's crash \
+                 radius. Use --pid on production hosts"
+            );
+        }
         warn_if_import_unusable(&dwarf);
         live::run(&cli, &dwarf)?
     };
@@ -93,11 +114,12 @@ fn main() -> Result<()> {
             export_trace_otlp(
                 otel::ExportConfig {
                     endpoint: &cli.otlp_endpoint,
-                    headers: &cli.otlp_header,
+                    client: otlp_client
+                        .as_ref()
+                        .expect("the OTLP client is built above for --output otlp"),
                     compression: cli.otlp_compression,
                     max_spans_per_batch: cli.otlp_max_spans_per_batch,
                     max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
-                    timeout: cli.otlp_timeout,
                     retries: cli.otlp_retries,
                     diagnostics: cli.otlp_diagnostics,
                 },

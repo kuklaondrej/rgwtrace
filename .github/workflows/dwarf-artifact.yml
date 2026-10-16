@@ -22,7 +22,9 @@ jobs:
     env:
       ARTIFACTS_DIR: dwarf-artifacts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Validate inputs
         env:
@@ -45,7 +47,10 @@ jobs:
           CEPH_VERSION: ${{ inputs.ceph_version }}
         run: |
           set -euo pipefail
-          mkdir -p "${ARTIFACTS_DIR}"
+          # The export script runs as root in the container and refuses an
+          # artifact directory it does not own; create it root-owned 0700 and
+          # hand it back to the runner user afterwards for the upload step.
+          sudo install -d -m 0700 -o root -g root "${ARTIFACTS_DIR}"
           docker pull --platform linux/amd64 "ubuntu:${UBUNTU_VERSION}"
           docker run --rm \
             --platform linux/amd64 \
@@ -57,9 +62,13 @@ jobs:
             "ubuntu:${UBUNTU_VERSION}" \
             bash /workspace/scripts/export-upstream-ceph-dwarf.sh
 
+      - name: Make artifacts readable by the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "${ARTIFACTS_DIR}" 2>/dev/null || true
+
       - name: Upload DWARF artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rgwtrace-dwarf-ubuntu-${{ inputs.ubuntu_version }}-ceph-${{ inputs.ceph_version }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.ARTIFACTS_DIR }}/

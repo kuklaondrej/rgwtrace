@@ -7,6 +7,16 @@
 > **assumption** (a literature value or a modelled constant to be measured). The
 > predictions table (§6) is the interface the benchmark subtask consumes.
 
+> **Update (BPF live-path hardening, see
+> [bugfix-bpf-live-path-hardening.md](bugfix-bpf-live-path-hardening.md)).** The
+> numbers below were derived and measured against the earlier layout and are kept
+> as recorded. Since then: `hprobes` is an 80-slot `ARRAY` (lookups are inlined
+> to a bounds check plus an add, cheaper than the hash lookups costed below, so
+> `send_op`'s "12 map lookups" are now mostly free); the ring buffer defaults to
+> 16 MiB (`--ringbuf-size`); a RADOS record is 568 B (576 B on the ring) and a
+> request marker reserves 168 B (176 B on the ring) instead of the full union;
+> and `rados_ops` defaults to 32 768 entries (`--bpf-rados-ops-entries`).
+
 The one number the whole model turns on is the **per-hit uprobe cost** `t_trap`.
 A uprobe fires by patching the target instruction with `int3`; each hit traps
 into the kernel, runs the attached BPF program, and single-steps/returns the
@@ -134,7 +144,11 @@ nothing). The single ring-buffer callback decodes each event and pushes it into
 the collector under one `Mutex` (`src/live/linux.rs:142-160`,
 `src/collector.rs:604`). At 20k req/s, k=10 that is `20000·12 = 240 000`
 records/s. At an assumed ~1 µs decode+push each → **~0.24 core** on the tracer
-process (separate from the traced process). This is a **single-threaded**
+process (separate from the traced process). Measured (release build, Apple M-series,
+`src/collector_bench.rs`): decode ~0.18 µs and decode+ingest of a tagged RADOS op
+~0.27 µs with 6.3 heap allocations, so the assumption is ~4x conservative. The
+periodic drain and `--correlate-inferred` markers no longer scale with resident
+state; see `docs/perf-collector-hot-path.md`. This is a **single-threaded**
 consumer behind a mutex; §3 shows why its throughput ceiling is the ring-buffer
 drop threshold.
 
@@ -149,6 +163,10 @@ record**. Max simultaneously-resident records:
 ```
 262144 / 552 ≈ 474 records
 ```
+
+(With the current 16 MiB default and 576 B RADOS records:
+`16777216 / 576 ≈ 29 127` records, ~121 ms at 240k records/s or ~1.4 s at
+20k RADOS ops/s. Request markers now take 176 B each.)
 
 Steady-state record rate = `R·(2 + k)`. Byte rate at 20k/k=10:
 `240 000 · 552 B ≈ 132 MB/s`.
@@ -267,11 +285,14 @@ BPF maps are `HASH`/`LRU_HASH` (preallocated at load). Static sizing:
 | `rgw_op_keys` (`:228`) | 16 + 24 | 16 384 | ~0.7 MB |
 | `events` ringbuf (`:242`) | — | — | 0.25 MB |
 
-BPF total ≈ **~32 MB**, dominated by the one LRU. Userspace adds the **8 MiB
+BPF total ≈ **~32 MB**, dominated by the one LRU. (Current defaults: `rados_ops`
+16 + 560 B × 32 768 ≈ ~20 MB, `hprobes` an 80 × 100 B array ≈ 8 KB, `events`
+16 MiB; total ≈ ~62 MB.) Userspace adds the **8 MiB
 Bloom filter** (`EMITTED_BLOOM_BITS = 1<<26`, allocated lazily on first insert,
 `src/collector.rs:32,:115-117`) plus the live `requests` `BTreeMap` (one
-`RequestBuilder` per in-flight request, `:129`) and the `pending_inference` `Vec`
-(`:130`, bounded by expiry `:780-789`). Floor is **~40 MB RSS** before any
+`RequestBuilder` per request until it expires -- END-closed requests after
+`--closed-request-grace`, 5 s by default, rather than the 120 s TTL) and the
+inference pending queue (capped by `--inference-max-pending`). Floor is **~40 MB RSS** before any
 in-flight state; the Bloom filter is fixed-size for the life of the run by design
 (no per-request growth, `ARCHITECTURE.md:108-112`).
 
