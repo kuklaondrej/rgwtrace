@@ -1,0 +1,25 @@
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_a8394bc266cf5a 23
+docs/README.md
+  s_ece52b9a589c27::t_a189057a35a240 58-59
+docs/bugfix-stale-sweep-cooldown.md
+  s_ece52b9a589c27::t_4b0fde33cb530c 1-14
+src/live/linux.rs
+  s_ece52b9a589c27::t_2c78ff9291ad93 208,211,675-678,770,784,792-802,808-815,841,875,2116-2155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cad5646b350efee3d33420c506154fd26a7a00d1",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
