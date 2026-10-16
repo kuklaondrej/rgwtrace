@@ -10,7 +10,20 @@ Live tracing pipeline for RGW and RADOS.
 
 `rgwtrace` starts by loading probe metadata from native DWARF or `cephtrace` JSON.
 
-The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
+The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, map sizes, and the target process, populates the `hprobes` map from the attach-target modules, attaches uprobes to that process, and polls the ring buffer.
+
+
+### BPF maps that are sized or maintained from userspace
+
+| Map | Type | Size | Why |
+|---|---|---|---|
+| `hprobes` | `ARRAY` | `RGWTRACE_HPROBE_SLOTS` = 80 | Probe descriptors keyed by `function base id + var_field index` (bases 0, 20, 30, 40, 50, 60, 70). An array lookup is a bounds check plus an add, which matters because `_send_op` does about a dozen of them per op while RGW holds the Objecter lock. Array lookups never miss for an in-range key, so every `struct VarField` carries a `present` word and `hprobe_lookup()` treats `present == 0` as "no descriptor". |
+| `events` | `RINGBUF` | `--ringbuf-size`, default 16 MiB | Set on the open object before load. A RADOS record takes 576 ring bytes (568 + 8-byte header), a request record 176 (168 + 8), so 16 MiB holds ~29k RADOS records: ~1.4 s of reader stall at 20k RADOS ops/s. The old fixed 256 KiB held ~470 (~25 ms). |
+| `rados_ops` | `HASH` (preallocated) | `--bpf-rados-ops-entries`, default 32768 | In-flight ops between `_send_op` and `_finish_op`. The default is above Ceph's `objecter_inflight_ops` (24576). ~600 bytes per entry, so ~20 MiB of kernel memory. |
+
+**Stale `rados_ops` sweep.** An op whose client exits before `_finish_op` is never deleted by BPF. When enabled, the poll loop walks the map in batches of at most 256 keys per poll turn and deletes entries whose `sent_ns` (`CLOCK_BOOTTIME`) is older than `--rados-ops-stale-after` (default 300 s). Complete cycles (including failed cycles) are separated by `clamp(threshold / 10, 1 s, 30 s)` of idle time; batches within a cycle still advance after each poll. The iterator stays across poll turns; a scan cycle is capped at twice the map's `max_entries` to bound restarts caused by concurrent `_finish_op` deletions. Stale candidates are collected before deletion because deleting a key a hash iteration sits on restarts the iteration. The count is added to `stale_rados_ops_swept` per delete batch. Ceph can resend a candidate op between the scan and the delete (same `cid`/`tid` key, fresh `sent_ns`), so each candidate is removed with an atomic lookup-and-delete and judged on the value actually removed; a refreshed entry is re-inserted with `NO_EXIST`. Only an `EEXIST` restore failure proves a newer submit already won. Other restore errors (such as a full map) fail the current batch with context instead of silently losing the removed entry. Kernels before 5.14 lack lookup-and-delete on hash maps and fall back to re-read-then-delete, which narrows the window without closing it. An entry with `sent_ns == 0` was just inserted and is never swept. The threshold floor is 60 s (twice Ceph's 30 s slow-op complaint time): the sweep must never evict a live op. An op still blocked past the threshold (an inactive PG, for example) is evicted anyway; its later `_finish_op` counts as `bpf_rados_finish_misses` and emits no event. `0` disables the sweep.
+
+**Ending the run.** The loop stops on `--timeout`, on SIGINT/SIGTERM/SIGHUP (ctrlc with its `termination` feature), or, with `--pid`, when the target exits: a pidfd (`pidfd_open`) polls readable once the process has exited, with a `/proc/<pid>/stat` state check (`Z`/`X`, or the file gone) as the fallback when `pidfd_open` is unavailable. All three paths finalize output the same way. On target exit the ring buffer is drained once more first: the target can no longer write, so its last completions and request ENDs are all still in the ring.
 
 Before live attach, preflight validation checks CLI input, discovered target files, required DWARF functions, minimum variable-field counts for the probes used by the BPF program, and ELF build IDs.
 
@@ -21,6 +34,37 @@ Pipeline:
 ```text
 native DWARF or cephtrace JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
+
+### Process scoping
+
+Live tracing is scoped to one radosgw process. `--pid` is required unless the operator passes `--all-processes`, which logs a warning. The scope is enforced in two places from the same value:
+
+```text
+--pid N  ->  uprobe attach pid = N            (kernel only fires the probes in N)
+         ->  .rodata TARGET_TGID = N          (set on the OPEN skeleton, before load)
+
+every SEC("uprobe") program:
+    if (rgwtrace_foreign_process()) return 0;   // FIRST statement: before any map
+                                                // op, probe read or ring-buffer use
+--all-processes  ->  attach pid = -1, TARGET_TGID = 0 (gate disabled)
+```
+
+The BPF gate compares against `bpf_get_current_pid_tgid() >> 32`, which is the tgid in the **init** pid namespace. A `--pid` run from a nested pid namespace is therefore refused at startup (`/proc/self/ns/pid` must be `pid:[4026531836]`); run the tracer with the host pid namespace (`docker run --pid=host`). `tests/bpf_source.rs` asserts that every uprobe program opens with the gate. The `rados_ops` in-flight key is `(cid, tid, tgid)`, so two processes, or two failed probe reads that both leave `(0, 0)`, cannot share one entry.
+
+### Target discovery
+
+`src/targets.rs` resolves `librados`, `librbd` (optional), `libceph-common` and `radosgw`. An explicit `--*-path` always wins. With `--pid`, discovery reads what the process actually runs:
+
+- Libraries come from `/proc/<pid>/maps`. A mapping whose path ends in ` (deleted)` (the file was replaced on disk after the process started, typically by a package upgrade) is a **hard error** naming the file and telling the operator to restart the daemon. Before this, the line was skipped and discovery fell back to the new on-disk file, which the process does not map: attach succeeded and no event arrived.
+- The executable comes from `/proc/<pid>/exe`. A deleted executable is the same hard error, and an executable that is not `radosgw`/`ceph-radosgw` is an error asking for the right pid or `--radosgw-path`. There is no fallback to a host path such as `/usr/bin/radosgw` when `--pid` is given.
+
+Every path derived for a `--pid` target is opened through `/proc/<pid>/root`. Only the first hop through that magic link is special: the kernel resolves any symlink further down against the **caller's** root, so a container's absolute symlink (or `..`) would reach a host file. `resolve_in_root` therefore walks the path by hand, expanding each symlink inside `/proc/<pid>/root` (absolute targets restart at that root, `..` stops at it, the semantics of `openat2(RESOLVE_IN_ROOT)`), and re-checks that the result is still under the prefix. Debug-file lookups for a target under `/proc/<pid>/root` go through the same confinement, and a `.gnu_debuglink` name that is not a plain filename (`/`, `.`, `..`, absolute) is an error.
+
+A residual race remains: a path component can be swapped for a symlink between this walk and the later open or uprobe attach. The stronger follow-up is to open each target with `openat2(RESOLVE_IN_ROOT)` (or through `/proc/<pid>/map_files/<range>`, which pins the exact mapped inode) and parse and attach through `/proc/self/fd/N`.
+
+### hprobes come only from the attach targets
+
+The `hprobes` map is keyed by a **global** function id, not by module, so one slot serves every address where that function is probed. `DwarfInfo::hprobe_entries_for_modules` installs only the descriptors of the modules resolved for the discovered attach targets (exact key, then the soname fallback). Any other module in the artifact, such as a stale `radosgw.old`, is ignored. If two target modules both describe the same slot, they must describe it identically; otherwise preflight and attach fail with an error naming both modules. A module with no descriptors for a function never conflicts, so an artifact that carries addresses in `librados` and descriptors in `libceph-common` still works. In the Ubuntu jammy 18.2.7/18.2.8 cephtrace artifacts, `librados`, `libceph-common` and `librbd` carry identical `Objecter` descriptors, which are deduplicated.
 
 ---
 
@@ -69,8 +113,22 @@ Fixed capture limits:
 - `MAX_OBJECT_NAME = 128`.
 - `MAX_ACTING = 16`.
 - `MAX_RADOS_OPS = 3`.
-- Class names are 8 bytes.
-- Method names are 32 bytes.
+- Class names are 16 bytes (`MAX_CLS_NAME`; every in-tree Ceph class fits).
+- Method names are 32 bytes (`MAX_METHOD_NAME`).
+
+For an OSD `call` op the indata is `class || method || payload`, so the method is read at the class name's full wire length. Only the copy lengths are clamped; a truncated class name does not move the method read.
+
+Wire layout (asserted at compile time on both sides: `_Static_assert` in `bpf/rgwtrace_events.h` and `bpf/ceph_abi.h`, `const` `size_of`/`offset_of!` assertions in `src/events.rs` and `src/dwarf_json.rs`):
+
+| Struct | Bytes |
+|---|---|
+| `struct rgwtrace_request_event` | 160 |
+| `struct rgwtrace_rados_event` | 560 |
+| `struct rgwtrace_event` (payload at offset 8) | 568 |
+| `struct rgwtrace_request_record` (what a request marker reserves) | 168 |
+| `struct VarField` (`hprobes` value) | 100 |
+
+RADOS records reserve the full `struct rgwtrace_event`; request markers reserve only `struct rgwtrace_request_record`. The decoder accepts any record at least as long as header + payload for its `type`. A test checks that every `RGWTRACE_*` constant in the headers, including the diagnostics indices, appears in Rust with the same value.
 
 BPF events carry truncation flags for these limits. Rust exposes counters in trace diagnostics and adds `rgwtrace.truncated` to affected RADOS spans. A BPF diagnostics map also counts ring-buffer reservation failures, RADOS state-map failures, missing finish state, request-context map failures, and probe-read failures.
 
@@ -237,6 +295,14 @@ OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name
 
 The exporter uses a bounded blocking HTTP client with configurable timeout, retry count, extra headers, periodic flush interval, and correlation TTL.
 
+**One `otel::ExportClient` per exporter.** The reqwest client (connection pool, TLS configuration, timeout, redirect policy) and the operator's validated header map are built once -- in `main` at startup, and once more for the live exporter thread -- and reused across every document and batch. A client per document meant a TCP connect and, over https, a TLS handshake per periodic drain, and configuration errors that surfaced only on the first export. The client is built before DWARF loading, so a bad `--otlp-ca-cert`, an unreadable or world-readable `--otlp-header-file`, or a malformed header fails in milliseconds. The redirect policy is `none`: a `3xx` is a fatal export error, because following it would re-send the headers and body to the `Location` host.
+
+**Headers come from three merged sources** (`src/otlp_headers.rs`): `--otlp-header-file` > `OTEL_EXPORTER_OTLP_TRACES_HEADERS`/`OTEL_EXPORTER_OTLP_HEADERS` > `--otlp-header`, by case-insensitive name, highest source winning; argv is public, so the secret-capable sources override it. No code path logs a header value or quotes a line of the file.
+
+**Logs never carry secrets.** The endpoint is parsed once and logged as scheme/host/port/path only; reqwest's own error text (which embeds the URL) is scrubbed of the userinfo and query string before it is logged; an error response body is read to at most 1 KiB and control characters are escaped so a hostile body cannot forge log lines.
+
+**Object-name redaction** (`--redact-object-names`) happens at the one place RADOS attributes are built (`rados_attributes` in `src/collector.rs`), after `classify_rados` has run on the raw name, so correlated children, background spans and their `rados.op` event, the final document and periodic drains, JSON and OTLP all see the same FNV-1a 64 hash (the one span ids already use) plus `rgwtrace.redacted = "ceph.rados.object"`. Detached expired batches retain the object-name redaction setting from drain time, so rendering on the exporter thread applies the same policy as final-document rendering.
+
 Trace diagnostics count decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity and early decisions forced by the pending cap (`inference_pending_overflow_rados_ops`), missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, the no-duplicate tombstone's occupancy (`emitted_request_keys`), and BPF-side drop/failure counters plus the informational re-seed (`bpf_reseed_*`), per-submit re-seed (`bpf_operate_seed_hits`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_unresolved`), request-end (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters.
 
 The run-summary counters are **always** surfaced two ways, regardless of any flag: the end-of-run `finished live tracing` / `rgwtrace shutdown summary` log lines carry them in a `diagnostics=` field of `key=value` pairs, and the JSON `trace.diagnostics` block carries them in full.
@@ -258,6 +324,19 @@ It supports optional gzip compression, span-count batching, and encoded-size bat
 Native DWARF parsing supports the current RGW/RADOS probe set: `Objecter::_send_op`, `Objecter::_finish_op`, and `RGWREST::get_handler`.
 
 It discovers debug data from embedded DWARF, `.gnu_debuglink`, and build-id paths, then extracts module build IDs, probe PCs, variable locations, and member field paths into the existing probe field model.
+
+Native extraction treats every input file as untrusted (see [DWARF parser limits](docs/bugfix-dwarf-parser-limits.md)):
+
+- Reference-following loops are bounded: 64 typedef/cv or pointer links per type walk, 4096 base classes per member lookup (with a visited set). The whole-unit type and scope searches are iterative `next_dfs` walks. The two function walkers stay recursive, because their `EntriesTree` skips subprogram bodies via `DW_AT_sibling`, and are capped at 256 scope levels. A limit that is hit is an error naming the DIE's `.debug_info` offset.
+- `--max-debug-file-bytes` (default 4 GiB) caps every whole-file read (target, debuglink/build-id debug file, DWZ supplementary file) and the total declared size of one file's compressed sections. The cap is checked before anything is read or inflated.
+- The Ceph version comes from `--ceph-version`, then an embedded `ceph version` string, then MicroCeph metadata, then the host package database. The host database is skipped, with an error that asks for `--ceph-version`, when a target is under a `/proc/<pid>/root` that is not the host root. Host tools run by absolute path with a cleared environment.
+
+Performance notes:
+
+- Each target is read once. The embedded version and the module build ID come from the buffer `parse_module` already holds. Preflight reads the build-ID note through `object::ReadCache`.
+- Uncompressed DWARF sections are borrowed from the file buffer, not copied.
+- Mangled names are demangled only if they contain a probe's leaf identifier, which is derived from the probe table.
+- Still open: type and scope lookups re-walk every unit per lookup, and zstd sections are bounded only after inflation (`object` 0.39). See the bugfix note.
 
 `cephtrace` JSON import remains supported as a stable fallback and oracle for native extraction.
 

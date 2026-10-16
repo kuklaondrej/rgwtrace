@@ -90,6 +90,20 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a LIVE run that is not scoped to one process, unless the operator
+/// opted in to system-wide probes with `--all-processes`. Dry-run, preflight and
+/// `--export-dwarf-json` attach nothing, so they never call this.
+pub fn validate_live_scope(cli: &Cli) -> Result<()> {
+    if cli.pid.is_none() && !cli.all_processes {
+        bail!(
+            "live tracing requires --pid <radosgw pid>; without it the uprobes would fire in \
+             every process that maps librados/libceph-common on this host. Pass \
+             --all-processes to trace system-wide anyway"
+        );
+    }
+    Ok(())
+}
+
 fn validate_explicit_path(flag: &str, path: Option<&Path>) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
@@ -131,6 +145,15 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
     }
 
     warn_on_silent_rados_skip(dwarf, targets);
+
+    // The same selection live attach installs: two target modules disagreeing
+    // on a shared hprobe slot fail here, before anything is attached.
+    let target_keys = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect::<Vec<_>>();
+    dwarf.hprobe_entries_for_modules(&target_keys)?;
 
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
     require_function(dwarf, &radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
@@ -501,10 +524,15 @@ fn build_id_check(dwarf: &DwarfInfo, path: &Path) -> Result<BuildIdCheck> {
 }
 
 fn elf_build_id(path: &Path) -> Result<Option<String>> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file = object::File::parse(data.as_slice())
+    // Read through a range cache, not the whole file: the build-id note is a few
+    // bytes near the start, and the target can be a multi-GB binary with
+    // embedded debug info (reading it whole here was its third full read).
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let cache = object::ReadCache::new(file);
+    let object = object::File::parse(&cache)
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
-    Ok(file.build_id()?.map(hex_string))
+    Ok(object.build_id()?.map(hex_string))
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -907,6 +935,22 @@ mod tests {
     }
 
     #[test]
+    fn live_scope_requires_pid_or_an_explicit_all_processes_opt_in() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["rgwtrace", "--import-json", "x.json"].iter().chain(args)).unwrap()
+        };
+
+        let err = validate_live_scope(&parse(&[])).unwrap_err().to_string();
+        assert!(
+            err.contains("--pid") && err.contains("--all-processes"),
+            "{err}"
+        );
+        assert!(validate_live_scope(&parse(&["--pid", "42"])).is_ok());
+        assert!(validate_live_scope(&parse(&["--all-processes"])).is_ok());
+    }
+
+    #[test]
     fn rejects_missing_ceph_version() {
         let mut dwarf = DwarfInfo::from_str(&dwarf_json("libceph-common.so.2", "radosgw")).unwrap();
         dwarf.version = None;
@@ -960,6 +1004,39 @@ mod tests {
             finish_fields = var_fields(finish_field_count),
             handler_fields = var_fields(handler_field_count),
         )
+    }
+
+    #[test]
+    fn reads_the_build_id_note_without_reading_the_whole_file() {
+        let mut note = Vec::new();
+        note.extend_from_slice(&4u32.to_le_bytes()); // namesz
+        note.extend_from_slice(&4u32.to_le_bytes()); // descsz
+        note.extend_from_slice(&3u32.to_le_bytes()); // NT_GNU_BUILD_ID
+        note.extend_from_slice(b"GNU\0");
+        note.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let elf = crate::test_elf::tiny_elf(&[(".note.gnu.build-id", 7, 0, note)]);
+        let dir = std::env::temp_dir().join(format!(
+            "rgwtrace-preflight-build-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("radosgw");
+        fs::write(&path, &elf).unwrap();
+        // A sparse 1 GiB tail stands in for embedded debug info: it costs nothing
+        // on disk, and nothing in memory unless the whole file is read.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+
+        assert_eq!(elf_build_id(&path).unwrap().as_deref(), Some("deadbeef"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn var_fields(count: usize) -> String {

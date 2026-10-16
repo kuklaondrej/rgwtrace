@@ -25,8 +25,14 @@ See [example traces](docs/trace-examples.md) for GET and DELETE requests.
 
 Live tracing requires **Linux**, root or equivalent BPF/perf privileges, and
 Ceph/RGW debug information or matching probe metadata. macOS supports offline
-workflows. Start with the [build guide](docs/development.md) and
-[runtime requirements](RUNBOOK.md#requirements).
+workflows. Download a Linux x86_64 or ARM64 archive from
+[GitHub Releases](https://github.com/kuklaondrej/rgwtrace/releases), verify it
+against `SHA256SUMS`, and follow the bundled `INSTALL.txt`; no Rust compiler is
+needed. Choose the `-centos9` archive for CentOS 9 (glibc 2.34), or the standard
+archive for Ubuntu 22.04+ (glibc 2.35+); both need libelf and zlib. Separate DWARF
+catalog releases provide metadata for the exact builds listed in `index.json`.
+See [using release downloads](RUNBOOK.md#release-downloads), or use the
+[build guide](docs/development.md) to compile from source.
 
 Once built, select the RGW process and validate it before capturing a short trace:
 
@@ -36,6 +42,10 @@ RGW_PID=12345
 sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --preflight
 sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 30 --output json
 ```
+
+Live tracing requires `--pid`: the probes fire only in that process. Pass
+`--all-processes` instead to probe every process that maps the Ceph libraries
+(for lab hosts only).
 
 Wait for `starting live tracing` before generating S3 traffic. JSON is written
 to stdout when the capture finishes; logs go to stderr.
@@ -71,3 +81,9 @@ cephtrace's `radostrace` implementation.
 
 Licensed **GPL-2.0-only**. See [NOTICE](NOTICE) for attribution and
 [LICENSE.GPL-2.0](LICENSE.GPL-2.0) for the full license.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test and review process,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and the
+[publication checklist](docs/publication-checklist.md) for administrator controls.

@@ -3,28 +3,97 @@ name: CI
 on:
   push:
   pull_request:
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  rust:
-    runs-on: ubuntu-24.04
+  check:
+    name: Verify (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@49fda20b3f489226feadfba7767be1db54e2cee1 # 1.90.0
+        with:
+          toolchain: 1.90.0
           components: rustfmt, clippy
-      - name: Install Linux build dependencies
+      - name: Install Linux build and fixture dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev
-      - name: Format
-        run: cargo fmt --check
-      - name: Test
-        run: cargo test
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-      - name: Audit dependencies
-        run: cargo audit
+          sudo apt-get install -y --no-install-recommends clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev g++ dwz binutils bpftool libbpf-dev
+      - name: Require Linux DWARF fixture coverage
+        if: matrix.os == 'ubuntu-24.04'
+        run: echo 'RGWTRACE_REQUIRE_DWARF_FIXTURES=1' >> "$GITHUB_ENV"
+      - name: Verify workspace and JSON verifier
+        run: scripts/verify.sh
+      - name: Release packaging tests
+        run: python3 -m unittest discover -s tests -p 'test_release.py'
       - name: Release build
-        run: cargo build --release
+        run: cargo build --workspace --locked --release
+      - name: Load BPF programs on the hosted Linux kernel
+        if: runner.os == 'Linux'
+        run: sudo scripts/verify-bpf-load.sh
+
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@49fda20b3f489226feadfba7767be1db54e2cee1 # 1.90.0
+        with:
+          toolchain: 1.90.0
+      - run: cargo install cargo-audit --version 0.22.2 --locked
+      - run: cargo audit --deny yanked --deny unmaintained
+
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned workflow and secret scanners
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          go install github.com/zricethezav/gitleaks/v8@v8.24.3
+      - name: Check committed whitespace
+        run: |
+          empty_tree=$(git hash-object -w -t tree /dev/null)
+          git diff --check "$empty_tree" HEAD
+      - name: Validate workflows
+        run: '"$(go env GOPATH)/bin/actionlint" .github/workflows/*.yml docs/lab/workflows/*.yml'
+      - name: Scan reachable Git history for secrets
+        run: '"$(go env GOPATH)/bin/gitleaks" git --redact --log-opts="--all"'
+
+  # Keep one stable required check; a skipped/cancelled matrix or audit is not green.
+  rust:
+    if: always()
+    needs: [check, audit, policy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all checks to pass
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+          AUDIT_RESULT: ${{ needs.audit.result }}
+          POLICY_RESULT: ${{ needs.policy.result }}
+        run: test "$CHECK_RESULT" = success && test "$AUDIT_RESULT" = success && test "$POLICY_RESULT" = success

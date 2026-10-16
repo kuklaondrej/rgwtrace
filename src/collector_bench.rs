@@ -71,7 +71,7 @@ fn raw_rados(trans_id: &str, object: &str, sent_ns: u64) -> RawRadosEvent {
     let mut acting = [-1; MAX_ACTING];
     acting[..3].copy_from_slice(&[11, 22, 33]);
     let empty = RawClsOp {
-        cls_name: [0; 8],
+        cls_name: [0; 16],
         method_name: [0; 32],
     };
     RawRadosEvent {

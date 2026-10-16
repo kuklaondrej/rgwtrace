@@ -23,13 +23,13 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 ## Build / test / lint
 
 - Build: `cargo build` / `cargo build --release` (→ `target/release/rgwtrace`)
-- Format: `cargo fmt --check` (fix with `cargo fmt`)
-- Lint: `cargo clippy --all-targets -- -D warnings` (warnings are errors)
-- Test: `cargo test` (inline unit tests + `tests/cli_dry_run.rs`, `tests/bpf_source.rs`; fixtures in `tests/fixtures/`)
+- Format: `cargo fmt --all --check` (fix with `cargo fmt`)
+- Lint: `cargo clippy --workspace --locked --all-targets -- -D warnings` (warnings are errors)
+- Test: `cargo test --workspace --locked` (inline unit tests + `tests/cli_dry_run.rs`, `tests/bpf_source.rs`; fixtures in `tests/fixtures/`)
 - JSON self-test, no cluster: `python3 tests/e2e/verify-rgwtrace-json.py --self-test`
 - BPF verifier load check (Linux + root): `sudo scripts/verify-bpf-load.sh`
 
-**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test`, clippy (deny warnings), the Python self-test, and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) mirrors this gate and adds `cargo audit` + a release build.
+**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test --workspace --locked`, clippy (deny warnings), the Python self-test and verifier regression tests, release packaging tests (`tests/test_release.py`), and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) runs this gate on Linux x86-64/ARM64 and macOS, with separate pinned audit and workflow/history scans, release builds, and hosted Linux BPF loads. Privileged live-test templates are in `docs/lab/workflows/` and must only be installed in a private lab repository.
 
 ## Running locally
 
@@ -54,7 +54,8 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - `src/dwarf_{input,json,native}.rs` — probe-metadata sources (`native` = gimli/object ELF+DWARF; `json` = cephtrace import); shared `DwarfInfo` model
 - `src/targets.rs` — locate `librados`/`librbd`/`libceph-common`/`radosgw` (via `/proc/<pid>/root`)
 - `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs)
-- `src/otel.rs` — OTLP/HTTP protobuf export
+- `src/otel.rs` — OTLP/HTTP protobuf export (`ExportClient`: one reqwest client per exporter, no redirects, redacted logging)
+- `src/otlp_headers.rs` — OTLP request-header sources (`--otlp-header-file` > `OTEL_EXPORTER_OTLP_HEADERS` > `--otlp-header`), merged by name; never logs a value
 - `src/live.rs` → `src/live/linux.rs` — Linux-only BPF load/attach/ring-buffer poll
 - `bpf/*.c`, `bpf/*.h` — eBPF program + C ABI mirror (`rgwtrace_events.h`, `ceph_abi.h`)
 - `build.rs` — skeleton generation; `scripts/`, `tests/`, `docker/`
@@ -70,6 +71,10 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 
 ## Gotchas — do not break
 
+- **Every `SEC("uprobe")` program opens with the process-scope gate** (`if (rgwtrace_foreign_process()) return 0;`) — before any map op, probe read or ring-buffer use. `TARGET_TGID` is `.rodata`, set from `--pid` on the open skeleton before load; live tracing requires `--pid` unless `--all-processes` is passed. `tests/bpf_source.rs` checks every program. See `docs/bugfix-target-scoping.md`.
+- **`hprobes` is filled only from the attach-target modules** (`hprobe_entries_for_modules`) — the map is keyed by a global function id, so a descriptor from any other artifact module would be read at the target's address. Two target modules that disagree on a slot are an error, never last-writer-wins.
+- **Never open a `/proc/<pid>/root` path by name without `resolve_in_root`/`confine_to_proc_root`** (`src/targets.rs`) — symlinks below the magic link resolve against the HOST root. With `--pid`, a ` (deleted)` mapping or exe is a hard error and there is no host-path fallback.
+
 - **Do not re-add a `process_request` return probe, or any uretprobe** — live testing showed it can crash RGW (a uretprobe patches the return address on the stack while asio switches fiber stacks underneath it). Request context is seeded from the `RGWREST::get_handler` **entry** probe, and the request END is taken from the `req_state::~req_state` **entry** probe.
 - **The request-END probe must bind to the complete/base destructor (D1/D2), never the deleting one (D0)** — all three demangle to `req_state::~req_state`, and g++ lists D0 first in both `.symtab` and DIE order. `dtor_variant_rank` (`src/dwarf_native.rs`) ranks candidates by *mangled* name and rejects D0. See `docs/design-request-end-probe.md`.
 - **The request-END probe is optional and fails soft** — a build whose destructor symbol/descriptor/provenance does not resolve must keep working, with request ends derived from RADOS child bounds (`rgw.duration_quality = "marker"` instead of `"measured"`). Never make it a hard requirement. It must also never be skipped *silently*: warn at attach time, because a missing end probe changes what every request duration means.
@@ -82,8 +87,12 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - **The per-submit re-seed must not attach without the request-END probe** — the END probe is the only thing that revokes bridge entries; without it, a recycled `req_state`/`RGWOp` address hits a dead request's entry and the (disabled) liveness gate fails open. Phase B degrades to Phase A, loudly.
 - **The `dpp` is an opaque identity token — never dereference it, never apply an inheritance offset** — and the offset-0 claim it rests on (`req_state`/`RGWOp` inherit `DoutPrefixProvider` at 0) is **verified in DWARF per build** (`dpp_base_offset`, `src/dwarf_native.rs`), never assumed. A build that cannot prove it loses the key — or the whole per-submit re-seed — rather than keying on a guess.
 - **A request must never be emitted twice under the same span id** — request-group expiry is open/closed aware (open = END still expected; never idle-expired, only lifetime-bounded), and every exported request key is remembered **for the whole session** in a never-reset Bloom filter so a straggler cannot resurrect it. Do not "bound" it with a FIFO: at production rates the memory turns over in seconds and a force-expired long request's late END then re-emits the same span id. A Bloom false positive is safe (it drops), a false negative is not (it duplicates) — and Bloom filters have none.
-- Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`.
+- Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`. Struct sizes are `_Static_assert`ed in the headers and const-asserted in Rust (`RGWTRACE_*_SIZE`); change both sides together. `every_header_abi_constant_is_mirrored_byte_for_byte_in_rust` fails if a header constant has no Rust twin.
+- **`hprobes` is an ARRAY: a lookup never misses for an in-range key.** Always go through `hprobe_lookup()`, which rejects slots whose `present` word is 0; a raw `bpf_map_lookup_elem(&hprobes, ...)` on an unpopulated slot returns a zeroed "register 0" descriptor. New hprobe keys must stay below `RGWTRACE_HPROBE_SLOTS`.
+- **The `rados_ops` stale sweep must never evict a live op.** `--rados-ops-stale-after` has a 60 s floor (twice Ceph's slow-op complaint time) and `sent_ns == 0` entries are never swept. Do not lower the floor to "reclaim faster"; a swept op that later completes emits no event.
+- Request markers reserve `struct rgwtrace_request_record` (168 B), not the full `struct rgwtrace_event`; the decoder must keep accepting a record that ends right after its payload.
 - Fixed capture caps (`MAX_TRANS_ID=128`, `MAX_OBJECT_NAME=128`, `MAX_ACTING=16`, `MAX_RADOS_OPS=3`, …). Overflow is surfaced via `RGWTRACE_TRUNC_*` flags (→ `rgwtrace.truncated` attr + counters), never silently dropped.
+- **Native DWARF input is untrusted** — every reference-following loop needs a hop cap or visited set, and a new DIE walker must be iterative (`next_dfs`) or depth-capped, never unbounded recursion. Whole-file reads go through `read_file_bounded` and decompression through `load_section`'s budget (`--max-debug-file-bytes`). Never fall back to the HOST package database for a target under another root's `/proc/<pid>/root`, and run host tools only through `host_tools::system_command`. See `docs/bugfix-dwarf-parser-limits.md`.
 - `dwarf_native.rs` hardcodes libstdc++ `std::string`/`std::vector` member names (`_M_dataplus`, `_M_string_length`, `_M_impl._M_start`) — ABI-coupled; touch with care.
 - Build-ID mismatch fails preflight/attach by default (`--allow-build-id-mismatch` overrides). Wrong DWARF yields silently wrong field offsets.
 - Correlation is intentionally conservative: RADOS ops join a request only via same-thread `trans_id`. Inference (`--correlate-inferred`) joins only a *unique* candidate within `--inference-window`.
@@ -121,4 +130,5 @@ For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` i
 - Prefer smaller, focused commits over one bulky commit.
 - Work on feature branches and PR into `main`; **never force-push `main`**.
 - Do not commit generated or ignored paths: `target/`, `dist/`, `*.o`, `*.skel.rs`, `trace-data/`, local env files.
-- PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).
+- Release automation: `.github/workflows/release.yml` publishes stable `vX.Y.Z` binary releases; `dwarf-release.yml` publishes validated, immutable DWARF catalogs from `release/dwarf-matrix.json`. See `docs/development.md#publishing-releases`.
+- PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test --workspace --locked`, `cargo fmt --all --check`, and `cargo clippy --workspace --locked --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).

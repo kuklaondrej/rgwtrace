@@ -6,6 +6,7 @@
 
 | Guide | What it covers |
 | --- | --- |
+| [Release automation](development.md#publishing-releases) | Binary builds, DWARF catalogs, validation, and publishing |
 | [Building and testing](development.md) | Native and container builds, local checks, and live end-to-end test setup |
 | [Production runbook](../RUNBOOK.md) | Requirements, preflight, capture, export, diagnostics, and troubleshooting |
 | [Reading a trace](trace-examples.md) | Annotated GET and DELETE captures |
@@ -34,8 +35,36 @@ superseded by later sections in the same document.
 
 ## Maintenance references
 
+- [Dependency audit fixes](bugfix-dependency-audit.md): patched TLS/QUIC and compressed-DWARF dependencies.
+
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
+  redaction, header sources, client reuse, private CAs, and object-name redaction.
+- [OTLP header pipe handling](bugfix-otlp-header-pipe.md): reject named pipes
+  without blocking during startup.
+- [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
+  bounds reference chains, nesting, file reads and decompression, and never
+  guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Target scoping](bugfix-target-scoping.md): why live tracing requires `--pid`,
+  how targets bind to the files the process maps, and how `/proc/<pid>/root`
+  paths stay inside the container.
+- [PID-root library discovery](bugfix-pid-root-library-discovery.md): why a
+  missing target library must not fall back to a host copy.
+- [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
+  decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
+  and SIGTERM / target-exit handling.
+- [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
+  superseding submit from map capacity or other restore errors.
+
+- [Private privileged-test lab](lab/README.md)
+- [Publication controls](publication-checklist.md)
+- [Dependency audit review](dependency-audit.md)
+- [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
+  why the privileged helper scripts use private directories, generated keys
+  and pinned downloads.
+
+- [Stale sweep cooldown](bugfix-stale-sweep-cooldown.md): bounded scan cycles yield CPU between cycles.
