@@ -34,8 +34,6 @@ use serde::Serialize;
 
 use crate::dwarf_native;
 
-const PF_X: u32 = 1;
-
 /// The file-backed part of one executable PT_LOAD.
 #[derive(Clone, Copy, Debug)]
 struct ExecSegment {
@@ -58,7 +56,7 @@ impl ProbeImage {
         let exec_segments = file
             .segments()
             .filter(|segment| {
-                matches!(segment.flags(), SegmentFlags::Elf { p_flags } if p_flags & PF_X != 0)
+                matches!(segment.flags(), SegmentFlags::Elf { p_flags, .. } if p_flags & object::elf::PF_X != object::elf::ProgramFlags(0))
             })
             .map(|segment| {
                 let (offset, filesz) = segment.file_range();

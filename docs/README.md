@@ -6,6 +6,7 @@
 
 | Guide | What it covers |
 | --- | --- |
+| [Release automation](development.md#publishing-releases) | Binary builds, DWARF catalogs, validation, and publishing |
 | [Building and testing](development.md) | Native and container builds, local checks, and live end-to-end test setup |
 | [Production runbook](../RUNBOOK.md) | Requirements, preflight, capture, export, diagnostics, and troubleshooting |
 | [Reading a trace](trace-examples.md) | Annotated GET and DELETE captures |
@@ -32,11 +33,18 @@ superseded by later sections in the same document.
 
 ## Maintenance references
 
+- [Dependency audit fixes](bugfix-dependency-audit.md): patched TLS/QUIC and compressed-DWARF dependencies.
+
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
+  bounds reference chains, nesting, file reads and decompression, and never
+  guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Frame-relative DWARF location fix](bugfix-frame-offset-trailing-ops.md): why
+  expressions must be fully checked after `DW_OP_fbreg`.
 - [Uprobe address validation](bugfix-uprobe-address-validation.md): why probe
   addresses are translated to file offsets and checked as function entries, why
   separate debug info must match the binary, and why member offsets are never

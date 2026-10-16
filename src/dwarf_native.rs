@@ -2,16 +2,16 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use gimli::{
     AttributeValue, DebugInfoOffset, DebuggingInformationEntry, Dwarf, EndianSlice,
-    EntriesTreeNode, Operation, Reader, RunTimeEndian, UnitOffset,
+    EntriesTreeNode, Operation, Reader, ReaderOffset, RunTimeEndian, UnitOffset,
 };
-use object::{Architecture, Object, ObjectSection, ObjectSymbol, SymbolKind};
+use object::{Architecture, CompressionFormat, Object, ObjectSection, ObjectSymbol, SymbolKind};
 use tracing::{debug, warn};
 
 #[cfg(test)]
@@ -82,6 +82,41 @@ fn probe_keys<'w>(demangled: &str, wanted: &[&'w str]) -> Vec<&'w str> {
         .filter(|key| !RGW_RADOS_OPERATE_OVERLOADS.contains(key))
         .filter(|key| *key == demangled)
         .collect()
+}
+
+/// The source identifier a definition of probe `key` must spell out in its
+/// MANGLED name: the key's last `::` component without a destructor's `~`
+/// (`req_state::~req_state` -> `req_state`, mangled `_ZN9req_stateD2Ev`), and the
+/// real function name for the synthetic `rgw_rados_operate` overload keys.
+///
+/// Derived from the probe keys themselves so the prefilter cannot drift from
+/// the probe table.
+fn probe_leaf_identifier(key: &str) -> &str {
+    let key = if RGW_RADOS_OPERATE_OVERLOADS.contains(&key) {
+        RGW_RADOS_OPERATE
+    } else {
+        key
+    };
+    key.rsplit("::")
+        .next()
+        .unwrap_or(key)
+        .trim_start_matches('~')
+}
+
+/// Cheap prefilter run before demangling `mangled`: can it name any of `wanted`?
+///
+/// Demangling every global text symbol and every subprogram linkage name was
+/// the dominant cost of native extraction. An Itanium-mangled name spells each
+/// source identifier of its own nested name out as `<length><identifier>` --
+/// substitutions (`S_`, `S0_`) only abbreviate a prefix or type seen EARLIER in
+/// the same name -- so a name whose demangled form ends in a probe's leaf must
+/// contain that identifier verbatim. A substring miss therefore proves the name
+/// can never match, and skipping it changes no result; a hit is just demangled
+/// as before.
+fn may_name_probe(mangled: &str, wanted: &[&str]) -> bool {
+    wanted
+        .iter()
+        .any(|key| mangled.contains(probe_leaf_identifier(key)))
 }
 
 /// Whether `name` is a DEMANGLED name that could belong to a probe function.
@@ -219,31 +254,70 @@ const FIRST_PARAM_PROBE_FUNCTIONS: &[&str] = &[
     REQ_STATE_DTOR,
 ];
 
-#[allow(dead_code)]
-pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
-    from_paths_with_version(paths, None)
+/// Default for `--max-debug-file-bytes`: 4 GiB. See [`NativeOptions`].
+pub const DEFAULT_MAX_DEBUG_FILE_BYTES: u64 = 4 << 30;
+
+/// Inputs to native DWARF extraction beyond the target paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeOptions {
+    /// Explicit Ceph version (`--ceph-version`); wins over every probe of the
+    /// target.
+    pub ceph_version: Option<String>,
+    /// Upper bound, in bytes, on (a) the on-disk size of every file read whole --
+    /// a target, its separate debug file, its DWZ supplementary file -- and (b)
+    /// the total bytes DECOMPRESSED out of one such file's compressed DWARF
+    /// sections. Together they bound extraction's peak memory at a small multiple
+    /// of this value per module, whatever a sparse file or a compressed-section
+    /// bomb declares.
+    pub max_debug_file_bytes: u64,
 }
 
-pub fn from_paths_with_version(
+impl Default for NativeOptions {
+    fn default() -> Self {
+        Self {
+            ceph_version: None,
+            max_debug_file_bytes: DEFAULT_MAX_DEBUG_FILE_BYTES,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn from_paths(paths: &[impl AsRef<Path>]) -> Result<DwarfInfo> {
+    from_paths_with_options(paths, &NativeOptions::default())
+}
+
+pub fn from_paths_with_options(
     paths: &[impl AsRef<Path>],
-    version_override: Option<&str>,
+    options: &NativeOptions,
 ) -> Result<DwarfInfo> {
     let mut modules = BTreeMap::new();
     let mut arch = None;
+    let mut embedded_version = None;
 
     for path in paths {
         let path = path.as_ref();
         let module_name = basename(path)
             .with_context(|| format!("native DWARF target {} has no file name", path.display()))?
             .to_string();
-        let module = parse_module(path, &module_name, &mut arch)
+        let parsed = parse_module(path, &module_name, &mut arch, options)
             .with_context(|| format!("failed to parse native DWARF from {}", path.display()))?;
-        modules.insert(module_name, module);
+        // First target (in path order) that embeds a version string wins -- the
+        // order the old per-path re-read scanned them in.
+        if embedded_version.is_none() {
+            embedded_version = parsed.embedded_version;
+        }
+        modules.insert(module_name, parsed.module);
     }
 
-    let version = version_override
+    let version = options
+        .ceph_version
+        .as_deref()
         .and_then(clean_version)
-        .or_else(|| resolve_ceph_version(paths));
+        .or(embedded_version);
+    let version = match version {
+        Some(version) => Some(version),
+        None => resolve_ceph_version(paths)?,
+    };
 
     Ok(DwarfInfo {
         version,
@@ -252,25 +326,103 @@ pub fn from_paths_with_version(
     })
 }
 
-fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
-    embedded_ceph_version(paths)
-        .or_else(|| microceph_ceph_version(paths))
-        .or_else(package_manager_ceph_version)
+/// Version sources beyond the targets' own bytes (which [`parse_module`]
+/// already scanned).
+///
+/// The HOST package database is consulted only when every target lives under
+/// the host's own root. A target reached through `/proc/<pid>/root` of a
+/// container belongs to whatever Ceph the container image ships; the host's
+/// `radosgw` package (if any) says nothing about it, and the version selects the
+/// `ceph_osd_op` ABI layout the BPF side reads -- a wrong guess there is wrong
+/// reads, not a missing feature. So that case is an error asking for the
+/// version, never a guess.
+fn resolve_ceph_version(paths: &[impl AsRef<Path>]) -> Result<Option<String>> {
+    if let Some(version) = microceph_ceph_version(paths) {
+        return Ok(Some(version));
+    }
+    let foreign: Vec<String> = paths
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|path| !shares_host_root(path))
+        .map(|path| path.display().to_string())
+        .collect();
+    if !foreign.is_empty() {
+        bail!(
+            "no embedded \"ceph version\" string found in the targets, and the host package \
+             database cannot describe {} (another mount namespace's root); pass \
+             --ceph-version with the version the target process runs",
+            foreign.join(", ")
+        );
+    }
+    Ok(package_manager_ceph_version())
 }
 
-fn embedded_ceph_version(paths: &[impl AsRef<Path>]) -> Option<String> {
-    paths
-        .iter()
-        .filter_map(|path| fs::read(path).ok())
-        .find_map(|data| ceph_version_from_bytes(&data))
+/// `/proc/<pid>/root` when `path` is reached through a numeric pid's root link.
+fn proc_pid_root(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut components = path.components();
+    let (
+        Some(Component::RootDir),
+        Some(Component::Normal(proc)),
+        Some(Component::Normal(pid)),
+        Some(Component::Normal(root)),
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return None;
+    };
+    let pid = pid.to_str()?;
+    (proc == "proc" && root == "root" && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| Path::new("/proc").join(pid).join("root"))
+}
+
+/// Whether host-side metadata (the package database) describes `path`: true
+/// unless `path` is under a `/proc/<pid>/root` that is NOT the host's own `/`.
+/// A process that merely runs on the host (not in a container) shares the host
+/// root -- same device and inode -- and keeps the package lookup.
+fn shares_host_root(path: &Path) -> bool {
+    let Some(root) = proc_pid_root(path) else {
+        return true;
+    };
+    same_file(&root, Path::new("/"))
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        // Cannot prove it is the host root: treat it as foreign.
+        _ => false,
+    }
+}
+
+/// Offset of the first `needle` in `haystack`. Jumps between occurrences of the
+/// needle's first byte (a tight single-byte scan) instead of comparing a whole
+/// window at every offset; no extra dependency.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let last_start = haystack.len().checked_sub(needle.len())?;
+    let mut from = 0;
+    while from <= last_start {
+        let candidate = from
+            + haystack[from..=last_start]
+                .iter()
+                .position(|&byte| byte == first)?;
+        if haystack[candidate + 1..candidate + needle.len()] == *rest {
+            return Some(candidate);
+        }
+        from = candidate + 1;
+    }
+    None
 }
 
 fn ceph_version_from_bytes(bytes: &[u8]) -> Option<String> {
     let needle = b"ceph version ";
-    let start = bytes
-        .windows(needle.len())
-        .position(|window| window == needle)?
-        + needle.len();
+    let start = find_bytes(bytes, needle)? + needle.len();
     let len = bytes[start..]
         .iter()
         .position(|byte| byte.is_ascii_whitespace() || *byte == 0)
@@ -341,24 +493,29 @@ fn clean_version(version: &str) -> Option<String> {
 
 fn package_manager_ceph_version() -> Option<String> {
     for package in ["radosgw", "librados2", "ceph-common"] {
-        if let Some(version) =
-            command_output_version("dpkg-query", &["-W", "-f=${Version}", package])
-        {
+        if let Some(version) = command_output_version(
+            crate::host_tools::DPKG_QUERY,
+            &["-W", "-f=${Version}", package],
+        ) {
             return Some(version);
         }
     }
     for package in ["ceph-radosgw", "librados2", "ceph-common"] {
-        if let Some(version) =
-            command_output_version("rpm", &["-q", "--qf", "%{VERSION}-%{RELEASE}", package])
-        {
+        if let Some(version) = command_output_version(
+            crate::host_tools::RPM,
+            &["-q", "--qf", "%{VERSION}-%{RELEASE}", package],
+        ) {
             return Some(version);
         }
     }
     None
 }
 
-fn command_output_version(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
+fn command_output_version(candidates: &[&str], args: &[&str]) -> Option<String> {
+    let output = crate::host_tools::system_command(candidates)?
+        .args(args)
+        .output()
+        .ok()?;
     output
         .status
         .success()
@@ -366,8 +523,95 @@ fn command_output_version(command: &str, args: &[&str]) -> Option<String> {
         .and_then(|stdout| first_version_token(&stdout))
 }
 
-fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Result<DwarfModule> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+/// Read all of `path`, refusing a file larger than `limit` bytes. `what` names
+/// the file's role in the error ("target", "debuglink file", ...).
+///
+/// The size is checked BEFORE reading (a sparse multi-GB file costs nothing to
+/// stat), and the read itself is capped too, so a file that grows between the
+/// two -- or one whose `stat` size understates it -- cannot exceed the limit.
+pub(crate) fn read_file_bounded(path: &Path, limit: u64, what: &str) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("failed to open {what} {}", path.display()))?;
+    let size = file
+        .metadata()
+        .with_context(|| format!("failed to stat {what} {}", path.display()))?
+        .len();
+    if size > limit {
+        bail!(
+            "{what} {} is {size} bytes, over the {limit}-byte limit \
+             (raise it with --max-debug-file-bytes)",
+            path.display()
+        );
+    }
+    let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut data)
+        .with_context(|| format!("failed to read {what} {}", path.display()))?;
+    if data.len() as u64 > limit {
+        bail!(
+            "{what} {} grew past the {limit}-byte limit while being read \
+             (raise it with --max-debug-file-bytes)",
+            path.display()
+        );
+    }
+    Ok(data)
+}
+
+/// Remaining decompression allowance for ONE object file's DWARF sections.
+///
+/// A compressed section's header declares its uncompressed size, and that
+/// declaration is attacker-controlled: inflating it on trust lets a few KiB on
+/// disk demand tens of GB. Every compressed section is charged against what is
+/// left of its file's budget BEFORE it is inflated.
+struct SectionBudget<'a> {
+    file: &'a Path,
+    limit: u64,
+    used: u64,
+}
+
+impl<'a> SectionBudget<'a> {
+    fn new(file: &'a Path, limit: u64) -> Self {
+        Self {
+            file,
+            limit,
+            used: 0,
+        }
+    }
+
+    fn reserve(&mut self, section: &str, size: u64) -> Result<()> {
+        let total = self.used.saturating_add(size);
+        if total > self.limit {
+            bail!(
+                "compressed DWARF section {section} of {} declares {size} uncompressed \
+                 bytes; with the {} bytes already decompressed from this file that exceeds \
+                 the {}-byte limit (raise it with --max-debug-file-bytes)",
+                self.file.display(),
+                self.used,
+                self.limit
+            );
+        }
+        self.used = total;
+        Ok(())
+    }
+}
+
+/// What [`parse_module`] learns from one target.
+struct ParsedModule {
+    module: DwarfModule,
+    /// Version from an embedded `ceph version X` string, scanned from the buffer
+    /// the module was parsed from (the target is read once, not once per use).
+    embedded_version: Option<String>,
+}
+
+fn parse_module(
+    path: &Path,
+    module_name: &str,
+    arch: &mut Option<String>,
+    options: &NativeOptions,
+) -> Result<ParsedModule> {
+    let limit = options.max_debug_file_bytes;
+    let data = read_file_bounded(path, limit, "target")?;
+    let embedded_version = ceph_version_from_bytes(&data);
     let file = object::File::parse(data.as_slice())
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
 
@@ -376,7 +620,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     }
 
     let build_id = file.build_id()?.map(hex_string);
-    let (debug_data, debug_file_path) = debug_data(path, &file, data.as_slice())?;
+    let (debug_data, debug_file_path) = debug_data(path, &file, data.as_slice(), limit)?;
     let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
         format!(
             "debug info for {} is not a supported object file",
@@ -394,7 +638,7 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     // strings reference it via `DW_FORM_GNU_ref_alt`/`DW_FORM_GNU_strp_alt`.
     // Read the supplementary object's bytes up front so they outlive the `Dwarf`
     // built below; missing/mismatched sup degrades to what resolves locally.
-    let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+    let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path, limit);
     let sup_file = match &sup_data {
         Some(bytes) => Some(object::File::parse(bytes.as_slice()).with_context(|| {
             format!(
@@ -405,17 +649,22 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
         None => None,
     };
 
-    // Load into owned `Vec<u8>` sections (not borrowed `Cow`s) so the main and
-    // supplementary section data share one owned type and no self-referential
-    // borrow is needed to attach the sup file.
-    let mut dwarf_owned =
-        Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))?;
+    // Sections stay BORROWED from the file buffers when stored uncompressed
+    // (`Cow::Borrowed`): copying them, as this used to, doubled peak memory for
+    // nothing. Only a compressed section allocates, against its file's
+    // decompression budget. The main and supplementary buffers both outlive
+    // `dwarf_sections`, so the two `Cow` lifetimes unify without any
+    // self-referential borrow.
+    let mut budget = SectionBudget::new(&debug_file_path, limit);
+    let mut dwarf_sections =
+        Dwarf::load(|section| load_section(&debug_file, section, &mut budget))?;
     if let Some(sup_file) = &sup_file {
-        dwarf_owned
-            .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))?;
+        let sup_label = debug_file_path.with_extension("dwz-supplementary");
+        let mut sup_budget = SectionBudget::new(&sup_label, limit);
+        dwarf_sections.load_sup(|section| load_section(sup_file, section, &mut sup_budget))?;
     }
     #[allow(deprecated)]
-    let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
+    let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
     // The probed binary's own symbols first: they describe the very file the
     // uprobe attaches to. A separate debug file's `.symtab` only fills the gaps a
@@ -455,11 +704,14 @@ fn parse_module(path: &Path, module_name: &str, arch: &mut Option<String>) -> Re
     let func2linkage = provenance_linkage_names(&resolved);
     let func2pc = ranked_pcs_into_pcs(resolved);
 
-    Ok(DwarfModule {
-        build_id,
-        func2pc,
-        func2vf,
-        func2linkage,
+    Ok(ParsedModule {
+        module: DwarfModule {
+            build_id,
+            func2pc,
+            func2vf,
+            func2linkage,
+        },
+        embedded_version,
     })
 }
 
@@ -568,6 +820,46 @@ struct DieRef<Offset> {
 /// are two or three links; the cap only bounds work on adversarial/looping DWARF
 /// (the visited check already breaks cycles).
 const ORIGIN_CHAIN_LIMIT: usize = 8;
+
+/// Hard cap on how many type DIEs one type walk may follow (typedef/cv
+/// qualifiers, and pointer/reference indirections within one field-path step).
+/// Real chains are a handful of links; only a reference cycle in malformed DWARF
+/// reaches the cap, and the walk then fails instead of spinning forever.
+const TYPE_CHAIN_LIMIT: usize = 64;
+
+/// Hard cap on how many classes one member lookup may search through the
+/// inheritance graph. The graph is already de-duplicated (a visited set breaks
+/// cycles and diamonds); this only bounds the work an adversarial file can force.
+const INHERITANCE_SEARCH_LIMIT: usize = 4096;
+
+/// Hard cap on namespace/class nesting for the RECURSIVE function walkers
+/// ([`collect_function_pcs`], [`collect_function_var_fields`]). They stop at every
+/// subprogram, so they only ever descend through scopes -- a few dozen levels in
+/// the deepest real C++. They stay recursive because the `EntriesTree` they walk
+/// skips a subprogram's body via `DW_AT_sibling` without parsing it; the cap keeps
+/// a hostile file from turning that recursion into a stack overflow (which aborts
+/// the process rather than returning an error).
+const SCOPE_NESTING_LIMIT: usize = 256;
+
+/// Human-readable location of a DIE for error messages: its `.debug_info`
+/// section offset (what `readelf --debug-dump=info` / `llvm-dwarfdump` print), and
+/// which file it lives in.
+fn die_location<R: Reader>(index: &DwarfUnitIndex<R>, die: DieRef<R::Offset>) -> String {
+    let section = if index.is_sup(die.unit) {
+        "supplementary (DWZ) .debug_info"
+    } else {
+        ".debug_info"
+    };
+    let unit = index.unit(die.unit);
+    match die.offset.to_debug_info_offset(&unit.header) {
+        Some(offset) => format!("DIE at {section} offset {:#x}", offset.0.into_u64()),
+        None => format!(
+            "DIE at unit offset {:#x} in {section} unit {}",
+            die.offset.0.into_u64(),
+            die.unit
+        ),
+    }
+}
 
 /// The DIEs an attribute of `die` may be inherited from, NEAREST FIRST: `die`
 /// itself, then the transitive closure of its `DW_AT_abstract_origin` and
@@ -842,6 +1134,7 @@ fn function_pcs<R: Reader>(
             index,
             unit_index,
             root,
+            0,
             &mut Vec::new(),
             &mut result,
             wanted,
@@ -880,6 +1173,7 @@ fn function_var_fields<R: Reader>(
             index,
             unit_index,
             root,
+            0,
             &mut Vec::new(),
             &mut result,
             wanted,
@@ -899,6 +1193,7 @@ fn collect_function_var_fields<R: Reader>(
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
     node: EntriesTreeNode<R>,
+    depth: usize,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, FunctionVarFields>,
     wanted: &[&str],
@@ -907,6 +1202,19 @@ fn collect_function_var_fields<R: Reader>(
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
+    }
+    if depth > SCOPE_NESTING_LIMIT {
+        anyhow::bail!(
+            "DWARF scope nesting deeper than {SCOPE_NESTING_LIMIT} levels at {} \
+             (malformed DWARF?)",
+            die_location(
+                index,
+                DieRef {
+                    unit: unit_index,
+                    offset: node.entry().offset(),
+                }
+            )
+        );
     }
 
     let unit = index.unit(unit_index);
@@ -958,7 +1266,16 @@ fn collect_function_var_fields<R: Reader>(
     let mut children = node.children();
     while let Some(child) = children.next()? {
         collect_function_var_fields(
-            dwarf, index, unit_index, child, scopes, result, wanted, facts, probe_pcs,
+            dwarf,
+            index,
+            unit_index,
+            child,
+            depth + 1,
+            scopes,
+            result,
+            wanted,
+            facts,
+            probe_pcs,
         )?;
         if has_all_functions(result, wanted) {
             break;
@@ -1416,69 +1733,104 @@ fn type_definition_die<R: Reader>(
         return Ok(None);
     };
     for unit_index in 0..index.len() {
-        let unit = index.unit(unit_index);
-        let mut tree = unit.entries_tree(None)?;
-        let root = tree.root()?;
-        let mut scopes = Vec::new();
-        if let Some(found) =
-            find_type_definition(dwarf, index, unit_index, root, &path, &mut scopes)?
-        {
+        if let Some(found) = find_type_definition(dwarf, index, unit_index, &path)? {
             return Ok(Some(found));
         }
     }
     Ok(None)
 }
 
-/// Find the non-declaration class/struct DIE whose enclosing scopes plus own name
-/// equal `path`, anywhere under `node`.
+/// Enclosing-scope stack for an iterative `next_dfs` walk: a scope pushed at
+/// depth `d` encloses every DIE deeper than `d`, and is popped as soon as the walk
+/// returns to depth `d` or shallower.
+///
+/// The type/scope searches below walk a WHOLE unit, subprogram bodies included,
+/// so their depth is whatever lexical-block / inlined-subroutine nesting the file
+/// has. Doing that with `next_dfs` instead of recursion keeps stack use constant,
+/// however deep the tree -- a recursive walker overflows (and aborts the process)
+/// on a hostile file's deep nesting.
+struct DfsScopes {
+    depth: isize,
+    scopes: Vec<(isize, String)>,
+}
+
+impl DfsScopes {
+    fn new() -> Self {
+        Self {
+            depth: 0,
+            scopes: Vec::new(),
+        }
+    }
+
+    /// Account for the `delta` `next_dfs` returned with the current entry and
+    /// drop every scope the walk has left.
+    fn step(&mut self, delta: isize) {
+        self.depth += delta;
+        while self
+            .scopes
+            .last()
+            .is_some_and(|(scope_depth, _)| *scope_depth >= self.depth)
+        {
+            self.scopes.pop();
+        }
+    }
+
+    /// The scopes enclosing the current entry, outermost first.
+    fn enclosing(&self) -> impl Iterator<Item = &str> {
+        self.scopes.iter().map(|(_, name)| name.as_str())
+    }
+
+    fn len(&self) -> usize {
+        self.scopes.len()
+    }
+
+    /// Open `scope` (the current entry's own scope name) for its descendants.
+    fn push(&mut self, scope: String) {
+        self.scopes.push((self.depth, scope));
+    }
+}
+
+/// Find the non-declaration class/struct DIE in unit `unit_index` whose
+/// enclosing scopes plus own name equal `path`.
 fn find_type_definition<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
-    node: EntriesTreeNode<R>,
     path: &[String],
-    scopes: &mut Vec<String>,
 ) -> Result<Option<DieRef<R::Offset>>> {
     let unit = index.unit(unit_index);
     let dwarf = dwarf_for(dwarf, index, unit_index);
-    let entry = node.entry();
-    let is_definition = matches!(
-        entry.tag(),
-        gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
-    ) && !entry_flag(entry, gimli::DW_AT_declaration)?;
-    let name = die_name(dwarf, unit, entry)?;
+    let mut scopes = DfsScopes::new();
+    let mut entries = unit.entries();
+    while let Some((delta, entry)) = entries.next_dfs()? {
+        scopes.step(delta);
+        let is_definition = matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type
+        ) && !entry_flag(entry, gimli::DW_AT_declaration)?;
+        let name = die_name(dwarf, unit, entry)?;
 
-    if is_definition {
-        if let Some(name) = &name {
-            // The candidate's identity is its scope stack plus its own name. Only an
-            // exact match on the WHOLE path is the same type.
-            if path.len() == scopes.len() + 1
-                && path[..scopes.len()] == scopes[..]
-                && path[scopes.len()] == *name
-            {
-                return Ok(Some(DieRef {
-                    unit: unit_index,
-                    offset: entry.offset(),
-                }));
+        if is_definition {
+            if let Some(name) = &name {
+                // The candidate's identity is its scope stack plus its own name. Only
+                // an exact match on the WHOLE path is the same type.
+                if path.len() == scopes.len() + 1
+                    && scopes
+                        .enclosing()
+                        .eq(path[..scopes.len()].iter().map(String::as_str))
+                    && path[scopes.len()] == *name
+                {
+                    return Ok(Some(DieRef {
+                        unit: unit_index,
+                        offset: entry.offset(),
+                    }));
+                }
             }
         }
-    }
 
-    let scope = scope_name(dwarf, unit, entry)?;
-    if let Some(scope) = &scope {
-        scopes.push(scope.clone());
-    }
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(found) = find_type_definition(dwarf, index, unit_index, child, path, scopes)? {
-            if scope.is_some() {
-                scopes.pop();
-            }
-            return Ok(Some(found));
+        if let Some(scope) = scope_name(dwarf, unit, entry)? {
+            scopes.push(scope);
         }
-    }
-    if scope.is_some() {
-        scopes.pop();
     }
     Ok(None)
 }
@@ -1641,6 +1993,9 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
         let Ok(name) = symbol.name() else {
             continue;
         };
+        if !may_name_probe(name, wanted) {
+            continue;
+        }
         let Some(function) = demangle_function_name(name) else {
             continue;
         };
@@ -1666,17 +2021,32 @@ fn symbol_function_pcs(file: &object::File<'_>, wanted: &[&str]) -> BTreeMap<Str
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_function_pcs<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
     node: EntriesTreeNode<R>,
+    depth: usize,
     scopes: &mut Vec<String>,
     result: &mut BTreeMap<String, RankedPc>,
     wanted: &[&str],
 ) -> Result<()> {
     if has_all_functions(result, wanted) {
         return Ok(());
+    }
+    if depth > SCOPE_NESTING_LIMIT {
+        anyhow::bail!(
+            "DWARF scope nesting deeper than {SCOPE_NESTING_LIMIT} levels at {} \
+             (malformed DWARF?)",
+            die_location(
+                index,
+                DieRef {
+                    unit: unit_index,
+                    offset: node.entry().offset(),
+                }
+            )
+        );
     }
 
     let unit = index.unit(unit_index);
@@ -1712,7 +2082,16 @@ fn collect_function_pcs<R: Reader>(
 
     let mut children = node.children();
     while let Some(child) = children.next()? {
-        collect_function_pcs(dwarf, index, unit_index, child, scopes, result, wanted)?;
+        collect_function_pcs(
+            dwarf,
+            index,
+            unit_index,
+            child,
+            depth + 1,
+            scopes,
+            result,
+            wanted,
+        )?;
         if has_all_functions(result, wanted) {
             break;
         }
@@ -1862,8 +2241,12 @@ fn add_entry_function_names<R: Reader>(
         });
     }
     if let Some(linkage_name) = linkage_name(dwarf, unit, entry)? {
-        if let Some(demangled) = demangle_function_name(&linkage_name) {
-            names.push(demangled);
+        // Every caller only matches these names against probe keys, so a name
+        // that cannot spell any probe's identifier is not worth demangling.
+        if may_name_probe(&linkage_name, PROBE_FUNCTIONS) {
+            if let Some(demangled) = demangle_function_name(&linkage_name) {
+                names.push(demangled);
+            }
         }
     }
     Ok(())
@@ -1876,39 +2259,17 @@ fn entry_scopes<R: Reader>(
 ) -> Result<Option<Vec<String>>> {
     let dwarf = dwarf_for(dwarf, index, die.unit);
     let unit = index.unit(die.unit);
-    let mut tree = unit.entries_tree(None)?;
-    let root = tree.root()?;
-    find_entry_scopes(dwarf, unit, root, die.offset, &mut Vec::new())
-}
-
-fn find_entry_scopes<R: Reader>(
-    dwarf: &Dwarf<R>,
-    unit: &gimli::Unit<R>,
-    node: EntriesTreeNode<R>,
-    offset: gimli::UnitOffset<R::Offset>,
-    scopes: &mut Vec<String>,
-) -> Result<Option<Vec<String>>> {
-    let entry = node.entry();
-    if entry.offset() == offset {
-        return Ok(Some(scopes.clone()));
-    }
-
-    let scope = scope_name(dwarf, unit, entry)?;
-    if let Some(scope) = &scope {
-        scopes.push(scope.clone());
-    }
-
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(found) = find_entry_scopes(dwarf, unit, child, offset, scopes)? {
-            return Ok(Some(found));
+    let mut scopes = DfsScopes::new();
+    let mut entries = unit.entries();
+    while let Some((delta, entry)) = entries.next_dfs()? {
+        scopes.step(delta);
+        if entry.offset() == die.offset {
+            return Ok(Some(scopes.enclosing().map(str::to_string).collect()));
+        }
+        if let Some(scope) = scope_name(dwarf, unit, entry)? {
+            scopes.push(scope);
         }
     }
-
-    if scope.is_some() {
-        scopes.pop();
-    }
-
     Ok(None)
 }
 
@@ -1936,6 +2297,9 @@ fn translate_field_path_from<R: Reader>(
     path: &[&str],
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
+    // Pointer/reference hops do not advance `field_index`, so a pointer type that
+    // (directly or through qualifiers) points at itself would loop here forever.
+    let mut indirections = 0;
     while field_index < path.len() {
         typedie = peel_type_qualifiers(index, typedie)?;
         let typedie_unit = index.unit(typedie.unit);
@@ -1945,6 +2309,16 @@ fn translate_field_path_from<R: Reader>(
             | gimli::DW_TAG_rvalue_reference_type
             | gimli::DW_TAG_pointer_type => {
                 fields[field_index].pointer = true;
+                indirections += 1;
+                if indirections > TYPE_CHAIN_LIMIT {
+                    anyhow::bail!(
+                        "type chain at {} exceeds {TYPE_CHAIN_LIMIT} pointer/reference \
+                         indirections while resolving field {:?} (malformed DWARF: \
+                         reference cycle?)",
+                        die_location(index, typedie),
+                        path[field_index]
+                    );
+                }
                 let Some(next_type) = die_type(index, typedie)? else {
                     return Ok(None);
                 };
@@ -2050,11 +2424,8 @@ fn translate_named_type_field_path<R: Reader>(
         field_index,
     };
     for unit_index in 0..index.len() {
-        let unit = index.unit(unit_index);
-        let mut tree = unit.entries_tree(None)?;
-        let root = tree.root()?;
         if let Some(fields) =
-            find_named_type_field_path(dwarf, index, unit_index, root, &search, resolving)?
+            find_named_type_field_path(dwarf, index, unit_index, &search, resolving)?
         {
             return Ok(Some(fields));
         }
@@ -2069,23 +2440,28 @@ struct NamedTypeFieldSearch<'a> {
     field_index: usize,
 }
 
+/// Try every definition of `search.type_name` in unit `unit_index`, in DIE
+/// order, and return the first one the remaining field path resolves through.
+/// Iterative (`next_dfs`) for the same reason as [`find_type_definition`].
 fn find_named_type_field_path<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     unit_index: usize,
-    node: EntriesTreeNode<R>,
     search: &NamedTypeFieldSearch<'_>,
     resolving: &mut Vec<String>,
 ) -> Result<Option<Vec<FieldJson>>> {
     let unit = index.unit(unit_index);
-    let entry = node.entry();
-    if matches!(
-        entry.tag(),
-        gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
-    ) && die_name(dwarf_for(dwarf, index, unit_index), unit, entry)?.as_deref()
-        == Some(search.type_name)
-        && !entry_flag(entry, gimli::DW_AT_declaration)?
-    {
+    let unit_dwarf = dwarf_for(dwarf, index, unit_index);
+    let mut entries = unit.entries();
+    while let Some((_, entry)) = entries.next_dfs()? {
+        if !matches!(
+            entry.tag(),
+            gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type
+        ) || die_name(unit_dwarf, unit, entry)?.as_deref() != Some(search.type_name)
+            || entry_flag(entry, gimli::DW_AT_declaration)?
+        {
+            continue;
+        }
         let typedie = DieRef {
             unit: unit_index,
             offset: entry.offset(),
@@ -2103,16 +2479,6 @@ fn find_named_type_field_path<R: Reader>(
             return Ok(Some(fields));
         }
     }
-
-    let mut children = node.children();
-    while let Some(child) = children.next()? {
-        if let Some(fields) =
-            find_named_type_field_path(dwarf, index, unit_index, child, search, resolving)?
-        {
-            return Ok(Some(fields));
-        }
-    }
-
     Ok(None)
 }
 
@@ -2185,17 +2551,18 @@ fn decode_location_expression<R: Reader>(
                 seen_location = true;
             }
             Operation::FrameOffset { offset } => {
-                let Some(frame_base) = frame_base else {
+                let Some(frame_base) = frame_base.as_ref() else {
                     return Ok(None);
                 };
                 let Some(mut frame_location) =
-                    decode_location_expression(encoding, None, frame_base)?
+                    decode_location_expression(encoding, None, frame_base.clone())?
                 else {
                     return Ok(None);
                 };
                 add_location_offset(&mut frame_location, offset)?;
                 frame_location.stack = true;
-                return Ok(Some(frame_location));
+                location = frame_location;
+                seen_location = true;
             }
             Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
                 add_location_offset(&mut location, value as i64)?;
@@ -2229,8 +2596,10 @@ fn add_location_offset(location: &mut VarLocationJson, offset: i64) -> Result<()
 
 fn peel_type_qualifiers<R: Reader>(
     index: &DwarfUnitIndex<R>,
-    mut typedie: DieRef<R::Offset>,
+    start: DieRef<R::Offset>,
 ) -> Result<DieRef<R::Offset>> {
+    let mut typedie = start;
+    let mut hops = 0;
     while matches!(
         index.entry(typedie)?.tag(),
         gimli::DW_TAG_typedef
@@ -2241,6 +2610,14 @@ fn peel_type_qualifiers<R: Reader>(
         let Some(next_type) = die_type(index, typedie)? else {
             break;
         };
+        hops += 1;
+        if hops > TYPE_CHAIN_LIMIT {
+            anyhow::bail!(
+                "type qualifier chain starting at {} exceeds {TYPE_CHAIN_LIMIT} typedef/cv links \
+                 (malformed DWARF: reference cycle?)",
+                die_location(index, start)
+            );
+        }
         typedie = next_type;
     }
     Ok(typedie)
@@ -2264,7 +2641,19 @@ fn find_member_entry<R: Reader>(
     member_name: &str,
 ) -> Result<Option<MemberMatch<R::Offset>>> {
     let mut queue: Vec<(DieRef<R::Offset>, Result<i64>)> = vec![(typedie, Ok(0))];
+    let mut visited: Vec<DieRef<R::Offset>> = Vec::new();
     while let Some((parent, parent_offset)) = queue.pop() {
+        if visited.contains(&parent) {
+            continue;
+        }
+        if visited.len() >= INHERITANCE_SEARCH_LIMIT {
+            anyhow::bail!(
+                "member lookup for {member_name:?} from {} searched more than \
+                 {INHERITANCE_SEARCH_LIMIT} base classes (malformed DWARF?)",
+                die_location(index, typedie)
+            );
+        }
+        visited.push(parent);
         let unit = index.unit(parent.unit);
         // A member's owning struct may live in the DWZ supplementary file
         // (reached via `DW_FORM_GNU_ref_alt` on `DW_AT_type`); its member names
@@ -2760,6 +3149,7 @@ fn entry_pc<R: Reader>(
 fn load_section<'data>(
     file: &object::File<'data>,
     section: gimli::SectionId,
+    budget: &mut SectionBudget<'_>,
 ) -> Result<Cow<'data, [u8]>> {
     let Some(section) = file
         .section_by_name(section.name())
@@ -2767,9 +3157,29 @@ fn load_section<'data>(
     else {
         return Ok(Cow::Borrowed(&[]));
     };
-    section
-        .uncompressed_data()
-        .with_context(|| format!("failed to read {}", section.name().unwrap_or("<unknown>")))
+    let name = section.name().unwrap_or("<unknown>");
+    let compressed = section
+        .compressed_data()
+        .with_context(|| format!("failed to read {name}"))?;
+    if compressed.format != CompressionFormat::None {
+        // Charge the DECLARED size before `decompress` reserves and fills it.
+        budget.reserve(name, compressed.uncompressed_size)?;
+    }
+    compressed
+        .decompress()
+        .with_context(|| format!("failed to decompress {name}"))
+}
+
+#[cfg(test)]
+fn load_section_unbounded<'data>(
+    file: &object::File<'data>,
+    section: gimli::SectionId,
+) -> Result<Cow<'data, [u8]>> {
+    load_section(
+        file,
+        section,
+        &mut SectionBudget::new(Path::new("<test>"), u64::MAX),
+    )
 }
 
 /// Returns the DWARF-bearing object bytes and the on-disk path they came from.
@@ -2780,12 +3190,13 @@ fn debug_data<'data>(
     path: &Path,
     file: &object::File<'data>,
     data: &'data [u8],
+    limit: u64,
 ) -> Result<(Cow<'data, [u8]>, PathBuf)> {
     if file.has_debug_symbols() {
         return Ok((Cow::Borrowed(data), path.to_path_buf()));
     }
 
-    if let Some((bytes, debug_path)) = separate_debug_file(path, file)? {
+    if let Some((bytes, debug_path)) = separate_debug_file_with_limit(path, file, limit)? {
         return Ok((Cow::Owned(bytes), debug_path));
     }
 
@@ -2808,6 +3219,14 @@ pub(crate) fn separate_debug_file(
     path: &Path,
     file: &object::File<'_>,
 ) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    separate_debug_file_with_limit(path, file, DEFAULT_MAX_DEBUG_FILE_BYTES)
+}
+
+fn separate_debug_file_with_limit(
+    path: &Path,
+    file: &object::File<'_>,
+    limit: u64,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
     let binary_build_id = file.build_id()?;
     let mut rejected = Vec::new();
 
@@ -2816,7 +3235,7 @@ pub(crate) fn separate_debug_file(
             std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
         let candidates = debuglink_candidates(path, filename);
         if let Some(found) =
-            first_matching_debug_file(candidates, binary_build_id, Some(crc), &mut rejected)?
+            first_matching_debug_file(candidates, binary_build_id, Some(crc), limit, &mut rejected)?
         {
             return Ok(Some(found));
         }
@@ -2825,7 +3244,7 @@ pub(crate) fn separate_debug_file(
     if let Some(build_id) = binary_build_id {
         let candidates = build_id_debug_candidates(path, &hex_string(build_id));
         if let Some(found) =
-            first_matching_debug_file(candidates, binary_build_id, None, &mut rejected)?
+            first_matching_debug_file(candidates, binary_build_id, None, limit, &mut rejected)?
         {
             return Ok(Some(found));
         }
@@ -2855,7 +3274,13 @@ pub(crate) fn subprogram_low_pcs(
     } else {
         RunTimeEndian::Big
     };
-    let dwarf_cow = Dwarf::load(|section| load_section(file, section))?;
+    let dwarf_cow = Dwarf::load(|section| {
+        load_section(
+            file,
+            section,
+            &mut SectionBudget::new(Path::new("<probe image>"), DEFAULT_MAX_DEBUG_FILE_BYTES),
+        )
+    })?;
     #[allow(deprecated)]
     let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
     let mut found = std::collections::BTreeSet::new();
@@ -2887,11 +3312,11 @@ fn first_matching_debug_file(
     candidates: Vec<PathBuf>,
     binary_build_id: Option<&[u8]>,
     debuglink_crc: Option<u32>,
+    limit: u64,
     rejected: &mut Vec<String>,
 ) -> Result<Option<(Vec<u8>, PathBuf)>> {
     for candidate in candidates.into_iter().filter(|path| path.is_file()) {
-        let bytes = fs::read(&candidate)
-            .with_context(|| format!("failed to read debug file {}", candidate.display()))?;
+        let bytes = read_file_bounded(&candidate, limit, "separate debug file")?;
         match debug_file_mismatch(binary_build_id, debuglink_crc, &bytes) {
             None => return Ok(Some((bytes, candidate))),
             Some(reason) => {
@@ -2951,7 +3376,11 @@ fn debug_file_mismatch(
 /// bytes when the file is found and its build-id matches the link; otherwise
 /// warns and returns `None` so extraction continues with whatever resolves
 /// without it (consistent with tolerating missing supplementary string refs).
-fn load_sup_object_bytes(debug_file: &object::File<'_>, debug_file_path: &Path) -> Option<Vec<u8>> {
+fn load_sup_object_bytes(
+    debug_file: &object::File<'_>,
+    debug_file_path: &Path,
+    limit: u64,
+) -> Option<Vec<u8>> {
     let section = debug_file.section_by_name(".gnu_debugaltlink")?;
     let data = match section.data() {
         Ok(data) => data,
@@ -2972,10 +3401,10 @@ fn load_sup_object_bytes(debug_file: &object::File<'_>, debug_file_path: &Path) 
         );
         return None;
     };
-    let bytes = match fs::read(&sup_path) {
+    let bytes = match read_file_bounded(&sup_path, limit, "DWZ supplementary file") {
         Ok(bytes) => bytes,
         Err(err) => {
-            warn!(path = %sup_path.display(), error = %err, "failed to read DWZ supplementary file; ignoring it");
+            warn!(path = %sup_path.display(), error = format!("{err:#}"), "failed to read DWZ supplementary file; ignoring it");
             return None;
         }
     };
@@ -3251,6 +3680,19 @@ mod tests {
         let location =
             decode_location_expression(test_encoding(), None, expression(&bytes)).unwrap();
         assert_eq!(location.map(|location| location.reg), Some(5));
+
+        // The frame-relative address is only valid if all following operations
+        // are also understood. In particular, dropping a dereference changes
+        // the variable's location and must fail closed.
+        let frame_base = expression(&[gimli::DW_OP_reg5.0]);
+        let frame_location = [gimli::DW_OP_fbreg.0, 0x78, gimli::DW_OP_deref.0];
+        assert!(decode_location_expression(
+            test_encoding(),
+            Some(frame_base),
+            expression(&frame_location),
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -3480,7 +3922,9 @@ mod tests {
             .build();
         let path = write_debuglink_pair("own-symbols-win", &binary, &debug);
 
-        let module = parse_module(&path, "radosgw", &mut None).unwrap();
+        let module = parse_module(&path, "radosgw", &mut None, &NativeOptions::default())
+            .unwrap()
+            .module;
         assert_eq!(module.func2pc.get(RGWREST_GET_HANDLER), Some(&0x1040));
     }
 
@@ -3814,7 +4258,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section)).unwrap();
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section)).unwrap();
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
         let index = DwarfUnitIndex::load(&dwarf).unwrap();
@@ -4693,9 +5137,10 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_owned =
-            Dwarf::load(|section| load_section(&file, section).map(|data| data.into_owned()))
-                .ok()?;
+        let dwarf_owned = Dwarf::load(|section| {
+            load_section_unbounded(&file, section).map(|data| data.into_owned())
+        })
+        .ok()?;
         #[allow(deprecated)]
         let dwarf = dwarf_owned.borrow(|section| EndianSlice::new(section, endian));
         let index = DwarfUnitIndex::load(&dwarf).ok()?;
@@ -5928,23 +6373,27 @@ mod tests {
     fn dwz_binary_uses_sup_refs(binary: &Path) -> bool {
         let data = std::fs::read(binary).unwrap();
         let file = object::File::parse(data.as_slice()).unwrap();
-        let (debug_data, debug_file_path) = debug_data(binary, &file, data.as_slice()).unwrap();
+        let (debug_data, debug_file_path) =
+            debug_data(binary, &file, data.as_slice(), u64::MAX).unwrap();
         let debug_file = object::File::parse(debug_data.as_ref()).unwrap();
         let endian = if debug_file.is_little_endian() {
             RunTimeEndian::Little
         } else {
             RunTimeEndian::Big
         };
-        let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path);
+        let sup_data = load_sup_object_bytes(&debug_file, &debug_file_path, u64::MAX);
         let sup_file = sup_data
             .as_ref()
             .map(|bytes| object::File::parse(bytes.as_slice()).unwrap());
-        let mut dwarf_owned =
-            Dwarf::load(|section| load_section(&debug_file, section).map(|data| data.into_owned()))
-                .unwrap();
+        let mut dwarf_owned = Dwarf::load(|section| {
+            load_section_unbounded(&debug_file, section).map(|data| data.into_owned())
+        })
+        .unwrap();
         if let Some(sup_file) = &sup_file {
             dwarf_owned
-                .load_sup(|section| load_section(sup_file, section).map(|data| data.into_owned()))
+                .load_sup(|section| {
+                    load_section_unbounded(sup_file, section).map(|data| data.into_owned())
+                })
                 .unwrap();
         }
         #[allow(deprecated)]
@@ -6257,7 +6706,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section)).unwrap();
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section)).unwrap();
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
@@ -6328,7 +6777,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section))?;
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
@@ -6372,7 +6821,7 @@ mod tests {
         } else {
             RunTimeEndian::Big
         };
-        let dwarf_cow = Dwarf::load(|section| load_section(&file, section))?;
+        let dwarf_cow = Dwarf::load(|section| load_section_unbounded(&file, section))?;
         #[allow(deprecated)]
         let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
 
@@ -6466,3 +6915,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dwarf_native_robustness_tests.rs"]
+mod robustness_tests;

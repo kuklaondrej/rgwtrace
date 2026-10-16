@@ -565,10 +565,15 @@ fn build_id_check(dwarf: &DwarfInfo, path: &Path) -> Result<BuildIdCheck> {
 }
 
 fn elf_build_id(path: &Path) -> Result<Option<String>> {
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let file = object::File::parse(data.as_slice())
+    // Read through a range cache, not the whole file: the build-id note is a few
+    // bytes near the start, and the target can be a multi-GB binary with
+    // embedded debug info (reading it whole here was its third full read).
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let cache = object::ReadCache::new(file);
+    let object = object::File::parse(&cache)
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
-    Ok(file.build_id()?.map(hex_string))
+    Ok(object.build_id()?.map(hex_string))
 }
 
 fn hex_string(bytes: &[u8]) -> String {
@@ -1149,6 +1154,39 @@ mod tests {
             finish_fields = var_fields(finish_field_count),
             handler_fields = var_fields(handler_field_count),
         )
+    }
+
+    #[test]
+    fn reads_the_build_id_note_without_reading_the_whole_file() {
+        let mut note = Vec::new();
+        note.extend_from_slice(&4u32.to_le_bytes()); // namesz
+        note.extend_from_slice(&4u32.to_le_bytes()); // descsz
+        note.extend_from_slice(&3u32.to_le_bytes()); // NT_GNU_BUILD_ID
+        note.extend_from_slice(b"GNU\0");
+        note.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let elf = crate::test_elf::tiny_elf(&[(".note.gnu.build-id", 7, 0, note)]);
+        let dir = std::env::temp_dir().join(format!(
+            "rgwtrace-preflight-build-id-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("radosgw");
+        fs::write(&path, &elf).unwrap();
+        // A sparse 1 GiB tail stands in for embedded debug info: it costs nothing
+        // on disk, and nothing in memory unless the whole file is read.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+
+        assert_eq!(elf_build_id(&path).unwrap().as_deref(), Some("deadbeef"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn var_fields(count: usize) -> String {
