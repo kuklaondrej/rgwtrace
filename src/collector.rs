@@ -392,14 +392,18 @@ pub const DEFAULT_INFERENCE_MAX_PENDING: usize = 65_536;
 /// range is a class-k interval that ended shortly before `start` -- a bounded,
 /// concurrency-sized set rather than everything resident.
 #[derive(Debug)]
-struct IntervalSet<K> {
+pub(crate) struct IntervalSet<K> {
     by_length: BTreeMap<u32, BTreeSet<(u64, u64, K)>>,
+    by_end: BTreeSet<(u64, u64, K)>,
+    pub(crate) scanned: std::cell::Cell<usize>,
 }
 
 impl<K> Default for IntervalSet<K> {
     fn default() -> Self {
         Self {
             by_length: BTreeMap::new(),
+            by_end: BTreeSet::new(),
+            scanned: std::cell::Cell::new(0),
         }
     }
 }
@@ -409,21 +413,23 @@ impl<K: Ord + Clone> IntervalSet<K> {
         64 - upper.saturating_sub(lower).leading_zeros()
     }
 
-    fn insert(&mut self, lower: u64, upper: u64, key: K) {
+    pub(crate) fn insert(&mut self, lower: u64, upper: u64, key: K) {
         self.by_length
             .entry(Self::length_class(lower, upper))
             .or_default()
-            .insert((lower, upper, key));
+            .insert((lower, upper, key.clone()));
+        self.by_end.insert((upper, lower, key));
     }
 
     fn remove(&mut self, lower: u64, upper: u64, key: K) {
         let class = Self::length_class(lower, upper);
         if let Some(entries) = self.by_length.get_mut(&class) {
-            entries.remove(&(lower, upper, key));
+            entries.remove(&(lower, upper, key.clone()));
             if entries.is_empty() {
                 self.by_length.remove(&class);
             }
         }
+        self.by_end.remove(&(upper, lower, key));
     }
 
     fn is_empty(&self) -> bool {
@@ -461,6 +467,15 @@ impl<K: Ord + Clone> IntervalSet<K> {
         self.near(lower, upper, min_key)
             .filter(move |(end, _)| *end >= lower)
             .map(|(_, key)| key)
+    }
+
+    /// Test whether any interval overlaps the query, using the end-ordered
+    /// index to skip intervals that have already ended before `lower`.
+    pub(crate) fn any_overlapping(&self, lower: u64, upper: u64, min_key: &K) -> bool {
+        self.by_end
+            .range((lower, 0, min_key.clone())..)
+            .inspect(|_| self.scanned.set(self.scanned.get() + 1))
+            .any(|(_, start, _)| *start <= upper)
     }
 }
 
@@ -648,11 +663,9 @@ impl Inference {
     /// candidate set, and later expiries could then leave a single survivor and
     /// infer the op onto it on the strength of an expiry, not of evidence.
     fn is_candidate_of_pending(&self, slot: CandidateSlot) -> bool {
-        self.pending_by_pid.get(&slot.pid).is_some_and(|ops| {
-            ops.overlapping(slot.lower_ns, slot.upper_ns, &0)
-                .next()
-                .is_some()
-        })
+        self.pending_by_pid
+            .get(&slot.pid)
+            .is_some_and(|ops| ops.any_overlapping(slot.lower_ns, slot.upper_ns, &0))
     }
 
     fn allocate_id(&mut self) -> u64 {
@@ -2442,6 +2455,17 @@ mod hot_path_tests;
 mod tests {
     use super::*;
     use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RadosOp, RequestEvent};
+
+    #[test]
+    fn pending_candidate_lookup_skips_ops_that_ended_before_request() {
+        let mut ops = IntervalSet::default();
+        for id in 0..10_000 {
+            ops.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+        }
+
+        assert!(!ops.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000, &0));
+        assert_eq!(ops.scanned.get(), 0);
+    }
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {

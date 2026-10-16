@@ -19,7 +19,7 @@ use std::{
 };
 
 use crate::{
-    collector::Collector,
+    collector::{Collector, IntervalSet},
     events::{
         CaptureTruncation, RadosEvent, RawClsOp, RawRadosEvent, RequestEvent, TraceEvent,
         MAX_ACTING, MAX_OBJECT_NAME, MAX_TRANS_ID,
@@ -319,4 +319,28 @@ fn collector_bench_inference_no_candidate() {
         0,
     );
     black_box(collector);
+}
+
+/// The drain's pending-inference guard with 10,000 long-lived ops that ended
+/// before the request being considered. The end index should skip every op.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn collector_bench_drain_pending_no_overlap() {
+    const OPS: u64 = 10_000;
+    const CHECKS: u64 = 100_000;
+    let mut pending = IntervalSet::default();
+    for id in 0..OPS {
+        pending.insert(100 * SEC, 170 * SEC, id);
+    }
+    let started = Instant::now();
+    for _ in 0..CHECKS {
+        black_box(pending.any_overlapping(180 * SEC, 181 * SEC, &0));
+    }
+    report(
+        "drain_pending_no_overlap ops=10000",
+        CHECKS,
+        started.elapsed().as_nanos(),
+        0,
+    );
+    assert_eq!(pending.scanned.get(), 0);
 }
