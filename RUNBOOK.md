@@ -357,10 +357,14 @@ cd rgwtrace-v0.1.0-x86_64-unknown-linux-gnu
 Replace the example version and architecture with the asset you downloaded.
 The fixture tests the executable offline; it cannot be used against a live RGW.
 
-For pre-generated metadata, choose a separate `dwarf-<hash>` release. Inspect
-`index.json` for the package source, exact package revisions, architecture,
-module build IDs, and optional probe capability checks. Download and verify
-the matching bundle using that catalog's `SHA256SUMS`, then extract it.
+For pre-generated metadata, open the same
+[GitHub Releases page](https://github.com/kuklaondrej/rgwtrace/releases) and
+choose a separate `dwarf-<hash>` catalog release. These catalogs are generated
+by the DWARF workflow; they appear alongside the binary releases, but do not
+replace the latest binary release. Inspect `index.json` for the package source,
+exact package revisions, architecture, module build IDs, and optional probe
+capability checks. Download and verify the matching bundle using that
+catalog's `SHA256SUMS`, then extract it.
 
 ```sh
 sudo ./rgwtrace --pid 12345 --import-json /path/to/native-dwarf.json --preflight
