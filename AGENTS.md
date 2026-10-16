@@ -9,7 +9,7 @@ Guidance for AI coding agents working in this repo. Keep it accurate as the code
 Pipeline:
 
 ```
-native DWARF or cephtrace JSON  ->  hprobes map  ->  eBPF uprobes  ->  ring buffer  ->  Rust events  ->  spans  ->  JSON or OTLP protobuf
+native DWARF or cephtrace JSON  ->  address validation  ->  hprobes map  ->  eBPF uprobes  ->  ring buffer  ->  Rust events  ->  spans  ->  JSON or OTLP protobuf
 ```
 
 Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostrace`). For depth, read `ARCHITECTURE.md` (stage-by-stage internals) and `RUNBOOK.md` (operations/troubleshooting); `README.md` has the overview.
@@ -53,7 +53,8 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - `src/events.rs` — BPF↔Rust ABI: `Raw*` on-wire structs decoded into owned Rust forms
 - `src/dwarf_{input,json,native}.rs` — probe-metadata sources (`native` = gimli/object ELF+DWARF; `json` = cephtrace import); shared `DwarfInfo` model
 - `src/targets.rs` — locate `librados`/`librbd`/`libceph-common`/`radosgw` (via `/proc/<pid>/root`)
-- `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs)
+- `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs, probe addresses)
+- `src/probe_sites.rs` — probe address validation and vaddr → file-offset translation (platform independent)
 - `src/otel.rs` — OTLP/HTTP protobuf export (`ExportClient`: one reqwest client per exporter, no redirects, redacted logging)
 - `src/otlp_headers.rs` — OTLP request-header sources (`--otlp-header-file` > `OTEL_EXPORTER_OTLP_HEADERS` > `--otlp-header`), merged by name; never logs a value
 - `src/live.rs` → `src/live/linux.rs` — Linux-only BPF load/attach/ring-buffer poll
@@ -87,6 +88,9 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - **The per-submit re-seed must not attach without the request-END probe** — the END probe is the only thing that revokes bridge entries; without it, a recycled `req_state`/`RGWOp` address hits a dead request's entry and the (disabled) liveness gate fails open. Phase B degrades to Phase A, loudly.
 - **The `dpp` is an opaque identity token — never dereference it, never apply an inheritance offset** — and the offset-0 claim it rests on (`req_state`/`RGWOp` inherit `DoutPrefixProvider` at 0) is **verified in DWARF per build** (`dpp_base_offset`, `src/dwarf_native.rs`), never assumed. A build that cannot prove it loses the key — or the whole per-submit re-seed — rather than keying on a guess.
 - **A request must never be emitted twice under the same span id** — request-group expiry is open/closed aware (open = END still expected; never idle-expired, only lifetime-bounded), and every exported request key is remembered **for the whole session** in a never-reset Bloom filter so a straggler cannot resurrect it. Do not "bound" it with a FIFO: at production rates the memory turns over in seconds and a force-expired long request's late END then re-emits the same span id. A Bloom false positive is safe (it drops), a false negative is not (it duplicates) — and Bloom filters have none.
+- **uprobes attach at FILE OFFSETS, never at `func2pc` virtual addresses** — `func2pc` stays a vaddr (artifact/cephtrace contract), and preflight's `validated_probe_sites` translates it through the target's executable `PT_LOAD` and proves it is a function entry (FUNC symbol, verified debug-file symbol, or DWARF `low_pc`). Every `attach_uprobe` call takes its offset from `ProbeSites::file_offset`; never pass or translate a raw address in the attach path. An absent optional probe fails soft; a present address that fails validation is a hard error, even for the END probe.
+- **Separate debug info is trusted only once proven to match the binary** — equal `NT_GNU_BUILD_ID`, else the `.gnu_debuglink` CRC. The preflight build-ID check compares the binary with itself and cannot catch a stale debuginfo package.
+- **Never default an unevaluable DWARF offset to 0** — an unsupported member location is an error naming the member and `DW_OP`; an inherited member adds its base's offset.
 - Keep the BPF↔Rust ABI (constants, `#[repr(C)]` structs, `MAX_*` caps) mirrored between `bpf/rgwtrace_events.h` and `src/events.rs`. Struct sizes are `_Static_assert`ed in the headers and const-asserted in Rust (`RGWTRACE_*_SIZE`); change both sides together. `every_header_abi_constant_is_mirrored_byte_for_byte_in_rust` fails if a header constant has no Rust twin.
 - **`hprobes` is an ARRAY: a lookup never misses for an in-range key.** Always go through `hprobe_lookup()`, which rejects slots whose `present` word is 0; a raw `bpf_map_lookup_elem(&hprobes, ...)` on an unpopulated slot returns a zeroed "register 0" descriptor. New hprobe keys must stay below `RGWTRACE_HPROBE_SLOTS`.
 - **The `rados_ops` stale sweep must never evict a live op.** `--rados-ops-stale-after` has a 60 s floor (twice Ceph's slow-op complaint time) and `sent_ns == 0` entries are never swept. Do not lower the floor to "reclaim faster"; a swept op that later completes emits no event.

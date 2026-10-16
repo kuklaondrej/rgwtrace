@@ -49,6 +49,15 @@ superseded by later sections in the same document.
   guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Probe-validation memory limits](bugfix-probe-validation-memory-limits.md): why
+  target and separate debug reads and cumulative DWARF decompression use the
+  configured limit.
+- [Frame-relative DWARF location fix](bugfix-frame-offset-trailing-ops.md): why
+  expressions must be fully checked after `DW_OP_fbreg`.
+- [Uprobe address validation](bugfix-uprobe-address-validation.md): why probe
+  addresses are translated to file offsets and checked as function entries, why
+  separate debug info must match the binary, and why member offsets are never
+  defaulted to 0.
 - [Long-session data integrity](bugfix-long-session-data-integrity.md): bounded
   collector memory, the rotating no-duplicate tombstone, OTLP loss accounting,
   and the expiry clock.

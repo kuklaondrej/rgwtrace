@@ -43,6 +43,10 @@ sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --prefligh
 sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 30 --output json
 ```
 
+Preflight refuses any probe address that is not a function entry in the
+target binary, and any separate debug info that does not match it, so a wrong
+artifact fails before a uprobe is placed.
+
 Live tracing requires `--pid`: the probes fire only in that process. Pass
 `--all-processes` instead to probe every process that maps the Ceph libraries
 (for lab hosts only).

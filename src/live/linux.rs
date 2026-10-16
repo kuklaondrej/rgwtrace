@@ -32,7 +32,9 @@ use crate::{
         RGW_RADOS_OPERATE_WRITE,
     },
     events::*,
-    otel, output, preflight, targets,
+    otel, output, preflight,
+    probe_sites::ProbeSites,
+    targets,
 };
 
 mod skel {
@@ -106,6 +108,10 @@ struct OtlpExporterConfig {
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = preflight::validated_targets(cli, dwarf)?;
+    // Every uprobe attaches at a FILE OFFSET proven here to be a function entry
+    // inside an executable PT_LOAD; the artifact's virtual addresses are never
+    // handed to the uprobe API directly.
+    let probe_sites = preflight::validated_probe_sites(dwarf, &targets, cli.max_debug_file_bytes)?;
     let scope = ProcessScope::from_cli(cli.pid, cli.all_processes)?;
     if scope.target_tgid != 0 {
         ensure_init_pid_namespace()?;
@@ -133,6 +139,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         &mut skel,
         dwarf,
         &targets,
+        &probe_sites,
         pid,
         cli.correlate_cross_thread,
         !cli.disable_rgw_op_bridge_key,
@@ -1279,6 +1286,7 @@ fn attach_probes(
     skel: &mut RgwtraceSkel<'_>,
     dwarf: &DwarfInfo,
     targets: &targets::ProbeTargets,
+    sites: &ProbeSites,
     pid: i32,
     correlate_cross_thread: bool,
     rgw_op_bridge_key: bool,
@@ -1306,9 +1314,14 @@ fn attach_probes(
             // This is an ENTRY uprobe (`retprobe = false`), never a uretprobe: see
             // the handler comment in bpf/rgwtrace.bpf.c.
             AttachStep::RequestEndProbe => {
-                request_end_probe =
-                    attach_request_end_probe(&mut links, skel, dwarf, &targets.radosgw, pid)
-                        == AttachOutcome::Attached;
+                request_end_probe = attach_request_end_probe(
+                    &mut links,
+                    skel,
+                    dwarf,
+                    sites,
+                    &targets.radosgw,
+                    pid,
+                )? == AttachOutcome::Attached;
             }
             // Published from the ACTUAL attach outcome above, and BEFORE any probe
             // that reads it. `REQUEST_END_PROBE_ATTACHED` tells the BPF side that
@@ -1328,6 +1341,7 @@ fn attach_probes(
                     pid,
                     &targets.radosgw,
                     dwarf,
+                    sites,
                     "RGWREST::get_handler",
                 )?;
                 // The cross-thread bridge's precondition: get_handler must resolve
@@ -1367,6 +1381,7 @@ fn attach_probes(
                         pid,
                         &targets.radosgw,
                         dwarf,
+                        sites,
                         RGW_PROCESS_AUTHENTICATED,
                     )?;
                     if rgw_op_bridge_key {
@@ -1394,7 +1409,14 @@ fn attach_probes(
             AttachStep::RadosOperate => {
                 if correlate_cross_thread {
                     if request_end_probe {
-                        attach_rados_operate_probes(&mut links, skel, dwarf, &targets.radosgw, pid);
+                        attach_rados_operate_probes(
+                            &mut links,
+                            skel,
+                            dwarf,
+                            sites,
+                            &targets.radosgw,
+                            pid,
+                        )?;
                     } else {
                         warn!(
                             "--correlate-cross-thread: the per-submit re-seed (rgw_rados_operate) \
@@ -1418,6 +1440,7 @@ fn attach_probes(
                         pid,
                         path,
                         dwarf,
+                        sites,
                         "Objecter::_send_op",
                     )?;
                     attach_if_present(
@@ -1427,6 +1450,7 @@ fn attach_probes(
                         pid,
                         path,
                         dwarf,
+                        sites,
                         "Objecter::_finish_op",
                     )?;
                 }
@@ -1518,27 +1542,30 @@ fn attach_rados_operate_probes(
     links: &mut Vec<Link>,
     skel: &mut RgwtraceSkel<'_>,
     dwarf: &DwarfInfo,
+    sites: &ProbeSites,
     radosgw: &Path,
     pid: i32,
-) -> usize {
+) -> Result<usize> {
     let read = attach_rados_operate_probe(
         links,
         &skel.progs.uprobe_rgw_rados_operate_read,
         false,
         dwarf,
+        sites,
         radosgw,
         pid,
         RGW_RADOS_OPERATE_READ,
-    );
+    )?;
     let write = attach_rados_operate_probe(
         links,
         &skel.progs.uprobe_rgw_rados_operate_write,
         false,
         dwarf,
+        sites,
         radosgw,
         pid,
         RGW_RADOS_OPERATE_WRITE,
-    );
+    )?;
 
     let attached = [read, write]
         .iter()
@@ -1553,18 +1580,20 @@ fn attach_rados_operate_probes(
              request ops will still be reported as background/inferred"
         );
     }
-    attached
+    Ok(attached)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach_rados_operate_probe(
     links: &mut Vec<Link>,
     prog: &libbpf_rs::ProgramMut<'_>,
     retprobe: bool,
     dwarf: &DwarfInfo,
+    sites: &ProbeSites,
     radosgw: &Path,
     pid: i32,
     function: &'static str,
-) -> AttachOutcome {
+) -> Result<AttachOutcome> {
     let probe = module_key_for_path(radosgw)
         .map(|module| dwarf.rados_operate_probe(&module, function))
         .unwrap_or(RadosOperateProbe::Unavailable(
@@ -1593,24 +1622,28 @@ fn attach_rados_operate_probe(
                 "per-submit cross-thread re-seed unavailable for this rgw_rados_operate overload; \
                  RADOS ops it would have submitted stay uncorrelated (background/inferred)"
             );
-            return AttachOutcome::Skipped;
+            return Ok(AttachOutcome::Skipped);
         }
     };
+    // A present address preflight did not validate is fatal, never a soft skip.
+    let file_offset = sites.file_offset(radosgw, function, addr)?;
 
-    match attach_uprobe(prog, retprobe, pid, radosgw, addr as usize) {
-        Ok(link) => {
-            links.push(link);
-            AttachOutcome::Attached
-        }
-        Err(err) => {
-            warn!(
-                function,
-                error = %format_args!("{err:#}"),
-                "failed to attach the per-submit cross-thread re-seed uprobe; continuing without it"
-            );
-            AttachOutcome::Skipped
-        }
-    }
+    Ok(
+        match attach_uprobe(prog, retprobe, pid, radosgw, file_offset as usize) {
+            Ok(link) => {
+                links.push(link);
+                AttachOutcome::Attached
+            }
+            Err(err) => {
+                warn!(
+                    function,
+                    error = %format_args!("{err:#}"),
+                    "failed to attach the per-submit cross-thread re-seed uprobe; continuing without it"
+                );
+                AttachOutcome::Skipped
+            }
+        },
+    )
 }
 
 /// Attach the request-END probe, degrading gracefully instead of failing the run,
@@ -1637,9 +1670,10 @@ fn attach_request_end_probe(
     links: &mut Vec<Link>,
     skel: &mut RgwtraceSkel<'_>,
     dwarf: &DwarfInfo,
+    sites: &ProbeSites,
     radosgw: &Path,
     pid: i32,
-) -> AttachOutcome {
+) -> Result<AttachOutcome> {
     let probe = module_key_for_path(radosgw)
         .map(|module| dwarf.request_end_probe(&module))
         .unwrap_or(RequestEndProbe::Unavailable(RequestEndProbeGap::NoModule));
@@ -1663,30 +1697,35 @@ fn attach_request_end_probe(
                 "request-END probe unavailable; request span durations will be DERIVED from RADOS \
                  child bounds (rgw.duration_quality=\"marker\") instead of measured"
             );
-            return AttachOutcome::Skipped;
+            return Ok(AttachOutcome::Skipped);
         }
     };
+    // Optional when ABSENT (above), but a PRESENT address preflight did not
+    // validate is fatal: a wrong breakpoint is worse than no END probe.
+    let file_offset = sites.file_offset(radosgw, REQ_STATE_DTOR, addr)?;
 
-    match attach_uprobe(
-        &skel.progs.uprobe_rgw_req_state_dtor,
-        false,
-        pid,
-        radosgw,
-        addr as usize,
-    ) {
-        Ok(link) => {
-            links.push(link);
-            AttachOutcome::Attached
-        }
-        Err(err) => {
-            warn!(
-                function = REQ_STATE_DTOR,
-                error = %format_args!("{err:#}"),
-                "failed to attach the request-END probe; continuing with DERIVED request durations"
-            );
-            AttachOutcome::Skipped
-        }
-    }
+    Ok(
+        match attach_uprobe(
+            &skel.progs.uprobe_rgw_req_state_dtor,
+            false,
+            pid,
+            radosgw,
+            file_offset as usize,
+        ) {
+            Ok(link) => {
+                links.push(link);
+                AttachOutcome::Attached
+            }
+            Err(err) => {
+                warn!(
+                    function = REQ_STATE_DTOR,
+                    error = %format_args!("{err:#}"),
+                    "failed to attach the request-END probe; continuing with DERIVED request durations"
+                );
+                AttachOutcome::Skipped
+            }
+        },
+    )
 }
 
 /// Whether the radosgw DWARF carries a valid varid-40 raw-pointer descriptor for
@@ -1706,6 +1745,7 @@ fn reseed_var_field_present(dwarf: &DwarfInfo, radosgw: &Path) -> bool {
 /// `path`'s module. Returns whether it was actually attached: an absent address
 /// is a legitimate skip (the function lives in another module), not an error, but
 /// the caller -- not this helper -- decides how loud that skip should be.
+#[allow(clippy::too_many_arguments)]
 fn attach_if_present(
     links: &mut Vec<Link>,
     prog: &libbpf_rs::ProgramMut<'_>,
@@ -1713,6 +1753,7 @@ fn attach_if_present(
     pid: i32,
     path: &Path,
     dwarf: &DwarfInfo,
+    sites: &ProbeSites,
     function: &str,
 ) -> Result<AttachOutcome> {
     // Derive the artifact module key from the CANONICALIZED path so a soname
@@ -1731,20 +1772,24 @@ fn attach_if_present(
         );
         return Ok(AttachOutcome::Skipped);
     };
+    let file_offset = sites.file_offset(path, function, addr)?;
     debug!(
         module = %module,
         function,
         addr,
+        file_offset,
         path = %path.display(),
-        "resolved func2pc; attaching uprobe"
+        "resolved func2pc; attaching uprobe at its validated file offset"
     );
 
-    let link = attach_uprobe(prog, retprobe, pid, path, addr as usize)
+    let link = attach_uprobe(prog, retprobe, pid, path, file_offset as usize)
         .with_context(|| format!("failed to attach {function} to {}", path.display()))?;
     links.push(link);
     Ok(AttachOutcome::Attached)
 }
 
+/// `func_offset` is a FILE offset into `binary_path` (what libbpf and the kernel
+/// take), never an ELF virtual address; callers get it from [`ProbeSites`].
 fn attach_uprobe(
     prog: &libbpf_rs::ProgramMut<'_>,
     retprobe: bool,

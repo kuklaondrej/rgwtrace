@@ -14,6 +14,7 @@ mod otel;
 mod otlp_headers;
 mod output;
 mod preflight;
+mod probe_sites;
 mod targets;
 #[cfg(test)]
 mod test_elf;

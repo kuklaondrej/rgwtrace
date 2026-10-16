@@ -620,8 +620,7 @@ fn parse_module(
     }
 
     let build_id = file.build_id()?.map(hex_string);
-    let (debug_data, debug_file_path) =
-        debug_data(path, &file, data.as_slice(), build_id.as_deref(), limit)?;
+    let (debug_data, debug_file_path) = debug_data(path, &file, data.as_slice(), limit)?;
     let debug_file = object::File::parse(debug_data.as_ref()).with_context(|| {
         format!(
             "debug info for {} is not a supported object file",
@@ -667,8 +666,11 @@ fn parse_module(
     #[allow(deprecated)]
     let dwarf = dwarf_sections.borrow(|section| EndianSlice::new(section, endian));
     let wanted = probe_functions_for_module(module_name);
-    let mut resolved = symbol_function_pcs(&debug_file, wanted);
-    for (function, ranked) in symbol_function_pcs(&file, wanted) {
+    // The probed binary's own symbols first: they describe the very file the
+    // uprobe attaches to. A separate debug file's `.symtab` only fills the gaps a
+    // stripped binary leaves (and it was proven to belong to this binary above).
+    let mut resolved = symbol_function_pcs(&file, wanted);
+    for (function, ranked) in symbol_function_pcs(&debug_file, wanted) {
         resolved.entry(function).or_insert(ranked);
     }
     // Load every compilation unit once and share it across both extraction
@@ -1618,12 +1620,18 @@ fn dpp_base_offset<R: Reader>(
         // DWARF 5 5.7.3: a member (here, a base class) whose location coincides with
         // the start of the containing entity may omit DW_AT_data_member_location, so
         // an absent attribute means offset 0. A virtual base encodes its location as
-        // an expression rather than a constant; `member_offset` yields None for those
-        // shapes too, and we must not read that as "0" -- so distinguish explicitly.
-        let Some(attr) = entry.attr(gimli::DW_AT_data_member_location)? else {
-            return Ok(Some(0));
-        };
-        return Ok(attr_offset(unit, attr.value())?.map(i64::from));
+        // a runtime expression that cannot be evaluated here; that is "unproven"
+        // (None), never "0", and costs only the key this offset would have proven.
+        return Ok(match inheritance_offset(unit, entry) {
+            Ok(offset) => Some(offset),
+            Err(err) => {
+                warn!(
+                    error = %format_args!("{err:#}"),
+                    "cannot evaluate the DoutPrefixProvider base location; its offset is unproven"
+                );
+                None
+            }
+        });
     }
     Ok(None)
 }
@@ -2317,7 +2325,7 @@ fn translate_field_path_from<R: Reader>(
                 typedie = next_type;
             }
             gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type => {
-                let Some(member) = find_member_entry(dwarf, index, typedie, path[field_index])?
+                let Some(found) = find_member_entry(dwarf, index, typedie, path[field_index])?
                 else {
                     if let Some(fields) = translate_declared_type_field_path(
                         dwarf,
@@ -2332,10 +2340,26 @@ fn translate_field_path_from<R: Reader>(
                     }
                     return Ok(None);
                 };
+                let member = found.member;
+                let member_name = path[field_index];
                 let member_unit = index.unit(member.unit);
                 let member_entry = member_unit.entry(member.offset)?;
-                fields[field_index].offset =
-                    member_offset(member_unit, &member_entry)?.unwrap_or_default();
+                let offset = member_offset(member_unit, &member_entry, member_name)?;
+                // The member's location is relative to the class that declares it;
+                // when it was found through a base class, that base's own location
+                // inside `typedie` must be added, not assumed to be zero.
+                let base_offset = found.base_offset.with_context(|| {
+                    format!(
+                        "member `{member_name}` is inherited through a base class whose \
+                         location cannot be evaluated"
+                    )
+                })?;
+                fields[field_index].offset = base_offset
+                    .checked_add(i64::from(offset))
+                    .and_then(|offset| i32::try_from(offset).ok())
+                    .with_context(|| {
+                        format!("offset of member `{member_name}` does not fit an i32")
+                    })?;
                 let Some(next_type) = die_type(index, member)? else {
                     return Ok(None);
                 };
@@ -2477,7 +2501,7 @@ fn variable_location<R: Reader>(
         });
 
     if let AttributeValue::Exprloc(expression) = attr.value() {
-        return decode_location_expression(unit, frame_base, expression);
+        return decode_location_expression(unit.encoding(), frame_base, expression);
     }
 
     let Some(mut locations) = dwarf.attr_locations(unit, attr.value())? else {
@@ -2485,15 +2509,19 @@ fn variable_location<R: Reader>(
     };
     while let Some(location) = locations.next()? {
         if pc >= location.range.begin && pc < location.range.end {
-            return decode_location_expression(unit, frame_base, location.data);
+            return decode_location_expression(unit.encoding(), frame_base, location.data);
         }
     }
 
     Ok(None)
 }
 
+/// Decode a variable location into the `reg + offset (+ stack)` shape the BPF
+/// side reads. An operation outside that shape yields NO location (the probe's
+/// descriptor is then rejected) -- skipping it would describe a different place
+/// than the one DWARF names.
 fn decode_location_expression<R: Reader>(
-    unit: &gimli::Unit<R>,
+    encoding: gimli::Encoding,
     frame_base: Option<gimli::Expression<R>>,
     expression: gimli::Expression<R>,
 ) -> Result<Option<VarLocationJson>> {
@@ -2503,9 +2531,13 @@ fn decode_location_expression<R: Reader>(
         stack: false,
     };
     let mut seen_location = false;
-    let mut operations = expression.operations(unit.encoding());
+    let mut operations = expression.clone().operations(encoding);
 
-    while let Some(operation) = operations.next()? {
+    loop {
+        let op_offset = operations.offset_from(&expression);
+        let Some(operation) = operations.next()? else {
+            break;
+        };
         match operation {
             Operation::Register { register } => {
                 location.reg = register.0 as i32;
@@ -2519,16 +2551,18 @@ fn decode_location_expression<R: Reader>(
                 seen_location = true;
             }
             Operation::FrameOffset { offset } => {
-                let Some(frame_base) = frame_base else {
+                let Some(frame_base) = frame_base.as_ref() else {
                     return Ok(None);
                 };
-                let Some(mut frame_location) = decode_location_expression(unit, None, frame_base)?
+                let Some(mut frame_location) =
+                    decode_location_expression(encoding, None, frame_base.clone())?
                 else {
                     return Ok(None);
                 };
                 add_location_offset(&mut frame_location, offset)?;
                 frame_location.stack = true;
-                return Ok(Some(frame_location));
+                location = frame_location;
+                seen_location = true;
             }
             Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
                 add_location_offset(&mut location, value as i64)?;
@@ -2538,7 +2572,13 @@ fn decode_location_expression<R: Reader>(
             }
             Operation::Nop => {}
             Operation::CallFrameCFA => return Ok(None),
-            _ => {}
+            _ => {
+                debug!(
+                    op = %operation_name(&expression, op_offset),
+                    "unsupported DWARF operation in a variable location; no location decoded"
+                );
+                return Ok(None);
+            }
         }
     }
 
@@ -2583,18 +2623,26 @@ fn peel_type_qualifiers<R: Reader>(
     Ok(typedie)
 }
 
+/// A `DW_TAG_member` found by [`find_member_entry`], plus the offset of the
+/// (possibly inherited) class that declares it inside the searched type.
+struct MemberMatch<O> {
+    member: DieRef<O>,
+    /// `Err` when the member was reached through a base class whose location
+    /// cannot be evaluated (a virtual base's location is a runtime expression).
+    /// Kept lazy so an unrelated virtual base elsewhere in the hierarchy does not
+    /// fail a lookup that never goes through it.
+    base_offset: Result<i64>,
+}
+
 fn find_member_entry<R: Reader>(
     dwarf: &Dwarf<R>,
     index: &DwarfUnitIndex<R>,
     typedie: DieRef<R::Offset>,
     member_name: &str,
-) -> Result<Option<DieRef<R::Offset>>> {
-    // Base classes are searched depth-first, each at most once: `visited` breaks
-    // an inheritance cycle (impossible in C++, possible in a hostile file) and
-    // keeps a diamond from being walked once per path to it.
-    let mut queue = vec![typedie];
+) -> Result<Option<MemberMatch<R::Offset>>> {
+    let mut queue: Vec<(DieRef<R::Offset>, Result<i64>)> = vec![(typedie, Ok(0))];
     let mut visited: Vec<DieRef<R::Offset>> = Vec::new();
-    while let Some(parent) = queue.pop() {
+    while let Some((parent, parent_offset)) = queue.pop() {
         if visited.contains(&parent) {
             continue;
         }
@@ -2623,12 +2671,23 @@ fn find_member_entry<R: Reader>(
             match entry.tag() {
                 gimli::DW_TAG_member => {
                     if die_name(parent_dwarf, unit, entry)?.as_deref() == Some(member_name) {
-                        return Ok(Some(child_ref));
+                        return Ok(Some(MemberMatch {
+                            member: child_ref,
+                            base_offset: parent_offset,
+                        }));
                     }
                 }
                 gimli::DW_TAG_inheritance => {
                     if let Some(parent_type) = die_type(index, child_ref)? {
-                        queue.push(parent_type);
+                        let base_offset = match &parent_offset {
+                            Ok(outer) => inheritance_offset(unit, entry)
+                                .map(|inner| outer + inner)
+                                .with_context(|| {
+                                    format!("cannot locate a base class while searching for `{member_name}`")
+                                }),
+                            Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                        };
+                        queue.push((parent_type, base_offset));
                     }
                 }
                 _ => {}
@@ -2816,28 +2875,92 @@ fn die_type<R: Reader>(
     Ok(None)
 }
 
+/// The facts about a `DW_TAG_member` that decide whether an ABSENT location
+/// attribute may be read as offset 0.
+#[derive(Clone, Copy, Debug, Default)]
+struct MemberShape {
+    /// A static data member (`DW_AT_external`/`DW_AT_declaration`): it has no
+    /// location inside the object at all.
+    is_static: bool,
+    /// A bit-field located by `DW_AT_data_bit_offset`: its start is a BIT offset.
+    has_data_bit_offset: bool,
+}
+
+/// Byte offset of `member` inside the class that declares it.
+///
+/// Every shape this cannot evaluate is an ERROR naming the member, never a
+/// default: an offset of 0 that is not really 0 makes the BPF side read the wrong
+/// bytes of every request, silently.
 fn member_offset<R: Reader>(
     unit: &gimli::Unit<R>,
     member: &DebuggingInformationEntry<R>,
-) -> Result<Option<i32>> {
-    let Some(attr) = member.attr(gimli::DW_AT_data_member_location)? else {
-        return Ok(None);
+    member_name: &str,
+) -> Result<i32> {
+    let shape = MemberShape {
+        is_static: entry_flag(member, gimli::DW_AT_external)?
+            || entry_flag(member, gimli::DW_AT_declaration)?,
+        has_data_bit_offset: member.attr(gimli::DW_AT_data_bit_offset)?.is_some(),
     };
-    attr_offset(unit, attr.value())
+    let location = member
+        .attr(gimli::DW_AT_data_member_location)?
+        .map(|attr| attr.value());
+    resolve_member_offset(unit.encoding(), member_name, location, shape)
 }
 
-fn attr_offset<R: Reader>(unit: &gimli::Unit<R>, value: AttributeValue<R>) -> Result<Option<i32>> {
-    let offset = match value {
+fn resolve_member_offset<R: Reader>(
+    encoding: gimli::Encoding,
+    member_name: &str,
+    location: Option<AttributeValue<R>>,
+    shape: MemberShape,
+) -> Result<i32> {
+    let Some(location) = location else {
+        // DWARF 5 5.7.6: a data member that starts at the beginning of its
+        // containing entity may omit both location attributes. That reading is only
+        // valid for an ordinary, non-static, byte-addressed member.
+        if shape.is_static {
+            anyhow::bail!("member `{member_name}` is a static data member and has no offset");
+        }
+        if shape.has_data_bit_offset {
+            anyhow::bail!(
+                "member `{member_name}` is located by DW_AT_data_bit_offset, which is not supported"
+            );
+        }
+        return Ok(0);
+    };
+    let offset = attr_offset(encoding, location)
+        .with_context(|| format!("cannot evaluate the location of member `{member_name}`"))?;
+    i32::try_from(offset)
+        .with_context(|| format!("offset {offset} of member `{member_name}` does not fit an i32"))
+}
+
+/// Offset of a base class (`DW_TAG_inheritance`) inside the derived class.
+fn inheritance_offset<R: Reader>(
+    unit: &gimli::Unit<R>,
+    entry: &DebuggingInformationEntry<R>,
+) -> Result<i64> {
+    // Same DWARF 5 rule as for members: a base at the start of the derived class
+    // may omit its location.
+    let Some(attr) = entry.attr(gimli::DW_AT_data_member_location)? else {
+        return Ok(0);
+    };
+    attr_offset(unit.encoding(), attr.value())
+}
+
+/// Evaluate a constant-class or simple-expression `DW_AT_data_member_location`.
+/// Any other form is an error: callers must never mistake "unsupported" for 0.
+fn attr_offset<R: Reader>(encoding: gimli::Encoding, value: AttributeValue<R>) -> Result<i64> {
+    Ok(match value {
         AttributeValue::Data1(value) => value as i64,
         AttributeValue::Data2(value) => value as i64,
         AttributeValue::Data4(value) => value as i64,
         AttributeValue::Data8(value) => value as i64,
         AttributeValue::Sdata(value) => value,
-        AttributeValue::Udata(value) => value as i64,
-        AttributeValue::Exprloc(expression) => expression_offset(unit, expression)?,
-        _ => return Ok(None),
-    };
-    Ok(i32::try_from(offset).ok())
+        AttributeValue::Udata(value) => {
+            i64::try_from(value).context("DW_AT_data_member_location does not fit an i64")?
+        }
+        AttributeValue::Exprloc(expression) => expression_offset(encoding, expression)?,
+        other => anyhow::bail!("unsupported DW_AT_data_member_location form {other:?}"),
+    })
 }
 
 fn entry_flag<R: Reader>(entry: &DebuggingInformationEntry<R>, attr: gimli::DwAt) -> Result<bool> {
@@ -2856,24 +2979,43 @@ fn entry_flag<R: Reader>(entry: &DebuggingInformationEntry<R>, attr: gimli::DwAt
 }
 
 fn expression_offset<R: Reader>(
-    unit: &gimli::Unit<R>,
+    encoding: gimli::Encoding,
     expression: gimli::Expression<R>,
 ) -> Result<i64> {
-    let mut offset = 0;
-    let mut operations = expression.operations(unit.encoding());
-    while let Some(operation) = operations.next()? {
-        match operation {
+    let mut offset: i64 = 0;
+    let mut operations = expression.clone().operations(encoding);
+    loop {
+        let op_offset = operations.offset_from(&expression);
+        let Some(operation) = operations.next()? else {
+            break;
+        };
+        let value = match operation {
             Operation::PlusConstant { value } | Operation::UnsignedConstant { value } => {
-                offset += value as i64;
+                i64::try_from(value).context("DWARF member location constant does not fit i64")?
             }
-            Operation::SignedConstant { value } | Operation::FrameOffset { offset: value } => {
-                offset += value;
-            }
-            Operation::Nop => {}
-            _ => return Ok(0),
-        }
+            Operation::SignedConstant { value } | Operation::FrameOffset { offset: value } => value,
+            Operation::Nop => continue,
+            _ => anyhow::bail!(
+                "unsupported DWARF operation {} in a member location expression",
+                operation_name(&expression, op_offset)
+            ),
+        };
+        offset = offset
+            .checked_add(value)
+            .context("DWARF member location offset overflow")?;
     }
     Ok(offset)
+}
+
+/// The `DW_OP_*` name of the operation at `op_offset` in `expression`, for error
+/// messages an operator can act on.
+fn operation_name<R: Reader>(expression: &gimli::Expression<R>, op_offset: R::Offset) -> String {
+    let mut reader = expression.0.clone();
+    reader
+        .skip(op_offset)
+        .and_then(|()| reader.read_u8())
+        .map(|opcode| gimli::DwOp(opcode).to_string())
+        .unwrap_or_else(|_| "<unreadable DW_OP>".to_string())
 }
 
 fn scope_name<R: Reader>(
@@ -3028,6 +3170,15 @@ fn load_section<'data>(
         .with_context(|| format!("failed to decompress {name}"))
 }
 
+fn load_dwarf_sections<'data>(
+    file: &object::File<'data>,
+    path: &Path,
+    limit: u64,
+) -> Result<Dwarf<Cow<'data, [u8]>>> {
+    let mut budget = SectionBudget::new(path, limit);
+    Dwarf::load(|section| load_section(file, section, &mut budget))
+}
+
 #[cfg(test)]
 fn load_section_unbounded<'data>(
     file: &object::File<'data>,
@@ -3048,26 +3199,182 @@ fn debug_data<'data>(
     path: &Path,
     file: &object::File<'data>,
     data: &'data [u8],
-    build_id: Option<&str>,
     limit: u64,
 ) -> Result<(Cow<'data, [u8]>, PathBuf)> {
     if file.has_debug_symbols() {
         return Ok((Cow::Borrowed(data), path.to_path_buf()));
     }
 
-    if let Some(debug_path) = debuglink_file(path, file)? {
-        let bytes = read_file_bounded(&debug_path, limit, "debuglink file")?;
+    if let Some((bytes, debug_path)) = separate_debug_file_with_limit(path, file, limit)? {
         return Ok((Cow::Owned(bytes), debug_path));
     }
 
-    if let Some(build_id) = build_id {
-        if let Some(debug_path) = build_id_debug_file(path, build_id) {
-            let bytes = read_file_bounded(&debug_path, limit, "build-id debug file")?;
-            return Ok((Cow::Owned(bytes), debug_path));
+    Ok((Cow::Borrowed(data), path.to_path_buf()))
+}
+
+/// Locate `path`'s separate debug file (`.gnu_debuglink`, then the
+/// `.build-id/xx/yyyy.debug` tree) and PROVE it belongs to this binary before
+/// any of its DWARF or symbols are trusted. Returns `Ok(None)` when no candidate
+/// exists, and an error when candidates exist but none of them matches: a debug
+/// file from another build yields wrong field offsets and wrong addresses with no
+/// other symptom, and the build-ID preflight check cannot see it (it compares
+/// the binary with itself).
+///
+/// The proof is the NT_GNU_BUILD_ID when both files carry one (equality
+/// required), otherwise the `.gnu_debuglink` CRC-32 over the whole debug file.
+/// The build ID wins when both are available because post-processing such as
+/// dwz can rewrite a debug file after its CRC was recorded.
+#[allow(dead_code)] // The test helper preserves a convenient default-limit API.
+pub(crate) fn separate_debug_file(
+    path: &Path,
+    file: &object::File<'_>,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    separate_debug_file_with_limit(path, file, DEFAULT_MAX_DEBUG_FILE_BYTES)
+}
+
+pub(crate) fn separate_debug_file_with_limit(
+    path: &Path,
+    file: &object::File<'_>,
+    limit: u64,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    let binary_build_id = file.build_id()?;
+    let mut rejected = Vec::new();
+
+    if let Some((filename, crc)) = file.gnu_debuglink()? {
+        let filename =
+            std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
+        let candidates = debuglink_candidates(path, filename)?;
+        if let Some(found) =
+            first_matching_debug_file(candidates, binary_build_id, Some(crc), limit, &mut rejected)?
+        {
+            return Ok(Some(found));
         }
     }
 
-    Ok((Cow::Borrowed(data), path.to_path_buf()))
+    if let Some(build_id) = binary_build_id {
+        let candidates = build_id_debug_candidates(path, &hex_string(build_id));
+        if let Some(found) =
+            first_matching_debug_file(candidates, binary_build_id, None, limit, &mut rejected)?
+        {
+            return Ok(Some(found));
+        }
+    }
+
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "refusing separate debug info for {}: {}. Install the debuginfo that matches the \
+             probed binary (or point --dwarf-source at a binary with embedded DWARF)",
+            path.display(),
+            rejected.join("; ")
+        );
+    }
+    Ok(None)
+}
+
+/// The subset of `wanted` that are `DW_AT_low_pc` of a `DW_TAG_subprogram` in
+/// `file`'s DWARF: a concrete, out-of-line function starts there. Only
+/// `low_pc` counts -- the first `DW_AT_ranges` entry of a hot/cold-split
+/// function is not guaranteed to be its entry.
+pub(crate) fn subprogram_low_pcs(
+    file: &object::File<'_>,
+    wanted: &std::collections::BTreeSet<u64>,
+    path: &Path,
+    limit: u64,
+) -> Result<std::collections::BTreeSet<u64>> {
+    let endian = if file.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+    let dwarf_cow = load_dwarf_sections(file, path, limit)?;
+    #[allow(deprecated)]
+    let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
+    let mut found = std::collections::BTreeSet::new();
+    let mut headers = dwarf.units();
+    while let Some(header) = headers.next()? {
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+        while let Some((_, entry)) = entries.next_dfs()? {
+            if entry.tag() != gimli::DW_TAG_subprogram {
+                continue;
+            }
+            let Some(attr) = entry.attr(gimli::DW_AT_low_pc)? else {
+                continue;
+            };
+            if let Some(pc) = dwarf.attr_address(&unit, attr.value())? {
+                if wanted.contains(&pc) {
+                    found.insert(pc);
+                }
+            }
+        }
+        if found.len() == wanted.len() {
+            break;
+        }
+    }
+    Ok(found)
+}
+
+fn first_matching_debug_file(
+    candidates: Vec<PathBuf>,
+    binary_build_id: Option<&[u8]>,
+    debuglink_crc: Option<u32>,
+    limit: u64,
+    rejected: &mut Vec<String>,
+) -> Result<Option<(Vec<u8>, PathBuf)>> {
+    for candidate in candidates.into_iter().filter(|path| path.is_file()) {
+        let bytes = read_file_bounded(&candidate, limit, "separate debug file")?;
+        match debug_file_mismatch(binary_build_id, debuglink_crc, &bytes) {
+            None => return Ok(Some((bytes, candidate))),
+            Some(reason) => {
+                warn!(
+                    path = %candidate.display(),
+                    reason = %reason,
+                    "ignoring a separate debug file that does not belong to the probed binary"
+                );
+                rejected.push(format!("{} ({reason})", candidate.display()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Why `debug_bytes` cannot be proven to be this binary's debug file, or `None`
+/// when it is proven.
+fn debug_file_mismatch(
+    binary_build_id: Option<&[u8]>,
+    debuglink_crc: Option<u32>,
+    debug_bytes: &[u8],
+) -> Option<String> {
+    let debug_build_id = match object::File::parse(debug_bytes) {
+        Ok(debug_file) => match debug_file.build_id() {
+            Ok(build_id) => build_id,
+            Err(err) => return Some(format!("unreadable build ID: {err}")),
+        },
+        Err(err) => return Some(format!("not a supported object file: {err}")),
+    };
+    if let (Some(expected), Some(actual)) = (binary_build_id, debug_build_id) {
+        return (expected != actual).then(|| {
+            format!(
+                "build ID {} does not match the binary's {}",
+                hex_string(actual),
+                hex_string(expected)
+            )
+        });
+    }
+    let Some(expected_crc) = debuglink_crc else {
+        return Some(
+            "the debug file carries no build ID, so nothing proves it belongs to the binary"
+                .to_string(),
+        );
+    };
+    let mut crc = flate2::Crc::new();
+    crc.update(debug_bytes);
+    let actual_crc = crc.sum();
+    (actual_crc != expected_crc).then(|| {
+        format!(
+            ".gnu_debuglink CRC {expected_crc:#010x} does not match the file's {actual_crc:#010x}"
+        )
+    })
 }
 
 /// Best-effort location and validation of the DWZ supplementary object named by
@@ -3173,18 +3480,6 @@ fn debugaltlink_candidates(debug_file: &Path, alt_path: &Path) -> Vec<PathBuf> {
         );
     }
     candidates
-}
-
-fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf>> {
-    let Some((filename, _crc)) = file.gnu_debuglink()? else {
-        return Ok(None);
-    };
-    let filename = std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
-    Ok(first_existing(debuglink_candidates(path, filename)?))
-}
-
-fn build_id_debug_file(path: &Path, build_id: &str) -> Option<PathBuf> {
-    first_existing(build_id_debug_candidates(path, build_id))
 }
 
 fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
@@ -3316,6 +3611,166 @@ mod tests {
         DwarfInfo, DwarfModule, FieldJson, FunctionVarFields, VarFieldJson, VarLocationJson,
     };
 
+    fn test_encoding() -> gimli::Encoding {
+        gimli::Encoding {
+            format: gimli::Format::Dwarf32,
+            version: 4,
+            address_size: 8,
+        }
+    }
+
+    fn expression(bytes: &[u8]) -> gimli::Expression<EndianSlice<'_, gimli::LittleEndian>> {
+        gimli::Expression(EndianSlice::new(bytes, gimli::LittleEndian))
+    }
+
+    #[test]
+    fn member_location_expression_evaluates_supported_constant_ops() {
+        let bytes = [gimli::DW_OP_plus_uconst.0, 0x18];
+        let offset = expression_offset(test_encoding(), expression(&bytes)).unwrap();
+        assert_eq!(offset, 0x18);
+    }
+
+    #[test]
+    fn member_location_expression_with_an_unsupported_op_is_an_error_not_offset_zero() {
+        // A virtual base's location: `DW_OP_dup; DW_OP_deref; ...`. It used to
+        // evaluate to offset 0, so the BPF side read the wrong bytes silently.
+        let bytes = [gimli::DW_OP_dup.0, gimli::DW_OP_deref.0];
+        let err = expression_offset(test_encoding(), expression(&bytes)).unwrap_err();
+        assert!(format!("{err:#}").contains("DW_OP_dup"), "message: {err:#}");
+    }
+
+    #[test]
+    fn member_offset_names_the_member_and_the_unsupported_op() {
+        let bytes = [gimli::DW_OP_dup.0, gimli::DW_OP_deref.0];
+        let err = resolve_member_offset(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::Exprloc(expression(&bytes))),
+            MemberShape::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("`target`"), "message: {msg}");
+        assert!(msg.contains("DW_OP_dup"), "message: {msg}");
+    }
+
+    #[test]
+    fn member_offset_refuses_unsupported_forms_and_out_of_range_values() {
+        let loclist = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::LocationListsRef(
+                gimli::LocationListsOffset(0),
+            )),
+            MemberShape::default(),
+        );
+        assert!(loclist.is_err());
+
+        // Used to be `i32::try_from(..).ok()` -> None -> `unwrap_or_default()` = 0.
+        let huge = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "target",
+            Some(AttributeValue::Udata(1 << 40)),
+            MemberShape::default(),
+        );
+        let msg = format!("{:#}", huge.unwrap_err());
+        assert!(msg.contains("`target`"), "message: {msg}");
+    }
+
+    #[test]
+    fn absent_member_location_is_offset_zero_only_for_a_plain_data_member() {
+        // DWARF 5 5.7.6: a member that starts at the beginning of its container may
+        // omit both location attributes.
+        let plain = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+            test_encoding(),
+            "first",
+            None,
+            MemberShape::default(),
+        )
+        .unwrap();
+        assert_eq!(plain, 0);
+
+        // A static data member has no in-object location at all, and a bit-field
+        // located by DW_AT_data_bit_offset is not at "offset 0" either.
+        for shape in [
+            MemberShape {
+                is_static: true,
+                has_data_bit_offset: false,
+            },
+            MemberShape {
+                is_static: false,
+                has_data_bit_offset: true,
+            },
+        ] {
+            let err = resolve_member_offset::<EndianSlice<'_, gimli::LittleEndian>>(
+                test_encoding(),
+                "counter",
+                None,
+                shape,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("`counter`"), "message: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_location_expression_with_an_unsupported_op_yields_no_location() {
+        // `DW_OP_reg5; DW_OP_deref`: ignoring the deref would hand the BPF side the
+        // register itself -- a wrong location, not a missing one.
+        let bytes = [gimli::DW_OP_reg5.0, gimli::DW_OP_deref.0];
+        let location =
+            decode_location_expression(test_encoding(), None, expression(&bytes)).unwrap();
+        assert!(location.is_none());
+
+        let bytes = [gimli::DW_OP_reg5.0];
+        let location =
+            decode_location_expression(test_encoding(), None, expression(&bytes)).unwrap();
+        assert_eq!(location.map(|location| location.reg), Some(5));
+
+        // The frame-relative address is only valid if all following operations
+        // are also understood. In particular, dropping a dereference changes
+        // the variable's location and must fail closed.
+        let frame_base = expression(&[gimli::DW_OP_reg5.0]);
+        let frame_location = [gimli::DW_OP_fbreg.0, 0x78, gimli::DW_OP_deref.0];
+        assert!(decode_location_expression(
+            test_encoding(),
+            Some(frame_base),
+            expression(&frame_location),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn inherited_member_offsets_include_the_base_class_offset() {
+        // `struct Derived : A, B` and the probed member lives in `B`, which sits at
+        // offset 16 inside `Derived`. The member's own location (8) is relative to
+        // `B`, so the real offset is 24 -- not 8, which is what dropping the
+        // inheritance edge's location produced.
+        let Some(binary) = compile_cpp_source(
+            "inherited-member-fixture",
+            r#"
+            struct A { long a0; long a1; };
+            struct B { long b0; long target; };
+            struct Derived : A, B { long own; };
+            long inspect(Derived* outer) { return outer->target; }
+            int main() { Derived d{}; return (int)inspect(&d); }
+            "#,
+        ) else {
+            fixture_skip();
+            return;
+        };
+        let Some(fields) =
+            fixture_field_path(&binary, "inspect", "outer", &["outer", "target"]).unwrap()
+        else {
+            // No DWARF in the linked binary (macOS keeps it in a .dSYM); the Linux
+            // CI build runs this for real.
+            return;
+        };
+        assert!(fields[1].pointer || fields[0].pointer);
+        assert_eq!(fields[1].offset, 24);
+    }
+
     // CI must not count a missing compiler, DWZ tool, or expected DWARF shape
     // as a passing regression test. Other platforms report the skip explicitly.
     fn fixture_skip() {
@@ -3362,29 +3817,26 @@ mod tests {
         assert!(module.function_addr("RGWREST::get_handler").is_some());
     }
 
-    #[test]
-    fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
-        let Some(binary) = compile_cpp_fixture() else {
-            fixture_skip();
-            return;
-        };
+    /// Split `binary` into a stripped copy carrying a `.gnu_debuglink` and its
+    /// `--only-keep-debug` file. `None` when objcopy is unavailable (macOS).
+    fn objcopy_debuglink_pair(binary: &Path) -> Option<(PathBuf, PathBuf)> {
         let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
         let debug_file = binary.with_extension("debug");
         let stripped = binary.with_file_name("fixture-stripped");
 
         if !std::process::Command::new(&objcopy)
             .args(["--only-keep-debug"])
-            .arg(&binary)
+            .arg(binary)
             .arg(&debug_file)
             .status()
             .is_ok_and(|status| status.success())
         {
             fixture_skip();
-            return;
+            return None;
         }
-        if std::fs::copy(&binary, &stripped).is_err() {
+        if std::fs::copy(binary, &stripped).is_err() {
             fixture_skip();
-            return;
+            return None;
         }
         if !std::process::Command::new(&objcopy)
             .args(["--strip-all"])
@@ -3397,8 +3849,21 @@ mod tests {
             .is_ok_and(|status| status.success())
         {
             fixture_skip();
-            return;
+            return None;
         }
+        Some((stripped, debug_file))
+    }
+
+    #[test]
+    fn parses_probe_function_pcs_from_gnu_debuglink_when_objcopy_is_available() {
+        let Some(binary) = compile_cpp_fixture() else {
+            fixture_skip();
+            return;
+        };
+        let Some((stripped, _)) = objcopy_debuglink_pair(&binary) else {
+            fixture_skip();
+            return;
+        };
 
         let info = from_paths(&[stripped.as_path()]).unwrap();
         let module = info.modules.values().next().unwrap();
@@ -3406,6 +3871,266 @@ mod tests {
         assert!(module.function_addr("Objecter::_send_op").is_some());
         assert!(module.function_addr("Objecter::_finish_op").is_some());
         assert!(module.function_addr("RGWREST::get_handler").is_some());
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+
+    /// Write `binary` (linking to `radosgw.debug`) and `debug` side by side and
+    /// return the binary's path.
+    fn write_debuglink_pair(name: &str, binary: &[u8], debug: &[u8]) -> PathBuf {
+        let dir = crate::test_elf::temp_dir(name);
+        std::fs::write(dir.join("radosgw.debug"), debug).unwrap();
+        let path = dir.join("radosgw");
+        std::fs::write(&path, binary).unwrap();
+        path
+    }
+
+    fn lookup_debug_file(path: &Path) -> Result<Option<(Vec<u8>, PathBuf)>> {
+        let data = std::fs::read(path).unwrap();
+        let file = object::File::parse(data.as_slice()).unwrap();
+        separate_debug_file(path, &file)
+    }
+
+    #[test]
+    fn a_debuglink_file_with_a_different_build_id_is_refused() {
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xbb; 20]))
+            .build();
+        // The CRC even matches: a build-ID disagreement still wins.
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .build();
+        let path = write_debuglink_pair("debuglink-build-id-mismatch", &binary, &debug);
+
+        let err = lookup_debug_file(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("build ID"), "message: {msg}");
+        assert!(msg.contains(&"bb".repeat(20)), "message: {msg}");
+    }
+
+    #[test]
+    fn a_debuglink_file_with_the_same_build_id_is_accepted_even_with_a_stale_crc() {
+        // dwz rewrites the debug file after the debuglink CRC was computed; the
+        // build ID is the stronger identity and is what gdb trusts first too.
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .build();
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xaa; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug) ^ 1))
+            .build();
+        let path = write_debuglink_pair("debuglink-build-id-match", &binary, &debug);
+
+        let (bytes, found) = lookup_debug_file(&path).unwrap().unwrap();
+        assert_eq!(bytes, debug);
+        assert_eq!(found, path.with_file_name("radosgw.debug"));
+    }
+
+    #[test]
+    fn without_build_ids_the_debuglink_crc_must_match() {
+        use crate::test_elf::{debuglink, TestElf};
+        let debug = TestElf::pie(0x1000, 0x100).build();
+
+        let corrupted = TestElf::pie(0x1000, 0x100)
+            .section(debuglink("radosgw.debug", crc32(&debug) ^ 0xdead_beef))
+            .build();
+        let path = write_debuglink_pair("debuglink-crc-mismatch", &corrupted, &debug);
+        let msg = format!("{:#}", lookup_debug_file(&path).unwrap_err());
+        assert!(msg.contains("CRC"), "message: {msg}");
+
+        let intact = TestElf::pie(0x1000, 0x100)
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .build();
+        let path = write_debuglink_pair("debuglink-crc-match", &intact, &debug);
+        assert!(lookup_debug_file(&path).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_build_id_tree_debug_file_must_carry_the_same_build_id() {
+        use crate::test_elf::{build_id_note, TestElf};
+        let id = [0x0a; 20];
+        let dir = crate::test_elf::temp_dir("build-id-tree");
+        let debug_dir = dir.join("usr/lib/debug/.build-id/0a");
+        std::fs::create_dir_all(&debug_dir).unwrap();
+        let debug_path = debug_dir.join(format!("{}.debug", "0a".repeat(19)));
+        let path = dir.join("radosgw");
+        std::fs::write(
+            &path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&id))
+                .build(),
+        )
+        .unwrap();
+
+        // No build ID in the debug file: nothing proves it belongs to the binary.
+        std::fs::write(&debug_path, TestElf::pie(0x1000, 0x100).build()).unwrap();
+        assert!(lookup_debug_file(&path).is_err());
+
+        std::fs::write(
+            &debug_path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&[0x0b; 20]))
+                .build(),
+        )
+        .unwrap();
+        assert!(lookup_debug_file(&path).is_err());
+
+        std::fs::write(
+            &debug_path,
+            TestElf::pie(0x1000, 0x100)
+                .section(build_id_note(&id))
+                .build(),
+        )
+        .unwrap();
+        let (_, found) = lookup_debug_file(&path).unwrap().unwrap();
+        assert_eq!(found, debug_path);
+    }
+
+    #[test]
+    fn the_probed_binarys_own_symbol_wins_over_the_debug_files() {
+        use crate::test_elf::{build_id_note, debuglink, TestElf};
+        const GET_HANDLER: &str = "_ZN7RGWREST11get_handlerEv";
+        let debug = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xcc; 20]))
+            .function(GET_HANDLER, 0x1080)
+            .build();
+        let binary = TestElf::pie(0x1000, 0x100)
+            .section(build_id_note(&[0xcc; 20]))
+            .section(debuglink("radosgw.debug", crc32(&debug)))
+            .function(GET_HANDLER, 0x1040)
+            .build();
+        let path = write_debuglink_pair("own-symbols-win", &binary, &debug);
+
+        let module = parse_module(&path, "radosgw", &mut None, &NativeOptions::default())
+            .unwrap()
+            .module;
+        assert_eq!(module.func2pc.get(RGWREST_GET_HANDLER), Some(&0x1040));
+    }
+
+    #[test]
+    fn refuses_a_gnu_debuglink_file_from_another_build_when_objcopy_is_available() {
+        let (Some(binary), Some(other)) = (compile_cpp_fixture(), compile_field_fixture()) else {
+            fixture_skip();
+            return;
+        };
+        let Some((stripped, debug_file)) = objcopy_debuglink_pair(&binary) else {
+            fixture_skip();
+            return;
+        };
+        // Replace the linked debug file with ANOTHER build's, under the same name:
+        // the stale-debuginfo-package situation. Its DWARF describes other code.
+        let Some((_, other_debug)) = objcopy_debuglink_pair(&other) else {
+            fixture_skip();
+            return;
+        };
+        std::fs::copy(&other_debug, &debug_file).unwrap();
+
+        let err = from_paths(&[stripped.as_path()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing separate debug info"),
+            "message: {msg}"
+        );
+    }
+
+    /// The artifact addresses native extraction produces for `binary`, as
+    /// `validate_target` requests. `None` off ELF (macOS Mach-O fixtures).
+    fn elf_probe_requests(binary: &Path) -> Option<Vec<(String, u64)>> {
+        let data = std::fs::read(binary).ok()?;
+        let file = object::File::parse(data.as_slice()).ok()?;
+        if file.format() != object::BinaryFormat::Elf {
+            return None;
+        }
+        let info = from_paths(&[binary]).unwrap();
+        let module = info.modules.values().next().unwrap();
+        let requests = module
+            .func2pc
+            .iter()
+            .map(|(function, addr)| (function.clone(), *addr))
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 3, "fixture resolves all three probes");
+        Some(requests)
+    }
+
+    fn as_requests(requests: &[(String, u64)]) -> Vec<(&str, u64)> {
+        requests
+            .iter()
+            .map(|(function, addr)| (function.as_str(), *addr))
+            .collect()
+    }
+
+    #[test]
+    fn real_probe_addresses_validate_as_function_entries() {
+        use crate::probe_sites::{validate_target, EntryEvidence};
+        let Some(binary) = compile_cpp_fixture() else {
+            fixture_skip();
+            return;
+        };
+        let Some(requests) = elf_probe_requests(&binary) else {
+            fixture_skip();
+            return;
+        };
+        let sites = validate_target(&binary, "fixture", &as_requests(&requests)).unwrap();
+        assert!(sites
+            .iter()
+            .all(|site| site.evidence == EntryEvidence::Symbol));
+
+        // One byte in is inside the function, not its entry.
+        let (function, addr) = &requests[0];
+        assert!(validate_target(&binary, "fixture", &[(function.as_str(), addr + 1)]).is_err());
+
+        // With no symbol table left, the DWARF subprogram low_pc still proves them.
+        let objcopy = std::env::var_os("OBJCOPY").unwrap_or_else(|| "objcopy".into());
+        let no_symtab = binary.with_file_name("fixture-no-symtab");
+        if !std::process::Command::new(&objcopy)
+            .args(["--strip-all", "--keep-section=.debug_*"])
+            .arg(&binary)
+            .arg(&no_symtab)
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let sites = validate_target(&no_symtab, "fixture", &as_requests(&requests)).unwrap();
+        assert!(
+            sites
+                .iter()
+                .all(|site| site.evidence == EntryEvidence::DwarfLowPc),
+            "{sites:?}"
+        );
+    }
+
+    #[test]
+    fn real_non_pie_probe_addresses_translate_to_file_offsets() {
+        let Some(binary) = compile_cpp_fixture_with_flags(&["-no-pie", "-fno-pie"]) else {
+            fixture_skip();
+            return;
+        };
+        let Some(requests) = elf_probe_requests(&binary) else {
+            fixture_skip();
+            return;
+        };
+        let sites =
+            crate::probe_sites::validate_target(&binary, "fixture", &as_requests(&requests))
+                .unwrap();
+        for site in sites {
+            // ET_EXEC text is linked at a base (0x400000 on x86_64/aarch64), so the
+            // vaddr the artifact carries is NOT the offset the uprobe API needs.
+            assert!(
+                site.file_offset < site.vaddr,
+                "{} vaddr {:#x} offset {:#x}",
+                site.function,
+                site.vaddr,
+                site.file_offset
+            );
+        }
     }
 
     /// F20: `.gnu_debuglink` is a bare FILENAME (the spec looks it up in a fixed
@@ -4709,7 +5434,7 @@ mod tests {
             // An expression is a location too. Ignoring it incorrectly classified
             // Apple clang's register-resident `this` as a stack-only fixture.
             if let AttributeValue::Exprloc(expression) = attr.value() {
-                entry_reg = decode_location_expression(unit, None, expression)
+                entry_reg = decode_location_expression(unit.encoding(), None, expression)
                     .ok()?
                     .filter(|location| !location.stack)
                     .map(|location| location.reg);
@@ -4717,7 +5442,8 @@ mod tests {
             if let Some(mut locations) = dwarf.attr_locations(unit, attr.value()).ok()? {
                 while let Some(location) = locations.next().ok()? {
                     loclist_entries += 1;
-                    let decoded = decode_location_expression(unit, None, location.data).ok()?;
+                    let decoded =
+                        decode_location_expression(unit.encoding(), None, location.data).ok()?;
                     let Some(decoded) = decoded.filter(|decoded| !decoded.stack) else {
                         continue;
                     };
@@ -5577,9 +6303,14 @@ mod tests {
     }
 
     fn compile_cpp_fixture() -> Option<std::path::PathBuf> {
-        compile_cpp_source(
-            "fixture",
-            r#"
+        compile_cpp_fixture_with_flags(&[])
+    }
+
+    fn compile_cpp_fixture_with_flags(flags: &[&str]) -> Option<std::path::PathBuf> {
+        compile_cpp_sources_with_flags("fixture", &[("fixture", CPP_FIXTURE_SOURCE)], flags)
+    }
+
+    const CPP_FIXTURE_SOURCE: &str = r#"
             class Objecter {
             public:
               __attribute__((noinline)) void _send_op(int op);
@@ -5602,9 +6333,7 @@ mod tests {
               rest.get_handler(3);
               return 0;
             }
-            "#,
-        )
-    }
+            "#;
 
     fn compile_field_fixture() -> Option<std::path::PathBuf> {
         compile_cpp_source(
@@ -5883,15 +6612,8 @@ mod tests {
     fn dwz_binary_uses_sup_refs(binary: &Path) -> bool {
         let data = std::fs::read(binary).unwrap();
         let file = object::File::parse(data.as_slice()).unwrap();
-        let build_id = file.build_id().unwrap().map(hex_string);
-        let (debug_data, debug_file_path) = debug_data(
-            binary,
-            &file,
-            data.as_slice(),
-            build_id.as_deref(),
-            u64::MAX,
-        )
-        .unwrap();
+        let (debug_data, debug_file_path) =
+            debug_data(binary, &file, data.as_slice(), u64::MAX).unwrap();
         let debug_file = object::File::parse(debug_data.as_ref()).unwrap();
         let endian = if debug_file.is_little_endian() {
             RunTimeEndian::Little
@@ -6294,6 +7016,15 @@ mod tests {
     }
 
     fn field_offsets_from_fixture(binary: &Path) -> Result<Option<Vec<FieldJson>>> {
+        fixture_field_path(binary, "inspect", "outer", &["outer", "leaf", "value"])
+    }
+
+    fn fixture_field_path(
+        binary: &Path,
+        function_name: &str,
+        param_name: &str,
+        path: &[&str],
+    ) -> Result<Option<Vec<FieldJson>>> {
         let data = std::fs::read(binary)?;
         let file = object::File::parse(data.as_slice())?;
         let endian = if file.is_little_endian() {
@@ -6308,7 +7039,8 @@ mod tests {
         let index = DwarfUnitIndex::load(&dwarf)?;
         for unit_index in 0..index.len() {
             let unit = index.unit(unit_index);
-            let Some(function) = find_subprogram_by_name(&dwarf, &index, unit_index, "inspect")?
+            let Some(function) =
+                find_subprogram_by_name(&dwarf, &index, unit_index, function_name)?
             else {
                 continue;
             };
@@ -6317,7 +7049,7 @@ mod tests {
                 unit,
                 function.offset(),
                 &[gimli::DW_TAG_formal_parameter],
-                "outer",
+                param_name,
             )?
             else {
                 continue;
@@ -6329,7 +7061,7 @@ mod tests {
                     unit: unit_index,
                     offset: param.offset(),
                 },
-                &["outer", "leaf", "value"],
+                path,
             );
         }
 

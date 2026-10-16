@@ -63,6 +63,23 @@ sudo rgwtrace --dwarf-source native --pid <pid> --max-debug-file-bytes 8G --pref
 
 Build ID mismatches fail preflight and live attach by default. Use `--allow-build-id-mismatch` only when the mismatch is understood.
 
+Preflight also validates every probe address against the target ELF and reports where each uprobe will attach. A probe address must be a function entry inside an executable `PT_LOAD`. It is attached at its **file offset**, which differs from the artifact's virtual address on non-PIE or lld-linked binaries:
+
+```json
+"probe_sites": [
+  {
+    "module": "radosgw",
+    "path": "/proc/4242/root/usr/bin/radosgw",
+    "function": "RGWREST::get_handler",
+    "vaddr": 4198464,
+    "file_offset": 4160,
+    "evidence": "symbol"
+  }
+]
+```
+
+`evidence` is `symbol` (the target's own `.symtab`/`.dynsym`), `debug_symbol` (its verified separate debug file), or `dwarf_low_pc`. A stripped target with no matching debug info installed cannot prove any address that is not exported in `.dynsym`, and fails preflight. Install the debuginfo package for the exact running build on the node.
+
 ---
 
 ## JSON Smoke Test
@@ -239,9 +256,11 @@ different loss: drains dropped because the exporter fell two drains behind.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
 - `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun with `--allow-build-id-mismatch` only if the mismatch is understood.
-- `... is N bytes, over the M-byte limit` or `compressed DWARF section ... exceeds the M-byte limit`: the named file or section is larger than `--max-debug-file-bytes`. Check that the file is the expected debug file. Then raise the limit, or export JSON on a host with more memory.
-- `the host package database cannot describe ... pass --ceph-version`: the target is in a container and has no embedded version string. Pass the version the RGW process runs, for example `--ceph-version 18.2.8`.
-- `type qualifier chain ...`, `... pointer/reference indirections ...`, `DWARF scope nesting deeper than ...`: the debug info is malformed (a reference cycle or absurd nesting). Use a debug file from the distribution's debuginfo package, or `--import-json`.
+- `refusing to probe <function> in module <module>: address 0x... is not inside an executable PT_LOAD segment`: the artifact was produced for a different binary. Regenerate it from the exact running binary (`--dwarf-source native`, or re-export the JSON). No flag overrides this.
+- `refusing to probe <function> ...: address 0x... is not the entry of any function`: the address is inside code but not at a function start, or the target has no symbols or matching debug info to prove it. Install the matching debuginfo package, or regenerate the artifact for this exact build. No flag overrides this, and it applies to the optional request-END probe too: an absent END address fails soft, a wrong one does not.
+- `refusing separate debug info for <binary>: <debug file> (build ID ... does not match ...)` or `(.gnu_debuglink CRC ... does not match ...)`: the installed debuginfo belongs to another build (typically a debuginfo package that was not upgraded with the binary). Install the matching debuginfo. `--allow-build-id-mismatch` does not apply: a mismatched debug file yields wrong offsets with no other symptom.
+- `cannot evaluate the location of member `<name>`` / `unsupported DWARF operation DW_OP_...`: the build's DWARF describes a probed member in a form rgwtrace does not evaluate (for example, through a virtual base). Native extraction fails rather than guess offset 0; report the Ceph build and the message.
+- `... was not validated by preflight; refusing to attach`: internal invariant. Attach only uses offsets preflight produced; report it as a bug.
 
 ---
 
