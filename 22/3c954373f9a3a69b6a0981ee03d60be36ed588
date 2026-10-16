@@ -1,0 +1,29 @@
+docs/bugfix-pending-inference-drain-index.md
+  s_ece52b9a589c27::t_20cd80253e1274 1-15
+src/collector.rs
+  s_ece52b9a589c27::t_700fd33209b031 2459-2469
+  s_ece52b9a589c27::t_c1628c1cf6d0a4 395,398,416,474
+  s_ece52b9a589c27::t_2cf6d3160e1633 406,420,477
+  s_ece52b9a589c27::t_408affc8b7f798 427
+  s_ece52b9a589c27::t_0aa6271de126bf 397,405,421,432,471-473,475-476,478-479,666-667
+  s_ece52b9a589c27::t_9328fb5beff50d 668
+src/collector_bench.rs
+  s_ece52b9a589c27::t_b097c4dcec4422 22,323-345
+  s_ece52b9a589c27::t_bf0ba0d15c1dd8 346
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "223c954373f9a3a69b6a0981ee03d60be36ed588",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
