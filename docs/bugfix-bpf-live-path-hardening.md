@@ -35,9 +35,11 @@ Ceph class. `struct rgwtrace_rados_event` grows from 536 to 560 bytes.
 which every new op was rejected (`bpf_rados_map_drops`).
 
 **Fix.** The default is 32768 and `--bpf-rados-ops-entries` overrides it before
-load. The poll loop sweeps the map every `min(30 s, threshold / 10)` and deletes
-entries whose `sent_ns` is older than `--rados-ops-stale-after` (default 300 s).
-The count is the new `stale_rados_ops_swept` diagnostic.
+load. The poll loop sweeps the map in batches of at most 256 keys per poll turn,
+deleting entries whose `sent_ns` is older than `--rados-ops-stale-after`
+(default 300 s). The iterator continues across turns, with each scan capped at
+twice the map's `max_entries` to bound restarts from concurrent completions.
+Sweep counts are added to `stale_rados_ops_swept` as each delete batch finishes.
 
 The sweep must never evict a live op. The threshold has a 60 s floor, twice
 Ceph's 30 s slow-op complaint time, and the 300 s default is far above any

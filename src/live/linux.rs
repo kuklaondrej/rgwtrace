@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use libbpf_rs::{
-    skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, OpenObject,
-    RingBufferBuilder,
+    skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, MapKeyIter,
+    OpenObject, RingBufferBuilder,
 };
 use tracing::{debug, info, warn};
 
@@ -131,8 +131,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let started = Instant::now();
     let mut last_flush = Instant::now();
     let target_watch = cli.pid.map(TargetWatch::new);
-    let rados_ops_sweep_every = rados_ops_sweep_interval(cli.rados_ops_stale_after);
-    let mut last_rados_ops_sweep = Instant::now();
+    let mut rados_ops_sweep = if cli.rados_ops_stale_after.is_zero() {
+        None
+    } else {
+        Some(StaleRadosOpsSweep::new(&skel.maps.rados_ops)?)
+    };
     // Latches once the OTLP exporter thread dies so a single fatal/misconfig
     // OTLP response cannot tear down the session or spam the log.
     let mut otlp_export_disabled = false;
@@ -181,12 +184,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                 break;
             }
         }
-        if !cli.rados_ops_stale_after.is_zero()
-            && last_rados_ops_sweep.elapsed() >= rados_ops_sweep_every
-        {
-            match sweep_stale_rados_ops(&skel.maps.rados_ops, cli.rados_ops_stale_after) {
-                Ok(0) => {}
-                Ok(swept) => {
+        if let Some(sweep) = &mut rados_ops_sweep {
+            match sweep.run_batch(&skel.maps.rados_ops, cli.rados_ops_stale_after) {
+                Ok(swept) if swept > 0 => {
                     info!(
                         swept,
                         stale_after_secs = cli.rados_ops_stale_after.as_secs(),
@@ -197,12 +197,21 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                         .expect("collector lock poisoned")
                         .record_stale_rados_ops_swept(swept);
                 }
-                Err(err) => warn!(
-                    error = %format_args!("{err:#}"),
-                    "failed to sweep stale rados_ops entries; retrying next interval"
-                ),
+                Ok(_) => {}
+                Err(err) => {
+                    // A later restore failure must not hide earlier successful
+                    // removals in the same batch.
+                    collector
+                        .lock()
+                        .expect("collector lock poisoned")
+                        .record_stale_rados_ops_swept(std::mem::take(&mut sweep.swept_pending));
+                    sweep.restart(&skel.maps.rados_ops);
+                    warn!(
+                        error = %format_args!("{err:#}"),
+                        "failed to sweep stale rados_ops entries; restarted the bounded scan"
+                    );
+                }
             }
-            last_rados_ops_sweep = Instant::now();
         }
         if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
         {
@@ -663,12 +672,9 @@ fn proc_stat_says_exited(stat: &str) -> bool {
         .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
 }
 
-/// How often the poll loop sweeps `rados_ops` for stale entries: often enough
-/// that a leak is reclaimed within a fraction of the threshold, rarely enough
-/// that iterating the map costs nothing measurable.
-fn rados_ops_sweep_interval(stale_after: Duration) -> Duration {
-    (stale_after / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
-}
+/// Limit map work between ring-buffer polls so a busy hash-map iterator cannot
+/// starve event consumption.
+const RADOS_OPS_SWEEP_BATCH_KEYS: usize = 256;
 
 /// Whether a `rados_ops` value (a `struct rados_op_state`, i.e. a
 /// `RawRadosEvent`) was sent more than `stale_after_ns` before `now_ns`.
@@ -728,69 +734,123 @@ fn reclaim_stale_rados_op(
     }
 }
 
-/// Delete `rados_ops` entries older than `stale_after`. Returns how many were
-/// deleted.
-///
-/// Keys are collected first and deleted afterwards: deleting the key a hash
-/// iteration is positioned on restarts the iteration. Between the scan and the
-/// delete, Ceph may RESEND a candidate op (same `cid`/`tid` key), and
-/// `_send_op` then replaces the entry with a fresh `sent_ns`; a blind delete by
-/// key would remove that live op. So each candidate is removed with an atomic
-/// lookup-and-delete and judged on the value actually removed; a refreshed one
-/// is re-inserted with `NO_EXIST` (a still newer submit wins). The only
-/// remaining window is a refreshed op completing in the microseconds between
-/// that removal and its re-insert, which counts as a finish miss.
-///
-/// Kernels before 5.14 lack lookup-and-delete on hash maps; there a candidate
-/// is re-read and deleted only if still stale, which narrows the window to the
-/// re-read-to-delete gap instead of closing it.
-/// `sent_ns` is CLOCK_BOOTTIME (`bpf_ktime_get_boot_ns`), so `now` is too.
-fn sweep_stale_rados_ops(map: &impl MapCore, stale_after: Duration) -> Result<u64> {
-    let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
-    let stale_after_ns = duration_ns(stale_after);
-    let mut stale = Vec::new();
-    for key in map.keys() {
-        let Some(value) = map
-            .lookup(&key, MapFlags::ANY)
-            .context("failed to read a rados_ops entry")?
-        else {
-            continue;
-        };
-        if rados_op_is_stale(&value, now_ns, stale_after_ns) {
-            stale.push(key);
+fn take_key_batch<I: Iterator>(
+    keys: &mut I,
+    cycle_budget: &mut usize,
+    batch_limit: usize,
+) -> (Vec<I::Item>, bool) {
+    let mut batch = Vec::with_capacity(batch_limit.min(*cycle_budget));
+    for _ in 0..batch_limit.min(*cycle_budget) {
+        match keys.next() {
+            Some(key) => {
+                batch.push(key);
+                *cycle_budget -= 1;
+            }
+            None => return (batch, true),
         }
     }
-    let mut swept = 0;
-    for key in stale {
-        let outcome = match map.lookup_and_delete(&key) {
-            Ok(taken) => reclaim_stale_rados_op(
-                || Ok(taken),
-                |value| {
-                    map.update(&key, value, MapFlags::NO_EXIST)
-                        .map_err(Into::into)
-                },
-                now_ns,
-                stale_after_ns,
-            )?,
-            // Pre-5.14 kernels refuse lookup-and-delete on hash maps (ENOTSUPP,
-            // which has no portable errno kind); fall back to re-read + delete.
-            Err(_) => match map.lookup(&key, MapFlags::ANY) {
-                Ok(Some(value)) if rados_op_is_stale(&value, now_ns, stale_after_ns) => {
-                    match map.delete(&key) {
-                        Ok(()) => Reclaim::Swept,
-                        Err(_) => Reclaim::Gone,
-                    }
+    let cycle_complete = *cycle_budget == 0;
+    (batch, cycle_complete)
+}
+
+/// State for a bounded stale-op sweep. A key walk spans multiple poll-loop
+/// turns, and its scan budget caps restarts caused by concurrent `_finish_op`
+/// deletions. Candidates are held until collection ends because deleting a
+/// key during hash iteration can restart that iteration too.
+struct StaleRadosOpsSweep<'a> {
+    keys: Option<MapKeyIter<'a>>,
+    stale_candidates: Vec<Vec<u8>>,
+    scan_limit: usize,
+    scan_remaining: usize,
+    swept_pending: u64,
+}
+
+impl<'a> StaleRadosOpsSweep<'a> {
+    fn new<M: MapCore>(map: &'a M) -> Result<Self> {
+        let scan_limit = (map.info()?.info.max_entries as usize)
+            .saturating_mul(2)
+            .max(1);
+        Ok(Self {
+            keys: Some(map.keys()),
+            stale_candidates: Vec::new(),
+            scan_limit,
+            scan_remaining: scan_limit,
+            swept_pending: 0,
+        })
+    }
+
+    fn restart<M: MapCore>(&mut self, map: &'a M) {
+        self.keys = Some(map.keys());
+        self.stale_candidates.clear();
+        self.scan_remaining = self.scan_limit;
+    }
+
+    /// Do at most one bounded scan or delete batch and return this batch's
+    /// reclaim count so diagnostics stay current even if a later batch fails.
+    fn run_batch<M: MapCore>(&mut self, map: &'a M, stale_after: Duration) -> Result<u64> {
+        let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
+        let stale_after_ns = duration_ns(stale_after);
+
+        if let Some(keys) = &mut self.keys {
+            let (batch, cycle_complete) =
+                take_key_batch(keys, &mut self.scan_remaining, RADOS_OPS_SWEEP_BATCH_KEYS);
+            for key in batch {
+                let Some(value) = map
+                    .lookup(&key, MapFlags::ANY)
+                    .context("failed to read a rados_ops entry")?
+                else {
+                    continue;
+                };
+                if rados_op_is_stale(&value, now_ns, stale_after_ns) {
+                    self.stale_candidates.push(key);
                 }
-                Ok(Some(_)) => Reclaim::Restored,
-                _ => Reclaim::Gone,
-            },
-        };
-        match outcome {
-            Reclaim::Swept => swept += 1,
-            other => debug!(outcome = ?other, "rados_ops sweep candidate was not stale any more"),
+            }
+            if cycle_complete {
+                self.keys = None;
+            }
+            return Ok(0);
         }
+
+        for _ in 0..RADOS_OPS_SWEEP_BATCH_KEYS {
+            let Some(key) = self.stale_candidates.pop() else {
+                self.restart(map);
+                return Ok(std::mem::take(&mut self.swept_pending));
+            };
+            let outcome = match map.lookup_and_delete(&key) {
+                Ok(taken) => reclaim_stale_rados_op(
+                    || Ok(taken),
+                    |value| {
+                        map.update(&key, value, MapFlags::NO_EXIST)
+                            .map_err(Into::into)
+                    },
+                    now_ns,
+                    stale_after_ns,
+                )?,
+                // Pre-5.14 kernels refuse lookup-and-delete on hash maps
+                // (ENOTSUPP); re-read then delete only a still-stale value.
+                Err(_) => match map.lookup(&key, MapFlags::ANY) {
+                    Ok(Some(value)) if rados_op_is_stale(&value, now_ns, stale_after_ns) => {
+                        match map.delete(&key) {
+                            Ok(()) => Reclaim::Swept,
+                            Err(_) => Reclaim::Gone,
+                        }
+                    }
+                    Ok(Some(_)) => Reclaim::Restored,
+                    _ => Reclaim::Gone,
+                },
+            };
+            match outcome {
+                Reclaim::Swept => self.swept_pending += 1,
+                other => {
+                    debug!(outcome = ?other, "rados_ops sweep candidate was not stale any more")
+                }
+            }
+        }
+        if self.stale_candidates.is_empty() {
+            self.restart(map);
+        }
+        Ok(std::mem::take(&mut self.swept_pending))
     }
-    Ok(swept)
 }
 
 fn page_size() -> Result<u64> {
@@ -2029,19 +2089,36 @@ mod tests {
     }
 
     #[test]
-    fn rados_ops_sweep_interval_tracks_the_threshold() {
+    fn stale_sweep_batches_bound_a_restarting_key_iterator() {
+        let mut generated = 0;
+        let mut keys = std::iter::repeat_with(|| {
+            generated += 1;
+            generated
+        });
+        let mut cycle_budget = 5;
+
+        let (first, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(first, vec![1, 2]);
+        assert!(!complete);
+        let (second, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(second, vec![3, 4]);
+        assert!(!complete);
+        let (last, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(last, vec![5]);
+        assert!(complete);
+        assert_eq!(generated, 5, "the per-cycle budget must stop restarts");
+    }
+
+    #[test]
+    fn stale_sweep_finishes_short_and_empty_iterators() {
+        let mut keys = [1, 2].into_iter();
+        let mut budget = 8;
         assert_eq!(
-            rados_ops_sweep_interval(Duration::from_secs(300)),
-            Duration::from_secs(30)
+            take_key_batch(&mut keys, &mut budget, 4),
+            (vec![1, 2], true)
         );
-        assert_eq!(
-            rados_ops_sweep_interval(Duration::from_secs(60)),
-            Duration::from_secs(6)
-        );
-        assert_eq!(
-            rados_ops_sweep_interval(Duration::from_secs(86_400)),
-            Duration::from_secs(30)
-        );
+        assert_eq!(budget, 6);
+        assert_eq!(take_key_batch(&mut keys, &mut budget, 4), (vec![], true));
     }
 
     #[test]

@@ -1102,7 +1102,9 @@ fn rados_ops_is_sized_at_load_and_swept_from_userspace() {
     // loop deletes entries older than --rados-ops-stale-after.
     assert!(RGWTRACE_BPF.contains("#define RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES 32768"));
     assert!(LIVE_LINUX.contains(".rados_ops\n        .set_max_entries(cli.bpf_rados_ops_entries)"));
-    assert!(LIVE_LINUX.contains("sweep_stale_rados_ops(&skel.maps.rados_ops,"));
+    assert!(LIVE_LINUX.contains("sweep.run_batch(&skel.maps.rados_ops"));
+    assert!(LIVE_LINUX.contains("const RADOS_OPS_SWEEP_BATCH_KEYS: usize = 256"));
+    assert!(LIVE_LINUX.contains("take_key_batch"));
     assert!(CLI.contains("pub bpf_rados_ops_entries: u32,"));
     assert!(CLI.contains("pub rados_ops_stale_after: Duration,"));
 }
