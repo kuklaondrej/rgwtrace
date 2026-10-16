@@ -17,7 +17,7 @@ clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.5", features = ["termination"] }
 cpp_demangle = "0.4"
 flate2 = "1.0"
-gimli = "0.31"
+gimli = "0.34"
 libc = "0.2"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 object = { version = "0.40", default-features = false, features = ["read", "elf", "compression"] }
