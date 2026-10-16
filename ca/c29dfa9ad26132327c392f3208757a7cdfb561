@@ -1,0 +1,27 @@
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_cfa37d660c0a75 23
+src/live/linux.rs
+  s_ece52b9a589c27::t_084c71f1543f7e 2018-2024,2028
+  s_ece52b9a589c27::t_f94e08e13a9c46 710,713,716,719-727,774,1992,2001,2009,2014
+  s_ece52b9a589c27::t_4652b7c21bd87e 2015-2017
+docs/README.md
+  s_ece52b9a589c27::t_17f171ab6c8465 43-44
+docs/bugfix-stale-op-restore-errors.md
+  s_ece52b9a589c27::t_965f44ab19c9c8 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cac29dfa9ad26132327c392f3208757a7cdfb561",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
