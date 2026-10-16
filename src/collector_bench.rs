@@ -328,7 +328,7 @@ fn collector_bench_inference_no_candidate() {
 fn collector_bench_drain_pending_no_overlap() {
     const OPS: u64 = 10_000;
     const CHECKS: u64 = 100_000;
-    let mut pending = IntervalSet::default();
+    let mut pending = IntervalSet::<_, true>::default();
     for id in 0..OPS {
         pending.insert(100 * SEC, 170 * SEC, id);
     }

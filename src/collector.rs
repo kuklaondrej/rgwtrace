@@ -392,7 +392,7 @@ pub const DEFAULT_INFERENCE_MAX_PENDING: usize = 65_536;
 /// range is a class-k interval that ended shortly before `start` -- a bounded,
 /// concurrency-sized set rather than everything resident.
 #[derive(Debug)]
-pub(crate) struct IntervalSet<K> {
+pub(crate) struct IntervalSet<K, const OVERLAP_INDEX: bool = false> {
     by_length: BTreeMap<u32, BTreeSet<(u64, u64, K)>>,
     overlap_root: Option<Box<IntervalNode<K>>>,
     next_priority: u64,
@@ -411,7 +411,7 @@ struct IntervalNode<K> {
     right: Option<Box<Self>>,
 }
 
-impl<K> Default for IntervalSet<K> {
+impl<K, const OVERLAP_INDEX: bool> Default for IntervalSet<K, OVERLAP_INDEX> {
     fn default() -> Self {
         Self {
             by_length: BTreeMap::new(),
@@ -422,7 +422,7 @@ impl<K> Default for IntervalSet<K> {
     }
 }
 
-impl<K: Ord + Clone> IntervalSet<K> {
+impl<K: Ord + Clone, const OVERLAP_INDEX: bool> IntervalSet<K, OVERLAP_INDEX> {
     fn length_class(lower: u64, upper: u64) -> u32 {
         64 - upper.saturating_sub(lower).leading_zeros()
     }
@@ -433,7 +433,7 @@ impl<K: Ord + Clone> IntervalSet<K> {
             .entry(Self::length_class(lower, upper))
             .or_default()
             .insert((lower, upper, key.clone()));
-        if !inserted {
+        if !inserted || !OVERLAP_INDEX {
             return;
         }
         let priority = splitmix64(self.next_priority);
@@ -464,7 +464,7 @@ impl<K: Ord + Clone> IntervalSet<K> {
         } else {
             false
         };
-        if removed {
+        if removed && OVERLAP_INDEX {
             self.overlap_root = remove_interval(self.overlap_root.take(), &(lower, upper, key));
         }
     }
@@ -505,7 +505,9 @@ impl<K: Ord + Clone> IntervalSet<K> {
             .filter(move |(end, _)| *end >= lower)
             .map(|(_, key)| key)
     }
+}
 
+impl<K: Ord + Clone> IntervalSet<K, true> {
     /// Test whether any interval overlaps the query. Subtree bounds on both
     /// interval endpoints skip ranges lying wholly before or after the query.
     pub(crate) fn any_overlapping(&self, lower: u64, upper: u64) -> bool {
@@ -707,7 +709,7 @@ struct Inference {
     unresolved: HashMap<u32, IntervalSet<u64>>,
     /// Every pending op per pid, as (op start, id): which requests are still a
     /// candidate of some pending op (and so must keep the full TTL).
-    pending_by_pid: HashMap<u32, IntervalSet<u64>>,
+    pending_by_pid: HashMap<u32, IntervalSet<u64, true>>,
     /// `AmbiguousAll` ops per (pid, send_tid), as (op start, id).
     ambiguous_all: HashMap<(u32, u32), IntervalSet<u64>>,
     /// (candidate key, op id) for each recorded witness of an ambiguous op.
@@ -948,8 +950,8 @@ fn remove_candidate_from<K>(
 
 /// Remove op `id` from the set at `map[map_key]`, dropping the set once empty so
 /// the map does not accumulate one empty set per pid/thread ever seen.
-fn remove_op_from<K>(
-    map: &mut HashMap<K, IntervalSet<u64>>,
+fn remove_op_from<K, const OVERLAP_INDEX: bool>(
+    map: &mut HashMap<K, IntervalSet<u64, OVERLAP_INDEX>>,
     map_key: K,
     start: u64,
     end: u64,
@@ -2611,7 +2613,7 @@ mod tests {
 
     #[test]
     fn pending_candidate_lookup_skips_ops_that_ended_before_request() {
-        let mut older = IntervalSet::default();
+        let mut older = IntervalSet::<_, true>::default();
         for id in 0..10_000 {
             older.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
         }
@@ -2622,7 +2624,7 @@ mod tests {
             older.scanned.get()
         );
 
-        let mut newer = IntervalSet::default();
+        let mut newer = IntervalSet::<_, true>::default();
         for id in 0..10_000 {
             newer.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id);
         }
@@ -2633,7 +2635,7 @@ mod tests {
             newer.scanned.get()
         );
 
-        let mut mixed = IntervalSet::default();
+        let mut mixed = IntervalSet::<_, true>::default();
         for id in 0..10_000 {
             mixed.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
             mixed.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id + 10_000);
@@ -2647,8 +2649,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_interval_indexes_do_not_allocate_overlap_nodes() {
+        let mut index: IntervalSet<u64> = IntervalSet::default();
+        index.insert(10, 20, 1);
+        assert!(index.overlap_root.is_none());
+        assert_eq!(
+            index.overlapping(15, 25, &0).copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        index.remove(10, 20, 1);
+        assert!(index.is_empty());
+    }
+
+    #[test]
     fn interval_treap_matches_linear_overlap_oracle_across_updates() {
-        let mut index = IntervalSet::default();
+        let mut index = IntervalSet::<_, true>::default();
         let mut reference = Vec::<(u64, u64, u64)>::new();
         for id in 0..32 {
             let (lower, upper) = if id < 16 { (10, 20) } else { (100, 110) };
@@ -2657,7 +2672,7 @@ mod tests {
         }
         index.insert(u64::MAX - 5, u64::MAX, 32);
         reference.push((u64::MAX - 5, u64::MAX, 32));
-        let mut duplicates = IntervalSet::default();
+        let mut duplicates = IntervalSet::<_, true>::default();
         duplicates.insert(10, 20, 0);
         duplicates.insert(10, 20, 0);
         duplicates.insert(30, 40, 1);
@@ -2665,7 +2680,7 @@ mod tests {
         assert!(!duplicates.any_overlapping(10, 20));
         assert!(duplicates.any_overlapping(30, 40));
 
-        let mut boundary = IntervalSet::default();
+        let mut boundary = IntervalSet::<_, true>::default();
         boundary.insert(10, 20, 1);
         assert!(boundary.any_overlapping(20, 25));
         assert!(!boundary.any_overlapping(21, 25));
