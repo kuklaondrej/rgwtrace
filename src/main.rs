@@ -12,6 +12,7 @@ mod host_tools;
 mod live;
 mod otel;
 mod otlp_headers;
+mod output;
 mod preflight;
 mod targets;
 #[cfg(test)]
@@ -26,7 +27,7 @@ use crate::{
     cli::{Cli, OutputMode},
     collector::{Collector, TraceDocument},
     dwarf_input::DwarfInput,
-    dwarf_json::DwarfInfo,
+    dwarf_json::{DwarfInfo, DwarfSummary},
 };
 
 fn main() -> Result<()> {
@@ -37,7 +38,7 @@ fn main() -> Result<()> {
     // milliseconds, not after DWARF extraction and probe attach.
     let otlp_client = match cli.output {
         OutputMode::Otlp => Some(otel::ExportClient::from_cli(&cli)?),
-        OutputMode::Json => None,
+        OutputMode::Json | OutputMode::Jsonl => None,
     };
 
     let dwarf_input = match cli.dwarf_source {
@@ -98,16 +99,18 @@ fn main() -> Result<()> {
         live::run(&cli, &dwarf)?
     };
 
+    let summary = dwarf.summary();
     match cli.output {
         OutputMode::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&trace_output_document(&dwarf, &trace)?)?
-            );
+            output::write_json_document(std::io::stdout().lock(), &summary, &trace)?;
+        }
+        OutputMode::Jsonl => {
+            // The live loop already streamed every periodic drain; this is the
+            // final line: what was still in flight at exit, plus the run's final
+            // counters. Always written, even without spans.
+            output::write_jsonl_document(&mut std::io::stdout().lock(), &summary, &trace)?;
         }
         OutputMode::Otlp => {
-            // Serialize once so a failed export can still preserve the trace.
-            let document = trace_output_document(&dwarf, &trace)?;
             export_trace_otlp(
                 otel::ExportConfig {
                     endpoint: &cli.otlp_endpoint,
@@ -120,26 +123,14 @@ fn main() -> Result<()> {
                     retries: cli.otlp_retries,
                     diagnostics: cli.otlp_diagnostics,
                 },
+                &summary,
                 &trace,
-                &document,
                 &mut std::io::stdout(),
             )?;
         }
     }
 
     Ok(())
-}
-
-/// Build the `{dwarf, trace}` JSON document emitted by the `OutputMode::Json`
-/// arm. Shared so a failed OTLP export can dump the exact same shape to stdout.
-fn trace_output_document(
-    dwarf: &crate::dwarf_json::DwarfInfo,
-    trace: &TraceDocument,
-) -> Result<serde_json::Value> {
-    Ok(serde_json::json!({
-        "dwarf": dwarf.summary(),
-        "trace": trace,
-    }))
 }
 
 /// The FINAL export of an `--output otlp` session: everything the live loop's
@@ -166,12 +157,12 @@ fn trace_output_document(
 /// non-empty one exports its spans normally.
 fn export_trace_otlp(
     config: otel::ExportConfig<'_>,
+    dwarf: &DwarfSummary,
     trace: &TraceDocument,
-    document: &serde_json::Value,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
     let export = otel::export_final_otlp_http(config, trace);
-    finish_otlp_export(export, document, trace, out)
+    finish_otlp_export(export, dwarf, trace, out)
 }
 
 /// Finish an `OutputMode::Otlp` session given the outcome of the final
@@ -186,7 +177,7 @@ fn export_trace_otlp(
 /// never masked, and the data is never silently discarded.
 fn finish_otlp_export(
     export: Result<otel::ExportDiagnostics>,
-    document: &serde_json::Value,
+    dwarf: &DwarfSummary,
     trace: &TraceDocument,
     out: &mut impl std::io::Write,
 ) -> Result<()> {
@@ -218,7 +209,7 @@ fn finish_otlp_export(
                 export_failed = true,
                 "rgwtrace shutdown summary"
             );
-            writeln!(out, "{}", serde_json::to_string_pretty(document)?)
+            output::write_json_document(out, dwarf, trace)
                 .context("failed to dump the un-exported trace to stdout")?;
             Err(err.context("OTLP export failed; the collected trace was dumped to stdout as JSON"))
         }
@@ -357,12 +348,12 @@ mod tests {
     #[test]
     fn shutdown_summary_log_carries_the_final_counters_with_no_spans() {
         let trace = empty_trace_with_final_counters();
-        let document = serde_json::json!({ "trace": &trace });
+        let dwarf = DwarfInfo::default().summary();
 
         let logged = capture_log(|| {
             finish_otlp_export(
                 Ok(otel::ExportDiagnostics::default()),
-                &document,
+                &dwarf,
                 &trace,
                 &mut Vec::new(),
             )
@@ -388,12 +379,12 @@ mod tests {
     #[test]
     fn shutdown_summary_log_carries_the_final_counters_when_the_export_fails() {
         let trace = empty_trace_with_final_counters();
-        let document = serde_json::json!({ "trace": &trace });
+        let dwarf = DwarfInfo::default().summary();
 
         let logged = capture_log(|| {
             let result = finish_otlp_export(
                 Err(anyhow::anyhow!("connection refused")),
-                &document,
+                &dwarf,
                 &trace,
                 &mut Vec::new(),
             );
@@ -416,7 +407,9 @@ mod tests {
         let trace = empty_trace_with_final_counters();
         let dwarf = DwarfInfo::default();
 
-        let document = trace_output_document(&dwarf, &trace).unwrap();
+        let mut out = Vec::new();
+        output::write_json_document(&mut out, &dwarf.summary(), &trace).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&out).unwrap();
 
         assert_eq!(document["trace"]["spans"].as_array().unwrap().len(), 0);
         assert_eq!(
@@ -432,12 +425,12 @@ mod tests {
     #[test]
     fn finish_otlp_export_returns_ok_without_dumping_on_success() {
         let trace = sample_trace();
-        let document = serde_json::json!({ "trace": &trace });
+        let dwarf = DwarfInfo::default().summary();
         let mut out = Vec::new();
 
         let result = finish_otlp_export(
             Ok(otel::ExportDiagnostics::default()),
-            &document,
+            &dwarf,
             &trace,
             &mut out,
         );
@@ -452,12 +445,13 @@ mod tests {
     #[test]
     fn finish_otlp_export_dumps_trace_and_errors_on_failure() {
         let trace = sample_trace();
-        let document = serde_json::json!({ "dwarf": "summary", "trace": &trace });
+        let dwarf = DwarfInfo::default().summary();
+        let document = serde_json::json!({ "dwarf": &dwarf, "trace": &trace });
         let mut out = Vec::new();
 
         let result = finish_otlp_export(
             Err(anyhow::anyhow!("connection refused")),
-            &document,
+            &dwarf,
             &trace,
             &mut out,
         );

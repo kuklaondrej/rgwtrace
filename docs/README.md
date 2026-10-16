@@ -49,6 +49,9 @@ superseded by later sections in the same document.
   guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Long-session data integrity](bugfix-long-session-data-integrity.md): bounded
+  collector memory, the rotating no-duplicate tombstone, OTLP loss accounting,
+  and the expiry clock.
 - [Target scoping](bugfix-target-scoping.md): why live tracing requires `--pid`,
   how targets bind to the files the process maps, and how `/proc/<pid>/root`
   paths stay inside the container.

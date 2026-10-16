@@ -83,6 +83,13 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
         }
     }
 
+    if cli.max_buffered_events.is_some() && cli.output.is_streaming() {
+        bail!(
+            "--max-buffered-events only applies to --output json; --output jsonl and \
+             --output otlp bound memory by draining every --flush-interval instead"
+        );
+    }
+
     validate_explicit_path("--librados-path", cli.librados_path.as_deref())?;
     validate_explicit_path("--librbd-path", cli.librbd_path.as_deref())?;
     validate_explicit_path("--libceph-common-path", cli.libceph_common_path.as_deref())?;

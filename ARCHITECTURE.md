@@ -183,11 +183,28 @@ background     seq -> op, plus (event_time, seq)
 
 Every exported request key is then **remembered for the whole session**, so a straggler can never re-open the group: a late marker is dropped (`late_request_markers_dropped`) and a late RADOS op becomes a background span with `rgw.correlation_reason = "request_already_emitted"`. **No request is ever emitted twice under one span id.**
 
-That memory is a never-reset **Bloom filter** (2^26 bits = 8 MiB, 20 hashes, `emitted_request_keys` counts the keys in it), not an exact set and not a bounded FIFO:
+That memory (`EmittedRequests` in `src/collector.rs`) has **fixed size** and a **false-positive rate that does not grow with session length**. It replaced a never-reset Bloom filter whose false-positive rate climbed with every exported request (~1e-7 at 2M keys, ~35% at 10M, ~91% at 18M), where each false positive dropped a fresh request's markers and demoted its ops. Before that, a bounded FIFO forgot keys within seconds at production rates and let a late END re-emit a span id. It has three parts:
 
-- it has **no false negatives**, so the no-duplicate guarantee holds for the entire run regardless of request volume -- which a bounded FIFO did *not* deliver: at production rates its memory turned over in seconds, so a force-expired long request's tombstone was evicted before its late END arrived, and that END then re-emitted the same deterministic span id;
-- its memory is **fixed**, unlike an exact set, which would grow ~100 bytes per request forever alongside a production RGW;
-- its one failure mode is a false **positive** (~1e-7 up to ~2M requests), and a false positive can only ever cause a **drop** -- a discarded straggler, or (rarely) a fresh request whose key collides being dropped and its ops demoted to background. It can never duplicate. Past the design capacity the rate climbs, and the collector warns once.
+```text
+                       event for key K, K not in the collector
+                                      |
+             +------------------------+-------------------------+
+             | K in exact OPEN set,   | K's request start is     |  otherwise
+             | or in either Bloom     | before horizon_ns        |
+             | generation             | (marker start_ns, or the |
+             |                        |  RGW trans_id timestamp) |
+             v                        v                          v
+   already emitted:          cannot be proven new:          new group
+   marker dropped,           marker dropped, op ->
+   op -> background          background
+   (request_already_emitted) (request_outside_tombstone_horizon)
+```
+
+- **Exact set for force-expired OPEN requests.** Their END (and, while the request lives, its ops) can arrive arbitrarily later, so they are remembered exactly while events keep arriving. An entry idle for a whole generation moves into the Bloom filter at the next rotation; the set is capped at 65,536 entries (overflow goes to the Bloom filter, `emitted_open_tombstone_overflows`).
+- **Two rotating Bloom generations** (2^26 bits = 8 MiB each, 20 hashes) for every other exported key. Lookups check both; inserts go to the current one; when it holds 2M keys the older generation is dropped (`emitted_tombstone_rotations`). Rotation is by **count**, so no generation exceeds its design point and the false-positive rate a lookup sees stays below ~2e-7 for any session length. A false positive still only **drops**, never duplicates.
+- **A horizon that makes forgetting safe.** After a rotation, every forgotten key was exported before `horizon_ns` (the start of the oldest surviving generation), and every exported request started before its export, because an expired group's start precedes the drain that expired it by at least the idle TTL. So an event for a key the collector does not hold and the tombstone does not remember, whose **request started before `horizon_ns`**, is rejected rather than re-grouped (`tombstone_horizon_rejections`). The request start is known for every marker (`start_ns`, which the END also carries) and for every RADOS op whose `trans_id` has RGW's `tx<21 hex>-<hex unix seconds>-<zone>` shape: RGW builds it from `time(NULL)` at request start. That second source matters without the END probe, where a stale request context can stamp an old `trans_id` onto a fresh op at any time.
+
+The residual is narrow and documented in `docs/bugfix-long-session-data-integrity.md`: an op whose `trans_id` is not RGW-shaped, for a key already rotated out, or a wall-clock step larger than `--correlation-ttl` between the tracer's startup and RGW's `time(NULL)`.
 
 RADOS events without `trans_id` become background spans instead of being attached to a request.
 
@@ -235,7 +252,21 @@ A request's alternate (`RGWOp*`) key is revoked at its destructor **even if the 
 
 `--disable-rgw-op-bridge-key` drops the alternate key at runtime (a BPF global published before the probe that writes it attaches). The key is insurance against RGW not passing the `req_state` as the `dpp`, and it carries the one hazard pointer identity cannot close -- the S3-website `retarget` replacing a live request's `RGWOp` (design doc §10.1). Whether it earns that risk is answered by `bpf_operate_seed_hits_rgwop` on a real rig, not by argument; see the interpretation table in `RUNBOOK.md`.
 
-For OTLP live mode, old request groups and background RADOS ops are queued to a background exporter when their correlation TTL expires. This bounds memory growth while keeping a conservative window for late RADOS events to join a request without blocking ring-buffer polling on collector latency.
+### Collector lifecycle and memory bounds
+
+What bounds the collector's memory depends on the output mode:
+
+| mode | during the run | at exit | memory bound |
+| --- | --- | --- | --- |
+| `--output json` | nothing leaves the collector | one pretty document on stdout | `--max-buffered-events` (default 100,000; ~1 KB each). Past it, new requests and ops are dropped and counted (`buffer_full_dropped_markers`, `buffer_full_dropped_rados_ops`) |
+| `--output jsonl` | every `--flush-interval`, expired groups and background ops are drained and written as one line | a final line: whatever is left, plus the final counters | rate x (`--correlation-ttl` + flush interval) for closed requests; 10x the TTL for open ones |
+| `--output otlp` | the same drain, queued to the exporter thread | final export (stdout dump on failure) | as `jsonl`; a full export queue drops batches (`otlp_queue_dropped_*`) |
+
+Expiry runs on the **trace clock**: CLOCK_BOOTTIME plus the unix offset sampled once at startup, the same clock the event timestamps are on. It used to read a fresh CLOCK_REALTIME, so an NTP step back stalled expiry and a step forward force-expired open requests early.
+
+`--output json` keeps a cap instead of draining because its format is one document; anything drained would still have to be held until exit. The cap was chosen over refusing to start without `--timeout`, because a long `--timeout` is just as unbounded at production rates. The document is written straight to stdout through a `BufWriter`, one span at a time (`src/output.rs`), instead of building a `serde_json::Value` copy and then a `String` of the whole trace. The bytes are unchanged: the old `Value` rendering sorted every object's keys, and `output.rs` reproduces that order (`json_output_is_byte_identical_to_the_legacy_value_rendering`).
+
+A batch that leaves the collector is never resurrected into it, so a drain cannot duplicate a span id. The ring-buffer callback and the drain share one mutex, and drains run on the poll thread between polls.
 
 ---
 
@@ -289,7 +320,7 @@ Roles include data, bucket index, bucket metadata, user metadata, auth metadata,
 
 ## Export
 
-JSON output prints a debug document with DWARF summary, trace spans, and trace diagnostics counters.
+JSON output prints a debug document with DWARF summary, trace spans, and trace diagnostics counters. JSONL output (`--output jsonl`) writes the same `{dwarf, trace}` document once per drain, compact, one per line: each line holds that drain's spans and the cumulative counters at that moment (`spans_produced` counts the line's own spans), and the last line carries the final totals.
 
 OTLP output sends OTLP/HTTP protobuf to `--otlp-endpoint` and sets `service.name` from `--service-name`.
 
@@ -303,7 +334,15 @@ The exporter uses a bounded blocking HTTP client with configurable timeout, retr
 
 **Object-name redaction** (`--redact-object-names`) happens at the one place RADOS attributes are built (`rados_attributes` in `src/collector.rs`), after `classify_rados` has run on the raw name, so correlated children, background spans and their `rados.op` event, the final document and periodic drains, JSON and OTLP all see the same FNV-1a 64 hash (the one span ids already use) plus `rgwtrace.redacted = "ceph.rados.object"`. Detached expired batches retain the object-name redaction setting from drain time, so rendering on the exporter thread applies the same policy as final-document rendering.
 
-Trace diagnostics count decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity and early decisions forced by the pending cap (`inference_pending_overflow_rados_ops`), missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, the no-duplicate tombstone's occupancy (`emitted_request_keys`), and BPF-side drop/failure counters plus the informational re-seed (`bpf_reseed_*`), per-submit re-seed (`bpf_operate_seed_hits`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_unresolved`), request-end (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters.
+**The exporter thread never exits on a failed export.** It used to return on the first batch that failed after its retries. That lost the batch and up to two queued behind it without counting them, and the live loop then found the channel disconnected, latched export off, and stopped draining, so the collector grew without bound. Now, per batch:
+
+- a **non-retryable** response (4xx other than 429) loses that batch; the next batch is tried, since the endpoint answered promptly;
+- **exhausted retries** (connection errors, timeouts, 5xx, 429) lose that batch and the rest of the same drain without trying them, so an unhealthy endpoint cannot block the worker for `batches x (retries + 1) x timeout`;
+- lost spans are counted in `otlp_export_failed_batches` / `otlp_export_failed_spans`, a warning is logged, and the worker takes the next drain.
+
+No error class latches export off, including a 4xx that signals misconfiguration: each drain costs one prompt request, every loss is counted, and a fix on the backend side (rotated token, restarted collector) takes effect without restarting the tracer. If the worker thread itself dies (a panic), the documents it had accepted but not finished (the one in flight and any still queued) are counted as lost when the run ends, later drains are counted as lost as they happen, and draining continues. The final export keeps its contract: any failed batch makes it fail, and the end-of-run trace is dumped to stdout as `--output json` would print it.
+
+Trace diagnostics count decoded events, decode errors, request START markers (`request_markers`) and END markers (`request_end_markers`), request-duration provenance (`measured_duration_requests` / `derived_duration_requests`), RADOS ops, correlated/background RADOS ops, same-thread, cross-thread, and inferred correlations, inference misses/ambiguity and pending-cap decisions (`inference_pending_overflow_rados_ops`), missing-`trans_id` background ops, background breakdowns by role/reason, capture truncation counters, produced spans, expired request groups, open requests force-expired at the lifetime backstop (`expired_open_requests`), markers dropped for an already-exported request (`late_request_markers_dropped`), expired background RADOS ops, dropped OTLP queue spans, lost OTLP export batches/spans (`otlp_export_failed_batches` / `otlp_export_failed_spans`), `--output json` buffer-cap drops (`buffer_full_dropped_markers` / `buffer_full_dropped_rados_ops`), the no-duplicate tombstone's state (`emitted_request_keys`, `emitted_tombstone_rotations`, `emitted_open_tombstone_overflows`, `tombstone_horizon_rejections`), and BPF-side drop/failure counters plus the informational re-seed (`bpf_reseed_*`), per-submit re-seed (`bpf_operate_seed_hits`, `bpf_operate_seed_misses`, `bpf_operate_miss_ctx_cleared`, `bpf_operate_miss_home_ctx_preserved`, `bpf_operate_unresolved_home_ctx_preserved`, `bpf_operate_base_unresolved`), multi-key bridge (`bpf_rgw_op_key_inserts`, `bpf_rgw_op_key_revokes`, `bpf_rgw_op_key_revoke_skipped`, `bpf_rgw_op_key_unresolved`), request-end (`bpf_request_end_*`), and `_send_op` liveness-gate (`bpf_sendop_stale_ctx_drops`, `bpf_sendop_unverifiable_ctx`, `bpf_sendop_unbridged_ctx_drops`) coverage counters.
 
 The run-summary counters are **always** surfaced two ways, regardless of any flag: the end-of-run `finished live tracing` / `rgwtrace shutdown summary` log lines carry them in a `diagnostics=` field of `key=value` pairs, and the JSON `trace.diagnostics` block carries them in full.
 

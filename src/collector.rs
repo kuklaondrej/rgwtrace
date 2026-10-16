@@ -7,7 +7,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     classify::{classify_rados, classify_request, RadosRole, RequestClass},
@@ -31,64 +31,178 @@ use crate::{
 /// counted in `expired_open_requests`.
 const OPEN_REQUEST_TTL_MULTIPLIER: u64 = 10;
 
-/// Bits in the emitted-request tombstone filter: 2^26 bits = 8 MiB, allocated
-/// lazily on the first export. See [`EmittedRequests`].
+/// Bits in ONE generation of the closed-request tombstone filter: 2^26 bits =
+/// 8 MiB. Two generations are live at once (16 MiB), each allocated lazily on
+/// first use. See [`EmittedRequests`].
 const EMITTED_BLOOM_BITS: u64 = 1 << 26;
 
 /// Hash functions per key. Chosen slightly below the theoretical optimum
-/// (~23 for the design capacity) because each one costs a random memory probe and
-/// the resulting false-positive rate is already ~1e-7.
+/// (~23 at the generation capacity) because each one costs a random memory
+/// probe and the resulting false-positive rate is already ~1e-7.
 const EMITTED_BLOOM_HASHES: u64 = 20;
 
-/// Requests this session can export before the tombstone filter's false-positive
-/// rate leaves its design point (~1e-7 at this many keys, rising steeply beyond).
-/// Exceeding it is SAFE -- a Bloom filter never produces a false NEGATIVE, so no
-/// request can ever be emitted twice -- but it starts costing dropped stragglers,
-/// so it is warned about exactly once.
-const EMITTED_BLOOM_DESIGN_CAPACITY: u64 = 2_000_000;
+/// Keys one Bloom generation takes before the tombstone ROTATES (drops the older
+/// generation and starts a fresh one). At this load a generation's
+/// false-positive rate is ~1e-7, and since no generation ever holds more, the
+/// rate a lookup sees (two generations are checked) stays below ~2e-7 for the
+/// whole session, however long it runs. The never-reset filter this replaces
+/// passed 35% false positives at 10M exported requests.
+const EMITTED_BLOOM_GENERATION_CAPACITY: u64 = 2_000_000;
+
+/// Exact tombstone entries kept for force-expired OPEN requests. Each one is a
+/// request whose END never arrived within the lifetime backstop, so it is rare
+/// (it means END markers are being lost). Past the cap a key falls back to the
+/// Bloom generations, which is still safe (see [`EmittedRequests`]).
+const EMITTED_OPEN_CAPACITY: usize = 65_536;
+
+/// One generation of the closed-request Bloom filter.
+#[derive(Debug, Default)]
+struct BloomGeneration {
+    /// Lazily allocated: a generation that never takes a key costs nothing.
+    bits: Vec<u64>,
+    inserted: u64,
+    /// Trace-clock time (the drain `now`) at which this generation started taking
+    /// keys. Every key in it was inserted at or after this instant.
+    started_ns: u64,
+}
+
+impl BloomGeneration {
+    fn contains(&self, indices: &[u64]) -> bool {
+        !self.bits.is_empty()
+            && indices
+                .iter()
+                .all(|&bit| self.bits[(bit / 64) as usize] & (1 << (bit % 64)) != 0)
+    }
+
+    fn insert(&mut self, indices: &[u64], words: usize) {
+        if self.bits.is_empty() {
+            self.bits = vec![0u64; words];
+        }
+        for &bit in indices {
+            self.bits[(bit / 64) as usize] |= 1 << (bit % 64);
+        }
+        self.inserted += 1;
+    }
+}
 
 /// Tombstone for request keys whose span has already been exported.
 ///
-/// WHY IT MUST NOT FORGET. A span id is a pure function of the request key, so
-/// re-creating a group under a key we already exported emits a SECOND span with
-/// the SAME trace/span id -- one request, split across two spans, duplicated in
-/// the backend. The straggler that causes it is not hypothetical: an OPEN request
+/// WHY IT EXISTS. A span id is a pure function of the request key, so re-creating
+/// a group under a key we already exported emits a SECOND span with the SAME
+/// trace/span id -- one request, split across two spans, duplicated in the
+/// backend. The straggler that causes it is not hypothetical: an OPEN request
 /// force-expired at the lifetime backstop is exported with a derived end, and its
 /// destructor END can still arrive afterwards.
 ///
-/// WHY A BLOOM FILTER. The previous bounded FIFO (65,536 keys, oldest evicted)
-/// did NOT deliver that guarantee: at production request rates its whole memory
-/// turns over in seconds, so a force-expired long request's tombstone was gone
-/// long before its late END arrived -- and the END then recreated the group and
-/// re-emitted the same span id. Exactly the duplicate the tombstone exists to
-/// prevent.
+/// WHY NOT A FIFO, AND WHY NOT ONE NEVER-RESET BLOOM FILTER. A bounded FIFO
+/// (65,536 keys) turned over in seconds at production rates, so a force-expired
+/// request's late END outlived its tombstone and re-emitted the span id. The
+/// never-reset Bloom filter that replaced it had no false negatives but its
+/// false-positive rate grew with the session: ~1e-7 at 2M keys, ~35% at 10M,
+/// ~91% at 18M -- and every false positive drops a FRESH request's markers and
+/// demotes its RADOS ops to background. A multi-hour session at thousands of
+/// requests per second reaches those numbers.
 ///
-/// A Bloom filter has NO false negatives, so the no-duplicate guarantee holds for
-/// the whole session, in FIXED memory (8 MiB), no matter how many requests are
-/// traced. What it can do is return a false POSITIVE, and the consequence of one
-/// is a DROP, never a duplicate: a straggler is discarded, or -- if the collision
-/// lands on a fresh request's key -- that one request's markers are dropped and
-/// its RADOS ops are demoted to background spans. At the design capacity that
-/// happens to roughly one request in ten million; past it the rate climbs, which
-/// is why crossing the capacity warns.
+/// THE DESIGN: fixed memory, a false-positive rate that cannot degrade, and no
+/// duplicate span id, from three parts.
 ///
-/// (An exact set has no false positives, but its memory grows without bound with
-/// the number of requests traced -- ~100 bytes per key, i.e. gigabytes on a
-/// long-running gateway. Unbounded growth in a tracer that is supposed to run
-/// alongside a production RGW is not a trade we can make; false-positive DROPS at
-/// 1e-7, which fail closed, are.)
-#[derive(Debug, Default)]
+/// 1. EXACT entries for force-expired OPEN requests (`open`). Their END -- and,
+///    while the request lives, its RADOS ops -- can arrive arbitrarily later, so
+///    they are remembered exactly while anything still arrives for them. An entry
+///    untouched for a whole generation is moved into the Bloom filter at the next
+///    rotation, and the set is capped at [`EMITTED_OPEN_CAPACITY`]. No false
+///    positives, and small: only lost-END requests land here.
+///
+/// 2. TWO ROTATING BLOOM GENERATIONS for every other exported key. A lookup checks
+///    both; an insert goes into the current one; when the current one reaches
+///    [`EMITTED_BLOOM_GENERATION_CAPACITY`] keys the older generation is dropped
+///    and a fresh one starts. Rotation is driven by COUNT, not time, so a
+///    generation never holds more keys than its design point and the
+///    false-positive rate stays at ~1e-7 no matter how long the session runs.
+///
+/// 3. A HORIZON that makes forgetting safe. Rotation forgets keys, so it needs a
+///    proof that nothing can arrive for a forgotten key and be mistaken for a new
+///    request. Every key in the dropped generation was inserted BEFORE the
+///    surviving older generation started, so after a rotation `horizon_ns` is that
+///    start time and every forgotten key was exported before it. An exported
+///    request STARTED before it was exported (an expired group's start precedes
+///    the drain that expired it by at least the idle TTL). So an event for a key
+///    that is in neither the collector nor the tombstone, and whose request start
+///    is before `horizon_ns`, is either a straggler of a forgotten export or a
+///    request that started before the oldest thing we remember and was never seen
+///    -- and both are rejected (counted in `tombstone_horizon_rejections`), never
+///    re-grouped.
+///
+///    The request start is known for every marker (`start_ns`, also carried by the
+///    END) and for every RADOS op whose `trans_id` is in RGW's
+///    `tx<21 hex>-<hex unix seconds>-<zone>` format, which embeds the request's
+///    start (see [`rgw_trans_id_start_ns`]). That second case matters: without the
+///    END probe, a stale context left on an RGW thread can stamp an OLD request's
+///    `trans_id` onto a fresh op at any later time, so an op's own timestamps prove
+///    nothing about how old its request is.
+///
+/// What remains unproven is narrow: a RADOS op whose `trans_id` is NOT in RGW's
+/// format, for a request whose key has been rotated out. That needs either a
+/// force-expired request that stayed alive and completely silent for a whole
+/// generation, or a stale-context stamp more than two generations late; both are
+/// documented in docs/bugfix-long-session-data-integrity.md.
+///
+/// A false positive still only ever DROPS (a straggler, or rarely a fresh
+/// request's markers and ops), never duplicates.
+#[derive(Debug)]
 struct EmittedRequests {
-    /// Lazily allocated: a `Collector` that never exports a request (every dry-run
-    /// unit test, and every run that traces nothing) pays nothing.
-    bits: Vec<u64>,
+    bloom_bits: u64,
+    generation_capacity: u64,
+    open_capacity: usize,
+    current: BloomGeneration,
+    previous: BloomGeneration,
+    /// Force-expired OPEN request key -> trace-clock time it was last touched
+    /// (exported, or a straggler for it rejected).
+    open: HashMap<String, u64>,
+    /// Requests that started before this instant and are not in the collector are
+    /// rejected: their key may have been forgotten. 0 until a rotation forgets
+    /// something.
+    horizon_ns: u64,
+    /// Keys remembered this session (the `emitted_request_keys` counter).
     inserted: u64,
+    rotations: u64,
+    /// Open keys that went to the Bloom filter because `open` was full.
+    open_overflows: u64,
+}
+
+impl Default for EmittedRequests {
+    fn default() -> Self {
+        Self::with_geometry(
+            EMITTED_BLOOM_BITS,
+            EMITTED_BLOOM_GENERATION_CAPACITY,
+            EMITTED_OPEN_CAPACITY,
+        )
+    }
 }
 
 impl EmittedRequests {
+    fn with_geometry(bloom_bits: u64, generation_capacity: u64, open_capacity: usize) -> Self {
+        assert!(
+            bloom_bits >= 64 && bloom_bits.is_power_of_two(),
+            "Bloom generation size must be a power-of-two number of bits"
+        );
+        Self {
+            bloom_bits,
+            generation_capacity,
+            open_capacity,
+            current: BloomGeneration::default(),
+            previous: BloomGeneration::default(),
+            open: HashMap::new(),
+            horizon_ns: 0,
+            inserted: 0,
+            rotations: 0,
+            open_overflows: 0,
+        }
+    }
+
     /// The `EMITTED_BLOOM_HASHES` bit indices for `key`, derived by
     /// Kirsch-Mitzenmacher double hashing from two independent 64-bit hashes.
-    fn indices(key: &str) -> impl Iterator<Item = u64> {
+    fn indices(&self, key: &str) -> [u64; EMITTED_BLOOM_HASHES as usize] {
         use std::hash::{Hash, Hasher};
         let mut first = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut first);
@@ -100,33 +214,138 @@ impl EmittedRequests {
         // Odd step: coprime with the power-of-two table size, so the probe sequence
         // visits distinct slots.
         let h2 = second.finish() | 1;
-        (0..EMITTED_BLOOM_HASHES)
-            .map(move |i| h1.wrapping_add(i.wrapping_mul(h2)) % EMITTED_BLOOM_BITS)
+        std::array::from_fn(|i| h1.wrapping_add((i as u64).wrapping_mul(h2)) % self.bloom_bits)
     }
 
-    /// Has `key` been exported? `false` is CERTAIN (no false negatives); `true` is
-    /// near-certain, and a false one only ever causes a drop.
+    fn words(&self) -> usize {
+        (self.bloom_bits / 64) as usize
+    }
+
+    /// Has `key` been exported (and not yet rotated out)? `false` is certain for
+    /// every key exported since `horizon_ns`; `true` is near-certain, and a false
+    /// one only ever causes a drop.
     fn contains(&self, key: &str) -> bool {
-        if self.bits.is_empty() {
-            return false;
+        if self.open.contains_key(key) {
+            return true;
         }
-        Self::indices(key).all(|bit| {
-            let word = (bit / 64) as usize;
-            self.bits[word] & (1 << (bit % 64)) != 0
-        })
+        let indices = self.indices(key);
+        self.current.contains(&indices) || self.previous.contains(&indices)
     }
 
-    fn insert(&mut self, key: &str) {
-        if self.bits.is_empty() {
-            self.bits = vec![0u64; (EMITTED_BLOOM_BITS / 64) as usize];
+    /// Requests that started before this instant cannot be proven new.
+    fn horizon_ns(&self) -> u64 {
+        self.horizon_ns
+    }
+
+    /// Remember an exported CLOSED request (or one whose END is not expected).
+    fn remember_closed(&mut self, key: &str, now_ns: u64) {
+        if self.current.inserted >= self.generation_capacity {
+            self.rotate(now_ns);
         }
-        for bit in Self::indices(key) {
-            let word = (bit / 64) as usize;
-            self.bits[word] |= 1 << (bit % 64);
-        }
+        self.insert_bloom(key, now_ns);
         self.inserted += 1;
     }
+
+    /// Remember a force-expired OPEN request exactly. Falls back to the Bloom
+    /// generations (still safe, see the type docs) when the exact set is full.
+    fn remember_open(&mut self, key: &str, now_ns: u64) {
+        if self.open.len() >= self.open_capacity && !self.open.contains_key(key) {
+            self.open_overflows += 1;
+            self.remember_closed(key, now_ns);
+            return;
+        }
+        self.open.insert(key.to_string(), now_ns);
+        self.inserted += 1;
+    }
+
+    /// A straggler for an exact OPEN entry was just rejected: the request is still
+    /// producing events, so keep its entry exact.
+    fn touch(&mut self, key: &str, at_ns: u64) {
+        if let Some(touched) = self.open.get_mut(key) {
+            *touched = (*touched).max(at_ns);
+        }
+    }
+
+    fn insert_bloom(&mut self, key: &str, now_ns: u64) {
+        let indices = self.indices(key);
+        let words = self.words();
+        if self.current.inserted == 0 && self.current.started_ns == 0 {
+            self.current.started_ns = now_ns;
+        }
+        self.current.insert(&indices, words);
+    }
+
+    /// Drop the older generation and start a fresh one at `now_ns`.
+    fn rotate(&mut self, now_ns: u64) {
+        let mut dropped = std::mem::take(&mut self.previous);
+        if dropped.inserted > 0 {
+            // Every key in `dropped` was inserted before the generation that now
+            // becomes `previous` started taking keys. A request is exported only
+            // after it started, so every forgotten request started before this.
+            self.horizon_ns = self.horizon_ns.max(self.current.started_ns);
+        }
+        // Reuse the dropped generation's allocation for the fresh one.
+        dropped.bits.fill(0);
+        dropped.inserted = 0;
+        dropped.started_ns = now_ns;
+        self.previous = std::mem::replace(&mut self.current, dropped);
+        self.rotations += 1;
+
+        // Exact OPEN entries untouched since the generation that just became
+        // `previous` started have gone quiet: move them into the fresh generation
+        // so the exact set stays small. They stay remembered for at least one more
+        // generation, and the horizon covers them after that.
+        let idle_before = self.previous.started_ns;
+        let idle: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, touched)| **touched < idle_before)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in idle {
+            self.open.remove(&key);
+            self.insert_bloom(&key, now_ns);
+        }
+    }
 }
+
+/// The request start RGW embeds in a `trans_id`, in nanoseconds since the unix
+/// epoch (rounded down to the second).
+///
+/// RGW builds every transaction id as `tx%021llx-%010llx-<zone suffix>` from a
+/// per-process request counter and `time(NULL)` at the start of request
+/// processing (`zone_unique_trans_id`), so the second field is the request's
+/// start in unix seconds. `None` for anything not in that shape -- the caller
+/// then simply has no start bound for the key.
+fn rgw_trans_id_start_ns(trans_id: &str) -> Option<u64> {
+    let rest = trans_id.strip_prefix("tx")?;
+    let (counter, rest) = rest.split_at_checked(21)?;
+    if !counter.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rest = rest.strip_prefix('-')?;
+    let stamp = rest.split('-').next()?;
+    if !(8..=16).contains(&stamp.len()) || !stamp.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(stamp, 16)
+        .ok()?
+        .checked_mul(1_000_000_000)
+}
+
+/// Why the tombstone refused to (re-)open a group for a key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TombstoneVerdict {
+    /// The key's span was already exported.
+    AlreadyEmitted,
+    /// The request started before the tombstone's horizon: its key may have been
+    /// rotated out, so it cannot be proven new.
+    OutsideHorizon,
+}
+
+/// Default cap on events buffered by `--output json`, which holds the whole
+/// session in memory until exit. See `Collector::set_max_buffered_events`.
+pub const DEFAULT_MAX_BUFFERED_EVENTS: usize = 100_000;
 
 #[derive(Debug, Default)]
 pub struct Collector {
@@ -161,12 +380,23 @@ pub struct Collector {
     /// would emit a SECOND span with the SAME trace/span id -- splitting one
     /// request's children across two spans and duplicating telemetry. Straggler
     /// events for these keys are therefore dropped (markers) or demoted to
-    /// background (RADOS ops), never re-grouped. See [`EmittedRequests`] for why it
-    /// is a Bloom filter and what its one failure mode costs.
+    /// background (RADOS ops), never re-grouped. See [`EmittedRequests`] for how it
+    /// stays in fixed memory without its false-positive rate degrading.
     emitted_requests: EmittedRequests,
-    /// Whether the "tombstone filter past its design capacity" warning has fired.
-    /// Once is enough: it is a property of the run, not of an event.
-    emitted_capacity_warned: bool,
+    /// Whether the first horizon rejection has been logged. Once is enough: it is a
+    /// property of the run, not of an event.
+    horizon_rejection_warned: bool,
+    /// Whether the exact OPEN tombstone overflowing has been logged.
+    open_overflow_warned: bool,
+    /// Cap on buffered events (request groups + correlated ops + background ops +
+    /// ops awaiting inference). `None` (the default) means uncapped: the streaming
+    /// output modes bound memory by draining instead. `--output json` never drains,
+    /// so it sets a cap -- see [`Collector::set_max_buffered_events`].
+    max_buffered_events: Option<usize>,
+    /// Correlated RADOS ops currently held across all request groups, so the
+    /// buffered-event count is O(1) per event.
+    buffered_correlated_ops: usize,
+    buffer_full_warned: bool,
     /// Replace every `ceph.rados.object` value with a stable hash of the name
     /// (`--redact-object-names`). RADOS object names carry S3 keys, user and
     /// tenant names and access-key ids; the default endpoint is plain http.
@@ -1016,6 +1246,11 @@ enum BackgroundReason {
     /// parent span with the same span id, so the op is kept as background with
     /// this reason instead -- visibly, not silently.
     RequestAlreadyEmitted,
+    /// The op carries a valid `trans_id` for a request the collector does not
+    /// hold, and that request started before the tombstone horizon: its span may
+    /// already have been exported and its key rotated out, so re-grouping it could
+    /// duplicate a span id. Kept as background, like `RequestAlreadyEmitted`.
+    RequestOutsideTombstoneHorizon,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1116,11 +1351,32 @@ pub struct TraceDiagnostics {
     /// Nonzero means the expiry bounds are too tight for the workload.
     pub late_request_markers_dropped: u64,
     /// Request keys remembered by the no-duplicate tombstone this session (see
-    /// `EmittedRequests`). Once it passes `EMITTED_BLOOM_DESIGN_CAPACITY` the
-    /// filter's false-positive rate rises -- which costs DROPS, never duplicates --
-    /// and a warning is logged once.
+    /// `EmittedRequests`). Unbounded by design: the tombstone rotates instead of
+    /// saturating, so a large value is not a problem in itself.
     pub emitted_request_keys: u64,
+    /// Times the tombstone dropped its older Bloom generation (every
+    /// `EMITTED_BLOOM_GENERATION_CAPACITY` exported requests). Each rotation moves
+    /// the tombstone horizon forward.
+    pub emitted_tombstone_rotations: u64,
+    /// Exported OPEN requests the exact tombstone could not hold (its cap was
+    /// reached) and that were remembered in the Bloom generations instead. Safe;
+    /// nonzero means END markers are being lost at a very high rate.
+    pub emitted_open_tombstone_overflows: u64,
+    /// Events for a request the collector does not hold and the tombstone does not
+    /// remember, whose request STARTED before the tombstone horizon. The key may
+    /// have been rotated out, so the event cannot be proven to belong to a new
+    /// request: markers are dropped and RADOS ops become background spans with
+    /// reason `request_outside_tombstone_horizon`. Expected to be ~0; a steady
+    /// count means requests (or stale request contexts) outlive a whole tombstone
+    /// generation.
+    pub tombstone_horizon_rejections: u64,
     pub expired_background_rados_ops: u64,
+    /// Request markers dropped because the `--output json` buffer cap
+    /// (`--max-buffered-events`) was reached. Always 0 in the streaming modes.
+    pub buffer_full_dropped_markers: u64,
+    /// RADOS ops dropped (not even kept as background) because the `--output json`
+    /// buffer cap was reached. Counted in `rados_ops` but in no span.
+    pub buffer_full_dropped_rados_ops: u64,
     pub truncated_trans_ids: u64,
     pub truncated_object_names: u64,
     pub truncated_acting_sets: u64,
@@ -1129,6 +1385,11 @@ pub struct TraceDiagnostics {
     pub truncated_method_names: u64,
     pub otlp_queue_dropped_traces: u64,
     pub otlp_queue_dropped_spans: u64,
+    /// Periodic OTLP export batches that failed for good (retries exhausted, or a
+    /// non-retryable response) and the spans they carried. Those spans are LOST:
+    /// the exporter keeps running and the next drain is exported normally.
+    pub otlp_export_failed_batches: u64,
+    pub otlp_export_failed_spans: u64,
     pub bpf_ringbuf_request_drops: u64,
     pub bpf_ringbuf_rados_drops: u64,
     pub bpf_rados_map_drops: u64,
@@ -1396,7 +1657,7 @@ impl Collector {
                 self.diagnostics.request_markers += 1;
                 record_truncation(&mut self.diagnostics, request.truncation);
                 let key = request_key(&request);
-                if self.reject_already_emitted(&key) {
+                if !self.admit_request_marker(&key, &request) {
                     return;
                 }
                 let builder = self.requests.entry(Arc::clone(&key)).or_default();
@@ -1425,7 +1686,7 @@ impl Collector {
                 self.diagnostics.request_end_markers += 1;
                 record_truncation(&mut self.diagnostics, request.truncation);
                 let key = request_key(&request);
-                if self.reject_already_emitted(&key) {
+                if !self.admit_request_marker(&key, &request) {
                     return;
                 }
                 let builder = self.requests.entry(Arc::clone(&key)).or_default();
@@ -1443,6 +1704,13 @@ impl Collector {
             TraceEvent::RadosOp(rados) => {
                 self.diagnostics.rados_ops += 1;
                 record_truncation(&mut self.diagnostics, rados.truncation);
+                // Every path below buffers the op somewhere (a group, background,
+                // or pending inference), so a full buffer drops it here. The one
+                // path that needs a SECOND slot is checked where it is taken.
+                if self.buffer_full() {
+                    self.diagnostics.buffer_full_dropped_rados_ops += 1;
+                    return;
+                }
                 if rados.trans_id.is_empty() {
                     let role = classify_rados(&rados);
                     match self.inference.as_ref() {
@@ -1465,14 +1733,31 @@ impl Collector {
                             self.record_background_rados(rados, background_reason_for_role(role));
                         }
                     }
-                } else if self.emitted_requests.contains(&rados.trans_id) {
-                    // This op's request span has ALREADY been exported, so
-                    // re-grouping it under that key would emit a second parent
-                    // span with the same trace/span id around it. The op itself
-                    // is a measured fact, so it is kept as a background span
-                    // with an explicit reason rather than dropped or re-parented.
-                    self.record_background_rados(rados, BackgroundReason::RequestAlreadyEmitted);
+                } else if let Some(verdict) = self.tombstone_verdict(
+                    &rados.trans_id,
+                    rgw_trans_id_start_ns(&rados.trans_id),
+                    rados_event_time_ns(&rados),
+                ) {
+                    // This op's request span has ALREADY been exported (or may
+                    // have been, and its key rotated out), so re-grouping it
+                    // under that key could emit a second parent span with the
+                    // same trace/span id around it. The op itself is a measured
+                    // fact, so it is kept as a background span with an explicit
+                    // reason rather than dropped or re-parented.
+                    let reason = match verdict {
+                        TombstoneVerdict::AlreadyEmitted => BackgroundReason::RequestAlreadyEmitted,
+                        TombstoneVerdict::OutsideHorizon => {
+                            BackgroundReason::RequestOutsideTombstoneHorizon
+                        }
+                    };
+                    self.record_background_rados(rados, reason);
                 } else {
+                    // An op whose request has no group yet (its START is missing
+                    // or still in flight) opens one: two buffered items, not one.
+                    if !self.requests.contains_key(&rados.trans_id) && self.buffer_lacks_room(2) {
+                        self.diagnostics.buffer_full_dropped_rados_ops += 1;
+                        return;
+                    }
                     // A non-empty `trans_id` correlates the op to its request,
                     // but the same_thread/cross_thread split is derived late in
                     // `request_spans` (the marker's `tid` may not be known yet).
@@ -1501,46 +1786,158 @@ impl Collector {
         }
     }
 
-    /// Whether `key` names a request whose span has already been exported, in
-    /// which case the caller must NOT re-open a group for it. Counts the drop.
-    fn reject_already_emitted(&mut self, key: &str) -> bool {
-        if !self.emitted_requests.contains(key) {
+    /// Whether a START/END marker for `key` may open or update a group. Refuses
+    /// (and counts) a marker whose request was already exported or cannot be
+    /// proven new, and a marker that would open a NEW group while the buffer cap is
+    /// reached. A marker for a group already held is always admitted: it adds no
+    /// buffered event, and an END is what completes the group.
+    fn admit_request_marker(&mut self, key: &str, request: &RequestEvent) -> bool {
+        if self.requests.contains_key(key) {
+            return true;
+        }
+        let seen_ns = request.end_ns.max(request.start_ns);
+        match self.tombstone_verdict(key, Some(request.start_ns), seen_ns) {
+            Some(TombstoneVerdict::AlreadyEmitted) => {
+                self.diagnostics.late_request_markers_dropped += 1;
+                return false;
+            }
+            // Counted in `tombstone_verdict`.
+            Some(TombstoneVerdict::OutsideHorizon) => return false,
+            None => {}
+        }
+        if self.buffer_full() {
+            self.diagnostics.buffer_full_dropped_markers += 1;
             return false;
         }
-        self.diagnostics.late_request_markers_dropped += 1;
         true
     }
 
-    /// Remember that `key`'s request span has been exported, so a straggler event
-    /// can never resurrect the group and produce a SECOND span with the same span
-    /// id (span ids are a pure function of the key).
+    /// Whether an event for `key` -- a key the collector does NOT currently hold a
+    /// group for -- must be kept out of a group, and why. `start_ns` is the
+    /// request's start when the event reveals it (every marker; a RADOS op only
+    /// through an RGW-format `trans_id`), `seen_ns` the event's own time.
     ///
-    /// The memory is never forgotten for the life of the run -- that is the whole
-    /// guarantee -- and it is bounded (8 MiB) because it is a Bloom filter rather
-    /// than an exact set. It has no false negatives, so no request can ever be
-    /// emitted twice. Past its design capacity its false-POSITIVE rate rises, which
-    /// costs dropped stragglers (and, rarely, a dropped fresh request) but can
-    /// never duplicate one; the operator is told exactly once.
-    fn remember_emitted(&mut self, key: &str) {
-        if self.emitted_requests.contains(key) {
-            return;
+    /// A key the collector holds is never passed here: it cannot have been
+    /// exported (an exported group is removed and never re-created), and checking
+    /// it would only expose live groups to Bloom false positives.
+    fn tombstone_verdict(
+        &mut self,
+        key: &str,
+        start_ns: Option<u64>,
+        seen_ns: u64,
+    ) -> Option<TombstoneVerdict> {
+        if self.requests.contains_key(key) {
+            return None;
         }
-        self.emitted_requests.insert(key);
+        if self.emitted_requests.contains(key) {
+            self.emitted_requests.touch(key, seen_ns);
+            return Some(TombstoneVerdict::AlreadyEmitted);
+        }
+        let horizon_ns = self.emitted_requests.horizon_ns();
+        if start_ns.is_some_and(|start_ns| start_ns < horizon_ns) {
+            self.diagnostics.tombstone_horizon_rejections += 1;
+            if !self.horizon_rejection_warned {
+                self.horizon_rejection_warned = true;
+                warn!(
+                    key,
+                    horizon_ns,
+                    "rejected an event for a request that started before the no-duplicate \
+                     tombstone horizon: its key may already have been exported and rotated out, \
+                     so it is not re-grouped (counted in tombstone_horizon_rejections; markers \
+                     are dropped, RADOS ops become background spans)"
+                );
+            }
+            return Some(TombstoneVerdict::OutsideHorizon);
+        }
+        None
+    }
+
+    /// Remember that `key`'s request span has been exported at trace-clock
+    /// `now_ns`, so a straggler event can never resurrect the group and produce a
+    /// SECOND span with the same span id (span ids are a pure function of the key).
+    ///
+    /// `open` marks a request force-expired at the lifetime backstop, whose END is
+    /// still expected: it is remembered exactly. Everything else goes into the
+    /// rotating Bloom generations. See [`EmittedRequests`] for why forgetting old
+    /// generations cannot duplicate a span.
+    fn remember_emitted(&mut self, key: &str, open: bool, now_ns: u64) {
+        let rotations = self.emitted_requests.rotations;
+        if open {
+            self.emitted_requests.remember_open(key, now_ns);
+        } else {
+            self.emitted_requests.remember_closed(key, now_ns);
+        }
         self.diagnostics.emitted_request_keys = self.emitted_requests.inserted;
-        if self.emitted_requests.inserted > EMITTED_BLOOM_DESIGN_CAPACITY
-            && !self.emitted_capacity_warned
-        {
-            self.emitted_capacity_warned = true;
-            warn!(
+        self.diagnostics.emitted_tombstone_rotations = self.emitted_requests.rotations;
+        self.diagnostics.emitted_open_tombstone_overflows = self.emitted_requests.open_overflows;
+        if self.emitted_requests.rotations != rotations {
+            info!(
+                rotations = self.emitted_requests.rotations,
                 exported_requests = self.emitted_requests.inserted,
-                design_capacity = EMITTED_BLOOM_DESIGN_CAPACITY,
-                "the no-duplicate tombstone filter is past its design capacity. No request can \
-                 ever be emitted twice (a Bloom filter has no false negatives), but its \
-                 false-positive rate is now rising: late stragglers -- and, increasingly, whole \
-                 fresh requests -- will be DROPPED (late_request_markers_dropped / background ops \
-                 with reason request_already_emitted). Restart the tracer to reset it"
+                horizon_ns = self.emitted_requests.horizon_ns(),
+                "rotated the no-duplicate tombstone; events for requests that started before \
+                 horizon_ns and are not in flight are now rejected rather than re-grouped"
             );
         }
+        if self.emitted_requests.open_overflows > 0 && !self.open_overflow_warned {
+            self.open_overflow_warned = true;
+            warn!(
+                capacity = EMITTED_OPEN_CAPACITY,
+                "the exact tombstone for force-expired OPEN requests is full; further ones are \
+                 remembered in the Bloom generations instead (still no duplicates). This many \
+                 lost END markers means the END probe is losing events -- check \
+                 bpf_ringbuf_request_drops and bpf_request_end_misses"
+            );
+        }
+    }
+
+    /// Cap the events this collector buffers (`None` = uncapped, the default).
+    ///
+    /// `--output json` sets it: that mode holds the whole session in memory and
+    /// prints one document at exit, so without a cap a long session at production
+    /// rates grows without bound. Once the cap is reached, events that would add a
+    /// buffered item (a new request group, a RADOS op) are dropped and counted
+    /// (`buffer_full_dropped_markers`, `buffer_full_dropped_rados_ops`); markers
+    /// for a group already held still land, so held requests can complete.
+    pub fn set_max_buffered_events(&mut self, max: Option<usize>) {
+        self.max_buffered_events = max;
+    }
+
+    /// Events currently buffered: request groups, their correlated ops,
+    /// background ops, and ops awaiting inference.
+    fn buffered_events(&self) -> usize {
+        self.requests.len()
+            + self.buffered_correlated_ops
+            + self.background.len()
+            + self
+                .inference
+                .as_ref()
+                .map_or(0, |inference| inference.pending.len())
+    }
+
+    fn buffer_full(&mut self) -> bool {
+        self.buffer_lacks_room(1)
+    }
+
+    /// Whether adding `needed` buffered items would pass the cap (warns once).
+    fn buffer_lacks_room(&mut self, needed: usize) -> bool {
+        let Some(max) = self.max_buffered_events else {
+            return false;
+        };
+        if self.buffered_events() + needed <= max {
+            return false;
+        }
+        if !self.buffer_full_warned {
+            self.buffer_full_warned = true;
+            warn!(
+                max_buffered_events = max,
+                "--output json buffer is full; new requests and RADOS ops are now DROPPED \
+                 (buffer_full_dropped_markers / buffer_full_dropped_rados_ops). Use \
+                 --output jsonl to stream a long session instead of buffering it, or raise \
+                 --max-buffered-events"
+            );
+        }
+        true
     }
 
     /// Opt in to hashing object names in the exported attributes. See the
@@ -1726,6 +2123,7 @@ impl Collector {
         let first_seen_ns = rados.sent_ns.min(rados.finish_ns);
         let builder = self.requests.entry(Arc::clone(&key)).or_default();
         builder.observe(first_seen_ns, last_seen_ns);
+        self.buffered_correlated_ops += 1;
         builder.rados.push(CorrelatedRados {
             event: rados,
             correlation,
@@ -1753,7 +2151,8 @@ impl Collector {
             }
             BackgroundReason::MissingTransId
             | BackgroundReason::ClassifiedBackgroundRole
-            | BackgroundReason::RequestAlreadyEmitted => {}
+            | BackgroundReason::RequestAlreadyEmitted
+            | BackgroundReason::RequestOutsideTombstoneHorizon => {}
         }
         record_background_breakdown(&mut self.diagnostics, &rados, reason);
         let seq = self.next_background_seq;
@@ -1784,6 +2183,18 @@ impl Collector {
             .diagnostics
             .otlp_queue_dropped_spans
             .saturating_add(spans as u64);
+    }
+
+    /// Periodic OTLP batches that could not be delivered: their spans are lost.
+    pub fn record_otlp_export_failure(&mut self, batches: u64, spans: u64) {
+        self.diagnostics.otlp_export_failed_batches = self
+            .diagnostics
+            .otlp_export_failed_batches
+            .saturating_add(batches);
+        self.diagnostics.otlp_export_failed_spans = self
+            .diagnostics
+            .otlp_export_failed_spans
+            .saturating_add(spans);
     }
 
     pub fn merge_bpf_diagnostics(&mut self, diagnostics: BpfDiagnostics) {
@@ -1928,6 +2339,7 @@ impl Collector {
             let Some(mut builder) = self.requests.remove(&key) else {
                 continue;
             };
+            self.buffered_correlated_ops -= builder.rados.len();
             self.expiry.replace(&key, builder.expiry.take(), None);
             if let Some(inference) = self.inference.as_mut() {
                 inference.replace_candidate(&key, builder.candidate.take(), None);
@@ -1945,8 +2357,8 @@ impl Collector {
             tally_request(&builder, &mut self.diagnostics);
             requests.push((key, builder));
         }
-        for (key, _) in &requests {
-            self.remember_emitted(key);
+        for (key, builder) in &requests {
+            self.remember_emitted(key, builder.is_open(self.end_probe_attached), now_ns);
         }
 
         let mut due: Vec<u64> = self
@@ -2527,6 +2939,7 @@ impl BackgroundReason {
             Self::NoInferenceCandidate => "no_inference_candidate",
             Self::AmbiguousInferenceCandidates => "ambiguous_inference_candidates",
             Self::RequestAlreadyEmitted => "request_already_emitted",
+            Self::RequestOutsideTombstoneHorizon => "request_outside_tombstone_horizon",
         }
     }
 }
@@ -3667,7 +4080,7 @@ mod tests {
 
         let inserted: Vec<String> = (0..50_000).map(|i| format!("tx-{i}")).collect();
         for key in &inserted {
-            emitted.insert(key);
+            emitted.remember_closed(key, 1);
         }
         for key in &inserted {
             assert!(
@@ -3685,6 +4098,431 @@ mod tests {
             "at 50k keys in a 2^26-bit filter the false-positive rate is ~1e-12; \
              {false_positives} collisions means the hashing is broken"
         );
+    }
+
+    // --- long-session tombstone: fixed memory, non-degrading false positives ---
+
+    /// Bits / generation capacity for the scaled-down tombstone the long-session
+    /// tests use: the SAME bits-per-key ratio as production (2^26 / 2M = 32), so the
+    /// false-positive behavior is the production one at a size a unit test can
+    /// fill many times over.
+    const TEST_BLOOM_BITS: u64 = 1 << 20;
+    const TEST_GENERATION_CAPACITY: u64 = 32_768;
+
+    fn false_positive_rate(emitted: &EmittedRequests, probes: usize) -> f64 {
+        let hits = (0..probes)
+            .filter(|i| emitted.contains(&format!("tx-fresh-{i}")))
+            .count();
+        hits as f64 / probes as f64
+    }
+
+    #[test]
+    fn tombstone_false_positive_rate_stays_flat_far_past_its_design_capacity() {
+        // REGRESSION (F4). The tombstone was ONE never-reset Bloom filter: ~1e-7
+        // false positives at its 2M-key design point, ~35% at 10M, ~91% at 18M --
+        // and every false positive drops a FRESH request's markers and demotes its
+        // ops to background. A multi-hour session at production rates reaches that.
+        //
+        // First, the failure mode itself, at production bits-per-key: a filter that
+        // never rotates, loaded with 10x its design capacity.
+        let mut never_rotates = EmittedRequests::with_geometry(TEST_BLOOM_BITS, u64::MAX, 16);
+        let load = TEST_GENERATION_CAPACITY * 10;
+        for i in 0..load {
+            never_rotates.remember_closed(&format!("tx-{i}"), 1 + i);
+        }
+        let saturated = false_positive_rate(&never_rotates, 20_000);
+        assert!(
+            saturated > 0.5,
+            "a never-reset filter at 10x capacity must be saturated (got {saturated}) -- \
+             otherwise this test does not reproduce the bug"
+        );
+
+        // The rotating tombstone under the same load: the rate a lookup sees stays
+        // at the design point (~2e-7 with two generations checked), however many
+        // keys the session has exported.
+        let mut emitted =
+            EmittedRequests::with_geometry(TEST_BLOOM_BITS, TEST_GENERATION_CAPACITY, 16);
+        for i in 0..load {
+            emitted.remember_closed(&format!("tx-{i}"), 1 + i);
+        }
+        assert!(emitted.rotations >= 9, "the load must force many rotations");
+        let probes = 200_000;
+        let hits = (0..probes)
+            .filter(|i| emitted.contains(&format!("tx-fresh-{i}")))
+            .count();
+        assert!(
+            hits <= 5,
+            "{hits} of {probes} fresh keys were claimed as already exported -- the \
+             false-positive rate must not degrade with session length"
+        );
+
+        // And no false negatives inside the retention window: every key of the two
+        // live generations is still remembered.
+        let retained = emitted.current.inserted + emitted.previous.inserted;
+        for i in (load - retained)..load {
+            assert!(
+                emitted.contains(&format!("tx-{i}")),
+                "tx-{i} is inside the retention window and must be remembered"
+            );
+        }
+        // Memory is fixed: two generations, never more.
+        assert_eq!(emitted.current.bits.len(), (TEST_BLOOM_BITS / 64) as usize);
+        assert_eq!(emitted.previous.bits.len(), (TEST_BLOOM_BITS / 64) as usize);
+    }
+
+    #[test]
+    fn tombstone_horizon_covers_every_key_a_rotation_forgets() {
+        // THE SAFETY ARGUMENT, checked directly. After any number of rotations, a
+        // key that is no longer remembered must have been inserted before the
+        // horizon -- so an event for it (whose request started before its export)
+        // is rejected by the horizon rather than re-grouped.
+        let capacity = 1_000;
+        let mut emitted = EmittedRequests::with_geometry(1 << 16, capacity, 16);
+        let mut inserted_at = Vec::new();
+        for i in 0..(capacity * 7) {
+            let now = 1_000 + i * 10;
+            emitted.remember_closed(&format!("tx-{i}"), now);
+            inserted_at.push(now);
+        }
+        assert!(emitted.rotations >= 5);
+        assert!(emitted.horizon_ns() > 0, "rotations must move the horizon");
+        for (i, &at) in inserted_at.iter().enumerate() {
+            if !emitted.contains(&format!("tx-{i}")) {
+                assert!(
+                    at < emitted.horizon_ns(),
+                    "tx-{i} was forgotten but was exported at {at}, after the horizon {}",
+                    emitted.horizon_ns()
+                );
+            }
+        }
+        // ...and the horizon never runs ahead of what is still remembered: the
+        // newest generation's keys are all still present.
+        for i in (capacity * 6)..(capacity * 7) {
+            assert!(emitted.contains(&format!("tx-{i}")));
+        }
+    }
+
+    /// Requests flowed through a collector in the production shape: START, a
+    /// child op, END, then a drain once the idle TTL has passed. Times advance so
+    /// every request is FRESH (it starts just before it is exported).
+    fn flood_closed_requests(collector: &mut Collector, from: u64, count: u64, now: &mut u64) {
+        let ttl = 1_000;
+        for i in from..from + count {
+            let key = format!("tx-flood-{i}");
+            *now += 10;
+            collector.push(start(&key, *now));
+            let mut child = rados("object", &key);
+            child.sent_ns = *now + 1;
+            child.finish_ns = *now + 2;
+            collector.push(TraceEvent::RadosOp(child));
+            collector.push(end(&key, *now, *now + 3));
+            if i % 100 == 99 {
+                // Drain everything older than the TTL, as the live loop does.
+                collector.drain_expired("rgwtrace", *now + ttl + 5, ttl);
+            }
+        }
+        collector.drain_expired("rgwtrace", *now + ttl + 5, ttl);
+    }
+
+    fn collector_with_small_tombstone(end_probe: bool) -> Collector {
+        let mut collector = Collector::default();
+        collector.set_end_probe_attached(end_probe);
+        collector.emitted_requests = EmittedRequests::with_geometry(1 << 16, 1_000, 64);
+        collector
+    }
+
+    #[test]
+    fn a_live_force_expired_request_is_never_re_emitted_across_many_rotations() {
+        // A force-expired OPEN request that is still ALIVE: its RADOS ops keep
+        // arriving long after it was exported, and its END arrives last. Through
+        // several tombstone rotations, nothing about it may be re-grouped: the ops
+        // become background spans and the END is dropped.
+        let ttl = 1_000;
+        let mut collector = collector_with_small_tombstone(true);
+        collector.push(start("tx-long-running", 100));
+        let mut now = 200 + ttl * OPEN_REQUEST_TTL_MULTIPLIER;
+        let drained = collector
+            .drain_expired("rgwtrace", now, ttl)
+            .expect("the open request is force-expired at the lifetime backstop");
+        assert_eq!(drained.diagnostics.expired_open_requests, 1);
+        let span_id = drained.spans[0].span_id.clone();
+
+        let mut stragglers = 0;
+        for round in 0..6 {
+            flood_closed_requests(&mut collector, round * 1_000, 1_000, &mut now);
+            let mut op = rados("still-running", "tx-long-running");
+            op.sent_ns = now;
+            op.finish_ns = now + 1;
+            collector.push(TraceEvent::RadosOp(op));
+            stragglers += 1;
+        }
+        assert!(
+            collector.diagnostics.emitted_tombstone_rotations >= 4,
+            "the flood must rotate the tombstone several times, or this proves nothing"
+        );
+
+        collector.push(end("tx-long-running", 100, now + 10));
+        assert_eq!(
+            collector.diagnostics.late_request_markers_dropped, 1,
+            "the late END must be recognised as an already-exported request"
+        );
+
+        let remaining = collector.into_trace_document("rgwtrace");
+        assert!(
+            !remaining.spans.iter().any(|span| span.span_id == span_id),
+            "the request was emitted a SECOND time under the same span id"
+        );
+        assert_eq!(
+            remaining
+                .diagnostics
+                .background_rados_by_reason
+                .get("request_already_emitted"),
+            Some(&stragglers)
+        );
+        // COVERAGE REGRESSION: the fresh requests of the flood were all correlated
+        // and exported normally -- the tombstone rotating never cost one of them.
+        assert_eq!(remaining.diagnostics.tombstone_horizon_rejections, 0);
+        assert_eq!(remaining.diagnostics.correlated_rados_ops, 6_000);
+        assert_eq!(remaining.diagnostics.measured_duration_requests, 6_000);
+    }
+
+    #[test]
+    fn a_silent_force_expired_request_is_rejected_by_the_horizon_once_rotated_out() {
+        // The same, for a force-expired request that then goes completely quiet:
+        // its exact entry is moved into the Bloom filter and eventually rotated
+        // out. Its END must STILL not re-open the group -- the horizon rejects it,
+        // because the request started long before anything still remembered.
+        let ttl = 1_000;
+        let mut collector = collector_with_small_tombstone(true);
+        collector.push(start("tx-silent", 100));
+        let mut now = 200 + ttl * OPEN_REQUEST_TTL_MULTIPLIER;
+        let drained = collector.drain_expired("rgwtrace", now, ttl).unwrap();
+        let span_id = drained.spans[0].span_id.clone();
+
+        for round in 0..6 {
+            flood_closed_requests(&mut collector, round * 1_000, 1_000, &mut now);
+        }
+        assert!(
+            !collector.emitted_requests.contains("tx-silent"),
+            "the scenario needs the key to have been rotated out"
+        );
+
+        collector.push(end("tx-silent", 100, now));
+        assert_eq!(collector.diagnostics.tombstone_horizon_rejections, 1);
+        let remaining = collector.into_trace_document("rgwtrace");
+        assert!(!remaining.spans.iter().any(|span| span.span_id == span_id));
+        assert!(remaining.spans.is_empty());
+    }
+
+    #[test]
+    fn a_stale_trans_id_on_a_fresh_op_is_rejected_once_its_key_is_rotated_out() {
+        // WITHOUT the END probe nothing revokes a request context, so a context
+        // left on an RGW thread can stamp an OLD request's trans_id onto a FRESH op
+        // at any later time. The op's own timestamps are new; only the trans_id --
+        // which RGW builds from time(NULL) at request start -- tells its age.
+        let base = 1_700_000_000 * 1_000_000_000_u64;
+        let old_trans_id = "tx000000000000000000001-006553f100-1a2b-default";
+        assert_eq!(rgw_trans_id_start_ns(old_trans_id), Some(base));
+
+        let ttl = 1_000;
+        let mut collector = collector_with_small_tombstone(false);
+        let mut now = base + 500;
+        collector.push(start(old_trans_id, now));
+        now += 2 * ttl;
+        let drained = collector.drain_expired("rgwtrace", now, ttl).unwrap();
+        let span_id = drained.spans[0].span_id.clone();
+
+        for round in 0..6 {
+            flood_closed_requests(&mut collector, round * 1_000, 1_000, &mut now);
+        }
+        // Rotation is driven by count, so in this compressed clock only a few
+        // microseconds passed; put the stale stamp seconds later, as it would be.
+        now += 5_000_000_000;
+        assert!(!collector.emitted_requests.contains(old_trans_id));
+
+        let mut stale = rados("unrelated-object", old_trans_id);
+        stale.sent_ns = now;
+        stale.finish_ns = now + 10;
+        collector.push(TraceEvent::RadosOp(stale));
+
+        assert_eq!(collector.diagnostics.tombstone_horizon_rejections, 1);
+        let remaining = collector.into_trace_document("rgwtrace");
+        assert!(
+            !remaining.spans.iter().any(|span| span.span_id == span_id),
+            "the stale op re-created the exported request under the same span id"
+        );
+        assert_eq!(
+            remaining
+                .diagnostics
+                .background_rados_by_reason
+                .get("request_outside_tombstone_horizon"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn parses_the_request_start_rgw_embeds_in_a_trans_id() {
+        // RGW: snprintf("tx%021llx-%010llx", counter, time(NULL)) + zone suffix.
+        assert_eq!(
+            rgw_trans_id_start_ns("tx00000c1ab2cd3ef456789-0065f3a1b2-1a2b3c-default"),
+            Some(0x65f3a1b2 * 1_000_000_000)
+        );
+        // No suffix, and a counter that has used all 21 digits.
+        assert_eq!(
+            rgw_trans_id_start_ns("txfffffffffffffffffffff-0000000001"),
+            Some(1_000_000_000)
+        );
+        for not_rgw in [
+            "",
+            "tx-golden",
+            "tx0001",
+            "tx00000c1ab2cd3ef456789",
+            "tx00000c1ab2cd3ef456789-",
+            "tx00000c1ab2cd3ef456789-12345",
+            "tx00000c1ab2cd3ef45678z-0065f3a1b2-zone",
+            "tx00000c1ab2cd3ef456789-0065f3a1bz-zone",
+            "pid:42:tid:7:start:100",
+            "tx00000c1ab2cd3ef456789-ffffffffffffffff-x",
+        ] {
+            assert_eq!(rgw_trans_id_start_ns(not_rgw), None, "{not_rgw:?}");
+        }
+    }
+
+    // --- bounded memory (F3) ---
+
+    #[test]
+    fn periodic_draining_bounds_the_request_map_over_a_long_session() {
+        // The streaming modes (`--output jsonl` / `otlp`) drain on every flush
+        // interval, so what the collector holds is bounded by rate x TTL however
+        // long the session runs. Simulate 50k requests at 10 per ms with a drain
+        // every 100 ms and check the high-water mark stays at that bound.
+        let ttl = 1_000_000; // 1 ms in ns
+        let flush = 100_000;
+        let mut collector = Collector::default();
+        collector.set_end_probe_attached(true);
+        let mut high_water = 0;
+        let mut exported = 0;
+        let mut next_flush = flush;
+        for i in 0..50_000_u64 {
+            let now = i * 100; // one request every 100 ns
+            push_request(&mut collector, &format!("tx-{i}"), now, now + 50);
+            if now >= next_flush {
+                if let Some(document) = collector.drain_expired("rgwtrace", now, ttl) {
+                    exported += document.spans.len();
+                }
+                next_flush += flush;
+            }
+            high_water = high_water.max(collector.requests.len());
+        }
+        // Requests in one TTL plus one flush interval: (ttl + flush) / 100 ns.
+        let bound = ((ttl + flush) / 100) as usize + 1;
+        assert!(
+            high_water <= bound,
+            "the request map grew to {high_water}, past the rate x (TTL + flush) bound {bound}"
+        );
+        assert!(exported > 35_000, "the drains must actually export");
+    }
+
+    #[test]
+    fn the_json_buffer_cap_bounds_buffered_events_and_counts_every_drop() {
+        // `--output json` never drains, so without a cap a long session grows until
+        // the process is OOM-killed next to the OSDs it shares a host with.
+        let mut collector = Collector::default();
+        collector.set_end_probe_attached(true);
+        collector.set_max_buffered_events(Some(10));
+
+        // Five requests, each START + one child: exactly 10 buffered events.
+        for i in 0..5 {
+            collector.push(start(&format!("tx-{i}"), 100 + i));
+            collector.push(TraceEvent::RadosOp(rados("object", &format!("tx-{i}"))));
+        }
+        assert_eq!(collector.buffered_events(), 10);
+
+        // Full: a new request, a new child of a held request, and a background op
+        // are all dropped and counted...
+        collector.push(start("tx-new", 200));
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-0")));
+        collector.push(TraceEvent::RadosOp(rados("notify.0", "")));
+        assert_eq!(collector.buffered_events(), 10, "the cap must hold");
+        assert_eq!(collector.diagnostics.buffer_full_dropped_markers, 1);
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 2);
+
+        // ...but the END of a HELD request still lands: it adds nothing to the
+        // buffer and is what makes that request's duration measured.
+        collector.push(end("tx-0", 100, 400));
+        assert_eq!(collector.diagnostics.buffer_full_dropped_markers, 1);
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.measured_duration_requests, 1);
+        // Every RADOS op is accounted for: in a span, or in the drop counter.
+        assert_eq!(
+            document.diagnostics.rados_ops,
+            document.diagnostics.correlated_rados_ops
+                + document.diagnostics.background_rados_ops
+                + document.diagnostics.buffer_full_dropped_rados_ops
+        );
+    }
+
+    #[test]
+    fn indexed_drain_releases_only_the_expired_groups_buffer_slots() {
+        let mut collector = Collector::default();
+        collector.set_max_buffered_events(Some(4));
+        for (key, time) in [("old", 10), ("live", 1_000)] {
+            collector.push(start(key, time));
+            let mut op = rados("object", key);
+            op.sent_ns = time;
+            op.finish_ns = time + 10;
+            collector.push(TraceEvent::RadosOp(op));
+        }
+        assert_eq!(collector.buffered_events(), 4);
+        let batch = collector.drain_expired_batch(200, 100).unwrap();
+        assert_eq!(batch.span_count(), 2);
+        assert_eq!(collector.buffered_events(), 2);
+        collector.push(start("new", 210));
+        collector.push(TraceEvent::RadosOp(rados("object", "new")));
+        assert_eq!(collector.buffered_events(), 4);
+        assert_eq!(collector.diagnostics.buffer_full_dropped_markers, 0);
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 0);
+        assert_eq!(collector.into_trace_document("test").spans.len(), 4);
+    }
+
+    #[test]
+    fn an_op_that_opens_a_new_group_needs_room_for_both_items() {
+        // A RADOS op whose trans_id has no group yet (its START is missing or
+        // still in flight) creates TWO buffered items: the group and the op. With
+        // one slot left it must be dropped, not squeezed in one over the cap.
+        let mut collector = Collector::default();
+        collector.set_max_buffered_events(Some(1));
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-no-start")));
+        assert_eq!(
+            collector.buffered_events(),
+            0,
+            "two items do not fit in one slot"
+        );
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 1);
+
+        let mut collector = Collector::default();
+        collector.set_max_buffered_events(Some(3));
+        collector.push(start("tx-a", 100));
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-a")));
+        // One slot left: a child of the held group fits, a new group's op does not.
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-no-start")));
+        assert_eq!(collector.buffered_events(), 2);
+        collector.push(TraceEvent::RadosOp(rados("object", "tx-a")));
+        assert_eq!(collector.buffered_events(), 3);
+        assert_eq!(collector.diagnostics.buffer_full_dropped_rados_ops, 1);
+    }
+
+    #[test]
+    fn an_uncapped_collector_never_drops_for_buffer_space() {
+        // The default (streaming modes, unit tests, dry-run) is uncapped.
+        let mut collector = Collector::default();
+        for i in 0..1_000 {
+            collector.push(start(&format!("tx-{i}"), 100));
+        }
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.buffer_full_dropped_markers, 0);
+        assert_eq!(document.spans.len(), 1_000);
     }
 
     #[test]
@@ -3802,6 +4640,18 @@ mod tests {
         let document = collector.into_trace_document("rgwtrace");
         assert_eq!(document.diagnostics.otlp_queue_dropped_traces, 2);
         assert_eq!(document.diagnostics.otlp_queue_dropped_spans, 5);
+    }
+
+    #[test]
+    fn records_otlp_export_failures() {
+        let mut collector = Collector::default();
+
+        collector.record_otlp_export_failure(1, 512);
+        collector.record_otlp_export_failure(2, 40);
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.otlp_export_failed_batches, 3);
+        assert_eq!(document.diagnostics.otlp_export_failed_spans, 552);
     }
 
     #[test]

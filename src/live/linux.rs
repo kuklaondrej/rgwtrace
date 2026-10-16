@@ -1,11 +1,12 @@
 use std::{
     ffi::CString,
+    io::BufWriter,
     mem::{align_of, size_of},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::Path,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -22,14 +23,16 @@ use tracing::{debug, info, warn};
 
 use crate::{
     cli::{Cli, OutputMode},
-    collector::{BpfDiagnostics, Collector, ExpiredBatch, TraceDocument},
+    collector::{
+        BpfDiagnostics, Collector, ExpiredBatch, TraceDocument, DEFAULT_MAX_BUFFERED_EVENTS,
+    },
     dwarf_json::{
         module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
         REQ_STATE_DTOR, RGWTRACE_HPROBE_SLOTS, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
         RGW_RADOS_OPERATE_WRITE,
     },
     events::*,
-    otel, preflight, targets,
+    otel, output, preflight, targets,
 };
 
 mod skel {
@@ -51,6 +54,40 @@ struct OtlpExporter {
     // them, so the ring-buffer thread never pays for span construction.
     sender: SyncSender<ExpiredBatch>,
     handle: JoinHandle<Result<otel::ExportDiagnostics>>,
+    ledger: Arc<ExportLedger>,
+}
+
+/// Documents (and their spans) handed to the OTLP worker vs. ones it finished
+/// with -- exported, or counted as lost. The difference is what a worker panic
+/// destroyed: the document in flight plus everything still queued. Those spans
+/// already left the collector, so `OtlpExporter::finish` counts them as lost.
+#[derive(Debug, Default)]
+struct ExportLedger {
+    queued_documents: AtomicU64,
+    queued_spans: AtomicU64,
+    settled_documents: AtomicU64,
+    settled_spans: AtomicU64,
+}
+
+impl ExportLedger {
+    fn queued(&self, spans: usize) {
+        self.queued_documents.fetch_add(1, Ordering::SeqCst);
+        self.queued_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    fn settled(&self, spans: usize) {
+        self.settled_documents.fetch_add(1, Ordering::SeqCst);
+        self.settled_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    /// (documents, spans) accepted by the worker but never settled.
+    fn unsettled(&self) -> (u64, u64) {
+        let load = |counter: &AtomicU64| counter.load(Ordering::SeqCst);
+        (
+            load(&self.queued_documents).saturating_sub(load(&self.settled_documents)),
+            load(&self.queued_spans).saturating_sub(load(&self.settled_spans)),
+        )
+    }
 }
 
 struct OtlpExporterConfig {
@@ -101,7 +138,8 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         !cli.disable_rgw_op_bridge_key,
     )?;
     let _links = attached.links;
-    let timestamp_offset_ns = unix_boottime_offset_ns()?;
+    let clock = TraceClock::new()?;
+    let timestamp_offset_ns = clock.offset_ns;
 
     let mut collector_state = if cli.correlate_inferred {
         Collector::with_inferred_correlation(duration_ns(cli.inference_window))
@@ -116,10 +154,31 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     collector_state.set_closed_request_grace(duration_ns(cli.closed_request_grace));
     collector_state.set_inference_max_pending(cli.inference_max_pending);
     collector_state.set_redact_object_names(cli.redact_object_names);
+    if cli.output == OutputMode::Json {
+        // `--output json` prints one document at exit and never drains, so the
+        // buffer cap is the only thing bounding its memory.
+        let max = cli
+            .max_buffered_events
+            .unwrap_or(DEFAULT_MAX_BUFFERED_EVENTS);
+        collector_state.set_max_buffered_events(Some(max));
+        if cli.timeout.is_none() {
+            warn!(
+                max_buffered_events = max,
+                "--output json holds the whole session in memory until exit and has no \
+                 --timeout; past --max-buffered-events new requests are dropped. Use \
+                 --output jsonl to stream a long session"
+            );
+        }
+    }
     let collector = Arc::new(Mutex::new(collector_state));
     let otlp_exporter = matches!(cli.output, OutputMode::Otlp)
-        .then(|| OtlpExporter::spawn(cli))
+        .then(|| OtlpExporter::spawn(cli, Arc::clone(&collector)))
         .transpose()?;
+    // `--output jsonl` writes each drain as one line. Buffered so a large drain is
+    // not thousands of small writes; flushed per line.
+    let mut jsonl_out = (cli.output == OutputMode::Jsonl)
+        .then(|| BufWriter::with_capacity(1 << 16, std::io::stdout()));
+    let dwarf_summary = dwarf.summary();
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);
@@ -159,14 +218,9 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     } else {
         Some(StaleRadosOpsSweep::new(&skel.maps.rados_ops)?)
     };
-    // Latches once the OTLP exporter thread dies so a single fatal/misconfig
-    // OTLP response cannot tear down the session or spam the log.
-    let mut otlp_export_disabled = false;
-    // Batches drained from the collector for OTLP export but stranded when the
-    // exporter channel was found `Disconnected`. Those spans have already left
-    // the collector, so retain them here and fold them back into the end-of-run
-    // trace rather than losing them.
-    let mut retained_otlp: Vec<ExpiredBatch> = Vec::new();
+    // Set once the OTLP worker thread is found gone (it only exits by panicking),
+    // so the loss is warned about once; drains continue and are counted as lost.
+    let mut otlp_worker_gone = false;
     loop {
         let ret = ringbuf.poll_raw(Duration::from_millis(250));
         if ret < 0 {
@@ -236,17 +290,25 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                 }
             }
         }
-        if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
-        {
+        // The streaming modes drain on every flush interval; that drain is what
+        // bounds their memory for any session length.
+        if cli.output.is_streaming() && last_flush.elapsed() >= cli.otlp_flush_interval {
             merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
-            if let Some(exporter) = &otlp_exporter {
-                if let Some(retained) = queue_expired_otlp(
-                    cli,
-                    &collector,
-                    &exporter.sender,
-                    &mut otlp_export_disabled,
-                )? {
-                    retained_otlp.push(retained);
+            if let Some(trace) = drain_expired(cli, &collector, &clock)? {
+                if let Some(exporter) = &otlp_exporter {
+                    dispatch_expired_otlp(
+                        &collector,
+                        &exporter.sender,
+                        &exporter.ledger,
+                        trace,
+                        &mut otlp_worker_gone,
+                    );
+                } else if let Some(out) = jsonl_out.as_mut() {
+                    output::write_jsonl_document(
+                        out,
+                        &dwarf_summary,
+                        &trace.into_trace_document(cli.service_name.clone()),
+                    )?;
                 }
             }
             last_flush = Instant::now();
@@ -256,19 +318,21 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     drop(ringbuf);
     merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
     if let Some(exporter) = otlp_exporter {
-        // The exporter thread returns `Err` after a fatal/exhausted OTLP export.
-        // Surface it for logging, but never let it abort the session: the
-        // collected spans below must still be emitted on the non-OTLP path.
-        match exporter.finish() {
+        // The worker never exits on a failed export, so `Err` here means it
+        // panicked. Never let that abort the session: the end-of-run trace below
+        // still goes through the final export (or the stdout dump).
+        match exporter.finish(&collector) {
             Ok(export) => info!(
                 export_batches = export.batches,
                 export_attempts = export.attempts,
                 export_failures = export.failures,
+                export_failed_batches = export.failed_batches,
+                export_failed_spans = export.failed_spans,
                 "finished live OTLP exporter"
             ),
             Err(err) => warn!(
                 error = %format_args!("{err:#}"),
-                "live OTLP exporter thread ended with an error; continuing without OTLP export"
+                "live OTLP exporter thread ended with an error"
             ),
         }
     }
@@ -276,24 +340,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
         .into_inner()
         .expect("collector lock poisoned");
-    let mut trace = collector.into_trace_document(cli.service_name.clone());
-    if !retained_otlp.is_empty() {
-        // Merge only the spans: `drain_expired` already folded these batches'
-        // diagnostics into the collector's cumulative counters (which
-        // `into_trace_document` above emitted), so the retained snapshots are
-        // stale and must be discarded to avoid double counting.
-        let retained_spans: usize = retained_otlp.iter().map(ExpiredBatch::span_count).sum();
-        for batch in retained_otlp {
-            trace
-                .spans
-                .extend(batch.into_trace_document(cli.service_name.clone()).spans);
-        }
-        trace.diagnostics.spans_produced = trace.spans.len() as u64;
-        debug!(
-            retained_spans,
-            "merged OTLP spans stranded by a disconnected exporter into the end-of-run trace"
-        );
-    }
+    let trace = collector.into_trace_document(cli.service_name.clone());
     // The run summary belongs in the log, not only in the JSON body: with
     // `--output otlp` the JSON document is never printed, so without it a live run
     // cannot be evaluated without guessing.
@@ -316,6 +363,13 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
             otlp_queue_dropped_traces = trace.diagnostics.otlp_queue_dropped_traces,
             otlp_queue_dropped_spans = trace.diagnostics.otlp_queue_dropped_spans,
             "dropped OTLP spans under export backpressure -- the exported trace is incomplete"
+        );
+    }
+    if trace.diagnostics.otlp_export_failed_spans > 0 {
+        warn!(
+            otlp_export_failed_batches = trace.diagnostics.otlp_export_failed_batches,
+            otlp_export_failed_spans = trace.diagnostics.otlp_export_failed_spans,
+            "OTLP export lost spans that could not be delivered -- the exported trace is incomplete"
         );
     }
     // Operator UX: RADOS ops were seen but not a single RGW request marker. The
@@ -435,7 +489,7 @@ fn read_bpf_counter(map: &impl MapCore, counter: u32) -> Result<u64> {
 }
 
 impl OtlpExporter {
-    fn spawn(cli: &Cli) -> Result<Self> {
+    fn spawn(cli: &Cli, collector: Arc<Mutex<Collector>>) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
         let config = OtlpExporterConfig {
             service_name: cli.service_name.clone(),
@@ -447,27 +501,71 @@ impl OtlpExporter {
             retries: cli.otlp_retries,
             diagnostics: cli.otlp_diagnostics,
         };
-        let handle = thread::spawn(move || run_otlp_exporter(receiver, config));
-        Ok(Self { sender, handle })
+        let ledger = Arc::new(ExportLedger::default());
+        let worker_ledger = Arc::clone(&ledger);
+        let handle = thread::spawn(move || {
+            Ok(run_otlp_exporter(
+                receiver,
+                config,
+                &collector,
+                &worker_ledger,
+            ))
+        });
+        Ok(Self {
+            sender,
+            handle,
+            ledger,
+        })
     }
 
-    fn finish(self) -> Result<otel::ExportDiagnostics> {
+    /// Close the queue and wait for the worker. If it panicked, every document it
+    /// had accepted but not settled is counted as lost before the error is
+    /// returned, so the final counters still measure all missing spans.
+    fn finish(self, collector: &Mutex<Collector>) -> Result<otel::ExportDiagnostics> {
         drop(self.sender);
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("OTLP exporter thread panicked"))?
+        match self.handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                let (documents, spans) = self.ledger.unsettled();
+                if let Ok(mut collector) = collector.lock() {
+                    collector.record_otlp_export_failure(documents, spans);
+                }
+                anyhow::bail!(
+                    "OTLP exporter thread panicked; {documents} queued document(s) with \
+                     {spans} span(s) were lost and counted in otlp_export_failed_spans"
+                )
+            }
+        }
     }
 }
 
-fn run_otlp_exporter(
-    receiver: Receiver<ExpiredBatch>,
+/// The OTLP worker: export every drained document until the channel closes.
+///
+/// It NEVER exits on a failed export. It used to return on the first batch that
+/// failed after its retries, which silently disabled OTLP export for the rest of
+/// the run: the batch in flight and the ones queued behind it were lost
+/// uncounted, the live loop then found the channel disconnected and stopped
+/// draining, and the collector grew without bound. Now a lost batch is counted
+/// in the collector's `otlp_export_failed_*` diagnostics and logged, and the
+/// worker moves on to the next drain -- which succeeds as soon as the endpoint
+/// recovers.
+///
+/// No class of error latches export off, including a non-retryable 4xx that
+/// signals misconfiguration (bad auth, wrong path): every drain still gets a
+/// prompt, cheap attempt, each loss is counted and warned about, and a fix on the
+/// collector side (a rotated token, a restarted backend) takes effect without
+/// restarting the tracer.
+fn run_otlp_exporter<T: SpanCount>(
+    receiver: Receiver<T>,
     config: OtlpExporterConfig,
-) -> Result<otel::ExportDiagnostics> {
+    collector: &Mutex<Collector>,
+    ledger: &ExportLedger,
+) -> otel::ExportDiagnostics {
     let mut total = otel::ExportDiagnostics::default();
     for batch in receiver {
         // Rendered here, off the ring-buffer thread and outside the collector
         // lock: span construction is the expensive half of a drain.
-        let trace = batch.into_trace_document(config.service_name.clone());
+        let trace = batch.render(&config.service_name);
         let spans = trace.spans.len();
         let export = otel::export_otlp_http(
             otel::ExportConfig {
@@ -480,90 +578,87 @@ fn run_otlp_exporter(
                 diagnostics: config.diagnostics,
             },
             &trace,
-        )?;
+        )
+        .unwrap_or_else(|err| {
+            // The request could not even be built: the whole document is lost.
+            otel::ExportDiagnostics {
+                failed_batches: 1,
+                failed_spans: spans as u64,
+                last_error: Some(format!("{err:#}")),
+                ..otel::ExportDiagnostics::default()
+            }
+        });
         total.batches += export.batches;
         total.attempts += export.attempts;
         total.failures += export.failures;
-        info!(
-            spans,
-            export_attempts = export.attempts,
-            export_failures = export.failures,
-            "exported expired OTLP spans"
-        );
+        total.failed_batches += export.failed_batches;
+        total.failed_spans += export.failed_spans;
+        if export.failed_batches > 0 {
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_export_failure(export.failed_batches, export.failed_spans);
+            warn!(
+                spans,
+                failed_batches = export.failed_batches,
+                failed_spans = export.failed_spans,
+                error = export.last_error.as_deref().unwrap_or("unknown"),
+                "OTLP export lost spans; continuing with the next drain"
+            );
+            total.last_error = export.last_error;
+        } else {
+            info!(
+                spans,
+                export_attempts = export.attempts,
+                export_failures = export.failures,
+                "exported expired OTLP spans"
+            );
+        }
+        // Settled only once its outcome is recorded: a panic before this point
+        // leaves the document to `OtlpExporter::finish` to count.
+        ledger.settled(spans);
     }
-    Ok(total)
+    total
 }
 
-fn queue_expired_otlp(
+/// Drain the requests and background ops that have expired by the TRACE clock.
+fn drain_expired(
     cli: &Cli,
-    collector: &Arc<Mutex<Collector>>,
-    sender: &SyncSender<ExpiredBatch>,
-    disabled: &mut bool,
+    collector: &Mutex<Collector>,
+    clock: &TraceClock,
 ) -> Result<Option<ExpiredBatch>> {
-    // Once the exporter thread has gone away we permanently stop draining spans
-    // into the (dead) channel so the session keeps running and the end-of-run
-    // `into_trace_document` still produces output for the non-OTLP path.
-    if *disabled {
-        return Ok(None);
-    }
-
     let ttl_ns = duration_ns(cli.correlation_ttl);
-    let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
-    // Only the cheap detach runs under the lock (and on this, the ring-buffer
-    // thread); spans are rendered by the exporter thread.
-    let trace = collector
+    let now_ns = clock.now_ns()?;
+    Ok(collector
         .lock()
         .expect("collector lock poisoned")
-        .drain_expired_batch(now_ns, ttl_ns);
-    let Some(trace) = trace else {
-        return Ok(None);
-    };
-
-    // A `Some` return carries a batch the caller must retain: it left the
-    // collector but could not reach a disconnected exporter.
-    Ok(dispatch_expired_otlp(collector, sender, trace, disabled))
+        .drain_expired_batch(now_ns, ttl_ns))
 }
 
-/// Hand a drained batch of expired spans to the OTLP exporter thread, degrading
-/// gracefully instead of aborting the session.
+/// Hand a drained batch of expired spans to the OTLP exporter thread, never
+/// aborting the session and never letting memory grow.
 ///
-/// A dead exporter thread (channel `Disconnected`) is treated as a permanent,
-/// non-fatal condition: OTLP export is disabled for the rest of the run via
-/// `disabled` and a single warning is logged. The batch has already left the
-/// collector, so it is NOT counted as a drop; instead it is returned as
-/// `Some(trace)` for the caller to retain and re-emit at end of run. Subsequent
-/// calls observe `disabled` and stay silent, so a transient/misconfig OTLP
-/// error can neither tear down live tracing nor spam the log.
-///
-/// Returns `Some(trace)` when the batch must be retained by the caller; `None`
-/// when it was queued for export or dropped as genuine backpressure (`Full`).
+/// `Full` is backpressure: the batch is dropped and counted
+/// (`otlp_queue_dropped_*`). `Disconnected` can only mean the worker panicked
+/// (it never exits on a send failure); the batch is counted as lost
+/// (`otlp_export_failed_*`) and the caller keeps draining, so the collector stays
+/// bounded. The old behavior -- retain the batch and stop draining for the rest
+/// of the run -- grew memory without limit. `worker_gone` only keeps the warning
+/// to one line.
 fn dispatch_expired_otlp<T: SpanCount>(
-    collector: &Arc<Mutex<Collector>>,
+    collector: &Mutex<Collector>,
     sender: &SyncSender<T>,
+    ledger: &ExportLedger,
     trace: T,
-    disabled: &mut bool,
-) -> Option<T> {
-    // Export already disabled: the channel is known dead, so retain the batch
-    // for end-of-run emission rather than dropping it. In the live loop
-    // `queue_expired_otlp` short-circuits before draining once disabled, so this
-    // path is defensive.
-    if *disabled {
-        return Some(trace);
-    }
-
+    worker_gone: &mut bool,
+) {
     let spans = trace.span_count();
     match sender.try_send(trace) {
         Ok(()) => {
+            ledger.queued(spans);
             info!(spans, "queued expired OTLP spans");
-            None
         }
         Err(TrySendError::Full(trace)) => {
-            // Asymmetry with `Disconnected` below is deliberate. `Full` is
-            // transient backpressure: retaining every full-dropped batch would
-            // grow `retained_otlp` without bound under sustained backpressure,
-            // so we drop the batch (counted via `record_otlp_queue_drop`) to
-            // keep memory bounded. `Disconnected` is a permanent condition that
-            // affects exactly one batch, so retaining that single batch is safe.
             collector
                 .lock()
                 .expect("collector lock poisoned")
@@ -572,15 +667,20 @@ fn dispatch_expired_otlp<T: SpanCount>(
                 spans = trace.span_count(),
                 "dropped expired OTLP spans; export queue is full"
             );
-            None
         }
         Err(TrySendError::Disconnected(trace)) => {
-            *disabled = true;
-            warn!(
-                spans = trace.span_count(),
-                "OTLP exporter worker stopped; retaining these spans for end-of-run emission and disabling OTLP export for the rest of this run"
-            );
-            Some(trace)
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_export_failure(1, trace.span_count() as u64);
+            if !*worker_gone {
+                *worker_gone = true;
+                warn!(
+                    spans = trace.span_count(),
+                    "OTLP exporter worker is gone; drained spans are counted as lost \
+                     (otlp_export_failed_spans) and draining continues"
+                );
+            }
         }
     }
 }
@@ -589,16 +689,23 @@ fn dispatch_expired_otlp<T: SpanCount>(
 /// concerned. The live queue carries [`ExpiredBatch`]es; a rendered
 /// [`TraceDocument`] counts the same way.
 trait SpanCount {
+    fn render(self, service_name: &str) -> TraceDocument;
     fn span_count(&self) -> usize;
 }
 
 impl SpanCount for ExpiredBatch {
+    fn render(self, service_name: &str) -> TraceDocument {
+        self.into_trace_document(service_name)
+    }
     fn span_count(&self) -> usize {
         ExpiredBatch::span_count(self)
     }
 }
 
 impl SpanCount for TraceDocument {
+    fn render(self, _service_name: &str) -> TraceDocument {
+        self
+    }
     fn span_count(&self) -> usize {
         self.spans.len()
     }
@@ -1707,6 +1814,30 @@ fn read_payload<T: Copy>(payload: &[u8]) -> Result<T> {
     Ok(unsafe { ptr.read_unaligned() })
 }
 
+/// The clock every span timestamp is on: CLOCK_BOOTTIME (what the BPF side
+/// stamps events with) plus a unix-epoch offset sampled ONCE at startup.
+///
+/// Expiry must read "now" from this same clock. It used to read a fresh
+/// CLOCK_REALTIME, so an NTP step BACK stalled expiry (nothing looked old enough
+/// to drain) and a step FORWARD made open requests look older than they are and
+/// force-expired them early. BOOTTIME never steps, and the fixed offset keeps
+/// `now_ns` comparable with event timestamps however the wall clock moves.
+struct TraceClock {
+    offset_ns: u64,
+}
+
+impl TraceClock {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            offset_ns: unix_boottime_offset_ns()?,
+        })
+    }
+
+    fn now_ns(&self) -> Result<u64> {
+        Ok(clock_time_ns(libc::CLOCK_BOOTTIME)?.saturating_add(self.offset_ns))
+    }
+}
+
 fn unix_boottime_offset_ns() -> Result<u64> {
     let realtime_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
     let boottime_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
@@ -1877,92 +2008,256 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_disconnected_otlp_does_not_abort_and_retains_batch() {
-        // Receiver dropped up front: every `try_send` sees `Disconnected`, the
-        // exact condition that previously `bail!`-ed and tore down the session.
+    fn dispatch_disconnected_otlp_counts_the_batch_lost_and_keeps_going() {
+        // REGRESSION (F15/F3): a disconnected worker used to latch export off and
+        // RETAIN every later batch in memory for the end of the run -- with
+        // draining stopped, an unbounded leak. The batch is now counted as lost
+        // and the caller keeps draining.
         let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
         drop(receiver);
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
+        let ledger = ExportLedger::default();
 
-        let collector = Arc::new(Mutex::new(Collector::default()));
-        let mut disabled = false;
-
-        // First disconnected dispatch: must not panic/return Err, must latch
-        // OTLP export off, and must RETAIN (return) the batch rather than drop
-        // it — the spans already left the collector.
-        let retained = dispatch_expired_otlp(
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(3),
-            &mut disabled,
+            &mut worker_gone,
         );
-        assert!(disabled, "a disconnected exporter must disable OTLP export");
-        assert_eq!(
-            retained.map(|doc| doc.spans.len()),
-            Some(3),
-            "the disconnect-discovering batch must be retained, not dropped"
-        );
-
-        // Idempotent: repeated calls stay disabled and keep retaining. The
-        // log-once guarantee is structural: only the first, transitioning call
-        // reaches the warning branch; later calls take the disabled path.
-        let retained = dispatch_expired_otlp(
+        assert!(worker_gone);
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(2),
-            &mut disabled,
-        );
-        assert!(
-            disabled,
-            "export must remain disabled after repeated disconnects"
-        );
-        assert_eq!(
-            retained.map(|doc| doc.spans.len()),
-            Some(2),
-            "batches must keep being retained while disabled"
+            &mut worker_gone,
         );
 
-        // The disconnect case must NOT bump the drop counter: retained spans are
-        // preserved, not lost.
-        let diagnostics = Arc::try_unwrap(collector)
-            .expect("collector still referenced")
+        let diagnostics = collector
             .into_inner()
-            .expect("collector lock poisoned")
+            .unwrap()
             .into_trace_document("rgwtrace")
             .diagnostics;
-        assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
-        assert_eq!(diagnostics.otlp_queue_dropped_spans, 0);
+        assert_eq!(diagnostics.otlp_export_failed_batches, 2);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 5);
+        assert_eq!(diagnostics.otlp_queue_dropped_spans, 0, "not backpressure");
+    }
+
+    fn expired_batch_with_spans(count: usize) -> ExpiredBatch {
+        let mut collector = Collector::default();
+        for i in 0..count {
+            collector.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+                start_ns: 10,
+                end_ns: 0,
+                pid: 1,
+                tid: 2,
+                trans_id: format!("tx-{i}").into(),
+                truncation: Default::default(),
+            }));
+        }
+        collector.drain_expired_batch(1_000, 100).unwrap()
     }
 
     #[test]
-    fn dispatch_successful_otlp_send_keeps_export_enabled() {
-        // A live receiver: the batch is accepted, no drop is recorded, and OTLP
-        // export stays enabled.
-        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
-        let collector = Arc::new(Mutex::new(Collector::default()));
-        let mut disabled = false;
+    fn a_panicked_worker_counts_the_documents_it_accepted_but_never_settled() {
+        // A worker panic drops the document it was exporting and every document
+        // still queued behind it. Those spans already left the collector, so they
+        // must be counted as lost at finish -- not only the ones dispatched after
+        // the channel was found disconnected.
+        let (sender, receiver) = mpsc::sync_channel::<ExpiredBatch>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let (go, wait) = mpsc::channel::<()>();
+        let ledger = Arc::new(ExportLedger::default());
+        let handle = thread::spawn(move || -> Result<otel::ExportDiagnostics> {
+            wait.recv().unwrap();
+            let _in_flight = receiver.recv().unwrap();
+            panic!("simulated exporter crash mid-export");
+        });
+        let exporter = OtlpExporter {
+            sender,
+            handle,
+            ledger: Arc::clone(&ledger),
+        };
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
 
-        let retained = dispatch_expired_otlp(
+        dispatch_expired_otlp(
+            &collector,
+            &exporter.sender,
+            &ledger,
+            expired_batch_with_spans(3),
+            &mut worker_gone,
+        );
+        dispatch_expired_otlp(
+            &collector,
+            &exporter.sender,
+            &ledger,
+            expired_batch_with_spans(2),
+            &mut worker_gone,
+        );
+        go.send(()).unwrap();
+
+        assert!(
+            exporter.finish(&collector).is_err(),
+            "the panic is still surfaced"
+        );
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_export_failed_batches, 2);
+        assert_eq!(
+            diagnostics.otlp_export_failed_spans, 5,
+            "the in-flight document AND the queued one are lost"
+        );
+    }
+
+    #[test]
+    fn dispatch_successful_otlp_send_queues_the_batch() {
+        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
+        let ledger = ExportLedger::default();
+
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(4),
-            &mut disabled,
+            &mut worker_gone,
         );
 
-        assert!(!disabled, "a successful send must not disable export");
-        assert!(
-            retained.is_none(),
-            "a queued batch must not be retained by the caller"
+        assert!(!worker_gone);
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("batch should be queued")
+                .spans
+                .len(),
+            4
         );
-        let received = receiver.try_recv().expect("batch should be queued");
-        assert_eq!(received.spans.len(), 4);
-
-        let diagnostics = Arc::try_unwrap(collector)
-            .expect("collector still referenced")
+        let diagnostics = collector
             .into_inner()
-            .expect("collector lock poisoned")
+            .unwrap()
             .into_trace_document("rgwtrace")
             .diagnostics;
         assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 0);
+    }
+
+    /// A loopback HTTP server answering each connection with the next status.
+    fn spawn_status_server(statuses: Vec<u16>) -> (String, thread::JoinHandle<usize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut served = 0;
+            for status in statuses {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).ok();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                served += 1;
+            }
+            served
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn the_otlp_worker_survives_a_failed_batch_and_exports_the_next_drain() {
+        // REGRESSION (F15): the worker used to return on the first failed batch.
+        // Everything queued behind it was lost uncounted and OTLP export stayed
+        // off for the rest of the run.
+        let (endpoint, server) = spawn_status_server(vec![400, 200]);
+        let (sender, receiver) = mpsc::sync_channel::<ExpiredBatch>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Mutex::new(Collector::default());
+        sender.send(expired_batch_with_spans(3)).unwrap();
+        sender.send(expired_batch_with_spans(2)).unwrap();
+        drop(sender);
+
+        let ledger = ExportLedger::default();
+        ledger.queued(3);
+        ledger.queued(2);
+        let total = run_otlp_exporter(
+            receiver,
+            OtlpExporterConfig {
+                endpoint,
+                service_name: "test".to_string(),
+                client: otel::ExportClient::new(Duration::from_secs(5), &[], None).unwrap(),
+                compression: crate::cli::OtlpCompression::None,
+                max_spans_per_batch: 512,
+                max_bytes_per_batch: 0,
+                retries: 0,
+                diagnostics: false,
+            },
+            &collector,
+            &ledger,
+        );
+
+        assert_eq!(ledger.unsettled(), (0, 0), "every document is settled");
+        assert_eq!(
+            server.join().unwrap(),
+            2,
+            "the second drain must still be exported"
+        );
+        assert_eq!(total.batches, 2);
+        assert_eq!(total.failed_batches, 1);
+        assert_eq!(total.failed_spans, 3);
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_export_failed_batches, 1);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 3);
+    }
+
+    #[test]
+    fn expiry_reads_the_boottime_trace_clock_not_the_wall_clock() {
+        // REGRESSION (clock): expiry compared BOOTTIME-based event timestamps
+        // against a fresh CLOCK_REALTIME, so an NTP step stalled or rushed expiry.
+        // With a zero offset the trace clock IS boottime -- nowhere near the wall
+        // clock (decades of nanoseconds away) -- which a realtime read would fail.
+        let clock = TraceClock { offset_ns: 0 };
+        let boottime = clock_time_ns(libc::CLOCK_BOOTTIME).unwrap();
+        let now = clock.now_ns().unwrap();
+        let realtime = clock_time_ns(libc::CLOCK_REALTIME).unwrap();
+        assert!(now >= boottime && now - boottime < 1_000_000_000);
+        assert!(
+            now < realtime / 2,
+            "the trace clock must not read CLOCK_REALTIME"
+        );
+
+        // And with the real offset it lands on the same clock events are stamped
+        // with: boottime + offset, monotonic across reads.
+        let clock = TraceClock::new().unwrap();
+        let first = clock.now_ns().unwrap();
+        let second = clock.now_ns().unwrap();
+        assert!(second >= first);
+        let boottime = clock_time_ns(libc::CLOCK_BOOTTIME).unwrap();
+        assert!(second <= boottime.saturating_add(clock.offset_ns));
     }
 
     #[test]
@@ -2022,8 +2317,8 @@ mod tests {
 
         let collector = Arc::new(Mutex::new(Collector::default()));
         let mut disabled = false;
-        let retained = dispatch_expired_otlp(&collector, &sender, batch, &mut disabled);
-        assert!(retained.is_none(), "a Full drop is not retained");
+        let ledger = ExportLedger::default();
+        dispatch_expired_otlp(&collector, &sender, &ledger, batch, &mut disabled);
         assert!(!disabled);
         let diagnostics = Arc::try_unwrap(collector)
             .expect("collector still referenced")
