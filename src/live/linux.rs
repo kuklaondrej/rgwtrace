@@ -100,7 +100,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // Every uprobe attaches at a FILE OFFSET proven here to be a function entry
     // inside an executable PT_LOAD; the artifact's virtual addresses are never
     // handed to the uprobe API directly.
-    let probe_sites = preflight::validated_probe_sites(dwarf, &targets)?;
+    let probe_sites = preflight::validated_probe_sites(dwarf, &targets, cli.max_debug_file_bytes)?;
     let pid = cli.pid.unwrap_or(-1);
     info!(pid, "starting live tracing");
 

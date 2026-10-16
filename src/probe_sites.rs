@@ -24,7 +24,6 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
     path::{Path, PathBuf},
 };
 
@@ -154,15 +153,30 @@ impl ProbeSites {
 
 /// Validate each `(function, vaddr)` the artifact supplies for the ELF file at
 /// `path` (artifact module `module`) and translate it to a file offset.
+#[allow(dead_code)] // Kept as the default-limit helper for tests and internal callers.
 pub fn validate_target(
     path: &Path,
     module: &str,
     requests: &[(&str, u64)],
 ) -> Result<Vec<ProbeSite>> {
+    validate_target_with_limit(
+        path,
+        module,
+        requests,
+        dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
+    )
+}
+
+pub fn validate_target_with_limit(
+    path: &Path,
+    module: &str,
+    requests: &[(&str, u64)],
+    max_debug_file_bytes: u64,
+) -> Result<Vec<ProbeSite>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
-    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let data = dwarf_native::read_file_bounded(path, max_debug_file_bytes, "target")?;
     let file = object::File::parse(data.as_slice())
         .with_context(|| format!("{} is not a supported object file", path.display()))?;
     let image = ProbeImage::from_file(&file).with_context(|| format!("{}", path.display()))?;
@@ -195,7 +209,8 @@ pub fn validate_target(
     }
 
     if !unproven.is_empty() {
-        let (debug_symbols, low_pcs) = debug_entry_evidence(path, &file, &unproven)?;
+        let (debug_symbols, low_pcs) =
+            debug_entry_evidence(path, &file, &unproven, max_debug_file_bytes)?;
         for site in sites
             .iter_mut()
             .filter(|site| unproven.contains(&site.vaddr))
@@ -228,13 +243,16 @@ fn debug_entry_evidence(
     path: &Path,
     file: &object::File<'_>,
     wanted: &BTreeSet<u64>,
+    max_debug_file_bytes: u64,
 ) -> Result<(BTreeSet<u64>, BTreeSet<u64>)> {
     if file.has_debug_symbols() {
-        let low_pcs = dwarf_native::subprogram_low_pcs(file, wanted)
+        let low_pcs = dwarf_native::subprogram_low_pcs(file, wanted, path, max_debug_file_bytes)
             .with_context(|| format!("failed to read DWARF of {}", path.display()))?;
         return Ok((BTreeSet::new(), low_pcs));
     }
-    let Some((bytes, debug_path)) = dwarf_native::separate_debug_file(path, file)? else {
+    let Some((bytes, debug_path)) =
+        dwarf_native::separate_debug_file_with_limit(path, file, max_debug_file_bytes)?
+    else {
         return Ok((BTreeSet::new(), BTreeSet::new()));
     };
     let debug_file = object::File::parse(bytes.as_slice())
@@ -247,7 +265,7 @@ fn debug_entry_evidence(
     let low_pcs = if remaining.is_empty() {
         BTreeSet::new()
     } else {
-        dwarf_native::subprogram_low_pcs(&debug_file, &remaining)
+        dwarf_native::subprogram_low_pcs(&debug_file, &remaining, &debug_path, max_debug_file_bytes)
             .with_context(|| format!("failed to read DWARF of {}", debug_path.display()))?
     };
     Ok((debug_symbols, low_pcs))
@@ -255,6 +273,8 @@ fn debug_entry_evidence(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::test_elf::{build_id_note, debuglink, temp_dir, TestElf, STT_OBJECT};
 
@@ -263,7 +283,7 @@ mod tests {
 
     fn write(name: &str, image: &TestElf) -> PathBuf {
         let path = temp_dir(name).join("radosgw");
-        fs::write(&path, image.build()).unwrap();
+        std::fs::write(&path, image.build()).unwrap();
         path
     }
 
@@ -378,6 +398,37 @@ mod tests {
     }
 
     #[test]
+    fn separate_debug_file_uses_the_configured_size_limit() {
+        let id = [0x5a; 20];
+        let debug = TestElf::pie(TEXT_OFFSET, TEXT_SIZE)
+            .section(build_id_note(&id))
+            .section(crate::test_elf::Section {
+                name: ".note.padding",
+                sh_type: 1,
+                data: vec![0; 6000],
+            })
+            .function("probe_me", 0x1040)
+            .build();
+        let dir = temp_dir("debug-file-read-limit");
+        fs::write(dir.join("radosgw.debug"), &debug).unwrap();
+        let path = dir.join("radosgw");
+        fs::write(
+            &path,
+            TestElf::pie(TEXT_OFFSET, TEXT_SIZE)
+                .section(build_id_note(&id))
+                .section(debuglink("radosgw.debug", 0))
+                .build(),
+        )
+        .unwrap();
+
+        let err = validate_target_with_limit(&path, "radosgw", &[("probe_me", 0x1040)], 6000)
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("separate debug file"), "{message}");
+        assert!(message.contains("6000-byte limit"), "{message}");
+    }
+
+    #[test]
     fn a_stripped_binary_without_debug_info_cannot_prove_an_entry() {
         let path = write("stripped-no-debug", &TestElf::pie(TEXT_OFFSET, TEXT_SIZE));
         let err = validate_target(&path, "radosgw", &[("probe_me", 0x1040)]).unwrap_err();
@@ -387,7 +438,7 @@ mod tests {
     #[test]
     fn a_non_elf_target_is_refused() {
         let path = temp_dir("not-elf").join("radosgw");
-        fs::write(&path, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
         assert!(validate_target(&path, "radosgw", &[("probe_me", 0x1040)]).is_err());
     }
 
@@ -395,5 +446,19 @@ mod tests {
     fn no_requests_needs_no_file() {
         let sites = validate_target(Path::new("/nonexistent/radosgw"), "radosgw", &[]).unwrap();
         assert!(sites.is_empty());
+    }
+
+    #[test]
+    fn target_image_read_respects_the_configured_debug_file_limit() {
+        let path = write(
+            "target-read-limit",
+            &TestElf::pie(TEXT_OFFSET, TEXT_SIZE).function("probe_me", 0x1040),
+        );
+
+        let err =
+            validate_target_with_limit(&path, "radosgw", &[("probe_me", 0x1040)], 128).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("128-byte limit"), "{message}");
+        assert!(message.contains("--max-debug-file-bytes"), "{message}");
     }
 }

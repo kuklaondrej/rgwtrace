@@ -439,6 +439,28 @@ fn decompressed_sections_share_one_budget_per_file() {
 }
 
 #[test]
+fn dwarf_loader_shares_one_decompression_budget_across_sections() {
+    let contents = vec![7u8; 1000];
+    let section = compressed_section(ELFCOMPRESS_ZLIB, 1000, &zlib(&contents));
+    let elf = tiny_elf(&[
+        (".debug_info", SHT_PROGBITS, SHF_COMPRESSED, section.clone()),
+        (".debug_abbrev", SHT_PROGBITS, SHF_COMPRESSED, section),
+    ]);
+    let file = object::File::parse(elf.as_slice()).unwrap();
+
+    // Both sections fit alone, but the cumulative uncompressed size exceeds the
+    // file budget. Dwarf::load must use one budget for all of its sections.
+    let err = load_dwarf_sections(&file, Path::new("radosgw.debug"), 1500).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains(".debug_info") || message.contains(".debug_abbrev"),
+        "{message}"
+    );
+    assert!(message.contains("radosgw.debug"), "{message}");
+    assert!(message.contains("1500-byte limit"), "{message}");
+}
+
+#[test]
 fn uncompressed_sections_are_borrowed_not_copied() {
     let elf = tiny_elf(&[(".debug_info", SHT_PROGBITS, 0, vec![1, 2, 3])]);
     let file = object::File::parse(elf.as_slice()).unwrap();

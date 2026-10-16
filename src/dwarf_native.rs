@@ -3170,6 +3170,15 @@ fn load_section<'data>(
         .with_context(|| format!("failed to decompress {name}"))
 }
 
+fn load_dwarf_sections<'data>(
+    file: &object::File<'data>,
+    path: &Path,
+    limit: u64,
+) -> Result<Dwarf<Cow<'data, [u8]>>> {
+    let mut budget = SectionBudget::new(path, limit);
+    Dwarf::load(|section| load_section(file, section, &mut budget))
+}
+
 #[cfg(test)]
 fn load_section_unbounded<'data>(
     file: &object::File<'data>,
@@ -3215,6 +3224,7 @@ fn debug_data<'data>(
 /// required), otherwise the `.gnu_debuglink` CRC-32 over the whole debug file.
 /// The build ID wins when both are available because post-processing such as
 /// dwz can rewrite a debug file after its CRC was recorded.
+#[allow(dead_code)] // The test helper preserves a convenient default-limit API.
 pub(crate) fn separate_debug_file(
     path: &Path,
     file: &object::File<'_>,
@@ -3222,7 +3232,7 @@ pub(crate) fn separate_debug_file(
     separate_debug_file_with_limit(path, file, DEFAULT_MAX_DEBUG_FILE_BYTES)
 }
 
-fn separate_debug_file_with_limit(
+pub(crate) fn separate_debug_file_with_limit(
     path: &Path,
     file: &object::File<'_>,
     limit: u64,
@@ -3268,19 +3278,15 @@ fn separate_debug_file_with_limit(
 pub(crate) fn subprogram_low_pcs(
     file: &object::File<'_>,
     wanted: &std::collections::BTreeSet<u64>,
+    path: &Path,
+    limit: u64,
 ) -> Result<std::collections::BTreeSet<u64>> {
     let endian = if file.is_little_endian() {
         RunTimeEndian::Little
     } else {
         RunTimeEndian::Big
     };
-    let dwarf_cow = Dwarf::load(|section| {
-        load_section(
-            file,
-            section,
-            &mut SectionBudget::new(Path::new("<probe image>"), DEFAULT_MAX_DEBUG_FILE_BYTES),
-        )
-    })?;
+    let dwarf_cow = load_dwarf_sections(file, path, limit)?;
     #[allow(deprecated)]
     let dwarf = dwarf_cow.borrow(|section| EndianSlice::new(section, endian));
     let mut found = std::collections::BTreeSet::new();

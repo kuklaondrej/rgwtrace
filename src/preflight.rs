@@ -70,7 +70,7 @@ pub struct BuildIdCheck {
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<PreflightReport> {
     let targets = validated_targets(cli, dwarf)?;
     let build_ids = build_id_checks(dwarf, &targets)?;
-    let probe_sites = validated_probe_sites(dwarf, &targets)?;
+    let probe_sites = validated_probe_sites(dwarf, &targets, cli.max_debug_file_bytes)?;
     let mut checks = checks(dwarf, &targets);
     checks.push(PreflightCheck {
         name: "probe_addresses".to_string(),
@@ -103,7 +103,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<PreflightReport> {
 ///
 /// `--allow-build-id-mismatch` does not relax this: it vouches for the DWARF,
 /// it cannot make an address land on an instruction boundary.
-pub fn validated_probe_sites(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<ProbeSites> {
+pub fn validated_probe_sites(
+    dwarf: &DwarfInfo,
+    targets: &ProbeTargets,
+    max_debug_file_bytes: u64,
+) -> Result<ProbeSites> {
     let mut sites = ProbeSites::default();
     for path in targets.all_paths() {
         let module = target_basename(path, "target")?;
@@ -121,7 +125,12 @@ pub fn validated_probe_sites(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Resul
                     .map(|addr| (*function, addr))
             })
             .collect::<Vec<_>>();
-        sites.extend(probe_sites::validate_target(path, &module, &requests)?);
+        sites.extend(probe_sites::validate_target_with_limit(
+            path,
+            &module,
+            &requests,
+            max_debug_file_bytes,
+        )?);
     }
     Ok(sites)
 }
@@ -643,7 +652,12 @@ mod tests {
         );
         let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), (REQ_STATE_DTOR, DTOR_VADDR)]);
 
-        let sites = validated_probe_sites(&dwarf, &targets).unwrap();
+        let sites = validated_probe_sites(
+            &dwarf,
+            &targets,
+            crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
+        )
+        .unwrap();
         assert_eq!(sites.len(), 2);
         assert_eq!(
             sites
@@ -669,7 +683,15 @@ mod tests {
         );
         let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR + 4)]);
 
-        let msg = format!("{:#}", validated_probe_sites(&dwarf, &targets).unwrap_err());
+        let msg = format!(
+            "{:#}",
+            validated_probe_sites(
+                &dwarf,
+                &targets,
+                crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES
+            )
+            .unwrap_err()
+        );
         assert!(msg.contains(GET_HANDLER), "message: {msg}");
         assert!(msg.contains("not the entry"), "message: {msg}");
     }
@@ -685,7 +707,15 @@ mod tests {
         );
         let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), (REQ_STATE_DTOR, DTOR_VADDR)]);
 
-        let msg = format!("{:#}", validated_probe_sites(&dwarf, &targets).unwrap_err());
+        let msg = format!(
+            "{:#}",
+            validated_probe_sites(
+                &dwarf,
+                &targets,
+                crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES
+            )
+            .unwrap_err()
+        );
         assert!(msg.contains(REQ_STATE_DTOR), "message: {msg}");
     }
 
@@ -697,7 +727,12 @@ mod tests {
         );
         let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR)]);
 
-        let sites = validated_probe_sites(&dwarf, &targets).unwrap();
+        let sites = validated_probe_sites(
+            &dwarf,
+            &targets,
+            crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
+        )
+        .unwrap();
         assert_eq!(sites.len(), 1);
         assert!(sites
             .file_offset(&targets.radosgw, REQ_STATE_DTOR, DTOR_VADDR)
@@ -712,7 +747,16 @@ mod tests {
         );
         let dwarf = radosgw_artifact(&[(GET_HANDLER, HANDLER_VADDR), ("Some::other", 1)]);
 
-        assert_eq!(validated_probe_sites(&dwarf, &targets).unwrap().len(), 1);
+        assert_eq!(
+            validated_probe_sites(
+                &dwarf,
+                &targets,
+                crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES
+            )
+            .unwrap()
+            .len(),
+            1
+        );
     }
 
     #[test]
