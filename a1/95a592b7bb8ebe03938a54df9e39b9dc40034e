@@ -1,0 +1,85 @@
+.github/workflows/ci.yml
+  s_ece52b9a589c27::t_f25cc61a4083fa 25-28
+.github/workflows/dwarf-release.yml
+  s_ece52b9a589c27::t_5dbc6da3ee1b38 1-88
+.github/workflows/release.yml
+  s_ece52b9a589c27::t_425a817649d79a 1-120
+AGENTS.md
+  s_ece52b9a589c27::t_d4512fdaea3ebb 32,88,126
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_baabf98bb1bc78 252-264
+Cargo.lock
+  s_ece52b9a589c27::t_9b41750992c00d 171,173,920,922,1087,1089,1337,1339,1361,1363,1378,1380
+Cargo.toml
+  s_ece52b9a589c27::t_2d52752575a599 22
+README.md
+  s_ece52b9a589c27::t_a5d85b6f79ccc8 28-35
+RUNBOOK.md
+  s_ece52b9a589c27::t_ec178bced2c7b8 52-58,189-191,406-447
+docker/Dockerfile.centos9-builder
+  s_ece52b9a589c27::t_16af9b621ff2a2 1-17
+docs/README.md
+  s_ece52b9a589c27::t_3cd33c7c61bb75 9,36-37,43-47
+docs/bugfix-dependency-audit.md
+  s_ece52b9a589c27::t_fc97a7e8d66dfb 1-27
+docs/bugfix-dwarf-parser-limits.md
+  s_ece52b9a589c27::t_4b89178fed0c82 1-144
+docs/development.md
+  s_ece52b9a589c27::t_cc5eded91dbce7 55,129-255
+release/BINARY-README.txt
+  s_ece52b9a589c27::t_79014888615e7a 1-34
+release/DWARF-README.txt
+  s_ece52b9a589c27::t_d59857c029d506 1-23
+release/dwarf-matrix.json
+  s_ece52b9a589c27::t_0ef310f332f2cc 1-276
+scripts/build-centos9-release.sh
+  s_ece52b9a589c27::t_a3fbca7394bf6d 1-13
+scripts/export-upstream-ceph-dwarf.sh
+  s_ece52b9a589c27::t_2d8387cf98983e 8,81-89,103,109-118,127-192,232-233,322,351-358,371-373
+scripts/package-binary.sh
+  s_ece52b9a589c27::t_f0f1efa5c079f9 1-25
+scripts/package-dwarf.py
+  s_ece52b9a589c27::t_ce955121326f91 1-137
+scripts/publish-release.sh
+  s_ece52b9a589c27::t_6b81b9fc8e15d7 1-26
+scripts/smoke-release-binary.sh
+  s_ece52b9a589c27::t_bcff9b8b33e1f2 1-12
+scripts/verify.sh
+  s_ece52b9a589c27::t_5a56925b74801b 12
+src/cli.rs
+  s_ece52b9a589c27::t_f37e2f9b849a1b 17-28,241-271,293-320
+src/dwarf_input.rs
+  s_ece52b9a589c27::t_4948433e1f697b 5-8,13,21-22,39,57
+src/dwarf_native.rs
+  s_ece52b9a589c27::t_db09e3408aa081 5,9,12,14,87-121,257-283,286,289,291,295,302,304-309,312-314,316-320,329-357,360-420,425,496-499,504-507,514-518,526-614,624,642,653-661,663-665,668,705-712,822-861,1135,1174,1194,1204-1216,1267-1276,1728,1735-1786,1795-1819,1823-1824,1988-1990,2016,2022,2030-2042,2077-2086,2236-2241,2254-2262,2292-2294,2304-2313,2404,2419-2421,2430-2440,2559,2561-2562,2573-2580,2592-2594,2596,2598-2608,3010,3018-3040,3052,3059,3065,3078-3082,3103,3106,3553,4432-4435,5665-5672,5679,5683-5686,5689-5691,6004,6066,6109,6203-6206
+src/dwarf_native_robustness_tests.rs
+  s_ece52b9a589c27::t_e4eb41070e4852 1-678
+src/host_tools.rs
+  s_ece52b9a589c27::t_00a6a85a6bd078 1-57
+src/main.rs
+  s_ece52b9a589c27::t_8bc07b44232cb0 9,15-16,55-61
+src/preflight.rs
+  s_ece52b9a589c27::t_d8a259210e531b 504-510,512,970-1002
+src/targets.rs
+  s_ece52b9a589c27::t_02c604541de789 251-254,290
+src/test_elf.rs
+  s_ece52b9a589c27::t_62ce0a4f9a0909 1-69
+tests/test_release.py
+  s_ece52b9a589c27::t_c677057d071a9e 1-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a195a592b7bb8ebe03938a54df9e39b9dc40034e",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
