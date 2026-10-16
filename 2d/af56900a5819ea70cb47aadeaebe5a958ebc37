@@ -1,0 +1,27 @@
+RUNBOOK.md
+  s_97d9945d2d82bf::t_4069381519259d 360-367
+release/DWARF-README.txt
+  s_97d9945d2d82bf::t_d78b42568ddda5 1-31
+docs/development.md
+  s_97d9945d2d82bf::t_f7616b4c4c0951 178-182
+release/BINARY-README.txt
+  s_97d9945d2d82bf::t_590c2c079ecc21 1-55
+README.md
+  s_97d9945d2d82bf::t_ad396acfe896f9 33-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2daf56900a5819ea70cb47aadeaebe5a958ebc37",
+  "prompts": {},
+  "sessions": {
+    "s_97d9945d2d82bf": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a14624-28ee-7900-9fff-8c43aa7d1a02",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
