@@ -1,0 +1,36 @@
+src/dwarf_native.rs
+  s_ece52b9a589c27::t_fa3e0fbabfef11 3173-3181
+  s_ece52b9a589c27::t_97fc68217d675f 3227,3235,3281-3282,3289
+src/dwarf_native_robustness_tests.rs
+  s_ece52b9a589c27::t_b17f7d08d2b05b 441-459,462
+  s_ece52b9a589c27::t_d661e02c9e752a 460-461
+src/probe_sites.rs
+  s_ece52b9a589c27::t_4ff8318174df67 162-174,212-213,246,255
+  s_ece52b9a589c27::t_1147756f7fe815 179,249,253,401-429
+  s_ece52b9a589c27::t_adfad7e74c6428 450-458
+  s_ece52b9a589c27::t_56265a7c42633f 156,161,254,268,276-277,286,400,430,441,459-463
+docs/README.md
+  s_ece52b9a589c27::t_3c4fd9911c75ec 46-48
+docs/bugfix-probe-validation-memory-limits.md
+  s_ece52b9a589c27::t_b088d9113163b3 1-13
+src/live/linux.rs
+  s_ece52b9a589c27::t_ee11bab0176620 103
+src/preflight.rs
+  s_ece52b9a589c27::t_71db3fd3d3a5ba 73,106-110,128-133,655-660,686-694,710-718,730-735,750-759
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e2ff9330a1adccbb6b2391694180f078a9aed1d3",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
