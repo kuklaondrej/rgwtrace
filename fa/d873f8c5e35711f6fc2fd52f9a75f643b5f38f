@@ -1,0 +1,81 @@
+AGENTS.md
+  s_ece52b9a589c27::t_92bec1f4b2bbe9 57-58,90-93
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_a76e81823081d2 13-26,116-131,280-287
+Cargo.lock
+  s_ece52b9a589c27::t_07309f329ec247 1283
+Cargo.toml
+  s_ece52b9a589c27::t_bb9fe669a353af 17,21,31-36
+RUNBOOK.md
+  s_ece52b9a589c27::t_6c6d0a78ee3cf3 115-175,213-217,352,356-371
+bench/README.md
+  s_ece52b9a589c27::t_1eea989e7d26b5 59-61,69-70,139-141,146-147
+bench/src/descriptors.rs
+  s_ece52b9a589c27::t_481dc18a40cee6 52-53,60-61,65-81,100,118,128,133,143-144
+bench/src/main.rs
+  s_ece52b9a589c27::t_641b8ef1f8de48 77-80,109-110,689,1261-1263,1267,1288-1289,1319,1465-1466,1491
+bpf/ceph_abi.h
+  s_ece52b9a589c27::t_6cecda2d150a68 11-17,44-45,77-82,85-95
+bpf/rgwtrace.bpf.c
+  s_ece52b9a589c27::t_9efb999dd6be8b 97-103,105-106,111,244-250,252-253,255,258-272,275,361-363,371-377,563,581,680,829,877,1122,1210,1219,1259,1268,1277,1301,1309,1317,1330,1340,1370,1379,1422-1429,1432,1434,1437,1440,1446,1462,1471
+bpf/rgwtrace_events.h
+  s_ece52b9a589c27::t_4ceff7128d371d 284-327
+docs/README.md
+  s_ece52b9a589c27::t_86c495a0094669 41-44,55-59,67-68
+docs/bugfix-bpf-live-path-hardening.md
+  s_ece52b9a589c27::t_442094ad701316 1-137
+docs/bugfix-otlp-export-hardening.md
+  s_ece52b9a589c27::t_313cc8c80f75bc 1-114
+docs/bugfix-otlp-header-pipe.md
+  s_ece52b9a589c27::t_377d0bf2c361f3 1-11
+docs/bugfix-stale-op-restore-errors.md
+  s_ece52b9a589c27::t_4f9368602ac39d 1-12
+docs/bugfix-stale-sweep-cooldown.md
+  s_ece52b9a589c27::t_a700b25d20b3da 1-14
+docs/overhead-analysis.md
+  s_ece52b9a589c27::t_2e7b9dc1850c37 10-19,163-166,284-286
+src/cli.rs
+  s_ece52b9a589c27::t_e77fd750300c1d 35-39,43-55,93-104,197-229,327-394,411-455
+src/collector.rs
+  s_ece52b9a589c27::t_97434aef1e1bb4 153-158,364-371,757-762,883-887,991-996,1010,1036,1038,1042,1083,1208,1233,1247-1252,1283,1300-1305,1314,1316-1318,1320-1324,1348,1359-1363,1371-1382,2652-2669,2751-2880
+src/dwarf_json.rs
+  s_ece52b9a589c27::t_c18c37e37591d0 105-109,112-186,733,1331,1361,1380-1462,1564-1566
+src/events.rs
+  s_ece52b9a589c27::t_6466cedb0cef28 9-10,31-80,84-85,123-163,463-464,526-608
+src/live/linux.rs
+  s_ece52b9a589c27::t_483421ef011e9d 4,18-19,28,31,51-54,72,78,108,110-112,116-118,120,146-151,181-228,350-384,387,391,393-395,398,402,426,430,438,459,664-968,984-997,1636,1641,1709-1710,1717,2002-2003,2040-2281
+src/main.rs
+  s_ece52b9a589c27::t_36af6a372f62fe 12,34-40,82-84,112-114
+src/otel.rs
+  s_ece52b9a589c27::t_23034f6c5d9ccf 1,20,36-118,122,200-202,237,245-246,254-255,439-440,444-448,450-451,457-459,468-481,490-582,647-649,658-664,672,814-817,821,1190-1192,1199-1259,1737-2035,2042,2051-2092
+src/otlp_headers.rs
+  s_ece52b9a589c27::t_23822131e5a26a 1-340
+src/targets.rs
+  s_ece52b9a589c27::t_25e088ff760853 569-570,578,589-591
+tests/bpf_source.rs
+  s_ece52b9a589c27::t_ead9b6b0e07de7 4,8-95,424,728,995,1003-1023,1123-1233
+tests/cli_otlp_config.rs
+  s_ece52b9a589c27::t_a6f1f56c707d96 1-365
+tests/fixtures/collector_trace_golden.json
+  s_ece52b9a589c27::t_e7eb0e19e504bf 285
+tests/fixtures/otlp_test_ca.pem
+  s_ece52b9a589c27::t_db02f29e56d1c4 1-12
+tests/fixtures/otlp_test_other_ca.pem
+  s_ece52b9a589c27::t_e61a2c1b5a8176 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fad873f8c5e35711f6fc2fd52f9a75f643b5f38f",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
