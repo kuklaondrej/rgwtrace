@@ -54,7 +54,8 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - `src/dwarf_{input,json,native}.rs` — probe-metadata sources (`native` = gimli/object ELF+DWARF; `json` = cephtrace import); shared `DwarfInfo` model
 - `src/targets.rs` — locate `librados`/`librbd`/`libceph-common`/`radosgw` (via `/proc/<pid>/root`)
 - `src/preflight.rs` — pre-attach validation (functions, field counts, build IDs)
-- `src/otel.rs` — OTLP/HTTP protobuf export
+- `src/otel.rs` — OTLP/HTTP protobuf export (`ExportClient`: one reqwest client per exporter, no redirects, redacted logging)
+- `src/otlp_headers.rs` — OTLP request-header sources (`--otlp-header-file` > `OTEL_EXPORTER_OTLP_HEADERS` > `--otlp-header`), merged by name; never logs a value
 - `src/live.rs` → `src/live/linux.rs` — Linux-only BPF load/attach/ring-buffer poll
 - `bpf/*.c`, `bpf/*.h` — eBPF program + C ABI mirror (`rgwtrace_events.h`, `ceph_abi.h`)
 - `build.rs` — skeleton generation; `scripts/`, `tests/`, `docker/`

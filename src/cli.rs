@@ -32,8 +32,26 @@ pub struct Cli {
     #[arg(long, default_value = "http://localhost:4318/v1/traces")]
     pub otlp_endpoint: String,
 
+    /// Extra request header, `Name:Value`, repeatable. Argv is readable by
+    /// every local user (`/proc/<pid>/cmdline`), so this is for non-secret
+    /// headers such as a tenant id; put credentials in `--otlp-header-file`
+    /// or `OTEL_EXPORTER_OTLP_HEADERS` instead. Those sources override a header
+    /// of the same name given here.
     #[arg(long, value_parser = parse_http_header)]
     pub otlp_header: Vec<(String, String)>,
+
+    /// File of request headers, one `Name: Value` per line (`#` comments and
+    /// blank lines ignored), for credentials that must stay off argv. Refused
+    /// if world-readable. Overrides the same header from the environment or
+    /// `--otlp-header`.
+    #[arg(long, value_name = "PATH")]
+    pub otlp_header_file: Option<PathBuf>,
+
+    /// PEM bundle of extra root certificates to trust for an https
+    /// `--otlp-endpoint`, for a collector behind a private PKI. The bundled web
+    /// roots stay trusted alongside it. Read and validated at startup.
+    #[arg(long, value_name = "PEM")]
+    pub otlp_ca_cert: Option<PathBuf>,
 
     #[arg(long, default_value = "5", value_parser = parse_duration_secs)]
     pub otlp_timeout: Duration,
@@ -71,6 +89,18 @@ pub struct Cli {
     /// never requires polluting OTLP.
     #[arg(long)]
     pub otlp_diagnostics: bool,
+
+    /// Export every `ceph.rados.object` as a stable FNV-1a 64 hash (16 hex
+    /// digits) instead of the name, and mark each such span with
+    /// `rgwtrace.redacted = "ceph.rados.object"` (default off).
+    ///
+    /// RADOS object names carry S3 object keys, `<uid>.buckets` user names,
+    /// tenant names and access-key ids, and the default endpoint is plain
+    /// http. The hash keeps ops of one object grouped and joinable while the
+    /// name stays on the host. Roles (`rgw.rados_role`) are still classified
+    /// from the raw name. Applies to JSON and OTLP output alike.
+    #[arg(long)]
+    pub redact_object_names: bool,
 
     #[arg(long, default_value = "120", value_parser = parse_duration_secs)]
     pub correlation_ttl: Duration,

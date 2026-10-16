@@ -38,6 +38,10 @@ superseded by later sections in the same document.
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
+  redaction, header sources, client reuse, private CAs, and object-name redaction.
+- [OTLP header pipe handling](bugfix-otlp-header-pipe.md): reject named pipes
+  without blocking during startup.
 - [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
   bounds reference chains, nesting, file reads and decompression, and never
   guesses a container's Ceph version.
