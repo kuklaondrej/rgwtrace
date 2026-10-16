@@ -145,7 +145,18 @@ fn read_header_file(path: &Path) -> Result<Vec<(String, String)>> {
     // Open once and check THAT handle: checking a pathname and then opening
     // the pathname again would let a file (or symlink) swapped in between be
     // the one that is read, unchecked.
-    let mut file = std::fs::File::open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // Opening a FIFO read-only blocks until a writer appears. Nonblocking
+        // open lets the metadata check reject it without waiting, while still
+        // checking the same handle that will be read.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(path)
         .with_context(|| format!("failed to read --otlp-header-file {}", path.display()))?;
     let metadata = file
         .metadata()

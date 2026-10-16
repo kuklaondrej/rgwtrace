@@ -16,6 +16,18 @@ fn rgwtrace() -> Command {
     // The environment is part of the configuration under test.
     command.env_remove("OTEL_EXPORTER_OTLP_HEADERS");
     command.env_remove("OTEL_EXPORTER_OTLP_TRACES_HEADERS");
+    // Local TLS collectors must be reached directly even on hosts with a
+    // corporate proxy configured. reqwest honors both cases of these vars.
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
     command
 }
 
@@ -99,6 +111,32 @@ fn refuses_a_world_readable_header_file_at_startup() {
         .expect("failed to run rgwtrace");
     assert!(output.status.success(), "{}", stderr_of(&output));
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_named_pipe_header_file_without_waiting_for_a_writer() {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Instant};
+
+    let dir = std::env::temp_dir().join(format!("rgwtrace-cli-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("headers");
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+    let start = Instant::now();
+    let output = rgwtrace()
+        .args(["--otlp-header-file", path.to_str().unwrap()])
+        .output()
+        .expect("failed to run rgwtrace");
+
+    assert!(!output.status.success());
+    assert!(stderr_of(&output).contains("not a regular file"));
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "FIFO open blocked"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
