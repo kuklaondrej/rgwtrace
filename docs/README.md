@@ -28,6 +28,8 @@ superseded by later sections in the same document.
 - [RGW A/B benchmark](bench-rgw-ab.md): compare live RGW workloads with and without tracing.
 - [Per-probe microbenchmark](../bench/README.md): isolate probe and ring-buffer costs.
 - [Overhead analysis](overhead-analysis.md): cost model, assumptions, and host-specific measurements.
+- [Collector hot path](perf-collector-hot-path.md): indexed expiry and inference, off-lock span
+  rendering, and the closed-request grace, with before/after numbers.
 - [Stage 0 measurement runbook](stage0-runbook.md): the diagnostic experiment used
   to investigate cross-thread correlation.
 

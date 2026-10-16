@@ -3,6 +3,8 @@ mod events;
 mod classify;
 mod cli;
 mod collector;
+#[cfg(test)]
+mod collector_bench;
 mod dwarf_input;
 mod dwarf_json;
 mod dwarf_native;

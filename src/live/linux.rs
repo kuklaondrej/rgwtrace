@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     cli::{Cli, OutputMode},
-    collector::{BpfDiagnostics, Collector, TraceDocument},
+    collector::{BpfDiagnostics, Collector, ExpiredBatch, TraceDocument},
     dwarf_json::{
         module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
         REQ_STATE_DTOR, RGWTRACE_HPROBE_SLOTS, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
@@ -39,14 +39,22 @@ mod skel {
 use skel::*;
 
 const EINTR: i32 = 4;
+// In DRAINS, not spans: each unit is one whole flush-interval drain. Splitting a
+// drain into fixed-size units behind a fixed unit capacity would bound memory,
+// but at production drain sizes (~10^5-10^6 spans) the poll thread's try_send
+// loop outruns any HTTP exporter and would drop most of every drain -- far more
+// than today, where a drop needs the exporter to be two whole intervals behind.
 const OTLP_EXPORT_QUEUE_CAPACITY: usize = 2;
 
 struct OtlpExporter {
-    sender: SyncSender<TraceDocument>,
+    // Detached request groups, not rendered spans: the exporter thread renders
+    // them, so the ring-buffer thread never pays for span construction.
+    sender: SyncSender<ExpiredBatch>,
     handle: JoinHandle<Result<otel::ExportDiagnostics>>,
 }
 
 struct OtlpExporterConfig {
+    service_name: String,
     endpoint: String,
     /// One HTTP client for the exporter's lifetime: its connection pool (and
     /// TLS session) is reused across every drain, instead of a fresh client --
@@ -105,6 +113,8 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // under its pending END (which would export it twice). Without it, no END is
     // ever coming and the plain idle TTL is correct.
     collector_state.set_end_probe_attached(attached.request_end_probe);
+    collector_state.set_closed_request_grace(duration_ns(cli.closed_request_grace));
+    collector_state.set_inference_max_pending(cli.inference_max_pending);
     collector_state.set_redact_object_names(cli.redact_object_names);
     let collector = Arc::new(Mutex::new(collector_state));
     let otlp_exporter = matches!(cli.output, OutputMode::Otlp)
@@ -156,7 +166,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // exporter channel was found `Disconnected`. Those spans have already left
     // the collector, so retain them here and fold them back into the end-of-run
     // trace rather than losing them.
-    let mut retained_otlp: Vec<TraceDocument> = Vec::new();
+    let mut retained_otlp: Vec<ExpiredBatch> = Vec::new();
     loop {
         let ret = ringbuf.poll_raw(Duration::from_millis(250));
         if ret < 0 {
@@ -272,9 +282,11 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         // diagnostics into the collector's cumulative counters (which
         // `into_trace_document` above emitted), so the retained snapshots are
         // stale and must be discarded to avoid double counting.
-        let retained_spans: usize = retained_otlp.iter().map(|doc| doc.spans.len()).sum();
-        for doc in retained_otlp {
-            trace.spans.extend(doc.spans);
+        let retained_spans: usize = retained_otlp.iter().map(ExpiredBatch::span_count).sum();
+        for batch in retained_otlp {
+            trace
+                .spans
+                .extend(batch.into_trace_document(cli.service_name.clone()).spans);
         }
         trace.diagnostics.spans_produced = trace.spans.len() as u64;
         debug!(
@@ -426,6 +438,7 @@ impl OtlpExporter {
     fn spawn(cli: &Cli) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
         let config = OtlpExporterConfig {
+            service_name: cli.service_name.clone(),
             endpoint: cli.otlp_endpoint.clone(),
             client: otel::ExportClient::from_cli(cli)?,
             compression: cli.otlp_compression,
@@ -447,11 +460,14 @@ impl OtlpExporter {
 }
 
 fn run_otlp_exporter(
-    receiver: Receiver<TraceDocument>,
+    receiver: Receiver<ExpiredBatch>,
     config: OtlpExporterConfig,
 ) -> Result<otel::ExportDiagnostics> {
     let mut total = otel::ExportDiagnostics::default();
-    for trace in receiver {
+    for batch in receiver {
+        // Rendered here, off the ring-buffer thread and outside the collector
+        // lock: span construction is the expensive half of a drain.
+        let trace = batch.into_trace_document(config.service_name.clone());
         let spans = trace.spans.len();
         let export = otel::export_otlp_http(
             otel::ExportConfig {
@@ -481,9 +497,9 @@ fn run_otlp_exporter(
 fn queue_expired_otlp(
     cli: &Cli,
     collector: &Arc<Mutex<Collector>>,
-    sender: &SyncSender<TraceDocument>,
+    sender: &SyncSender<ExpiredBatch>,
     disabled: &mut bool,
-) -> Result<Option<TraceDocument>> {
+) -> Result<Option<ExpiredBatch>> {
     // Once the exporter thread has gone away we permanently stop draining spans
     // into the (dead) channel so the session keeps running and the end-of-run
     // `into_trace_document` still produces output for the non-OTLP path.
@@ -493,10 +509,12 @@ fn queue_expired_otlp(
 
     let ttl_ns = duration_ns(cli.correlation_ttl);
     let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
+    // Only the cheap detach runs under the lock (and on this, the ring-buffer
+    // thread); spans are rendered by the exporter thread.
     let trace = collector
         .lock()
         .expect("collector lock poisoned")
-        .drain_expired(cli.service_name.clone(), now_ns, ttl_ns);
+        .drain_expired_batch(now_ns, ttl_ns);
     let Some(trace) = trace else {
         return Ok(None);
     };
@@ -519,12 +537,12 @@ fn queue_expired_otlp(
 ///
 /// Returns `Some(trace)` when the batch must be retained by the caller; `None`
 /// when it was queued for export or dropped as genuine backpressure (`Full`).
-fn dispatch_expired_otlp(
+fn dispatch_expired_otlp<T: SpanCount>(
     collector: &Arc<Mutex<Collector>>,
-    sender: &SyncSender<TraceDocument>,
-    trace: TraceDocument,
+    sender: &SyncSender<T>,
+    trace: T,
     disabled: &mut bool,
-) -> Option<TraceDocument> {
+) -> Option<T> {
     // Export already disabled: the channel is known dead, so retain the batch
     // for end-of-run emission rather than dropping it. In the live loop
     // `queue_expired_otlp` short-circuits before draining once disabled, so this
@@ -533,7 +551,7 @@ fn dispatch_expired_otlp(
         return Some(trace);
     }
 
-    let spans = trace.spans.len();
+    let spans = trace.span_count();
     match sender.try_send(trace) {
         Ok(()) => {
             info!(spans, "queued expired OTLP spans");
@@ -549,9 +567,9 @@ fn dispatch_expired_otlp(
             collector
                 .lock()
                 .expect("collector lock poisoned")
-                .record_otlp_queue_drop(trace.spans.len());
+                .record_otlp_queue_drop(trace.span_count());
             warn!(
-                spans = trace.spans.len(),
+                spans = trace.span_count(),
                 "dropped expired OTLP spans; export queue is full"
             );
             None
@@ -559,11 +577,30 @@ fn dispatch_expired_otlp(
         Err(TrySendError::Disconnected(trace)) => {
             *disabled = true;
             warn!(
-                spans = trace.spans.len(),
+                spans = trace.span_count(),
                 "OTLP exporter worker stopped; retaining these spans for end-of-run emission and disabling OTLP export for the rest of this run"
             );
             Some(trace)
         }
+    }
+}
+
+/// What crosses the exporter queue, as far as the drop/retain accounting is
+/// concerned. The live queue carries [`ExpiredBatch`]es; a rendered
+/// [`TraceDocument`] counts the same way.
+trait SpanCount {
+    fn span_count(&self) -> usize;
+}
+
+impl SpanCount for ExpiredBatch {
+    fn span_count(&self) -> usize {
+        ExpiredBatch::span_count(self)
+    }
+}
+
+impl SpanCount for TraceDocument {
+    fn span_count(&self) -> usize {
+        self.spans.len()
     }
 }
 
@@ -1929,6 +1966,76 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_full_queue_counts_every_span_of_an_unrendered_batch() {
+        // The live queue carries detached request groups; a Full drop must still
+        // count the spans they WOULD have rendered to (request + children +
+        // background), or the drop counters under-report.
+        let mut source = Collector::default();
+        source.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 1,
+            tid: 2,
+            trans_id: "tx-full".into(),
+            truncation: Default::default(),
+        }));
+        for (trans_id, sent_ns) in [("tx-full", 11), ("tx-full", 12), ("", 13)] {
+            source.push(TraceEvent::RadosOp(crate::events::RadosEvent {
+                pid: 1,
+                send_tid: 2,
+                cid: 1,
+                tid: sent_ns,
+                sent_ns,
+                finish_ns: sent_ns + 1,
+                duration_ns: 1,
+                pool: 1,
+                target_osd: 0,
+                pg_seed: 0,
+                acting: Vec::new(),
+                rw: crate::events::RadosDirection::Read,
+                object_name: "obj".to_string(),
+                trans_id: trans_id.into(),
+                truncation: Default::default(),
+                ops: Vec::new(),
+                offset: 0,
+                length: 0,
+            }));
+        }
+        let batch = source
+            .drain_expired_batch(1_000, 100)
+            .expect("everything is expired");
+        assert_eq!(batch.span_count(), 4);
+
+        let (sender, _receiver) = mpsc::sync_channel::<ExpiredBatch>(1);
+        let mut filler_source = Collector::default();
+        filler_source.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 1,
+            tid: 2,
+            trans_id: "tx-filler".into(),
+            truncation: Default::default(),
+        }));
+        sender
+            .try_send(filler_source.drain_expired_batch(1_000, 100).unwrap())
+            .expect("first unit fits");
+
+        let collector = Arc::new(Mutex::new(Collector::default()));
+        let mut disabled = false;
+        let retained = dispatch_expired_otlp(&collector, &sender, batch, &mut disabled);
+        assert!(retained.is_none(), "a Full drop is not retained");
+        assert!(!disabled);
+        let diagnostics = Arc::try_unwrap(collector)
+            .expect("collector still referenced")
+            .into_inner()
+            .expect("collector lock poisoned")
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_queue_dropped_traces, 1);
+        assert_eq!(diagnostics.otlp_queue_dropped_spans, 4);
+    }
+
+    #[test]
     fn decodes_request_end_event() {
         let raw = RawRequestEvent {
             start_ns: 10,
@@ -1947,7 +2054,7 @@ mod tests {
         assert_eq!(request.start_ns, 10);
         assert_eq!(request.end_ns, 30);
         assert_eq!(request.pid, 42);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
     }
 
     #[test]
@@ -1973,7 +2080,7 @@ mod tests {
         assert_eq!(request.start_ns, 10);
         assert_eq!(request.end_ns, 0);
         assert_eq!(request.tid, 7);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
     }
 
     #[test]
@@ -2017,7 +2124,7 @@ mod tests {
         assert_eq!(rados.acting, vec![1, 2]);
         assert_eq!(rados.ops[0].name, "read");
         assert_eq!(rados.object_name, "bucket-object");
-        assert_eq!(rados.trans_id, "tx0002");
+        assert_eq!(&*rados.trans_id, "tx0002");
     }
 
     #[test]
@@ -2058,7 +2165,7 @@ mod tests {
             else {
                 panic!("expected a request event");
             };
-            assert_eq!(request.trans_id, "tx0003");
+            assert_eq!(request.trans_id.as_ref(), "tx0003");
 
             let err = decode_event(&data[..RGWTRACE_REQUEST_RECORD_SIZE - 1]).unwrap_err();
             assert!(err.to_string().contains("payload too short"));

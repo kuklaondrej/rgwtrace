@@ -177,8 +177,11 @@ matches raw S3 keys, so do not combine it with this flag.
 In live OTLP mode, `--otlp-flush-interval` controls how often eligible spans are
 queued for the background exporter. `--correlation-ttl` governs retention of
 correlation state; open requests awaiting an END marker have a separate lifetime
-backstop. `--inference-window` governs optional inferred correlation and is
-independent of the retention setting. See `rgwtrace --help` for all options and
+backstop, and requests whose END marker arrived are exported after
+`--closed-request-grace` (default 5 s; capped at the TTL). `--inference-window`
+governs optional inferred correlation and is independent of the retention
+setting; `--inference-max-pending` (default 65536) caps the untagged ops waiting
+for an inference decision. See `rgwtrace --help` for all options and
 defaults.
 
 ---
@@ -232,6 +235,7 @@ Inspect:
 - `rgw.correlation_reason`, usually `missing_trans_id` or `classified_background_role`; with `--correlate-inferred`, it can also be `no_inference_candidate` or `ambiguous_inference_candidates`.
 - `trace.diagnostics.missing_trans_id_background_ops` for volume.
 - `trace.diagnostics.inference_no_candidate_rados_ops` and `trace.diagnostics.inference_ambiguous_rados_ops` when inferred correlation is enabled.
+- `trace.diagnostics.inference_pending_overflow_rados_ops`: untagged ops decided early because the pending queue hit `--inference-max-pending`. They are decided against the candidates present at that moment, usually ending as ambiguous/no-candidate background ops instead of waiting for a candidate to appear or drop out. Nonzero means inference coverage is being traded for bounded memory and per-marker cost; raise the cap if memory allows (each pending op is a few hundred bytes).
 - `trace.diagnostics.background_rados_by_role` and `trace.diagnostics.background_rados_by_reason` for breakdowns.
 
 Do not assume background spans are errors. A rising background ratio is useful signal for deciding whether `--correlate-inferred` is warranted.
@@ -329,6 +333,8 @@ The request-END probe (`req_state::~req_state`) is ON by default and needs no fl
 **`bpf_sendop_unbridged_ctx_drops` is nonzero.** No RADOS op is being correlated, and the reason is upstream of correlation: this build's `RGWREST::get_handler` does not hold the `req_state*` in a register at entry, so no request is ever entered into the bridge. Such a context can never be verified *or revoked*, so with the END probe attached `_send_op` refuses to stamp from it (a lingering one would otherwise let a long-dead request stamp later ops on a pooled thread). Attach warns about this explicitly. **Fix:** re-export the DWARF artifact with a current rgwtrace; if the build genuinely cannot expose it, the tracer still reports RADOS ops as background spans.
 
 **`expired_open_requests` is nonzero.** Requests whose END marker never arrived within 10x `--correlation-ttl` of the request's start, so they were force-expired with a derived end. This means END markers are being lost (ring-buffer drops — check `bpf_ringbuf_request_drops` — or destructor bridge misses, `bpf_request_end_misses`), not that requests are slow. `late_request_markers_dropped` counts markers that arrived for a request whose span had already been exported; they are dropped rather than emitting a second span with the same span id, and a nonzero count means the expiry bounds are too tight for the workload.
+
+**Background ops with reason `request_already_emitted` rise after an upgrade.** Requests whose END marker arrived are now exported after `--closed-request-grace` (default 5 s) of inactivity instead of the full `--correlation-ttl`. A RADOS completion that lands later than that becomes a background op with this reason rather than a child span. RGW waits for its own ops before the request ends, so this should be rare; asynchronous completions (for example fire-and-forget bucket-index `complete` ops on a slow OSD) are the expected exception. If the count matters, raise `--closed-request-grace`; memory grows with it (one group per request finished within the grace).
 
 **"the no-duplicate tombstone filter is past its design capacity".** Every exported request key is remembered for the life of the run so a straggler can never resurrect an already-exported group and emit a second span with the same span id. That memory is a fixed 8 MiB Bloom filter (`emitted_request_keys` counts the keys in it), which **never** produces a false negative — so the no-duplicate guarantee holds no matter how long the run — but past ~2M exported requests its false-**positive** rate starts to climb. A false positive can only cause a DROP: a late straggler discarded, or a fresh request whose key collides dropped (`late_request_markers_dropped`) with its ops demoted to background (`request_already_emitted`). It can never duplicate a span. **Fix:** restart the tracer, or run with `--timeout` for bounded windows.
 

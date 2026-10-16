@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::{borrow::Cow, sync::Arc};
+
 use serde::Serialize;
 
 pub const MAX_ACTING: usize = 16;
@@ -201,7 +203,10 @@ pub struct RequestEvent {
     pub end_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub trans_id: String,
+    /// Shared, not owned: the same id becomes the request group's key and every
+    /// index entry that points at the group, and an `Arc` clone is a refcount
+    /// bump where a `String` clone is a heap allocation per event.
+    pub trans_id: Arc<str>,
     pub truncation: CaptureTruncation,
 }
 
@@ -220,7 +225,8 @@ pub struct RadosEvent {
     pub acting: Vec<i32>,
     pub rw: RadosDirection,
     pub object_name: String,
-    pub trans_id: String,
+    /// See [`RequestEvent::trans_id`]: shared with the group key it joins.
+    pub trans_id: Arc<str>,
     pub truncation: CaptureTruncation,
     pub ops: Vec<RadosOp>,
     pub offset: u64,
@@ -237,7 +243,8 @@ pub enum RadosDirection {
 #[derive(Clone, Debug, Serialize)]
 pub struct RadosOp {
     pub code: u16,
-    pub name: String,
+    /// Borrowed for every known opcode; only `unknown(0x..)` allocates.
+    pub name: Cow<'static, str>,
     pub class: Option<String>,
     pub method: Option<String>,
 }
@@ -293,8 +300,15 @@ pub fn nul_terminated_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-pub fn rados_op_name(code: u16) -> String {
-    match code {
+/// Like [`nul_terminated_string`], but straight into the shared form: valid
+/// UTF-8 (the normal case) is copied once, into the `Arc` allocation itself.
+pub fn nul_terminated_arc(bytes: &[u8]) -> Arc<str> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    Arc::from(String::from_utf8_lossy(&bytes[..end]).as_ref())
+}
+
+pub fn rados_op_name(code: u16) -> Cow<'static, str> {
+    Cow::Borrowed(match code {
         0x1201 => "read",
         0x1202 => "stat",
         0x1203 => "mapext",
@@ -312,9 +326,8 @@ pub fn rados_op_name(code: u16) -> String {
         0x2215 => "omap-set-vals",
         0x1220 => "cmpext",
         0x1401 => "call",
-        _ => return format!("unknown({code:#x})"),
-    }
-    .to_string()
+        _ => return Cow::Owned(format!("unknown({code:#x})")),
+    })
 }
 
 impl From<RawRequestEvent> for RequestEvent {
@@ -324,7 +337,7 @@ impl From<RawRequestEvent> for RequestEvent {
             end_ns: raw.end_ns,
             pid: raw.pid,
             tid: raw.tid,
-            trans_id: nul_terminated_string(&raw.trans_id),
+            trans_id: nul_terminated_arc(&raw.trans_id),
             truncation: CaptureTruncation::from_flags(raw.flags),
         }
     }
@@ -360,14 +373,19 @@ impl From<RawRadosEvent> for RadosEvent {
             pool: raw.pool,
             target_osd: raw.target_osd,
             pg_seed: raw.pg_seed,
-            acting: raw.acting.into_iter().take_while(|osd| *osd >= 0).collect(),
+            // Sized up front: `take_while(..).collect()` cannot know its length
+            // and would grow (reallocate) on the way.
+            acting: {
+                let len = raw.acting.iter().take_while(|osd| **osd >= 0).count();
+                raw.acting[..len].to_vec()
+            },
             rw: if raw.rw & 0x0020 != 0 {
                 RadosDirection::Write
             } else {
                 RadosDirection::Read
             },
             object_name: nul_terminated_string(&raw.object_name),
-            trans_id: nul_terminated_string(&raw.trans_id),
+            trans_id: nul_terminated_arc(&raw.trans_id),
             truncation: CaptureTruncation::from_flags(raw.flags),
             ops,
             offset: raw.offset,
@@ -387,7 +405,7 @@ mod tests {
             end_ns: 0,
             pid: 1,
             tid: 2,
-            trans_id: String::new(),
+            trans_id: "".into(),
             truncation: CaptureTruncation::default(),
         });
 
@@ -416,7 +434,7 @@ mod tests {
             acting: Vec::new(),
             rw: RadosDirection::Read,
             object_name: String::new(),
-            trans_id: String::new(),
+            trans_id: "".into(),
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
@@ -448,7 +466,7 @@ mod tests {
         assert_eq!(request.end_ns, 20);
         assert_eq!(request.pid, 42);
         assert_eq!(request.tid, 7);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
         assert!(request.truncation.trans_id);
         assert!(!request.truncation.object_name);
     }
@@ -508,7 +526,7 @@ mod tests {
         assert_eq!(event.acting, vec![1, 2]);
         assert_eq!(event.rw, RadosDirection::Write);
         assert_eq!(event.object_name, "bucket-object");
-        assert_eq!(event.trans_id, "tx0002");
+        assert_eq!(&*event.trans_id, "tx0002");
         assert_eq!(event.offset, 64);
         assert_eq!(event.length, 4096);
         assert_eq!(event.ops.len(), MAX_RADOS_OPS);

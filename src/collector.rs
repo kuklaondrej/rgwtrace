@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Write as _,
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
@@ -126,12 +130,25 @@ impl EmittedRequests {
 
 #[derive(Debug, Default)]
 pub struct Collector {
-    requests: BTreeMap<String, RequestBuilder>,
-    pending_inference: Vec<RadosEvent>,
-    background: Vec<BackgroundRados>,
+    /// Request groups by key. Keys are `Arc<str>` because the same key also lives
+    /// in the expiry index and the inference indexes; a clone is a refcount bump.
+    requests: BTreeMap<Arc<str>, RequestBuilder>,
+    /// Which groups expire when, so a drain visits only what has aged out
+    /// instead of every resident group. See [`ExpiryIndex`].
+    expiry: ExpiryIndex,
+    /// `--correlate-inferred` state: candidate markers and pending untagged ops,
+    /// both indexed. `None` when inference is off.
+    inference: Option<Inference>,
+    /// Background (uncorrelated) RADOS ops in arrival order, plus a by-time index
+    /// so a drain finds the expired ones without scanning the rest.
+    background: BTreeMap<u64, BackgroundRados>,
+    background_by_time: BTreeSet<(u64, u64)>,
+    next_background_seq: u64,
     diagnostics: TraceDiagnostics,
-    infer_correlation: bool,
-    inference_window_ns: u64,
+    /// How long an END-closed request group (its destructor END marker arrived)
+    /// is kept for straggler events before it is exported. `None` keeps the
+    /// pre-grace behavior: the full idle TTL. See [`Collector::set_closed_request_grace`].
+    closed_request_grace_ns: Option<u64>,
     /// Whether the `req_state::~req_state` END probe is attached for this run.
     /// It decides whether a request without an END marker is OPEN (its END is
     /// still coming, so do not idle-expire it) or simply CLOSED-WITHOUT-AN-END
@@ -173,6 +190,12 @@ struct RequestBuilder {
     /// send), i.e. when the request began. `last_seen_ns` bounds IDLENESS;
     /// this bounds LIFETIME, which is what an open request is expired on.
     first_seen_ns: u64,
+    /// This group's entry in the [`ExpiryIndex`], if any (`None` while its
+    /// expiry clock is still 0, i.e. it can never expire).
+    expiry: Option<ExpirySlot>,
+    /// This group's entry in the inference candidate index (`--correlate-inferred`
+    /// only, and only once it has a request marker).
+    candidate: Option<CandidateSlot>,
 }
 
 impl RequestBuilder {
@@ -189,6 +212,19 @@ impl RequestBuilder {
 
     /// Fold one event's bounds into the group's idleness (`last_seen_ns`) and
     /// lifetime (`first_seen_ns`) clocks.
+    /// The clock this group expires on, given its state. See
+    /// [`Collector::drain_expired_batch`]. A zero clock never expires.
+    fn expiry_slot(&self, end_probe_attached: bool) -> Option<ExpirySlot> {
+        let (class, clock_ns) = if self.measured_end_ns.is_some() {
+            (ExpiryClass::Ended, self.last_seen_ns)
+        } else if self.is_open(end_probe_attached) {
+            (ExpiryClass::Open, self.first_seen_ns)
+        } else {
+            (ExpiryClass::Idle, self.last_seen_ns)
+        };
+        (clock_ns != 0).then_some(ExpirySlot { class, clock_ns })
+    }
+
     fn observe(&mut self, begin_ns: u64, end_ns: u64) {
         self.last_seen_ns = self.last_seen_ns.max(end_ns);
         if begin_ns != 0 {
@@ -197,6 +233,742 @@ impl RequestBuilder {
             } else {
                 self.first_seen_ns.min(begin_ns)
             };
+        }
+    }
+}
+
+/// Which clock a request group is expired on. See [`Collector::drain_expired_batch`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpiryClass {
+    /// Closed, no END marker: the idle TTL, on `last_seen_ns`.
+    Idle,
+    /// The END marker arrived: the closed-request grace, on `last_seen_ns`.
+    Ended,
+    /// END still expected: the lifetime backstop, on `first_seen_ns`.
+    Open,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExpirySlot {
+    class: ExpiryClass,
+    clock_ns: u64,
+}
+
+/// Request groups ordered by the clock they expire on, one ordered set per
+/// [`ExpiryClass`].
+///
+/// A drain walks each set from the oldest entry and stops at the first one that
+/// has not expired, so it costs O(expired · log n) instead of a pass over every
+/// resident group. Entries are allowed to lag behind a group's real clock (see
+/// `reindex`), which keeps ingest at a comparison per event; a lagging entry
+/// costs one extra visit, after which it is re-filed at its real clock.
+#[derive(Debug, Default)]
+struct ExpiryIndex {
+    idle: BTreeSet<(u64, Arc<str>)>,
+    ended: BTreeSet<(u64, Arc<str>)>,
+    open: BTreeSet<(u64, Arc<str>)>,
+    /// Index entries drains have visited. Test-observable proof that a drain
+    /// does not scan unexpired groups.
+    visited: u64,
+}
+
+impl ExpiryIndex {
+    fn set(&mut self, class: ExpiryClass) -> &mut BTreeSet<(u64, Arc<str>)> {
+        match class {
+            ExpiryClass::Idle => &mut self.idle,
+            ExpiryClass::Ended => &mut self.ended,
+            ExpiryClass::Open => &mut self.open,
+        }
+    }
+
+    fn replace(&mut self, key: &Arc<str>, old: Option<ExpirySlot>, new: Option<ExpirySlot>) {
+        if let Some(old) = old {
+            self.set(old.class).remove(&(old.clock_ns, Arc::clone(key)));
+        }
+        if let Some(new) = new {
+            self.set(new.class).insert((new.clock_ns, Arc::clone(key)));
+        }
+    }
+
+    /// Entries of `class` whose clock is at or before `cutoff_ns`, oldest first.
+    fn due_with_clock(
+        &mut self,
+        class: ExpiryClass,
+        cutoff_ns: u64,
+    ) -> impl Iterator<Item = (u64, &Arc<str>)> {
+        let (set, visited) = match class {
+            ExpiryClass::Idle => (&self.idle, &mut self.visited),
+            ExpiryClass::Ended => (&self.ended, &mut self.visited),
+            ExpiryClass::Open => (&self.open, &mut self.visited),
+        };
+        set.iter()
+            .take_while(move |(clock_ns, _)| *clock_ns <= cutoff_ns)
+            .map(move |(clock_ns, key)| {
+                *visited += 1;
+                (*clock_ns, key)
+            })
+    }
+}
+
+/// A request marker's footprint in the inference index: the untagged ops it is
+/// a candidate for are exactly those of the same `pid` whose interval overlaps
+/// `[lower_ns, upper_ns]` (the request interval plus `--inference-window`).
+/// `tid` additionally selects it in the same-thread stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateSlot {
+    pid: u32,
+    tid: u32,
+    lower_ns: u64,
+    upper_ns: u64,
+}
+
+impl CandidateSlot {
+    /// Byte-for-byte the predicate the inference has always used: an op is a
+    /// candidate when `rados_end >= request_start` and
+    /// `rados_start <= request_end + window`, with both intervals normalized
+    /// against inverted stamps. (A START-only marker has `end_ns == 0`, which
+    /// makes its interval `[0, start]`: that pre-existing quirk is preserved.)
+    fn of(request: &RequestEvent, window_ns: u64) -> Self {
+        Self {
+            pid: request.pid,
+            tid: request.tid,
+            lower_ns: request.start_ns.min(request.end_ns),
+            upper_ns: request
+                .end_ns
+                .max(request.start_ns)
+                .saturating_add(window_ns),
+        }
+    }
+}
+
+/// An untagged op's normalized interval.
+#[derive(Clone, Copy, Debug)]
+struct OpSpan {
+    start_ns: u64,
+    end_ns: u64,
+}
+
+impl OpSpan {
+    fn of(rados: &RadosEvent) -> Self {
+        Self {
+            start_ns: rados.sent_ns.min(rados.finish_ns),
+            end_ns: rados.finish_ns.max(rados.sent_ns),
+        }
+    }
+}
+
+/// Why a pending op is still pending, with the evidence needed to know when that
+/// can change.
+#[derive(Clone, Debug)]
+enum PendingState {
+    /// No candidate at all. Only a NEW overlapping candidate can change that.
+    NoCandidate,
+    /// Two or more candidates on the op's own submit thread (`send_tid`), two
+    /// of which are recorded. Only losing one of those two can change it.
+    AmbiguousTid([Arc<str>; 2]),
+    /// No candidate on `send_tid`, two or more on the pid. Changes when one of
+    /// the two recorded candidates goes, or a candidate appears on `send_tid`.
+    AmbiguousAll([Arc<str>; 2]),
+}
+
+enum InferenceOutcome {
+    Match(Arc<str>),
+    Pending(PendingState),
+}
+
+#[derive(Debug)]
+struct PendingOp {
+    event: RadosEvent,
+    span: OpSpan,
+    state: PendingState,
+}
+
+/// Default for `--inference-max-pending`.
+pub const DEFAULT_INFERENCE_MAX_PENDING: usize = 65_536;
+
+/// Closed intervals `[lower, upper]` tagged with a `K`, indexed so that an
+/// overlap query visits only entries that can overlap.
+///
+/// A single ordering cannot do that for intervals. Ordered by `upper`, a query
+/// for an OLD interval walks every newer entry (all have `upper >= start`, none
+/// `lower <= end`); ordered by `lower`, it has to start an unknown distance back.
+/// So entries are split by length into power-of-two classes, each ordered by
+/// `lower`: an overlapping entry of length `< 2^k` must start in
+/// `[start - (2^k - 1), end]`, and every non-overlapping entry visited in that
+/// range is a class-k interval that ended shortly before `start` -- a bounded,
+/// concurrency-sized set rather than everything resident.
+#[derive(Debug)]
+pub(crate) struct IntervalSet<K, const OVERLAP_INDEX: bool = false> {
+    by_length: BTreeMap<u32, BTreeSet<(u64, u64, K)>>,
+    overlap_root: Option<Box<IntervalNode<K>>>,
+    next_priority: u64,
+    pub(crate) scanned: std::cell::Cell<usize>,
+}
+
+#[derive(Debug)]
+struct IntervalNode<K> {
+    lower: u64,
+    upper: u64,
+    key: K,
+    priority: u64,
+    min_lower: u64,
+    max_upper: u64,
+    left: Option<Box<Self>>,
+    right: Option<Box<Self>>,
+}
+
+impl<K, const OVERLAP_INDEX: bool> Default for IntervalSet<K, OVERLAP_INDEX> {
+    fn default() -> Self {
+        Self {
+            by_length: BTreeMap::new(),
+            overlap_root: None,
+            next_priority: 0,
+            scanned: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl<K: Ord + Clone, const OVERLAP_INDEX: bool> IntervalSet<K, OVERLAP_INDEX> {
+    fn length_class(lower: u64, upper: u64) -> u32 {
+        64 - upper.saturating_sub(lower).leading_zeros()
+    }
+
+    pub(crate) fn insert(&mut self, lower: u64, upper: u64, key: K) {
+        let inserted = self
+            .by_length
+            .entry(Self::length_class(lower, upper))
+            .or_default()
+            .insert((lower, upper, key.clone()));
+        if !inserted || !OVERLAP_INDEX {
+            return;
+        }
+        let priority = splitmix64(self.next_priority);
+        self.next_priority = self.next_priority.wrapping_add(1);
+        self.overlap_root = Some(insert_interval(
+            self.overlap_root.take(),
+            Box::new(IntervalNode {
+                lower,
+                upper,
+                key,
+                priority,
+                min_lower: lower,
+                max_upper: upper,
+                left: None,
+                right: None,
+            }),
+        ));
+    }
+
+    fn remove(&mut self, lower: u64, upper: u64, key: K) {
+        let class = Self::length_class(lower, upper);
+        let removed = if let Some(entries) = self.by_length.get_mut(&class) {
+            let removed = entries.remove(&(lower, upper, key.clone()));
+            if entries.is_empty() {
+                self.by_length.remove(&class);
+            }
+            removed
+        } else {
+            false
+        };
+        if removed && OVERLAP_INDEX {
+            self.overlap_root = remove_interval(self.overlap_root.take(), &(lower, upper, key));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_length.is_empty()
+    }
+
+    /// Every entry whose start lies in the window an overlapping entry of its
+    /// class must start in, as `(upper, key)`, class by class. Callers keep only
+    /// those with `upper >= lower` -- the remainder is the bounded overscan.
+    fn near<'a>(
+        &'a self,
+        lower: u64,
+        upper: u64,
+        min_key: &'a K,
+    ) -> impl Iterator<Item = (u64, &'a K)> + 'a {
+        self.by_length.iter().flat_map(move |(class, entries)| {
+            let reach = if *class >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << class) - 1
+            };
+            entries
+                .range((lower.saturating_sub(reach), 0, min_key.clone())..)
+                .take_while(move |(start, _, _)| *start <= upper)
+                .map(|(_, end, key)| (*end, key))
+        })
+    }
+
+    fn overlapping<'a>(
+        &'a self,
+        lower: u64,
+        upper: u64,
+        min_key: &'a K,
+    ) -> impl Iterator<Item = &'a K> + 'a {
+        self.near(lower, upper, min_key)
+            .filter(move |(end, _)| *end >= lower)
+            .map(|(_, key)| key)
+    }
+}
+
+impl<K: Ord + Clone> IntervalSet<K, true> {
+    /// Test whether any interval overlaps the query. Subtree bounds on both
+    /// interval endpoints skip ranges lying wholly before or after the query.
+    pub(crate) fn any_overlapping(&self, lower: u64, upper: u64) -> bool {
+        any_interval_overlapping(self.overlap_root.as_deref(), lower, upper, &self.scanned)
+    }
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e3779b97f4a7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
+}
+
+fn interval_key_cmp<K: Ord>(a: &IntervalNode<K>, b: &IntervalNode<K>) -> std::cmp::Ordering {
+    (&a.lower, &a.upper, &a.key).cmp(&(&b.lower, &b.upper, &b.key))
+}
+
+fn refresh_interval<K>(node: &mut IntervalNode<K>) {
+    node.min_lower = node.lower;
+    node.max_upper = node.upper;
+    for child in [&node.left, &node.right].into_iter().flatten() {
+        node.min_lower = node.min_lower.min(child.min_lower);
+        node.max_upper = node.max_upper.max(child.max_upper);
+    }
+}
+
+fn rotate_interval_right<K>(mut root: Box<IntervalNode<K>>) -> Box<IntervalNode<K>> {
+    let mut pivot = root.left.take().expect("right rotation needs left child");
+    root.left = pivot.right.take();
+    refresh_interval(&mut root);
+    pivot.right = Some(root);
+    refresh_interval(&mut pivot);
+    pivot
+}
+
+fn rotate_interval_left<K>(mut root: Box<IntervalNode<K>>) -> Box<IntervalNode<K>> {
+    let mut pivot = root.right.take().expect("left rotation needs right child");
+    root.right = pivot.left.take();
+    refresh_interval(&mut root);
+    pivot.left = Some(root);
+    refresh_interval(&mut pivot);
+    pivot
+}
+
+fn insert_interval<K: Ord>(
+    root: Option<Box<IntervalNode<K>>>,
+    inserted: Box<IntervalNode<K>>,
+) -> Box<IntervalNode<K>> {
+    let Some(mut root) = root else {
+        return inserted;
+    };
+    if interval_key_cmp(&inserted, &root).is_lt() {
+        root.left = Some(insert_interval(root.left.take(), inserted));
+        if root
+            .left
+            .as_ref()
+            .is_some_and(|left| left.priority > root.priority)
+        {
+            root = rotate_interval_right(root);
+        }
+    } else {
+        root.right = Some(insert_interval(root.right.take(), inserted));
+        if root
+            .right
+            .as_ref()
+            .is_some_and(|right| right.priority > root.priority)
+        {
+            root = rotate_interval_left(root);
+        }
+    }
+    refresh_interval(&mut root);
+    root
+}
+
+fn merge_intervals<K>(
+    left: Option<Box<IntervalNode<K>>>,
+    right: Option<Box<IntervalNode<K>>>,
+) -> Option<Box<IntervalNode<K>>> {
+    match (left, right) {
+        (None, tree) | (tree, None) => tree,
+        (Some(mut left), Some(right)) if left.priority >= right.priority => {
+            left.right = merge_intervals(left.right.take(), Some(right));
+            refresh_interval(&mut left);
+            Some(left)
+        }
+        (Some(left), Some(mut right)) => {
+            right.left = merge_intervals(Some(left), right.left.take());
+            refresh_interval(&mut right);
+            Some(right)
+        }
+    }
+}
+
+fn remove_interval<K: Ord>(
+    root: Option<Box<IntervalNode<K>>>,
+    key: &(u64, u64, K),
+) -> Option<Box<IntervalNode<K>>> {
+    let mut root = root?;
+    match (&root.lower, &root.upper, &root.key).cmp(&(&key.0, &key.1, &key.2)) {
+        std::cmp::Ordering::Less => root.right = remove_interval(root.right.take(), key),
+        std::cmp::Ordering::Greater => root.left = remove_interval(root.left.take(), key),
+        std::cmp::Ordering::Equal => return merge_intervals(root.left.take(), root.right.take()),
+    }
+    refresh_interval(&mut root);
+    Some(root)
+}
+
+fn any_interval_overlapping<K: Ord>(
+    root: Option<&IntervalNode<K>>,
+    lower: u64,
+    upper: u64,
+    scanned: &std::cell::Cell<usize>,
+) -> bool {
+    let Some(node) = root else { return false };
+    scanned.set(scanned.get() + 1);
+    if node.max_upper < lower || node.min_lower > upper {
+        return false;
+    }
+    if node.lower <= upper && node.upper >= lower {
+        return true;
+    }
+    any_interval_overlapping(node.left.as_deref(), lower, upper, scanned)
+        || any_interval_overlapping(node.right.as_deref(), lower, upper, scanned)
+}
+
+/// The candidate markers of one pid (or one thread).
+///
+/// START-only markers have `lower == 0` (their interval is `[0, start + window]`,
+/// see [`CandidateSlot::of`]) and would all land in the top length class, where
+/// the [`IntervalSet`] bound is useless; they are kept apart, ordered by `upper`,
+/// where every entry from `op.start` up IS a candidate.
+#[derive(Debug, Default)]
+struct CandidateSet {
+    from_zero: BTreeSet<(u64, Arc<str>)>,
+    bounded: IntervalSet<Arc<str>>,
+}
+
+impl CandidateSet {
+    fn insert(&mut self, slot: CandidateSlot, key: &Arc<str>) {
+        if slot.lower_ns == 0 {
+            self.from_zero.insert((slot.upper_ns, Arc::clone(key)));
+        } else {
+            self.bounded
+                .insert(slot.lower_ns, slot.upper_ns, Arc::clone(key));
+        }
+    }
+
+    fn remove(&mut self, slot: CandidateSlot, key: &Arc<str>) {
+        if slot.lower_ns == 0 {
+            self.from_zero.remove(&(slot.upper_ns, Arc::clone(key)));
+        } else {
+            self.bounded
+                .remove(slot.lower_ns, slot.upper_ns, Arc::clone(key));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.from_zero.is_empty() && self.bounded.is_empty()
+    }
+}
+
+/// `--correlate-inferred` state, indexed so that a request marker costs work
+/// proportional to the pending ops it can actually affect.
+///
+/// An untagged op is inferred onto a request when that request is its UNIQUE
+/// candidate: first among the requests on its submit thread, else among all
+/// requests of its pid. Ops without a unique candidate wait in `pending` and are
+/// re-decided as candidates come and go -- the old code re-decided EVERY pending
+/// op against EVERY group on EVERY marker, O(pending x groups) per marker.
+///
+/// Which pending ops can a candidate change affect? An op's decision depends
+/// only on its candidate set, so:
+///
+/// * a candidate APPEARING can change a `NoCandidate` op (it now has one), or an
+///   `AmbiguousAll` op when the newcomer is on its `send_tid` (the same-thread
+///   stage now has exactly one). It cannot rescue an `AmbiguousTid` op, which
+///   already has two same-thread candidates. Found via `unresolved` /
+///   `ambiguous_all`, by op start time.
+/// * a candidate DISAPPEARING (marker moved, or group expired) can only change
+///   an ambiguous op if it was one of the two candidates recorded for it: the
+///   other two are still there. Found via `witnessed`.
+///
+/// Those ops are marked `dirty` and re-decided at the same points the old code
+/// re-decided everything (each START/END marker, and each drain), in arrival
+/// order -- so every decision, and the order matched ops join their groups, is
+/// identical to the exhaustive version.
+#[derive(Debug, Default)]
+struct Inference {
+    window_ns: u64,
+    max_pending: usize,
+    /// Candidate markers per pid and per (pid, tid).
+    by_pid: HashMap<u32, CandidateSet>,
+    by_thread: HashMap<(u32, u32), CandidateSet>,
+    pending: BTreeMap<u64, PendingOp>,
+    /// (event time, id): which pending ops are past the TTL at a drain.
+    pending_by_time: BTreeSet<(u64, u64)>,
+    /// `NoCandidate` ops per pid, as (op start, id).
+    unresolved: HashMap<u32, IntervalSet<u64>>,
+    /// Every pending op per pid, as (op start, id): which requests are still a
+    /// candidate of some pending op (and so must keep the full TTL).
+    pending_by_pid: HashMap<u32, IntervalSet<u64, true>>,
+    /// `AmbiguousAll` ops per (pid, send_tid), as (op start, id).
+    ambiguous_all: HashMap<(u32, u32), IntervalSet<u64>>,
+    /// (candidate key, op id) for each recorded witness of an ambiguous op.
+    witnessed: BTreeSet<(Arc<str>, u64)>,
+    dirty: BTreeSet<u64>,
+    next_id: u64,
+    /// Range sentinel (the minimum `Arc<str>`), allocated once.
+    min_key: Arc<str>,
+    /// Candidate entries visited by queries: test-observable proof that a query
+    /// does not walk non-overlapping requests.
+    scanned: std::cell::Cell<u64>,
+}
+
+impl Inference {
+    fn new(window_ns: u64) -> Self {
+        Self {
+            window_ns,
+            max_pending: DEFAULT_INFERENCE_MAX_PENDING,
+            ..Self::default()
+        }
+    }
+
+    /// Decide `rados` against the current candidates. Pure; identical in outcome
+    /// to filtering every group, but stops at the second candidate.
+    fn query(&self, rados: &RadosEvent, span: OpSpan) -> InferenceOutcome {
+        if rados.send_tid != 0 {
+            if let Some(set) = self.by_thread.get(&(rados.pid, rados.send_tid)) {
+                match self.first_two(set, span) {
+                    (None, _) => {}
+                    (Some(key), None) => return InferenceOutcome::Match(key),
+                    (Some(a), Some(b)) => {
+                        return InferenceOutcome::Pending(PendingState::AmbiguousTid([a, b]))
+                    }
+                }
+            }
+        }
+        match self
+            .by_pid
+            .get(&rados.pid)
+            .map_or((None, None), |set| self.first_two(set, span))
+        {
+            (None, _) => InferenceOutcome::Pending(PendingState::NoCandidate),
+            (Some(key), None) => InferenceOutcome::Match(key),
+            (Some(a), Some(b)) => InferenceOutcome::Pending(PendingState::AmbiguousAll([a, b])),
+        }
+    }
+
+    fn first_two(&self, set: &CandidateSet, span: OpSpan) -> (Option<Arc<str>>, Option<Arc<str>>) {
+        // `[0, upper]` overlaps the op exactly when `upper >= op.start`.
+        let from_zero = set
+            .from_zero
+            .range((span.start_ns, Arc::clone(&self.min_key))..)
+            .map(|(_, key)| (u64::MAX, key));
+        let bounded = set.bounded.near(span.start_ns, span.end_ns, &self.min_key);
+        let mut candidates = from_zero
+            .chain(bounded)
+            .inspect(|_| self.scanned.set(self.scanned.get() + 1))
+            .filter(|(upper_ns, _)| *upper_ns >= span.start_ns)
+            .map(|(_, key)| Arc::clone(key));
+        let first = candidates.next();
+        let second = first.as_ref().and_then(|_| candidates.next());
+        (first, second)
+    }
+
+    /// Move `key`'s candidate entry from `old` to `new`, marking every pending op
+    /// the move can affect as dirty.
+    fn replace_candidate(
+        &mut self,
+        key: &Arc<str>,
+        old: Option<CandidateSlot>,
+        new: Option<CandidateSlot>,
+    ) {
+        if let Some(old) = old {
+            remove_candidate_from(&mut self.by_pid, old.pid, old, key);
+            remove_candidate_from(&mut self.by_thread, (old.pid, old.tid), old, key);
+            let witnessed = self
+                .witnessed
+                .range((Arc::clone(key), 0)..=(Arc::clone(key), u64::MAX))
+                .map(|(_, id)| *id);
+            self.dirty.extend(witnessed);
+        }
+        if let Some(new) = new {
+            self.by_pid.entry(new.pid).or_default().insert(new, key);
+            self.by_thread
+                .entry((new.pid, new.tid))
+                .or_default()
+                .insert(new, key);
+            let dirty = Self::overlapping(self.unresolved.get(&new.pid), new);
+            self.dirty.extend(dirty);
+            let dirty = Self::overlapping(self.ambiguous_all.get(&(new.pid, new.tid)), new);
+            self.dirty.extend(dirty);
+        }
+    }
+
+    /// Ids in `ops` whose interval overlaps `slot`.
+    fn overlapping(ops: Option<&IntervalSet<u64>>, slot: CandidateSlot) -> Vec<u64> {
+        ops.map_or_else(Vec::new, |ops| {
+            ops.overlapping(slot.lower_ns, slot.upper_ns, &0)
+                .copied()
+                .collect()
+        })
+    }
+
+    /// Whether `slot` is a candidate of ANY pending op (recorded or not). Such a
+    /// request must keep the full TTL: dropping it early changes a pending op's
+    /// candidate set, and later expiries could then leave a single survivor and
+    /// infer the op onto it on the strength of an expiry, not of evidence.
+    fn is_candidate_of_pending(&self, slot: CandidateSlot) -> bool {
+        self.pending_by_pid
+            .get(&slot.pid)
+            .is_some_and(|ops| ops.any_overlapping(slot.lower_ns, slot.upper_ns))
+    }
+
+    fn allocate_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn oldest_pending(&self) -> Option<u64> {
+        self.pending.keys().next().copied()
+    }
+
+    fn park(&mut self, id: u64, op: PendingOp) {
+        let (start, end) = (op.span.start_ns, op.span.end_ns);
+        match &op.state {
+            PendingState::NoCandidate => {
+                self.unresolved
+                    .entry(op.event.pid)
+                    .or_default()
+                    .insert(start, end, id);
+            }
+            PendingState::AmbiguousTid(witnesses) => {
+                for key in witnesses {
+                    self.witnessed.insert((Arc::clone(key), id));
+                }
+            }
+            PendingState::AmbiguousAll(witnesses) => {
+                for key in witnesses {
+                    self.witnessed.insert((Arc::clone(key), id));
+                }
+                if op.event.send_tid != 0 {
+                    self.ambiguous_all
+                        .entry((op.event.pid, op.event.send_tid))
+                        .or_default()
+                        .insert(start, end, id);
+                }
+            }
+        }
+        self.pending_by_time
+            .insert((rados_event_time_ns(&op.event), id));
+        self.pending_by_pid
+            .entry(op.event.pid)
+            .or_default()
+            .insert(start, end, id);
+        self.pending.insert(id, op);
+    }
+
+    fn take(&mut self, id: u64) -> Option<PendingOp> {
+        let op = self.pending.remove(&id)?;
+        self.dirty.remove(&id);
+        self.pending_by_time
+            .remove(&(rados_event_time_ns(&op.event), id));
+        let (start, end) = (op.span.start_ns, op.span.end_ns);
+        remove_op_from(&mut self.pending_by_pid, op.event.pid, start, end, id);
+        match &op.state {
+            PendingState::NoCandidate => {
+                remove_op_from(&mut self.unresolved, op.event.pid, start, end, id);
+            }
+            PendingState::AmbiguousTid(witnesses) | PendingState::AmbiguousAll(witnesses) => {
+                for key in witnesses {
+                    self.witnessed.remove(&(Arc::clone(key), id));
+                }
+                remove_op_from(
+                    &mut self.ambiguous_all,
+                    (op.event.pid, op.event.send_tid),
+                    start,
+                    end,
+                    id,
+                );
+            }
+        }
+        Some(op)
+    }
+}
+
+/// See [`Collector::reindex_group`]; split out so a caller already holding the
+/// group's builder does not pay a second map lookup.
+fn reindex(
+    expiry: &mut ExpiryIndex,
+    inference: Option<&mut Inference>,
+    end_probe_attached: bool,
+    key: &Arc<str>,
+    builder: &mut RequestBuilder,
+) {
+    // The index entry may lag BEHIND the group's real clock (same class, older
+    // clock): a drain that reaches a stale entry re-files it at the real clock
+    // instead of expiring it. Clocks only move forward on nearly every event, so
+    // this turns a remove+insert per RADOS op into a comparison. A move to an
+    // EARLIER clock or another class is applied immediately, so an entry is never
+    // later than the truth and nothing expires late.
+    let slot = builder.expiry_slot(end_probe_attached);
+    let lagging_is_fine = matches!(
+        (builder.expiry, slot),
+        (Some(indexed), Some(real)) if indexed.class == real.class && indexed.clock_ns <= real.clock_ns
+    );
+    if slot != builder.expiry && !lagging_is_fine {
+        expiry.replace(key, builder.expiry, slot);
+        builder.expiry = slot;
+    }
+    if let Some(inference) = inference {
+        let candidate = builder
+            .request
+            .as_ref()
+            .map(|request| CandidateSlot::of(request, inference.window_ns));
+        if candidate != builder.candidate {
+            inference.replace_candidate(key, builder.candidate, candidate);
+            builder.candidate = candidate;
+        }
+    }
+}
+
+fn remove_candidate_from<K>(
+    map: &mut HashMap<K, CandidateSet>,
+    map_key: K,
+    slot: CandidateSlot,
+    key: &Arc<str>,
+) where
+    K: std::hash::Hash + Eq,
+{
+    if let Some(set) = map.get_mut(&map_key) {
+        set.remove(slot, key);
+        if set.is_empty() {
+            map.remove(&map_key);
+        }
+    }
+}
+
+/// Remove op `id` from the set at `map[map_key]`, dropping the set once empty so
+/// the map does not accumulate one empty set per pid/thread ever seen.
+fn remove_op_from<K, const OVERLAP_INDEX: bool>(
+    map: &mut HashMap<K, IntervalSet<u64, OVERLAP_INDEX>>,
+    map_key: K,
+    start: u64,
+    end: u64,
+    id: u64,
+) where
+    K: std::hash::Hash + Eq,
+{
+    if let Some(set) = map.get_mut(&map_key) {
+        set.remove(start, end, id);
+        if set.is_empty() {
+            map.remove(&map_key);
         }
     }
 }
@@ -244,13 +1016,6 @@ enum BackgroundReason {
     /// parent span with the same span id, so the op is kept as background with
     /// this reason instead -- visibly, not silently.
     RequestAlreadyEmitted,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum InferenceMatch {
-    Match(String),
-    NoCandidate,
-    Ambiguous,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -327,6 +1092,13 @@ pub struct TraceDiagnostics {
     pub inferred_correlations: u64,
     pub inference_no_candidate_rados_ops: u64,
     pub inference_ambiguous_rados_ops: u64,
+    /// Untagged ops decided EARLY because the `--correlate-inferred` pending
+    /// queue hit `--inference-max-pending`: the oldest pending op is decided
+    /// against the candidates present at that moment (usually ending up as an
+    /// ambiguous/no-candidate background op) instead of waiting out the TTL for a
+    /// candidate to appear or drop out. Nonzero means inference coverage is being
+    /// traded for bounded memory and per-marker cost.
+    pub inference_pending_overflow_rados_ops: u64,
     pub missing_trans_id_background_ops: u64,
     pub background_rados_by_role: BTreeMap<String, u64>,
     pub background_rados_by_reason: BTreeMap<String, u64>,
@@ -609,8 +1381,7 @@ pub enum AttributeValue {
 impl Collector {
     pub fn with_inferred_correlation(inference_window_ns: u64) -> Self {
         Self {
-            infer_correlation: true,
-            inference_window_ns,
+            inference: Some(Inference::new(inference_window_ns)),
             ..Self::default()
         }
     }
@@ -628,7 +1399,7 @@ impl Collector {
                 if self.reject_already_emitted(&key) {
                     return;
                 }
-                let builder = self.requests.entry(key).or_default();
+                let builder = self.requests.entry(Arc::clone(&key)).or_default();
                 builder.observe(request.start_ns, request.end_ns.max(request.start_ns));
                 // Keep an END that already landed (out-of-order ring-buffer
                 // delivery is possible): only the identity/start fields are
@@ -643,6 +1414,7 @@ impl Collector {
                     }
                     _ => builder.request = Some(request),
                 }
+                self.reindex_group(&key);
                 self.retry_pending_inference();
             }
             TraceEvent::RequestEnd(request) => {
@@ -656,7 +1428,7 @@ impl Collector {
                 if self.reject_already_emitted(&key) {
                     return;
                 }
-                let builder = self.requests.entry(key).or_default();
+                let builder = self.requests.entry(Arc::clone(&key)).or_default();
                 builder.observe(request.start_ns, request.end_ns.max(request.start_ns));
                 builder.measured_end_ns = Some(request.end_ns);
                 match builder.request.as_mut() {
@@ -665,6 +1437,7 @@ impl Collector {
                     Some(existing) => existing.end_ns = request.end_ns,
                     None => builder.request = Some(request),
                 }
+                self.reindex_group(&key);
                 self.retry_pending_inference();
             }
             TraceEvent::RadosOp(rados) => {
@@ -672,21 +1445,25 @@ impl Collector {
                 record_truncation(&mut self.diagnostics, rados.truncation);
                 if rados.trans_id.is_empty() {
                     let role = classify_rados(&rados);
-                    if self.infer_correlation && inferable_rados_role(role) {
-                        match self.inferred_request_key(&rados) {
-                            InferenceMatch::Match(key) => {
-                                self.record_correlated_rados(
-                                    key,
-                                    rados,
-                                    RadosCorrelation::Inferred,
-                                );
+                    match self.inference.as_ref() {
+                        Some(inference) if inferable_rados_role(role) => {
+                            let span = OpSpan::of(&rados);
+                            match inference.query(&rados, span) {
+                                InferenceOutcome::Match(key) => {
+                                    self.record_correlated_rados(
+                                        key,
+                                        rados,
+                                        RadosCorrelation::Inferred,
+                                    );
+                                }
+                                InferenceOutcome::Pending(state) => {
+                                    self.park_pending_inference(rados, span, state);
+                                }
                             }
-                            InferenceMatch::NoCandidate | InferenceMatch::Ambiguous => {
-                                self.pending_inference.push(rados);
-                            }
-                        };
-                    } else {
-                        self.record_background_rados(rados, background_reason_for_role(role));
+                        }
+                        _ => {
+                            self.record_background_rados(rados, background_reason_for_role(role));
+                        }
                     }
                 } else if self.emitted_requests.contains(&rados.trans_id) {
                     // This op's request span has ALREADY been exported, so
@@ -700,12 +1477,27 @@ impl Collector {
                     // but the same_thread/cross_thread split is derived late in
                     // `request_spans` (the marker's `tid` may not be known yet).
                     self.record_correlated_rados(
-                        rados.trans_id.clone(),
+                        Arc::clone(&rados.trans_id),
                         rados,
                         RadosCorrelation::TransId,
                     );
                 }
             }
+        }
+    }
+
+    /// Bring `key`'s entries in the expiry index and (under inference) the
+    /// candidate index in line with its group's current state. Called after every
+    /// mutation of a group; a no-op when nothing the indexes key on changed.
+    fn reindex_group(&mut self, key: &Arc<str>) {
+        if let Some(builder) = self.requests.get_mut(key) {
+            reindex(
+                &mut self.expiry,
+                self.inference.as_mut(),
+                self.end_probe_attached,
+                key,
+                builder,
+            );
         }
     }
 
@@ -751,87 +1543,174 @@ impl Collector {
         }
     }
 
-    /// Declare whether the `req_state::~req_state` END probe is attached for this
-    /// run. Live tracing sets it from the actual attach outcome; everything else
-    /// leaves it `false`, which preserves the pre-end-probe expiry behavior.
     /// Opt in to hashing object names in the exported attributes. See the
     /// `redact_object_names` field and [`redacted_object_name`].
     pub fn set_redact_object_names(&mut self, redact: bool) {
         self.redact_object_names = redact;
     }
 
+    /// Declare whether the `req_state::~req_state` END probe is attached for this
+    /// run. Live tracing sets it from the actual attach outcome; everything else
+    /// leaves it `false`, which preserves the pre-end-probe expiry behavior.
     pub fn set_end_probe_attached(&mut self, attached: bool) {
         self.end_probe_attached = attached;
-    }
-
-    fn inferred_request_key(&self, rados: &RadosEvent) -> InferenceMatch {
-        if rados.send_tid != 0 {
-            let same_thread_match =
-                unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
-                    let request = builder.request.as_ref()?;
-                    (request.tid == rados.send_tid
-                        && inferred_candidate(request, rados, self.inference_window_ns))
-                    .then(|| key.clone())
-                }));
-            if same_thread_match != InferenceMatch::NoCandidate {
-                return same_thread_match;
-            }
+        // The flag decides every group's expiry class (open vs closed). Live
+        // tracing sets it before the first event, so this is normally empty.
+        let keys: Vec<Arc<str>> = self.requests.keys().cloned().collect();
+        for key in keys {
+            self.reindex_group(&key);
         }
-
-        unique_inference_match(self.requests.iter().filter_map(|(key, builder)| {
-            let request = builder.request.as_ref()?;
-            inferred_candidate(request, rados, self.inference_window_ns).then(|| key.clone())
-        }))
     }
 
-    fn retry_pending_inference(&mut self) {
-        let mut remaining = Vec::new();
-        for rados in std::mem::take(&mut self.pending_inference) {
-            match self.inferred_request_key(&rados) {
-                InferenceMatch::Match(key) => {
-                    self.record_correlated_rados(key, rados, RadosCorrelation::Inferred);
+    /// Export a request group whose END marker has arrived after `grace_ns` of
+    /// inactivity instead of the full idle TTL (`--closed-request-grace`).
+    ///
+    /// The END is the request's destructor, so the group is complete except for
+    /// RADOS completions still in flight at that moment. Holding it for the whole
+    /// `--correlation-ttl` (120 s by default) keeps every finished request of the
+    /// last two minutes resident -- hundreds of thousands of groups on a busy
+    /// gateway. A straggler that arrives after the grace is not lost or
+    /// duplicated: the tombstone turns it into a background op with reason
+    /// `request_already_emitted`.
+    ///
+    /// The effective grace is never longer than the TTL, and under
+    /// `--correlate-inferred` never shorter than the inference window (a closed
+    /// request stays an inference candidate for that long after its end).
+    pub fn set_closed_request_grace(&mut self, grace_ns: u64) {
+        self.closed_request_grace_ns = Some(grace_ns);
+    }
+
+    /// Cap the `--correlate-inferred` pending queue (`--inference-max-pending`).
+    /// Past it, the OLDEST pending op is decided immediately against the
+    /// candidates present now, and counted in
+    /// `inference_pending_overflow_rados_ops`.
+    pub fn set_inference_max_pending(&mut self, max_pending: usize) {
+        if let Some(inference) = self.inference.as_mut() {
+            inference.max_pending = max_pending.max(1);
+        }
+    }
+
+    fn closed_request_ttl_ns(&self, ttl_ns: u64) -> u64 {
+        let Some(grace_ns) = self.closed_request_grace_ns else {
+            return ttl_ns;
+        };
+        let floor_ns = self
+            .inference
+            .as_ref()
+            .map_or(0, |inference| inference.window_ns);
+        grace_ns.max(floor_ns).min(ttl_ns)
+    }
+
+    /// Queue an untagged op whose inference is not decided yet, enforcing the
+    /// pending cap first.
+    fn park_pending_inference(&mut self, rados: RadosEvent, span: OpSpan, state: PendingState) {
+        let Some(inference) = self.inference.as_mut() else {
+            return;
+        };
+        if inference.pending.len() >= inference.max_pending {
+            if let Some(oldest) = inference.oldest_pending() {
+                if let Some(op) = inference.take(oldest) {
+                    self.diagnostics.inference_pending_overflow_rados_ops += 1;
+                    self.finalize_pending_inference(op);
                 }
-                InferenceMatch::NoCandidate | InferenceMatch::Ambiguous => remaining.push(rados),
             }
         }
-        self.pending_inference = remaining;
+        if let Some(inference) = self.inference.as_mut() {
+            let id = inference.allocate_id();
+            inference.park(
+                id,
+                PendingOp {
+                    event: rados,
+                    span,
+                    state,
+                },
+            );
+        }
+    }
+
+    /// Re-decide every pending op whose candidate set may have changed since it
+    /// was last decided (see [`Inference`] for why the rest cannot have).
+    fn retry_pending_inference(&mut self) {
+        let Some(inference) = self.inference.as_mut() else {
+            return;
+        };
+        // Ascending id == arrival order, the order the old full retry visited
+        // them in, so matched ops join their groups in the same order.
+        let dirty = std::mem::take(&mut inference.dirty);
+        for id in dirty {
+            let Some(inference) = self.inference.as_mut() else {
+                return;
+            };
+            let Some(op) = inference.take(id) else {
+                continue;
+            };
+            match inference.query(&op.event, op.span) {
+                InferenceOutcome::Match(key) => {
+                    self.record_correlated_rados(key, op.event, RadosCorrelation::Inferred);
+                }
+                InferenceOutcome::Pending(state) => {
+                    inference.park(id, PendingOp { state, ..op });
+                }
+            }
+        }
     }
 
     fn finalize_expired_pending_inference(&mut self, cutoff_ns: u64) {
-        let mut remaining = Vec::new();
-        for rados in std::mem::take(&mut self.pending_inference) {
-            if rados_event_time_ns(&rados) <= cutoff_ns {
-                self.finalize_pending_inference(rados);
-            } else {
-                remaining.push(rados);
+        let Some(inference) = self.inference.as_mut() else {
+            return;
+        };
+        let mut due: Vec<u64> = inference
+            .pending_by_time
+            .iter()
+            .take_while(|(time_ns, _)| *time_ns <= cutoff_ns)
+            .map(|(_, id)| *id)
+            .collect();
+        due.sort_unstable();
+        for id in due {
+            if let Some(op) = self.inference.as_mut().and_then(|i| i.take(id)) {
+                self.finalize_pending_inference(op);
             }
         }
-        self.pending_inference = remaining;
     }
 
     fn finalize_all_pending_inference(&mut self) {
-        for rados in std::mem::take(&mut self.pending_inference) {
-            self.finalize_pending_inference(rados);
+        let Some(inference) = self.inference.as_mut() else {
+            return;
+        };
+        let ids: Vec<u64> = inference.pending.keys().copied().collect();
+        for id in ids {
+            if let Some(op) = self.inference.as_mut().and_then(|i| i.take(id)) {
+                self.finalize_pending_inference(op);
+            }
         }
     }
 
-    fn finalize_pending_inference(&mut self, rados: RadosEvent) {
-        match self.inferred_request_key(&rados) {
-            InferenceMatch::Match(key) => {
-                self.record_correlated_rados(key, rados, RadosCorrelation::Inferred);
+    fn finalize_pending_inference(&mut self, op: PendingOp) {
+        let outcome = match self.inference.as_ref() {
+            Some(inference) => inference.query(&op.event, op.span),
+            None => InferenceOutcome::Pending(PendingState::NoCandidate),
+        };
+        match outcome {
+            InferenceOutcome::Match(key) => {
+                self.record_correlated_rados(key, op.event, RadosCorrelation::Inferred);
             }
-            InferenceMatch::NoCandidate => {
-                self.record_background_rados(rados, BackgroundReason::NoInferenceCandidate);
+            InferenceOutcome::Pending(PendingState::NoCandidate) => {
+                self.record_background_rados(op.event, BackgroundReason::NoInferenceCandidate);
             }
-            InferenceMatch::Ambiguous => {
-                self.record_background_rados(rados, BackgroundReason::AmbiguousInferenceCandidates);
+            InferenceOutcome::Pending(
+                PendingState::AmbiguousTid(_) | PendingState::AmbiguousAll(_),
+            ) => {
+                self.record_background_rados(
+                    op.event,
+                    BackgroundReason::AmbiguousInferenceCandidates,
+                );
             }
         }
     }
 
     fn record_correlated_rados(
         &mut self,
-        key: String,
+        key: Arc<str>,
         rados: RadosEvent,
         correlation: RadosCorrelation,
     ) {
@@ -845,12 +1724,19 @@ impl Collector {
         }
         let last_seen_ns = rados_event_time_ns(&rados);
         let first_seen_ns = rados.sent_ns.min(rados.finish_ns);
-        let builder = self.requests.entry(key).or_default();
+        let builder = self.requests.entry(Arc::clone(&key)).or_default();
         builder.observe(first_seen_ns, last_seen_ns);
         builder.rados.push(CorrelatedRados {
             event: rados,
             correlation,
         });
+        reindex(
+            &mut self.expiry,
+            self.inference.as_mut(),
+            self.end_probe_attached,
+            &key,
+            builder,
+        );
     }
 
     fn record_background_rados(&mut self, rados: RadosEvent, reason: BackgroundReason) {
@@ -870,10 +1756,17 @@ impl Collector {
             | BackgroundReason::RequestAlreadyEmitted => {}
         }
         record_background_breakdown(&mut self.diagnostics, &rados, reason);
-        self.background.push(BackgroundRados {
-            event: rados,
-            reason,
-        });
+        let seq = self.next_background_seq;
+        self.next_background_seq += 1;
+        self.background_by_time
+            .insert((rados_event_time_ns(&rados), seq));
+        self.background.insert(
+            seq,
+            BackgroundRados {
+                event: rados,
+                reason,
+            },
+        );
     }
 
     pub fn record_decode_error(&mut self) {
@@ -934,14 +1827,33 @@ impl Collector {
     }
 
     /// Export every request group and background op that has aged out, and drop
-    /// them from the collector.
+    /// them from the collector. Convenience wrapper over
+    /// [`Self::drain_expired_batch`] that renders the spans in place; the live
+    /// loop calls the batch form so rendering happens off the ring-buffer thread.
+    pub fn drain_expired(
+        &mut self,
+        service_name: impl Into<String>,
+        now_ns: u64,
+        ttl_ns: u64,
+    ) -> Option<TraceDocument> {
+        self.drain_expired_batch(now_ns, ttl_ns)
+            .map(|batch| batch.into_trace_document(service_name))
+    }
+
+    /// Detach every request group and background op that has aged out, WITHOUT
+    /// rendering them: the caller holds the collector lock for this, and span
+    /// rendering (a dozen-plus attribute strings per span) is done afterwards by
+    /// [`ExpiredBatch::into_trace_document`], outside the lock.
     ///
-    /// Two clocks, because a request group has two very different reasons to be
+    /// Three clocks, because a request group has very different reasons to be
     /// finished with:
     ///
-    /// * CLOSED groups (the END marker arrived, or no END will ever arrive
-    ///   because the end probe is not attached) expire on IDLENESS, `ttl_ns`
-    ///   since the last event -- the long-standing behavior.
+    /// * CLOSED-WITHOUT-END groups (the end probe is not attached, so no END will
+    ///   ever arrive) expire on IDLENESS, `ttl_ns` since the last event -- the
+    ///   long-standing behavior.
+    /// * END-CLOSED groups (the destructor END arrived) expire after the shorter
+    ///   closed-request grace since the last event (see
+    ///   [`Self::set_closed_request_grace`]; without one, `ttl_ns`).
     /// * OPEN groups (END probe attached, END not yet seen) do NOT expire on
     ///   idleness. A long-running request that is simply quiet between RADOS ops
     ///   would otherwise be exported with a derived duration and removed, and its
@@ -952,79 +1864,120 @@ impl Collector {
     ///   the backstop against a lost END (ring-buffer drop, destructor bridge
     ///   miss) pinning the group forever.
     ///
+    /// Each clock has its own ordered index ([`ExpiryIndex`]), so the cost is
+    /// proportional to what expires, not to what is resident.
+    ///
     /// Whatever the reason, an exported key is REMEMBERED: a straggler event can
     /// never re-open it, so no request is ever emitted twice under one span id.
-    pub fn drain_expired(
-        &mut self,
-        service_name: impl Into<String>,
-        now_ns: u64,
-        ttl_ns: u64,
-    ) -> Option<TraceDocument> {
+    pub fn drain_expired_batch(&mut self, now_ns: u64, ttl_ns: u64) -> Option<ExpiredBatch> {
         let cutoff_ns = now_ns.saturating_sub(ttl_ns);
         let open_cutoff_ns =
             now_ns.saturating_sub(ttl_ns.saturating_mul(OPEN_REQUEST_TTL_MULTIPLIER));
+        let closed_cutoff_ns = now_ns.saturating_sub(self.closed_request_ttl_ns(ttl_ns));
         self.retry_pending_inference();
         self.finalize_expired_pending_inference(cutoff_ns);
 
-        let mut spans = Vec::new();
-        let mut remaining_requests = BTreeMap::new();
-        let mut emitted_keys = Vec::new();
-        let end_probe_attached = self.end_probe_attached;
-
-        for (key, request) in std::mem::take(&mut self.requests) {
-            let open = request.is_open(end_probe_attached);
-            let expired = if open {
-                request.first_seen_ns != 0 && request.first_seen_ns <= open_cutoff_ns
-            } else {
-                request.last_seen_ns != 0 && request.last_seen_ns <= cutoff_ns
+        // Index entries at or before their class's cutoff. An entry's clock may
+        // be STALE-LOW (see `reindex`): such a group is re-filed at its real clock
+        // here instead of being expired.
+        let mut visited: Vec<(u64, Arc<str>)> = Vec::new();
+        for (class, class_cutoff_ns) in [
+            (ExpiryClass::Idle, cutoff_ns),
+            (ExpiryClass::Open, open_cutoff_ns),
+            (ExpiryClass::Ended, closed_cutoff_ns),
+        ] {
+            visited.extend(
+                self.expiry
+                    .due_with_clock(class, class_cutoff_ns)
+                    .map(|(_, key)| (class_cutoff_ns, Arc::clone(key))),
+            );
+        }
+        let mut expired: Vec<Arc<str>> = Vec::with_capacity(visited.len());
+        for (class_cutoff_ns, key) in visited {
+            let Some(builder) = self.requests.get_mut(&key) else {
+                continue;
             };
-            if expired {
-                self.diagnostics.expired_request_groups += 1;
-                if open {
-                    // A request that never delivered its END and outlived the
-                    // backstop: exported now (with a derived end) so it cannot
-                    // leak, and its key remembered so a very late END cannot
-                    // duplicate it.
-                    self.diagnostics.expired_open_requests += 1;
+            let Some(slot) = builder.expiry_slot(self.end_probe_attached) else {
+                continue;
+            };
+            if slot.clock_ns > class_cutoff_ns {
+                self.expiry.replace(&key, builder.expiry, Some(slot));
+                builder.expiry = Some(slot);
+                continue;
+            }
+            // A group that is still a candidate of a pending inference keeps the
+            // full TTL -- recorded witness or not. Removing it early changes that
+            // op's candidate set, and a later expiry could then leave one
+            // survivor and infer the op onto it on the strength of an expiry,
+            // not of evidence.
+            if slot.class == ExpiryClass::Ended && slot.clock_ns > cutoff_ns {
+                let candidate = builder.candidate;
+                if let (Some(inference), Some(candidate)) = (self.inference.as_ref(), candidate) {
+                    if inference.is_candidate_of_pending(candidate) {
+                        continue;
+                    }
                 }
-                emitted_keys.push(key.clone());
-                spans.extend(request_spans(
-                    key,
-                    request,
-                    &mut self.diagnostics,
-                    self.redact_object_names,
-                ));
-            } else {
-                remaining_requests.insert(key, request);
             }
+            expired.push(key);
         }
-        self.requests = remaining_requests;
-        for key in emitted_keys {
-            self.remember_emitted(&key);
+        // Key order, exactly as the old whole-map walk emitted them.
+        expired.sort_unstable();
+
+        let mut requests = Vec::with_capacity(expired.len());
+        for key in expired {
+            let Some(mut builder) = self.requests.remove(&key) else {
+                continue;
+            };
+            self.expiry.replace(&key, builder.expiry.take(), None);
+            if let Some(inference) = self.inference.as_mut() {
+                inference.replace_candidate(&key, builder.candidate.take(), None);
+            }
+            self.diagnostics.expired_request_groups += 1;
+            if builder.is_open(self.end_probe_attached) {
+                // A request that never delivered its END and outlived the
+                // backstop: exported now (with a derived end) so it cannot
+                // leak, and its key remembered so a very late END cannot
+                // duplicate it.
+                self.diagnostics.expired_open_requests += 1;
+            }
+            // Counted here, under the lock, so the snapshot below is complete
+            // even though the spans are rendered later.
+            tally_request(&builder, &mut self.diagnostics);
+            requests.push((key, builder));
+        }
+        for (key, _) in &requests {
+            self.remember_emitted(key);
         }
 
-        let mut remaining_background = Vec::new();
-        for background in std::mem::take(&mut self.background) {
-            if rados_event_time_ns(&background.event) <= cutoff_ns {
+        let mut due: Vec<u64> = self
+            .background_by_time
+            .iter()
+            .take_while(|(time_ns, _)| *time_ns <= cutoff_ns)
+            .map(|(_, seq)| *seq)
+            .collect();
+        due.sort_unstable();
+        let mut background = Vec::with_capacity(due.len());
+        for seq in due {
+            if let Some(op) = self.background.remove(&seq) {
+                self.background_by_time
+                    .remove(&(rados_event_time_ns(&op.event), seq));
                 self.diagnostics.expired_background_rados_ops += 1;
-                spans.push(background_span(background, self.redact_object_names));
-            } else {
-                remaining_background.push(background);
+                background.push(op);
             }
         }
-        self.background = remaining_background;
 
-        if spans.is_empty() {
+        if requests.is_empty() && background.is_empty() {
             return None;
         }
 
-        let mut diagnostics = self.diagnostics.clone();
-        diagnostics.spans_produced = spans.len() as u64;
-        Some(TraceDocument {
-            service_name: service_name.into(),
-            spans,
-            diagnostics,
-        })
+        let mut batch = ExpiredBatch {
+            requests,
+            background,
+            diagnostics: self.diagnostics.clone(),
+            redact_object_names: self.redact_object_names,
+        };
+        batch.diagnostics.spans_produced = batch.span_count() as u64;
+        Some(batch)
     }
 
     pub fn into_trace_document(mut self, service_name: impl Into<String>) -> TraceDocument {
@@ -1033,13 +1986,17 @@ impl Collector {
 
         let mut spans = Vec::new();
 
-        let redact = self.redact_object_names;
-        for (key, request) in self.requests {
-            spans.extend(request_spans(key, request, &mut self.diagnostics, redact));
+        for (key, request) in std::mem::take(&mut self.requests) {
+            spans.extend(request_spans(
+                &key,
+                request,
+                &mut self.diagnostics,
+                self.redact_object_names,
+            ));
         }
 
-        for background in self.background {
-            spans.push(background_span(background, redact));
+        for background in std::mem::take(&mut self.background).into_values() {
+            spans.push(background_span(background, self.redact_object_names));
         }
         self.diagnostics.spans_produced = spans.len() as u64;
 
@@ -1051,37 +2008,92 @@ impl Collector {
     }
 }
 
-fn unique_inference_match(mut candidates: impl Iterator<Item = String>) -> InferenceMatch {
-    let Some(candidate) = candidates.next() else {
-        return InferenceMatch::NoCandidate;
-    };
-    if candidates.next().is_some() {
-        return InferenceMatch::Ambiguous;
+/// Request groups and background ops detached from the collector by
+/// [`Collector::drain_expired_batch`], not yet rendered into spans.
+///
+/// Detaching is a handful of moves per group; rendering is the expensive part
+/// (span/trace ids, a dozen-plus attribute strings per span), so it is done by
+/// whoever receives the batch -- the OTLP exporter thread in a live run --
+/// instead of on the ring-buffer thread under the collector lock. Its
+/// diagnostics were snapshotted, complete, at drain time.
+#[derive(Debug)]
+pub struct ExpiredBatch {
+    redact_object_names: bool,
+    requests: Vec<(Arc<str>, RequestBuilder)>,
+    background: Vec<BackgroundRados>,
+    diagnostics: TraceDiagnostics,
+}
+
+impl ExpiredBatch {
+    /// Spans this batch renders to: one per request plus one per child op, and
+    /// one per background op. Known before rendering, so a dropped batch can be
+    /// counted accurately.
+    pub fn span_count(&self) -> usize {
+        self.requests
+            .iter()
+            .map(|(_, builder)| 1 + builder.rados.len())
+            .sum::<usize>()
+            + self.background.len()
     }
-    InferenceMatch::Match(candidate)
+
+    pub fn into_trace_document(self, service_name: impl Into<String>) -> TraceDocument {
+        let mut spans = Vec::with_capacity(self.span_count());
+        for (key, builder) in self.requests {
+            spans.extend(render_request_spans(
+                &key,
+                builder,
+                self.redact_object_names,
+            ));
+        }
+        spans.extend(
+            self.background
+                .into_iter()
+                .map(|op| background_span(op, self.redact_object_names)),
+        );
+        TraceDocument {
+            service_name: service_name.into(),
+            spans,
+            diagnostics: self.diagnostics,
+        }
+    }
 }
 
 fn rados_event_time_ns(rados: &RadosEvent) -> u64 {
     rados.finish_ns.max(rados.sent_ns)
 }
 
-fn request_key(request: &RequestEvent) -> String {
+fn request_key(request: &RequestEvent) -> Arc<str> {
     if request.trans_id.is_empty() {
         format!(
             "pid:{}:tid:{}:start:{}",
             request.pid, request.tid, request.start_ns
         )
+        .into()
     } else {
-        request.trans_id.clone()
+        Arc::clone(&request.trans_id)
     }
 }
 
-fn request_spans(
-    key: String,
-    builder: RequestBuilder,
-    diagnostics: &mut TraceDiagnostics,
-    redact_object_names: bool,
-) -> Vec<SpanDocument> {
+/// A request span's bounds and how they were obtained. Computed by both the
+/// diagnostics tally (under the collector lock) and the renderer (outside it),
+/// so the two can never disagree.
+struct RequestBounds {
+    start_ns: u64,
+    end_ns: u64,
+    /// The MEASURED start: the get_handler marker's own clock read. `None` only
+    /// when the group has no marker at all (a `rados_bounds` reconstruction).
+    measured_start_ns: Option<u64>,
+    /// The measured end from the `req_state::~req_state` probe, when it fired.
+    measured_end_ns: Option<u64>,
+    duration_quality: DurationQuality,
+    /// The marker's thread ID is the late-derivation evidence for the
+    /// same_thread/cross_thread split. A group reconstructed purely from RADOS
+    /// bounds (no marker) has no thread evidence, so its `TransId` ops stay
+    /// `same_thread` -- cross_thread requires marker evidence (design §3).
+    marker_tid: Option<u32>,
+}
+
+fn request_bounds(builder: &RequestBuilder) -> RequestBounds {
     let request_start_ns = builder.request.as_ref().map(|request| request.start_ns);
     let rados_start_ns = builder.rados.iter().map(|rados| rados.event.sent_ns).min();
     let start_ns = request_start_ns
@@ -1089,7 +2101,6 @@ fn request_spans(
         .chain(rados_start_ns)
         .min()
         .unwrap_or_default();
-    // The measured end from the `req_state::~req_state` probe, when it fired.
     let measured_end_ns = builder.measured_end_ns;
     // Use the clamped child-span end (`finish_ns.max(sent_ns)`), not the raw
     // `finish_ns`. An inverted op whose `sent_ns` exceeds every `finish_ns` (and
@@ -1121,12 +2132,68 @@ fn request_spans(
         // precedes its start_ns): a span must never end before it starts, which
         // the JSON validator also enforces. Raw values are kept on the event.
         .max(start_ns);
+    RequestBounds {
+        start_ns,
+        end_ns,
+        measured_start_ns: request_start_ns,
+        measured_end_ns,
+        duration_quality: request_duration_quality(
+            request_start_ns,
+            measured_end_ns,
+            start_ns,
+            end_ns,
+        ),
+        marker_tid: builder.request.as_ref().map(|request| request.tid),
+    }
+}
+
+/// Count a request group into the run diagnostics: duration quality, and the
+/// late-derived same_thread/cross_thread split (Inferred was already counted at
+/// ingest), which keeps the invariant
+/// `correlated_rados_ops == same_thread + cross_thread + inferred`.
+fn tally_request(builder: &RequestBuilder, diagnostics: &mut TraceDiagnostics) {
+    let bounds = request_bounds(builder);
+    match bounds.duration_quality {
+        DurationQuality::Measured | DurationQuality::MeasuredExtended => {
+            diagnostics.measured_duration_requests += 1;
+        }
+        DurationQuality::Marker | DurationQuality::RadosBounds => {
+            diagnostics.derived_duration_requests += 1;
+        }
+    }
+    for rados in &builder.rados {
+        match resolve_correlation(rados.correlation, &rados.event, bounds.marker_tid) {
+            ResolvedCorrelation::SameThread => diagnostics.same_thread_correlations += 1,
+            ResolvedCorrelation::CrossThread => diagnostics.cross_thread_correlations += 1,
+            ResolvedCorrelation::Inferred => {}
+        }
+    }
+}
+
+fn request_spans(
+    key: &str,
+    builder: RequestBuilder,
+    diagnostics: &mut TraceDiagnostics,
+    redact_object_names: bool,
+) -> Vec<SpanDocument> {
+    tally_request(&builder, diagnostics);
+    render_request_spans(key, builder, redact_object_names)
+}
+
+/// Render a request group into its parent span plus one child span per RADOS
+/// op. Pure: all diagnostics are counted by [`tally_request`].
+fn render_request_spans(
+    key: &str,
+    builder: RequestBuilder,
+    redact_object_names: bool,
+) -> Vec<SpanDocument> {
+    let bounds = request_bounds(&builder);
     let trans_id = builder
         .request
         .as_ref()
-        .map(|request| request.trans_id.as_str())
+        .map(|request| &*request.trans_id)
         .filter(|trans_id| !trans_id.is_empty())
-        .unwrap_or(key.as_str());
+        .unwrap_or(key);
     let request_class = classify_request(
         trans_id,
         builder
@@ -1136,35 +2203,17 @@ fn request_spans(
     );
     let trace_id = trace_id(trans_id);
     let request_span_id = span_id(&format!("request:{trans_id}"));
-    // The MEASURED start: the get_handler marker's own clock read. `None` only
-    // when the group has no marker at all (a `rados_bounds` reconstruction).
-    let measured_start_ns = request_start_ns;
-    let duration_quality =
-        request_duration_quality(measured_start_ns, measured_end_ns, start_ns, end_ns);
-    match duration_quality {
-        DurationQuality::Measured | DurationQuality::MeasuredExtended => {
-            diagnostics.measured_duration_requests += 1;
-        }
-        DurationQuality::Marker | DurationQuality::RadosBounds => {
-            diagnostics.derived_duration_requests += 1;
-        }
-    }
-    // The marker's thread ID is the late-derivation evidence for the
-    // same_thread/cross_thread split. A group reconstructed purely from RADOS
-    // bounds (no marker) has no thread evidence, so its `TransId` ops stay
-    // `same_thread` -- cross_thread requires marker evidence (design §3).
-    let marker_tid = builder.request.as_ref().map(|request| request.tid);
 
     let mut attributes = vec![
         string_attr("rgw.trans_id", trans_id),
         string_attr("rgw.request_class", request_class_name(request_class)),
-        string_attr("rgw.duration_quality", duration_quality.name()),
+        string_attr("rgw.duration_quality", bounds.duration_quality.name()),
     ];
     // The request marker's thread. Paired with each child's `ceph.rados.send_tid`
     // this is the direct evidence of a coroutine migration (send_tid != tid) and
     // the only way to measure, from the exported trace alone, how much of the
     // correlation came from the same thread versus a bridge.
-    if let Some(tid) = marker_tid {
+    if let Some(tid) = bounds.marker_tid {
         attributes.push(u64_attr("rgw.request.tid", tid as u64));
     }
     // The untouched MEASURED interval, so a consumer can always recover the true
@@ -1172,34 +2221,27 @@ fn request_spans(
     // envelope an out-of-bounds child. Emitted per boundary, whenever that
     // boundary was actually measured: the start whenever a request marker exists
     // (get_handler's own clock read), the end whenever the END probe fired.
-    if let Some(measured) = measured_start_ns {
+    if let Some(measured) = bounds.measured_start_ns {
         attributes.push(u64_attr("rgw.request.measured_start_ns", measured));
     }
-    if let Some(measured) = measured_end_ns {
+    if let Some(measured) = bounds.measured_end_ns {
         attributes.push(u64_attr("rgw.request.measured_end_ns", measured));
     }
 
-    let mut spans = vec![SpanDocument {
+    let mut spans = Vec::with_capacity(1 + builder.rados.len());
+    spans.push(SpanDocument {
         trace_id: trace_id.clone(),
         span_id: request_span_id.clone(),
         parent_span_id: None,
         name: "rgw.request".to_string(),
-        start_ns,
-        end_ns,
+        start_ns: bounds.start_ns,
+        end_ns: bounds.end_ns,
         attributes,
         events: Vec::new(),
-    }];
+    });
 
     for rados in builder.rados {
-        let resolved = resolve_correlation(rados.correlation, &rados.event, marker_tid);
-        // Tally the late-derived split here (Inferred was already counted at
-        // ingest); this keeps the invariant
-        // `correlated_rados_ops == same_thread + cross_thread + inferred`.
-        match resolved {
-            ResolvedCorrelation::SameThread => diagnostics.same_thread_correlations += 1,
-            ResolvedCorrelation::CrossThread => diagnostics.cross_thread_correlations += 1,
-            ResolvedCorrelation::Inferred => {}
-        }
+        let resolved = resolve_correlation(rados.correlation, &rados.event, bounds.marker_tid);
         spans.push(rados_child_span(
             rados,
             resolved,
@@ -1322,15 +2364,19 @@ fn rados_attributes(
     } else {
         rados.object_name.clone()
     };
-    let ops = rados
-        .ops
-        .iter()
-        .map(|op| match (&op.class, &op.method) {
-            (Some(class), Some(method)) => format!("call({class}.{method})"),
-            _ => op.name.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Built in one buffer rather than a String per op joined afterwards.
+    let mut ops = String::new();
+    for op in &rados.ops {
+        if !ops.is_empty() {
+            ops.push(' ');
+        }
+        match (&op.class, &op.method) {
+            (Some(class), Some(method)) => {
+                let _ = write!(ops, "call({class}.{method})");
+            }
+            _ => ops.push_str(&op.name),
+        }
+    }
 
     let mut attributes = vec![
         u64_attr("ceph.rados.duration_ns", rados.duration_ns),
@@ -1641,9 +2687,118 @@ fn fnv1a64_with_seed(bytes: &[u8], seed: u64) -> u64 {
 }
 
 #[cfg(test)]
+mod hot_path_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::{CaptureTruncation, RadosDirection, RadosEvent, RadosOp, RequestEvent};
+
+    #[test]
+    fn pending_candidate_lookup_skips_ops_that_ended_before_request() {
+        let mut older = IntervalSet::<_, true>::default();
+        for id in 0..10_000 {
+            older.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+        }
+        assert!(!older.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            older.scanned.get() <= 64,
+            "visited {} older ops",
+            older.scanned.get()
+        );
+
+        let mut newer = IntervalSet::<_, true>::default();
+        for id in 0..10_000 {
+            newer.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id);
+        }
+        assert!(!newer.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            newer.scanned.get() <= 64,
+            "visited {} newer ops",
+            newer.scanned.get()
+        );
+
+        let mut mixed = IntervalSet::<_, true>::default();
+        for id in 0..10_000 {
+            mixed.insert(100 * 1_000_000_000, 170 * 1_000_000_000, id);
+            mixed.insert(190 * 1_000_000_000, 191 * 1_000_000_000, id + 10_000);
+        }
+        assert!(!mixed.any_overlapping(180 * 1_000_000_000, 181 * 1_000_000_000));
+        assert!(
+            mixed.scanned.get() <= 64,
+            "visited {} mixed ops",
+            mixed.scanned.get()
+        );
+    }
+
+    #[test]
+    fn ordinary_interval_indexes_do_not_allocate_overlap_nodes() {
+        let mut index: IntervalSet<u64> = IntervalSet::default();
+        index.insert(10, 20, 1);
+        assert!(index.overlap_root.is_none());
+        assert_eq!(
+            index.overlapping(15, 25, &0).copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        index.remove(10, 20, 1);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn interval_treap_matches_linear_overlap_oracle_across_updates() {
+        let mut index = IntervalSet::<_, true>::default();
+        let mut reference = Vec::<(u64, u64, u64)>::new();
+        for id in 0..32 {
+            let (lower, upper) = if id < 16 { (10, 20) } else { (100, 110) };
+            index.insert(lower, upper, id);
+            reference.push((lower, upper, id));
+        }
+        index.insert(u64::MAX - 5, u64::MAX, 32);
+        reference.push((u64::MAX - 5, u64::MAX, 32));
+        let mut duplicates = IntervalSet::<_, true>::default();
+        duplicates.insert(10, 20, 0);
+        duplicates.insert(10, 20, 0);
+        duplicates.insert(30, 40, 1);
+        duplicates.remove(10, 20, 0);
+        assert!(!duplicates.any_overlapping(10, 20));
+        assert!(duplicates.any_overlapping(30, 40));
+
+        let mut boundary = IntervalSet::<_, true>::default();
+        boundary.insert(10, 20, 1);
+        assert!(boundary.any_overlapping(20, 25));
+        assert!(!boundary.any_overlapping(21, 25));
+
+        let mut seed = 0x7a31_4c29_u64;
+        let mut next_key = 33;
+        for step in 0..2_000_u64 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            if step % 3 == 0 && !reference.is_empty() {
+                let slot = (seed as usize) % reference.len();
+                let (lower, upper, key) = reference.swap_remove(slot);
+                index.remove(lower, upper, key);
+            } else {
+                let lower = (seed >> 16) % 256;
+                let upper = lower + ((seed >> 40) % 32);
+                index.insert(lower, upper, next_key);
+                reference.push((lower, upper, next_key));
+                next_key += 1;
+            }
+
+            let query_lower = (seed >> 24) % 280;
+            let query_upper = query_lower + ((seed >> 48) % 24);
+            let expected = reference
+                .iter()
+                .any(|(lower, upper, _)| *lower <= query_upper && *upper >= query_lower);
+            assert_eq!(index.any_overlapping(query_lower, query_upper), expected);
+        }
+
+        index.insert(u64::MAX - 5, u64::MAX, 32);
+        assert!(index.any_overlapping(u64::MAX, u64::MAX));
+        index.remove(u64::MAX - 5, u64::MAX, 32);
+        assert!(!index.any_overlapping(u64::MAX, u64::MAX));
+        let saturated = CandidateSlot::of(&request("saturation", u64::MAX - 2, u64::MAX - 1), 10);
+        assert_eq!(saturated.upper_ns, u64::MAX);
+    }
 
     fn rados(object_name: &str, trans_id: &str) -> RadosEvent {
         RadosEvent {
@@ -1660,7 +2815,7 @@ mod tests {
             acting: vec![1, 2, 3],
             rw: RadosDirection::Read,
             object_name: object_name.to_string(),
-            trans_id: trans_id.to_string(),
+            trans_id: trans_id.into(),
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
@@ -2842,6 +3997,25 @@ mod tests {
         assert!(json.contains(&redacted_object_name("bucket/drained-object")));
     }
 
+    #[test]
+    fn detached_batches_snapshot_redaction_for_request_children() {
+        let mut collector = Collector::default();
+        collector.set_redact_object_names(true);
+        collector.push(start("tx-detached", 100));
+        let mut child = rados("bucket/detached-secret", "tx-detached");
+        child.sent_ns = 120;
+        child.finish_ns = 130;
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(end("tx-detached", 100, 200));
+        let batch = collector.drain_expired_batch(1_000, 100).unwrap();
+        collector.set_redact_object_names(false);
+        let document = batch.into_trace_document("rgwtrace");
+        let json = serde_json::to_string(&document).unwrap();
+        assert!(!json.contains("detached-secret"));
+        assert!(json.contains(&redacted_object_name("bucket/detached-secret")));
+        assert_eq!(document.spans.len(), 2);
+    }
+
     /// Off by default: the golden fixture (below) pins the raw names, and this
     /// pins the absence of the marker attribute.
     #[test]
@@ -2898,13 +4072,13 @@ mod tests {
         child.ops = vec![
             RadosOp {
                 code: 0x2202,
-                name: "writefull".to_string(),
+                name: "writefull".into(),
                 class: None,
                 method: None,
             },
             RadosOp {
                 code: 0x1401,
-                name: "call".to_string(),
+                name: "call".into(),
                 class: Some("cls".to_string()),
                 method: Some("method".to_string()),
             },
@@ -2917,7 +4091,7 @@ mod tests {
         background.duration_ns = 20;
         background.ops = vec![RadosOp {
             code: 0x1201,
-            name: "read".to_string(),
+            name: "read".into(),
             class: None,
             method: None,
         }];
@@ -3179,7 +4353,7 @@ mod tests {
             end_ns,
             pid: 42,
             tid,
-            trans_id: trans_id.to_string(),
+            trans_id: trans_id.into(),
             truncation: CaptureTruncation::default(),
         }
     }

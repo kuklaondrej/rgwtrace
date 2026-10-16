@@ -144,7 +144,11 @@ nothing). The single ring-buffer callback decodes each event and pushes it into
 the collector under one `Mutex` (`src/live/linux.rs:142-160`,
 `src/collector.rs:604`). At 20k req/s, k=10 that is `20000·12 = 240 000`
 records/s. At an assumed ~1 µs decode+push each → **~0.24 core** on the tracer
-process (separate from the traced process). This is a **single-threaded**
+process (separate from the traced process). Measured (release build, Apple M-series,
+`src/collector_bench.rs`): decode ~0.18 µs and decode+ingest of a tagged RADOS op
+~0.27 µs with 6.3 heap allocations, so the assumption is ~4x conservative. The
+periodic drain and `--correlate-inferred` markers no longer scale with resident
+state; see `docs/perf-collector-hot-path.md`. This is a **single-threaded**
 consumer behind a mutex; §3 shows why its throughput ceiling is the ring-buffer
 drop threshold.
 
@@ -286,8 +290,9 @@ BPF total ≈ **~32 MB**, dominated by the one LRU. (Current defaults: `rados_op
 16 MiB; total ≈ ~62 MB.) Userspace adds the **8 MiB
 Bloom filter** (`EMITTED_BLOOM_BITS = 1<<26`, allocated lazily on first insert,
 `src/collector.rs:32,:115-117`) plus the live `requests` `BTreeMap` (one
-`RequestBuilder` per in-flight request, `:129`) and the `pending_inference` `Vec`
-(`:130`, bounded by expiry `:780-789`). Floor is **~40 MB RSS** before any
+`RequestBuilder` per request until it expires -- END-closed requests after
+`--closed-request-grace`, 5 s by default, rather than the 120 s TTL) and the
+inference pending queue (capped by `--inference-max-pending`). Floor is **~40 MB RSS** before any
 in-flight state; the Bloom filter is fixed-size for the life of the run by design
 (no per-request growth, `ARCHITECTURE.md:108-112`).
 
