@@ -4,7 +4,6 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{bail, Context, Result};
@@ -249,7 +248,10 @@ fn common_library_paths(soname: &str) -> Vec<PathBuf> {
 }
 
 fn ldconfig_path(soname: &str) -> Option<PathBuf> {
-    let output = Command::new("ldconfig").arg("-p").output().ok()?;
+    let output = crate::host_tools::system_command(crate::host_tools::LDCONFIG)?
+        .arg("-p")
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -285,6 +287,7 @@ mod tests {
             import_json: Some("x.json".into()),
             dwarf_source: crate::cli::DwarfSource::Json,
             ceph_version: None,
+            max_debug_file_bytes: crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES,
             output: crate::cli::OutputMode::Json,
             otlp_endpoint: "http://localhost:4318/v1/traces".to_string(),
             otlp_header: Vec::new(),
