@@ -1057,6 +1057,7 @@ impl DwarfInfo {
     /// `_send_op` therefore refuses to stamp ANY op (fail-closed, Finding 4). That
     /// is a total correlation blackout and must be warned about at attach, not
     /// discovered from an empty trace.
+    #[cfg(target_os = "linux")]
     pub fn get_handler_req_state_is_register_resolvable(&self, module_basename: &str) -> bool {
         self.resolve_module(module_basename)
             .and_then(|module| module.func2vf.get(RGWREST_GET_HANDLER))

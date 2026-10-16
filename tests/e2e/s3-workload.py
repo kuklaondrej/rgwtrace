@@ -4,6 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import math
+import os
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -15,9 +18,17 @@ from botocore.config import Config
 def parse_args():
     parser = argparse.ArgumentParser(description="Drive deterministic S3 traffic for rgwtrace e2e")
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--access-key", required=True)
-    parser.add_argument("--secret-key", required=True)
+    # Credentials: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in the environment
+    # are preferred. The flags remain for compatibility, but a secret on argv is
+    # visible to every local user via /proc/<pid>/cmdline and ps.
+    parser.add_argument("--access-key", default=None,
+                        help="S3 access key (prefer the AWS_ACCESS_KEY_ID env var)")
+    parser.add_argument("--secret-key", default=None,
+                        help="S3 secret key (prefer the AWS_SECRET_ACCESS_KEY env var; argv is world-readable)")
     parser.add_argument("--bucket", default=None)
+    parser.add_argument("--bucket-shards", type=int, default=0,
+                        help="reshard the functional-test bucket before traffic (requires local RGW admin)")
+    parser.add_argument("--rgw-admin", default="radosgw-admin")
     parser.add_argument("--output", required=True, help="per-operation workload JSONL log")
     parser.add_argument(
         "--manifest",
@@ -87,7 +98,30 @@ def parse_args():
         help="benchmark mode: path to the JSON state file shared between "
         "--bench-phase prepare/run/cleanup (bucket name + seed keys)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    resolve_credentials(args)
+    return args
+
+
+def resolve_credentials(args):
+    """Fill args.access_key / args.secret_key from the environment when set.
+
+    The environment wins over argv so a wrapper that exports AWS_* cannot be
+    silently overridden by a stale flag, and so the secret stays off the
+    command line.
+    """
+    env_access = os.environ.get("AWS_ACCESS_KEY_ID")
+    env_secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if args.secret_key is not None:
+        print("warning: --secret-key passes the secret on argv (visible in ps); "
+              "set AWS_SECRET_ACCESS_KEY instead", file=sys.stderr)
+    if env_access:
+        args.access_key = env_access
+    if env_secret:
+        args.secret_key = env_secret
+    if not args.access_key or not args.secret_key:
+        raise SystemExit("S3 credentials missing: set AWS_ACCESS_KEY_ID and "
+                         "AWS_SECRET_ACCESS_KEY (or pass --access-key/--secret-key)")
 
 
 def request_id_from_response(response):
@@ -511,6 +545,17 @@ def main():
         recorder = Recorder(handle)
         try:
             run_op(recorder, "create_bucket", bucket, None, lambda: client.create_bucket(Bucket=bucket))
+
+            if args.bucket_shards:
+                if args.bucket_shards < 2:
+                    raise ValueError("--bucket-shards must be at least 2")
+                subprocess.run([args.rgw_admin, "bucket", "reshard", "--bucket", bucket,
+                                "--num-shards", str(args.bucket_shards), "--yes-i-really-mean-it"],
+                               check=True, capture_output=True, text=True)
+                stats = subprocess.run([args.rgw_admin, "bucket", "stats", "--bucket", bucket],
+                                       check=True, capture_output=True, text=True)
+                if json.loads(stats.stdout).get("num_shards") != args.bucket_shards:
+                    raise RuntimeError("RGW bucket shard count does not match the requested test fixture")
 
             run_op(
                 recorder,

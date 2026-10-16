@@ -81,3 +81,9 @@ cephtrace's `radostrace` implementation.
 
 Licensed **GPL-2.0-only**. See [NOTICE](NOTICE) for attribution and
 [LICENSE.GPL-2.0](LICENSE.GPL-2.0) for the full license.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test and review process,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and the
+[publication checklist](docs/publication-checklist.md) for administrator controls.
