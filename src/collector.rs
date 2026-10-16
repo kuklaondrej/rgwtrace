@@ -150,6 +150,12 @@ pub struct Collector {
     /// Whether the "tombstone filter past its design capacity" warning has fired.
     /// Once is enough: it is a property of the run, not of an event.
     emitted_capacity_warned: bool,
+    /// Replace every `ceph.rados.object` value with a stable hash of the name
+    /// (`--redact-object-names`). RADOS object names carry S3 keys, user and
+    /// tenant names and access-key ids; the default endpoint is plain http.
+    /// Applied where the attribute is rendered, so classification still sees
+    /// the raw name.
+    redact_object_names: bool,
 }
 
 #[derive(Debug, Default)]
@@ -355,6 +361,14 @@ pub struct TraceDiagnostics {
     pub bpf_ringbuf_rados_drops: u64,
     pub bpf_rados_map_drops: u64,
     pub bpf_rados_finish_misses: u64,
+    /// `rados_ops` entries the userspace sweep deleted because their `sent_ns`
+    /// was older than `--rados-ops-stale-after`: ops whose client exited (or
+    /// whose `_finish_op` was never probed) before completing, which would
+    /// otherwise hold a map slot for the rest of the run. An op that was merely
+    /// SLOW past the threshold and completes later shows up as a
+    /// `bpf_rados_finish_misses` and emits no event, so a nonzero count on a
+    /// healthy cluster means the threshold is too low.
+    pub stale_rados_ops_swept: u64,
     pub bpf_request_context_drops: u64,
     pub bpf_probe_read_failures: u64,
     pub bpf_reqstate_map_drops: u64,
@@ -740,6 +754,12 @@ impl Collector {
     /// Declare whether the `req_state::~req_state` END probe is attached for this
     /// run. Live tracing sets it from the actual attach outcome; everything else
     /// leaves it `false`, which preserves the pre-end-probe expiry behavior.
+    /// Opt in to hashing object names in the exported attributes. See the
+    /// `redact_object_names` field and [`redacted_object_name`].
+    pub fn set_redact_object_names(&mut self, redact: bool) {
+        self.redact_object_names = redact;
+    }
+
     pub fn set_end_probe_attached(&mut self, attached: bool) {
         self.end_probe_attached = attached;
     }
@@ -860,6 +880,11 @@ impl Collector {
         self.diagnostics.decode_errors += 1;
     }
 
+    pub fn record_stale_rados_ops_swept(&mut self, swept: u64) {
+        self.diagnostics.stale_rados_ops_swept =
+            self.diagnostics.stale_rados_ops_swept.saturating_add(swept);
+    }
+
     pub fn record_otlp_queue_drop(&mut self, spans: usize) {
         self.diagnostics.otlp_queue_dropped_traces += 1;
         self.diagnostics.otlp_queue_dropped_spans = self
@@ -963,7 +988,12 @@ impl Collector {
                     self.diagnostics.expired_open_requests += 1;
                 }
                 emitted_keys.push(key.clone());
-                spans.extend(request_spans(key, request, &mut self.diagnostics));
+                spans.extend(request_spans(
+                    key,
+                    request,
+                    &mut self.diagnostics,
+                    self.redact_object_names,
+                ));
             } else {
                 remaining_requests.insert(key, request);
             }
@@ -977,7 +1007,7 @@ impl Collector {
         for background in std::mem::take(&mut self.background) {
             if rados_event_time_ns(&background.event) <= cutoff_ns {
                 self.diagnostics.expired_background_rados_ops += 1;
-                spans.push(background_span(background));
+                spans.push(background_span(background, self.redact_object_names));
             } else {
                 remaining_background.push(background);
             }
@@ -1003,12 +1033,13 @@ impl Collector {
 
         let mut spans = Vec::new();
 
+        let redact = self.redact_object_names;
         for (key, request) in self.requests {
-            spans.extend(request_spans(key, request, &mut self.diagnostics));
+            spans.extend(request_spans(key, request, &mut self.diagnostics, redact));
         }
 
         for background in self.background {
-            spans.push(background_span(background));
+            spans.push(background_span(background, redact));
         }
         self.diagnostics.spans_produced = spans.len() as u64;
 
@@ -1049,6 +1080,7 @@ fn request_spans(
     key: String,
     builder: RequestBuilder,
     diagnostics: &mut TraceDiagnostics,
+    redact_object_names: bool,
 ) -> Vec<SpanDocument> {
     let request_start_ns = builder.request.as_ref().map(|request| request.start_ns);
     let rados_start_ns = builder.rados.iter().map(|rados| rados.event.sent_ns).min();
@@ -1173,6 +1205,7 @@ fn request_spans(
             resolved,
             trace_id.clone(),
             request_span_id.clone(),
+            redact_object_names,
         ));
     }
 
@@ -1197,7 +1230,7 @@ fn resolve_correlation(
     }
 }
 
-fn background_span(background: BackgroundRados) -> SpanDocument {
+fn background_span(background: BackgroundRados, redact_object_names: bool) -> SpanDocument {
     let rados = background.event;
     let start_ns = rados.sent_ns;
     // `_send_op` and `_finish_op` run on different worker threads, so
@@ -1211,7 +1244,12 @@ fn background_span(background: BackgroundRados) -> SpanDocument {
     // it keeps matching `end_ns`.
     let end_ns = rados_event_time_ns(&rados);
     let trace_key = format!("background:{}:{}:{}", rados.pid, rados.tid, rados.sent_ns);
-    let attributes = rados_attributes(&rados, "none", Some(background.reason.name()));
+    let attributes = rados_attributes(
+        &rados,
+        "none",
+        Some(background.reason.name()),
+        redact_object_names,
+    );
 
     SpanDocument {
         trace_id: trace_id(&trace_key),
@@ -1242,6 +1280,7 @@ fn rados_child_span(
     resolved: ResolvedCorrelation,
     trace_id: String,
     parent_span_id: String,
+    redact_object_names: bool,
 ) -> SpanDocument {
     let event = rados.event;
     let span_key = format!(
@@ -1258,7 +1297,12 @@ fn rados_child_span(
         // `background_span`); `end_ns - start_ns` then matches the
         // `ceph.rados.duration_ns` attribute (0 when timestamps invert).
         end_ns: rados_event_time_ns(&event),
-        attributes: rados_attributes(&event, resolved.name(), resolved.reason()),
+        attributes: rados_attributes(
+            &event,
+            resolved.name(),
+            resolved.reason(),
+            redact_object_names,
+        ),
         events: Vec::new(),
     }
 }
@@ -1267,8 +1311,17 @@ fn rados_attributes(
     rados: &RadosEvent,
     correlation: &'static str,
     correlation_reason: Option<&'static str>,
+    redact_object_names: bool,
 ) -> Vec<Attribute> {
+    // Classified on the RAW name, before any redaction: the role heuristics
+    // key on object-name prefixes, and the role is what makes a redacted trace
+    // still readable (`bucket_index` vs `data` vs `user_meta`).
     let role = classify_rados(rados);
+    let object_name = if redact_object_names {
+        redacted_object_name(&rados.object_name)
+    } else {
+        rados.object_name.clone()
+    };
     let ops = rados
         .ops
         .iter()
@@ -1292,7 +1345,7 @@ fn rados_attributes(
         u64_attr("ceph.rados.pg_seed", rados.pg_seed as u64),
         u64_attr("ceph.rados.target_osd", rados.target_osd as u64),
         string_attr("ceph.rados.acting", acting_set(&rados.acting)),
-        string_attr("ceph.rados.object", &rados.object_name),
+        string_attr("ceph.rados.object", object_name),
         string_attr("ceph.rados.ops", &ops),
         string_attr("ceph.rados.rw", format!("{:?}", rados.rw).to_lowercase()),
         u64_attr("ceph.rados.offset", rados.offset),
@@ -1303,11 +1356,28 @@ fn rados_attributes(
     if let Some(reason) = correlation_reason {
         attributes.push(string_attr("rgw.correlation_reason", reason));
     }
+    if redact_object_names {
+        // Names the redacted attribute, so a consumer can tell a hash from a
+        // name without guessing from its shape.
+        attributes.push(string_attr("rgwtrace.redacted", "ceph.rados.object"));
+    }
     let truncation = rados.truncation.names();
     if !truncation.is_empty() {
         attributes.push(string_attr("rgwtrace.truncated", truncation.join(",")));
     }
     attributes
+}
+
+/// The exported stand-in for an object name under `--redact-object-names`:
+/// the FNV-1a 64-bit hash of the name as 16 lowercase hex digits (the same
+/// [`fnv1a64`] the span ids use). Stable across runs and hosts, so the ops
+/// of one object still group together and can be joined with a hash computed
+/// elsewhere, while the key itself (an S3 object key, a `<uid>.buckets` user
+/// name, an access-key id) stays home. Not a secrecy primitive against a
+/// guessing attacker who knows the candidate names; it keeps names out of a
+/// backend that was never meant to hold them.
+fn redacted_object_name(name: &str) -> String {
+    format!("{:016x}", fnv1a64(name.as_bytes()))
 }
 
 fn record_truncation(
@@ -2580,6 +2650,24 @@ mod tests {
     }
 
     #[test]
+    fn records_swept_stale_rados_ops_cumulatively() {
+        // The sweep runs every few seconds; the counter is a run total, and a BPF
+        // diagnostics merge (which overwrites the bpf_* snapshot) must not reset it.
+        let mut collector = Collector::default();
+
+        collector.record_stale_rados_ops_swept(3);
+        collector.merge_bpf_diagnostics(BpfDiagnostics::default());
+        collector.record_stale_rados_ops_swept(4);
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.stale_rados_ops_swept, 7);
+        assert!(document
+            .diagnostics
+            .counters()
+            .contains(&("stale_rados_ops_swept".to_string(), 7)));
+    }
+
+    #[test]
     fn merges_bpf_diagnostics() {
         let mut collector = Collector::default();
 
@@ -2658,6 +2746,136 @@ mod tests {
                 .bpf_operate_unresolved_home_ctx_preserved,
             33
         );
+    }
+
+    /// FNV-1a 64 known answers (the published test vectors), so the exported
+    /// hash is the one a consumer can recompute.
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(redacted_object_name("a"), "af63dc4c8601ec8c");
+    }
+
+    /// `--redact-object-names`: every `ceph.rados.object` -- on correlated
+    /// children, on background spans AND on their `rados.op` event, in the
+    /// final document and in a periodic drain -- is the hash, the span says so
+    /// with `rgwtrace.redacted`, and the role is still classified from the raw
+    /// name.
+    #[test]
+    fn redacts_object_names_at_the_one_point_attributes_are_built() {
+        let mut collector = Collector::default();
+        collector.set_redact_object_names(true);
+        collector.push(start("tx-redact", 100));
+        let mut child = rados("bucket/customer-upload.jpg", "tx-redact");
+        child.sent_ns = 120;
+        child.finish_ns = 130;
+        collector.push(TraceEvent::RadosOp(child));
+        let mut index = rados(".dir.bucket-id.3", "");
+        index.sent_ns = 140;
+        index.finish_ns = 150;
+        collector.push(TraceEvent::RadosOp(index));
+        collector.push(end("tx-redact", 100, 200));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .expect("correlated child span");
+        assert_eq!(
+            attr(child, "ceph.rados.object"),
+            Some(redacted_object_name("bucket/customer-upload.jpg").as_str())
+        );
+        assert_eq!(attr(child, "rgwtrace.redacted"), Some("ceph.rados.object"));
+        assert_eq!(attr(child, "rgw.rados_role"), Some("data"));
+
+        let background = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rgw.background.rados_op")
+            .expect("background span");
+        let hashed = redacted_object_name(".dir.bucket-id.3");
+        assert_eq!(attr(background, "ceph.rados.object"), Some(hashed.as_str()));
+        assert_eq!(
+            attr(background, "rgwtrace.redacted"),
+            Some("ceph.rados.object")
+        );
+        // Classified from the RAW name, not the hash.
+        assert_eq!(attr(background, "rgw.rados_role"), Some("bucket_index"));
+        let event_object = background.events[0]
+            .attributes
+            .iter()
+            .find(|attribute| attribute.key == "ceph.rados.object")
+            .map(|attribute| &attribute.value);
+        assert!(
+            matches!(event_object, Some(AttributeValue::String(value)) if *value == hashed),
+            "the rados.op event carries the redacted name too: {event_object:?}"
+        );
+
+        // The raw names appear NOWHERE in the serialized document.
+        let json = serde_json::to_string(&document).unwrap();
+        assert!(!json.contains("customer-upload"), "{json}");
+        assert!(!json.contains(".dir.bucket-id"), "{json}");
+    }
+
+    /// The periodic-drain path renders through the same functions with the
+    /// same flag; a flag honored only by the final document would leak every
+    /// name a live `--output otlp` run exports.
+    #[test]
+    fn redaction_applies_to_periodic_drains() {
+        let mut collector = Collector::default();
+        collector.set_redact_object_names(true);
+        let mut background = rados("bucket/drained-object", "");
+        background.sent_ns = 10;
+        background.finish_ns = 20;
+        collector.push(TraceEvent::RadosOp(background));
+
+        let drained = collector
+            .drain_expired("rgwtrace", 1_000, 100)
+            .expect("the background op has expired");
+
+        let json = serde_json::to_string(&drained).unwrap();
+        assert!(!json.contains("drained-object"), "{json}");
+        assert!(json.contains(&redacted_object_name("bucket/drained-object")));
+    }
+
+    /// Off by default: the golden fixture (below) pins the raw names, and this
+    /// pins the absence of the marker attribute.
+    #[test]
+    fn object_names_are_exported_verbatim_by_default() {
+        let mut collector = Collector::default();
+        collector.push(start("tx-plain", 100));
+        let mut child = rados("bucket/plain-object", "tx-plain");
+        child.sent_ns = 120;
+        child.finish_ns = 130;
+        collector.push(TraceEvent::RadosOp(child));
+        collector.push(end("tx-plain", 100, 200));
+
+        let document = collector.into_trace_document("rgwtrace");
+
+        let child = document
+            .spans
+            .iter()
+            .find(|span| span.name == "rados.op")
+            .unwrap();
+        assert_eq!(
+            attr(child, "ceph.rados.object"),
+            Some("bucket/plain-object")
+        );
+        assert_eq!(attr(child, "rgwtrace.redacted"), None);
+    }
+
+    fn attr<'a>(span: &'a SpanDocument, key: &str) -> Option<&'a str> {
+        span.attributes
+            .iter()
+            .find(|attribute| attribute.key == key)
+            .and_then(|attribute| match &attribute.value {
+                AttributeValue::String(value) => Some(value.as_str()),
+                AttributeValue::U64(_) => None,
+            })
     }
 
     #[test]

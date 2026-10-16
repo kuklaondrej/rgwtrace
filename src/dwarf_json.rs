@@ -102,7 +102,87 @@ pub struct VarFieldKernel {
     pub varloc: VarLocationKernel,
     pub fields: [FieldKernel; 10],
     pub size: i32,
+    /// 1 for every descriptor built from an artifact. `hprobes` is a BPF ARRAY,
+    /// so the BPF side cannot tell an unpopulated slot from a populated one by
+    /// lookup alone; it trusts a slot only when this is set.
+    #[serde(skip)]
+    pub present: u32,
 }
+
+/// `sizeof(struct VarField)` in bpf/ceph_abi.h, which asserts the same number.
+pub const RGWTRACE_VAR_FIELD_SIZE: usize = 100;
+
+/// Number of `hprobes` ARRAY slots (bpf/ceph_abi.h). Every key is
+/// `function base id + var_field index`, so the highest base's var_fields must
+/// stay below this (enforced by `DwarfInfo::validate`).
+pub const RGWTRACE_HPROBE_SLOTS: i32 = 80;
+
+impl VarFieldKernel {
+    /// The exact bytes of `struct VarField`, written field by field into a
+    /// zeroed buffer. The struct has implicit padding after every `bool`, so
+    /// viewing it as `&[u8]` would read uninitialized bytes (undefined behavior)
+    /// and ship them to the kernel.
+    // Only the Linux runner writes hprobes; elsewhere this is exercised by tests.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn to_bytes(self) -> [u8; RGWTRACE_VAR_FIELD_SIZE] {
+        use std::mem::{offset_of, size_of};
+
+        fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+
+        let mut out = [0_u8; RGWTRACE_VAR_FIELD_SIZE];
+        let varloc = offset_of!(VarFieldKernel, varloc);
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, reg),
+            &self.varloc.reg.to_ne_bytes(),
+        );
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, offset),
+            &self.varloc.offset.to_ne_bytes(),
+        );
+        put(
+            &mut out,
+            varloc + offset_of!(VarLocationKernel, stack),
+            &[u8::from(self.varloc.stack)],
+        );
+        for (idx, field) in self.fields.iter().enumerate() {
+            let base = offset_of!(VarFieldKernel, fields) + idx * size_of::<FieldKernel>();
+            put(
+                &mut out,
+                base + offset_of!(FieldKernel, offset),
+                &field.offset.to_ne_bytes(),
+            );
+            put(
+                &mut out,
+                base + offset_of!(FieldKernel, pointer),
+                &[u8::from(field.pointer)],
+            );
+        }
+        put(
+            &mut out,
+            offset_of!(VarFieldKernel, size),
+            &self.size.to_ne_bytes(),
+        );
+        put(
+            &mut out,
+            offset_of!(VarFieldKernel, present),
+            &self.present.to_ne_bytes(),
+        );
+        out
+    }
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<VarFieldKernel>() == RGWTRACE_VAR_FIELD_SIZE);
+    assert!(offset_of!(VarFieldKernel, fields) == 12);
+    assert!(offset_of!(VarFieldKernel, size) == 92);
+    assert!(offset_of!(VarFieldKernel, present) == 96);
+};
 
 /// The request-START probe: the earliest site where the request's `trans_id` and
 /// its `req_state*` (the bridge's canonical key) are both available.
@@ -570,11 +650,6 @@ pub fn is_raw_pointer_descriptor(var_field: &VarFieldJson) -> bool {
         && !var_field.fields[0].pointer
 }
 
-/// Number of slots in the kernel `hprobes` map. Mirrors `max_entries, 8192` on
-/// the `hprobes` BPF_MAP_TYPE_HASH in `bpf/rgwtrace.bpf.c`. hprobe keys are
-/// `base_id + idx`, so the highest base's var_fields must stay below this.
-const HPROBES_MAP_CAPACITY: i32 = 8192;
-
 /// Maximum length of a nested field-deref chain per var_field. Bounded by the
 /// fixed kernel array `struct Field fields[10]` in `bpf/ceph_abi.h`, walked by
 /// `for (int i = 2; i < 10; i++)` in `fetch_var_member_addr` (bpf/bpf_utils.h).
@@ -655,7 +730,7 @@ impl DwarfInfo {
                     bail!(
                         "module {module_name} function {function}: {} var_fields exceed the \
                          {capacity} hprobe map slots reserved for it; keys (base_id + idx) would \
-                         spill into the next function's range or past the {HPROBES_MAP_CAPACITY}-entry map",
+                         spill into the next function's range or past the {RGWTRACE_HPROBE_SLOTS}-entry map",
                         vars.var_fields.len()
                     );
                 }
@@ -1253,6 +1328,7 @@ impl VarFieldJson {
             },
             fields,
             size: self.fields.len().min(MAX_VAR_FIELD_CHAIN) as i32,
+            present: 1,
         }
     }
 }
@@ -1282,7 +1358,7 @@ fn function_slot_capacity(function: &str) -> Option<usize> {
         .map(|(_, id)| *id)
         .filter(|id| *id > base)
         .min()
-        .unwrap_or(HPROBES_MAP_CAPACITY);
+        .unwrap_or(RGWTRACE_HPROBE_SLOTS);
     Some((next - base) as usize)
 }
 
@@ -1301,6 +1377,89 @@ fn arch_max_reg(arch: Option<&str>) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn var_field_kernel_bytes_follow_the_c_layout_with_zeroed_padding() {
+        let mut field = VarFieldKernel {
+            varloc: VarLocationKernel {
+                reg: 5,
+                offset: -8,
+                stack: true,
+            },
+            fields: [FieldKernel::default(); MAX_VAR_FIELD_CHAIN],
+            size: 3,
+            present: 0,
+        };
+        field.fields[1] = FieldKernel {
+            offset: 0x40,
+            pointer: true,
+        };
+        field.fields[9] = FieldKernel {
+            offset: 7,
+            pointer: false,
+        };
+
+        let bytes = field.to_bytes();
+
+        assert_eq!(bytes.len(), RGWTRACE_VAR_FIELD_SIZE);
+        let mut expected = [0_u8; RGWTRACE_VAR_FIELD_SIZE];
+        expected[0..4].copy_from_slice(&5_i32.to_ne_bytes());
+        expected[4..8].copy_from_slice(&(-8_i32).to_ne_bytes());
+        expected[8] = 1;
+        // struct Field fields[10] starts at 12, 8 bytes per {int offset; bool pointer;}.
+        expected[20..24].copy_from_slice(&0x40_i32.to_ne_bytes());
+        expected[24] = 1;
+        expected[84..88].copy_from_slice(&7_i32.to_ne_bytes());
+        expected[92..96].copy_from_slice(&3_i32.to_ne_bytes());
+        // Every padding byte (9..12 and 3 per Field) is zero, never uninitialized.
+        // `present` (offset 96) is 0 here: this value was not built by to_kernel.
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn hprobe_entries_fit_the_dense_array_and_are_marked_present() {
+        // hprobes is a BPF ARRAY: an unpopulated in-range slot still LOOKS UP (as
+        // all zeroes), so a slot is only trusted when `present` is set, and every
+        // key must be a dense index below RGWTRACE_HPROBE_SLOTS.
+        let send = (0..12)
+            .map(|reg| var_field_json(reg % 16, 0, 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw_pointer = r#"{"location": {"reg": 5, "offset": 0, "stack": false}, "fields": [{"offset": 0, "pointer": false}]}"#;
+        let json = format!(
+            r#"{{"version": "v", "arch": "amd64", "libceph-common.so.2": {{"build_id": "abc",
+               "func2vf": {{"Objecter::_send_op": {{"var_fields": [{send}]}},
+                            "{RGW_RADOS_OPERATE_WRITE}": {{"var_fields": [{raw_pointer}]}}}}}}}}"#
+        );
+        let info = DwarfInfo::from_str(&json).unwrap();
+        let entries = info.hprobe_entries();
+        assert_eq!(entries.len(), 13);
+        for entry in &entries {
+            assert!(
+                (0..RGWTRACE_HPROBE_SLOTS).contains(&entry.key),
+                "key {}",
+                entry.key
+            );
+            assert_eq!(entry.field.present, 1);
+            assert_eq!(entry.field.to_bytes()[96..100], 1_u32.to_ne_bytes());
+        }
+        assert_eq!(
+            entries.iter().map(|entry| entry.key).max(),
+            Some(70),
+            "rgw_rados_operate(write) is the highest slot"
+        );
+    }
+
+    #[test]
+    fn every_function_slot_range_ends_inside_the_hprobes_array() {
+        // validate() bounds each function's var_fields by its slot range, so as
+        // long as every range ends at or before RGWTRACE_HPROBE_SLOTS no accepted
+        // artifact can produce a key the ARRAY cannot hold.
+        for (function, base) in FUNCTION_BASE_IDS {
+            let capacity = function_slot_capacity(function).unwrap() as i32;
+            assert!(base + capacity <= RGWTRACE_HPROBE_SLOTS, "{function}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1402,11 +1561,9 @@ mod tests {
         assert_eq!(function_slot_capacity(REQ_STATE_DTOR), Some(10));
         // req_state::~req_state base 50 -> rgw_rados_operate(read) base 60 => 10.
         assert_eq!(function_slot_capacity(RGW_RADOS_OPERATE_READ), Some(10));
-        // Highest base (rgw_rados_operate(write), 70) extends to the map capacity.
-        assert_eq!(
-            function_slot_capacity(RGW_RADOS_OPERATE_WRITE),
-            Some((HPROBES_MAP_CAPACITY - 70) as usize)
-        );
+        // Highest base (rgw_rados_operate(write), 70) extends to the end of the
+        // dense hprobes ARRAY: 80 slots, so 10.
+        assert_eq!(function_slot_capacity(RGW_RADOS_OPERATE_WRITE), Some(10));
         assert_eq!(function_slot_capacity("Unknown::function"), None);
     }
 

@@ -38,6 +38,10 @@ superseded by later sections in the same document.
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
+  redaction, header sources, client reuse, private CAs, and object-name redaction.
+- [OTLP header pipe handling](bugfix-otlp-header-pipe.md): reject named pipes
+  without blocking during startup.
 - [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
   bounds reference chains, nesting, file reads and decompression, and never
   guesses a container's Ceph version.
@@ -48,6 +52,11 @@ superseded by later sections in the same document.
   paths stay inside the container.
 - [PID-root library discovery](bugfix-pid-root-library-discovery.md): why a
   missing target library must not fall back to a host copy.
+- [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
+  decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
+  and SIGTERM / target-exit handling.
+- [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
+  superseding submit from map capacity or other restore errors.
 
 - [Private privileged-test lab](lab/README.md)
 - [Publication controls](publication-checklist.md)
@@ -55,3 +64,5 @@ superseded by later sections in the same document.
 - [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
   why the privileged helper scripts use private directories, generated keys
   and pinned downloads.
+
+- [Stale sweep cooldown](bugfix-stale-sweep-cooldown.md): bounded scan cycles yield CPU between cycles.
