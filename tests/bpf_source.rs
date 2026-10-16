@@ -289,7 +289,7 @@ fn every_uprobe_attaches_at_a_validated_file_offset_never_a_raw_vaddr() {
     // preflight validated (`ProbeSites::file_offset`), never translate or pass a
     // raw address itself.
     assert!(LIVE_LINUX
-        .contains("let probe_sites = preflight::validated_probe_sites(dwarf, &targets)?;"));
+        .contains("let probe_sites = preflight::validated_probe_sites(dwarf, &targets, cli.max_debug_file_bytes)?;"));
     assert!(!LIVE_LINUX.contains("addr as usize"));
     let attach_calls = LIVE_LINUX.matches("attach_uprobe(").count()
         - LIVE_LINUX.matches("bpf_program__attach_uprobe(").count();
