@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, io::Write, thread, time::Duration};
+use std::{error::Error as StdError, io::Write, path::Path, thread, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use flate2::{write::GzEncoder, Compression as GzipCompression};
@@ -17,7 +17,7 @@ use reqwest::{
 use tracing::{debug, info, warn};
 
 use crate::{
-    cli::OtlpCompression,
+    cli::{Cli, OtlpCompression},
     collector::{
         span_id, trace_id, Attribute, AttributeValue, SpanDocument, SpanEvent, TraceDiagnostics,
         TraceDocument,
@@ -26,21 +26,111 @@ use crate::{
 
 const OTLP_PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ExportDiagnostics {
     pub batches: u64,
     pub attempts: u64,
+    /// Failed ATTEMPTS, including ones a retry recovered from.
     pub failures: u64,
+    /// Batches that were never delivered (retries exhausted, a non-retryable
+    /// response, or abandoned after an earlier batch exhausted its retries).
+    pub failed_batches: u64,
+    /// Real spans (not the synthetic run summary) in those batches: LOST.
+    pub failed_spans: u64,
+    /// The error that lost the most recent failed batch, for the log.
+    pub last_error: Option<String>,
+}
+
+/// The HTTP half of an exporter: the reqwest client (connection pool, TLS
+/// configuration, timeout, redirect policy) and the operator's headers, built
+/// ONCE and reused for every document and batch the exporter sends.
+///
+/// It used to be built per exported document. Each build is a new connection
+/// pool, so every periodic drain paid a TCP connect and, over https, a full TLS
+/// handshake, and an operator's misconfigured header or CA file surfaced only
+/// when the first export ran -- after DWARF extraction and probe attach. Now
+/// one client lives as long as its exporter, and the configuration is
+/// validated when the client is built, at startup.
+#[derive(Clone, Debug)]
+pub struct ExportClient {
+    client: Client,
+    /// The operator's headers, validated as HTTP header names/values. Per
+    /// request, `Content-Type` and (when compressing) `Content-Encoding` are
+    /// added on a copy.
+    headers: HeaderMap,
+    /// The header VALUES, kept so that anything the far end echoes back -- a
+    /// proxy that repeats the request's `Authorization` in its error page --
+    /// can be scrubbed out of the error text before it is logged.
+    secret_values: Vec<String>,
+    timeout: Duration,
+}
+
+impl ExportClient {
+    /// The client for a `--output otlp` run, from the CLI: the headers from
+    /// every source (`crate::otlp_headers`) and the optional `--otlp-ca-cert`
+    /// PEM bundle. Reads the files and environment they name, so a missing,
+    /// malformed or exposed one fails here, at startup.
+    pub fn from_cli(cli: &Cli) -> Result<Self> {
+        let headers = crate::otlp_headers::load(cli)?;
+        let ca_cert_pem = cli
+            .otlp_ca_cert
+            .as_deref()
+            .map(read_ca_cert_file)
+            .transpose()?;
+        Self::new(cli.otlp_timeout, &headers, ca_cert_pem.as_deref())
+    }
+
+    /// Build the client. `ca_cert_pem` is a PEM bundle of extra root
+    /// certificates to trust, for collectors behind a private PKI; the bundled
+    /// web roots stay trusted alongside it.
+    pub fn new(
+        timeout: Duration,
+        headers: &[(String, String)],
+        ca_cert_pem: Option<&[u8]>,
+    ) -> Result<Self> {
+        let secret_values = headers.iter().map(|(_, value)| value.clone()).collect();
+        let headers = validated_headers(headers)?;
+        let mut builder = Client::builder()
+            .timeout(timeout)
+            // Never follow a redirect. reqwest's default (up to ten) would re-send
+            // the request -- the operator's auth headers AND the trace body -- to
+            // whatever host `Location` names, including an https -> http
+            // downgrade. A moved collector is an `--otlp-endpoint` change, made
+            // by the operator; see `send_once` for the error a 3xx turns into.
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = ca_cert_pem {
+            let certificates = reqwest::Certificate::from_pem_bundle(pem)
+                .context("OTLP CA certificate is not a PEM certificate bundle")?;
+            if certificates.is_empty() {
+                bail!("OTLP CA certificate file contains no PEM certificate");
+            }
+            for certificate in certificates {
+                builder = builder.add_root_certificate(certificate);
+            }
+        }
+        let client = builder
+            .build()
+            .context("failed to build OTLP HTTP client")?;
+        Ok(Self {
+            client,
+            headers,
+            secret_values,
+            timeout,
+        })
+    }
+}
+
+fn read_ca_cert_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("failed to read --otlp-ca-cert {}", path.display()))
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExportConfig<'a> {
     pub endpoint: &'a str,
-    pub headers: &'a [(String, String)],
+    pub client: &'a ExportClient,
     pub compression: OtlpCompression,
     pub max_spans_per_batch: usize,
     pub max_bytes_per_batch: usize,
-    pub timeout: Duration,
     pub retries: u32,
     /// Opt-in: carry the run-summary counters into the OTLP stream.
     ///
@@ -57,7 +147,14 @@ pub struct ExportConfig<'a> {
 /// One periodic drain of expired spans, mid-run. Sends nothing when the drain is
 /// empty; the run summary rides along on the resource of whatever batches it does
 /// send, and is superseded by the final export.
-#[allow(dead_code)] // Called by the Linux-only live exporter.
+///
+/// A batch that cannot be delivered does NOT make this return `Err`: the batch is
+/// counted in `failed_batches`/`failed_spans` and the caller keeps exporting later
+/// drains. `Err` is reserved for failures to even build the request (an invalid
+/// endpoint, a span that cannot be encoded), which lose the whole document --
+/// the caller counts that too. See [`export`] for which failures move on to the
+/// next batch and which abandon the rest of the document.
+#[cfg(any(target_os = "linux", test))]
 pub fn export_otlp_http(
     config: ExportConfig<'_>,
     document: &TraceDocument,
@@ -105,7 +202,7 @@ pub fn export_final_otlp_http(
 /// Which export a call is: a mid-run drain, or the run's last word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Export {
-    #[allow(dead_code)] // Used by the Linux-only live exporter.
+    #[cfg(any(target_os = "linux", test))]
     Periodic,
     Final,
 }
@@ -115,18 +212,26 @@ fn export(
     document: &TraceDocument,
     kind: Export,
 ) -> Result<ExportDiagnostics> {
-    validate_otlp_endpoint(config.endpoint)?;
+    let endpoint = validate_otlp_endpoint(config.endpoint)?;
+    // The only form of the endpoint that reaches a log line.
+    let logged_endpoint = redact_url(&endpoint);
     if config.max_spans_per_batch == 0 {
         bail!("OTLP max spans per batch must be at least 1");
     }
 
     let resource_attributes = resource_attributes(document, config.diagnostics);
-    let mut batches = otlp_batches(
+    let mut batches: Vec<(Vec<Span>, usize)> = otlp_batches(
         document,
         config.max_spans_per_batch,
         config.max_bytes_per_batch,
         config.diagnostics,
-    )?;
+    )?
+    .into_iter()
+    .map(|batch| {
+        let real_spans = batch.len();
+        (batch, real_spans)
+    })
+    .collect();
     if kind == Export::Final && config.diagnostics {
         // Its OWN batch, appended last: it is therefore the final batch on the
         // wire (so a consumer reading "the last batch's resource" reads the final
@@ -138,24 +243,32 @@ fn export(
         // diagnostics off there is nothing to deliver, so an empty final drain
         // sends nothing -- the pre-diagnostics behavior -- and a non-empty final
         // drain still exports its spans below.
-        batches.push(vec![run_summary_span(document)?]);
+        batches.push((vec![run_summary_span(document)?], 0));
     }
-    let client = Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .context("failed to build OTLP HTTP client")?;
-
     let max_attempts = config.retries.saturating_add(1);
     let batch_count = batches.len();
     let mut diagnostics = ExportDiagnostics {
         batches: batch_count as u64,
         ..ExportDiagnostics::default()
     };
-    for (batch_idx, batch) in batches.into_iter().enumerate() {
+    // FAILURE POLICY, per batch (none of it stops the exporter -- see
+    // `export_otlp_http`):
+    //
+    // * a NON-RETRYABLE response (a 4xx other than 429: bad auth, wrong path, a
+    //   payload the collector refuses) is about THIS batch, and the endpoint
+    //   answered promptly, so the batch is counted lost and the next batch is
+    //   tried;
+    // * RETRIES EXHAUSTED (connection refused, timeouts, 5xx, 429) means the
+    //   endpoint is unhealthy right now, so the rest of this document is counted
+    //   lost without being tried -- otherwise one drain of N batches would block
+    //   the exporter for N x (retries + 1) x timeout while drains pile up behind
+    //   it. The next drain starts fresh and recovers as soon as the endpoint does.
+    let mut batches = batches.into_iter().enumerate();
+    while let Some((batch_idx, (batch, real_spans))) = batches.next() {
         let span_count = batch.len();
         let protobuf_body = spans_to_otlp_protobuf(&resource_attributes, batch);
         let body = encode_body(protobuf_body, config.compression)?;
-        let headers = otlp_headers(config.headers, body.content_encoding)?;
+        let headers = request_headers(&config.client.headers, body.content_encoding);
         for attempt in 1..=max_attempts {
             diagnostics.attempts += 1;
             debug!(
@@ -163,8 +276,8 @@ fn export(
                 max_attempts,
                 batch = batch_idx + 1,
                 batches = batch_count,
-                endpoint = config.endpoint,
-                timeout_ms = config.timeout.as_millis(),
+                endpoint = %logged_endpoint,
+                timeout_ms = config.client.timeout.as_millis(),
                 spans = span_count,
                 body_bytes = body.bytes.len(),
                 uncompressed_body_bytes = body.uncompressed_len,
@@ -172,8 +285,8 @@ fn export(
                 "exporting OTLP traces"
             );
             match send_once(
-                &client,
-                config.endpoint,
+                config.client,
+                &endpoint,
                 headers.clone(),
                 body.bytes.clone(),
             ) {
@@ -194,16 +307,35 @@ fn export(
                 }
                 Err(err) => {
                     diagnostics.failures += 1;
-                    bail!(
-                        "{}; export batches: {}, export attempts: {}, export failures: {}",
-                        err.message,
-                        diagnostics.batches,
-                        diagnostics.attempts,
-                        diagnostics.failures
-                    )
+                    diagnostics.failed_batches += 1;
+                    diagnostics.failed_spans += real_spans as u64;
+                    if err.retryable {
+                        for (_, (_, abandoned_spans)) in batches.by_ref() {
+                            diagnostics.failed_batches += 1;
+                            diagnostics.failed_spans += abandoned_spans as u64;
+                        }
+                    }
+                    diagnostics.last_error = Some(err.message);
+                    break;
                 }
             }
         }
+    }
+
+    if kind == Export::Final && diagnostics.failed_batches > 0 {
+        // The final export keeps failing loudly: its caller dumps the whole trace
+        // to stdout instead, so nothing here is lost.
+        bail!(
+            "{}; export batches: {}, export attempts: {}, export failures: {}, failed batches: {}",
+            diagnostics
+                .last_error
+                .as_deref()
+                .unwrap_or("OTLP export failed"),
+            diagnostics.batches,
+            diagnostics.attempts,
+            diagnostics.failures,
+            diagnostics.failed_batches
+        );
     }
 
     Ok(diagnostics)
@@ -357,20 +489,27 @@ fn spans_to_otlp_protobuf(resource_attributes: &[KeyValue], spans: Vec<Span>) ->
 }
 
 fn send_once(
-    client: &Client,
-    endpoint: &str,
+    client: &ExportClient,
+    endpoint: &Url,
     headers: HeaderMap,
     body: Vec<u8>,
 ) -> Result<(), ExportError> {
+    // Everything that originates on the far end or in reqwest -- never our own
+    // words -- passes through this before it can reach a log line.
+    let scrub = |text: String| {
+        scrub_header_values(scrub_url_secrets(text, endpoint), &client.secret_values)
+    };
     let response = client
-        .post(endpoint)
+        .client
+        .post(endpoint.clone())
         .headers(headers)
         .body(body)
         .send()
         .map_err(|err| {
             ExportError::retryable(format!(
-                "failed to send OTLP request to {endpoint}: {}",
-                error_chain(&err)
+                "failed to send OTLP request to {}: {}",
+                redact_url(endpoint),
+                scrub(error_chain(&err))
             ))
         })?;
     let status = response.status();
@@ -379,15 +518,119 @@ fn send_once(
         return Ok(());
     }
 
-    let body = response
-        .text()
-        .unwrap_or_else(|err| format!("failed to read response body: {err}"));
+    if status.is_redirection() {
+        // Fatal, not retried: the same endpoint answers the same way again, and
+        // following it ourselves is exactly what the no-redirect client policy
+        // exists to prevent (credentials and payload re-sent to another host).
+        return Err(ExportError::fatal(format!(
+            "OTLP endpoint returned {status}: redirects are not followed because they would \
+             re-send the configured headers and the trace body to another location; point \
+             --otlp-endpoint at the final URL"
+        )));
+    }
+
+    // The body is the collector's (or an intermediary's) to write, and some
+    // echo the request they rejected -- URL, query string, auth header and all.
+    let body = scrub(read_error_body(response));
     let message = format!("OTLP endpoint returned {status}: {body}");
     if is_retryable_status(status) {
         Err(ExportError::retryable(message))
     } else {
         Err(ExportError::fatal(message))
     }
+}
+
+/// How much of an error response body is kept for the log. A collector's error
+/// page is a sentence; anything longer is an HTML error page or a proxy's
+/// splash, and this message is repeated on every retry.
+const ERROR_BODY_EXCERPT_BYTES: usize = 1024;
+
+/// The error response body as a log-safe excerpt. Reads at most one byte past
+/// the excerpt limit off the socket -- enough to know the body was longer --
+/// so a misconfigured endpoint that answers with megabytes of HTML costs
+/// neither memory nor a verbatim dump of itself on every attempt.
+fn read_error_body(response: reqwest::blocking::Response) -> String {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    match response
+        .take(ERROR_BODY_EXCERPT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        Ok(_) => body_excerpt(&bytes),
+        Err(err) => format!("failed to read response body: {err}"),
+    }
+}
+
+/// `bytes` as a bounded, single-line-safe string: lossily decoded, cut to
+/// [`ERROR_BODY_EXCERPT_BYTES`] on a character boundary, control characters
+/// (newlines, escape sequences a hostile body could use to forge log lines)
+/// rendered as escapes, and a marker saying how much was dropped.
+fn body_excerpt(bytes: &[u8]) -> String {
+    let truncated = bytes.len() > ERROR_BODY_EXCERPT_BYTES;
+    let kept = &bytes[..bytes.len().min(ERROR_BODY_EXCERPT_BYTES)];
+    let text = String::from_utf8_lossy(kept);
+    let mut excerpt = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            excerpt.extend(ch.escape_default());
+        } else {
+            excerpt.push(ch);
+        }
+    }
+    if truncated {
+        // Only the excerpt was read, so the real length is unknown; say so
+        // rather than inventing a byte count.
+        excerpt.push_str(" [truncated]");
+    }
+    excerpt
+}
+
+/// Remove every form of `url`'s secrets from `text`, an error chain that was
+/// not written by us. reqwest's Display appends ` for url (<url>)` with the
+/// userinfo already stripped but the query string intact, and a future version
+/// may print it differently again, so this does not depend on one rendering:
+/// it replaces the URL as given and as reqwest renders it, then the query
+/// string and the password on their own wherever they occur.
+fn scrub_url_secrets(text: String, url: &Url) -> String {
+    let redacted = redact_url(url);
+    let mut without_userinfo = url.clone();
+    let _ = without_userinfo.set_password(None);
+    let _ = without_userinfo.set_username("");
+    let mut text = text
+        .replace(url.as_str(), &redacted)
+        .replace(without_userinfo.as_str(), &redacted);
+    if let Some(query) = url.query().filter(|query| !query.is_empty()) {
+        text = text.replace(&format!("?{query}"), "");
+    }
+    if let Some(password) = url.password().filter(|password| !password.is_empty()) {
+        text = text.replace(password, "<redacted>");
+    }
+    text
+}
+
+/// Replace every configured header value found in `text` with a marker. The
+/// values are the credentials; an error page that echoes the request's headers
+/// would otherwise carry them into the log on every retry.
+fn scrub_header_values(mut text: String, values: &[String]) -> String {
+    for value in values.iter().filter(|value| !value.is_empty()) {
+        text = text.replace(value.as_str(), "<redacted>");
+    }
+    text
+}
+
+/// `url` as it may appear in a log line or an error: scheme, host, port and
+/// path only. Userinfo (`user:pass@`) and the query string are where
+/// credentials live when an operator puts them in the endpoint URL
+/// (`?api-key=...`), and the endpoint is logged on every export attempt.
+fn redact_url(url: &Url) -> String {
+    let mut redacted = url.clone();
+    // Both setters only fail for cannot-be-a-base URLs; the endpoint is
+    // validated to be http(s), which can always carry (and drop) userinfo.
+    let _ = redacted.set_password(None);
+    let _ = redacted.set_username("");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 fn span_to_otlp(span: &SpanDocument) -> Result<Span> {
@@ -454,10 +697,9 @@ fn string_key_value(key: &str, value: &str) -> KeyValue {
     }
 }
 
-fn otlp_headers(
-    headers: &[(String, String)],
-    content_encoding: Option<&'static str>,
-) -> Result<HeaderMap> {
+/// The operator's headers as a validated `HeaderMap`. The error names the
+/// header, never its value: values are where the secrets are.
+fn validated_headers(headers: &[(String, String)]) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes())
@@ -466,6 +708,13 @@ fn otlp_headers(
             .with_context(|| format!("invalid OTLP header value for {name}"))?;
         map.insert(name, value);
     }
+    Ok(map)
+}
+
+/// The headers of one request: the operator's, plus the content headers the
+/// body's encoding dictates.
+fn request_headers(base: &HeaderMap, content_encoding: Option<&'static str>) -> HeaderMap {
+    let mut map = base.clone();
     map.insert(
         CONTENT_TYPE,
         HeaderValue::from_static(OTLP_PROTOBUF_CONTENT_TYPE),
@@ -473,7 +722,7 @@ fn otlp_headers(
     if let Some(content_encoding) = content_encoding {
         map.insert(CONTENT_ENCODING, HeaderValue::from_static(content_encoding));
     }
-    Ok(map)
+    map
 }
 
 fn encode_body(bytes: Vec<u8>, compression: OtlpCompression) -> Result<EncodedBody> {
@@ -615,11 +864,14 @@ struct EncodedBody {
     uncompressed_len: usize,
 }
 
-fn validate_otlp_endpoint(endpoint: &str) -> Result<()> {
+/// Parse and check the endpoint. The error for an unparseable endpoint quotes
+/// it verbatim: nothing has been redacted yet because nothing could be parsed,
+/// and the operator who typed it needs to see what was wrong with it.
+fn validate_otlp_endpoint(endpoint: &str) -> Result<Url> {
     let url =
         Url::parse(endpoint).with_context(|| format!("invalid OTLP endpoint {endpoint:?}"))?;
     match url.scheme() {
-        "http" | "https" => Ok(()),
+        "http" | "https" => Ok(url),
         scheme => bail!("unsupported OTLP endpoint scheme {scheme:?}; use http:// or https://"),
     }
 }
@@ -988,13 +1240,76 @@ mod tests {
 
     #[test]
     fn sets_otlp_content_headers() {
-        let headers = otlp_headers(&[], Some("gzip")).unwrap();
+        let base =
+            validated_headers(&[("X-Scope-OrgID".to_string(), "tenant".to_string())]).unwrap();
+        let headers = request_headers(&base, Some("gzip"));
 
         assert_eq!(
             headers.get(CONTENT_TYPE).unwrap(),
             OTLP_PROTOBUF_CONTENT_TYPE
         );
         assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+        assert_eq!(headers.get("x-scope-orgid").unwrap(), "tenant");
+        assert!(
+            base.get(CONTENT_TYPE).is_none(),
+            "the base map is not mutated"
+        );
+    }
+
+    /// Configuration errors surface when the client is BUILT (at startup), not
+    /// on the first export minutes later.
+    #[test]
+    fn export_client_validates_headers_when_built() {
+        let err = ExportClient::new(
+            Duration::from_secs(1),
+            &[("not a header".to_string(), "x".to_string())],
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid OTLP header name"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn export_client_rejects_a_bad_ca_certificate() {
+        let err = ExportClient::new(Duration::from_secs(1), &[], Some(b"not a pem")).unwrap_err();
+        assert!(err.to_string().contains("PEM"), "{err:#}");
+
+        // A PEM file with no CERTIFICATE block is just as wrong: the operator
+        // pointed the flag at a key or an empty file.
+        let err = ExportClient::new(Duration::from_secs(1), &[], Some(b"")).unwrap_err();
+        assert!(err.to_string().contains("PEM"), "{err:#}");
+    }
+
+    #[test]
+    fn export_client_accepts_a_pem_ca_certificate() {
+        let pem = include_bytes!("../tests/fixtures/otlp_test_ca.pem");
+        ExportClient::new(Duration::from_secs(1), &[], Some(pem)).unwrap();
+    }
+
+    /// ONE connection pool per exporter. Two documents exported through the same
+    /// client reuse the same keep-alive connection; a client built per document
+    /// (the old shape) would open a second connection -- and, over https, pay a
+    /// second TLS handshake -- for every periodic drain.
+    #[test]
+    fn one_client_is_reused_across_documents() {
+        let (endpoint, handle) = spawn_keepalive_mock_server(2);
+        let client = ExportClient::new(Duration::from_secs(5), &[], None).unwrap();
+        let config = ExportConfig {
+            client: &client,
+            ..export_config(&endpoint, 0)
+        };
+
+        export_otlp_http(config, &trace_document(1)).unwrap();
+        export_otlp_http(config, &trace_document(1)).unwrap();
+
+        assert_eq!(
+            handle.join().unwrap().len(),
+            2,
+            "both documents must arrive on the ONE accepted connection"
+        );
     }
 
     #[test]
@@ -1189,10 +1504,10 @@ mod tests {
         trace.diagnostics.bpf_operate_seed_hits_rgwop = 7;
         trace.diagnostics.rados_ops = 128;
         assert!(trace.spans.is_empty(), "this is the empty-final-trace case");
-        let document = serde_json::json!({ "trace": &trace });
+        let dwarf = crate::dwarf_json::DwarfInfo::default().summary();
         let mut out = Vec::new();
 
-        crate::export_trace_otlp(export_config(&endpoint, 2), &trace, &document, &mut out).unwrap();
+        crate::export_trace_otlp(export_config(&endpoint, 2), &dwarf, &trace, &mut out).unwrap();
 
         let bodies = handle.join().unwrap();
         assert_eq!(
@@ -1441,34 +1756,412 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_non_retryable_otlp_error() {
+    fn a_non_retryable_periodic_failure_is_counted_not_fatal() {
+        // REGRESSION (F15): a failed batch used to be an `Err` that ended the
+        // exporter thread, so one bad response disabled OTLP export for the rest
+        // of the run and lost the spans uncounted. It is now counted and returned
+        // as data; the caller keeps exporting.
         let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
         let document = trace_document(1);
 
-        let err = export_otlp_http(export_config(&endpoint, 3), &document).unwrap_err();
+        let export = export_otlp_http(export_config(&endpoint, 3), &document)
+            .expect("an undeliverable batch must not fail the periodic export");
 
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1);
         assert!(
-            err.to_string().contains("400"),
-            "error should surface status: {err}"
+            export.last_error.as_deref().unwrap().contains("400"),
+            "the failure must surface the status: {:?}",
+            export.last_error
         );
         assert_eq!(handle.join().unwrap().len(), 1, "must not retry a 4xx");
     }
 
     #[test]
-    fn surfaces_exhausted_retries_otlp_error() {
+    fn exhausted_retries_are_counted_not_fatal() {
         let (endpoint, handle) = spawn_mock_server(vec![http_response(503), http_response(503)]);
         let document = trace_document(1);
 
-        let err = export_otlp_http(export_config(&endpoint, 1), &document).unwrap_err();
+        let export = export_otlp_http(export_config(&endpoint, 1), &document).unwrap();
 
-        assert!(
-            err.to_string().contains("503"),
-            "error should surface status: {err}"
-        );
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1);
+        assert!(export.last_error.as_deref().unwrap().contains("503"));
         assert_eq!(
             handle.join().unwrap().len(),
             2,
             "should exhaust both attempts"
+        );
+    }
+
+    #[test]
+    fn a_rejected_batch_does_not_stop_the_next_batch() {
+        // A 4xx is about one batch, and the endpoint answered: try the rest.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400), http_response(200)]);
+        let document = trace_document(2);
+        let config = ExportConfig {
+            max_spans_per_batch: 1,
+            ..export_config(&endpoint, 0)
+        };
+
+        let export = export_otlp_http(config, &document).unwrap();
+
+        assert_eq!(export.batches, 2);
+        assert_eq!(export.failed_batches, 1);
+        assert_eq!(export.failed_spans, 1, "only the rejected batch is lost");
+        assert_eq!(handle.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exhausted_retries_abandon_the_rest_of_the_document_and_count_it() {
+        // An unhealthy endpoint: do not block the exporter retrying every batch of
+        // this drain; count them all lost and let the next drain try again.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(503)]);
+        let document = trace_document(3);
+        let config = ExportConfig {
+            max_spans_per_batch: 1,
+            ..export_config(&endpoint, 0)
+        };
+
+        let export = export_otlp_http(config, &document).unwrap();
+
+        assert_eq!(export.failed_batches, 3);
+        assert_eq!(export.failed_spans, 3);
+        assert_eq!(
+            handle.join().unwrap().len(),
+            1,
+            "later batches are not tried"
+        );
+    }
+
+    #[test]
+    fn the_final_export_still_fails_loudly_so_the_trace_is_dumped() {
+        // The final export's caller dumps the trace to stdout on `Err`; that
+        // contract is unchanged.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
+        let document = trace_document(1);
+
+        let err = export_final_otlp_http(export_config_no_diagnostics(&endpoint, 3), &document)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("400"), "{err}");
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_lost_run_summary_batch_fails_the_final_export_without_counting_spans() {
+        // The synthetic run-summary span is not request telemetry: it is never
+        // counted as a lost span, but losing it still fails the final export.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(400)]);
+        let document = trace_document(0);
+
+        let err = export_final_otlp_http(export_config(&endpoint, 0), &document).unwrap_err();
+
+        assert!(err.to_string().contains("failed batches: 1"), "{err}");
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_from_logged_urls() {
+        let url = Url::parse("https://alice:s3cr3t@tempo.example.net:4318/v1/traces?api-key=k3y#x")
+            .unwrap();
+        assert_eq!(redact_url(&url), "https://tempo.example.net:4318/v1/traces");
+
+        // Nothing to redact: the URL passes through unchanged, so the log stays
+        // useful for the common case.
+        let plain = Url::parse("http://localhost:4318/v1/traces").unwrap();
+        assert_eq!(redact_url(&plain), "http://localhost:4318/v1/traces");
+    }
+
+    #[test]
+    fn error_body_excerpt_is_capped_and_escaped() {
+        // A hostile or merely verbose body: a forged log line, an ANSI escape, and
+        // more than the cap.
+        let mut body = b"bad request\r\n\x1b[31mFAKE LOG LINE\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', 2 * ERROR_BODY_EXCERPT_BYTES));
+
+        let excerpt = body_excerpt(&body);
+
+        assert!(
+            !excerpt.contains('\n') && !excerpt.contains('\r') && !excerpt.contains('\x1b'),
+            "control characters must be escaped: {excerpt:?}"
+        );
+        assert!(
+            excerpt.starts_with("bad request\\r\\n\\u{1b}[31mFAKE LOG LINE\\n"),
+            "{excerpt}"
+        );
+        assert!(excerpt.ends_with(" [truncated]"), "{excerpt}");
+        // The cap bounds the excerpt; escaping can only add a few bytes per
+        // control character, so 2x is a generous ceiling.
+        assert!(
+            excerpt.len() < 2 * ERROR_BODY_EXCERPT_BYTES,
+            "{}",
+            excerpt.len()
+        );
+
+        // Cutting inside a multi-byte character must not panic; the lossy decode
+        // of the cut tail is acceptable, a crash is not.
+        let mut straddle = vec![b'a'; ERROR_BODY_EXCERPT_BYTES - 1];
+        straddle.extend("é".as_bytes());
+        straddle.push(b'z');
+        let excerpt = body_excerpt(&straddle);
+        assert!(excerpt.ends_with(" [truncated]"), "{excerpt}");
+    }
+
+    /// The cap holds on the wire, not just in the helper: an 8 KiB error page
+    /// yields an error of about 1 KiB.
+    #[test]
+    fn error_response_body_is_capped() {
+        let page = "x".repeat(8 * 1024);
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                page.len()
+            )
+            .into_boxed_str(),
+        );
+        let (endpoint, handle) = spawn_mock_server(vec![response]);
+        let document = trace_document(1);
+
+        let err = export_final_otlp_http(export_config_no_diagnostics(&endpoint, 0), &document)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("400"), "{message}");
+        assert!(message.contains("[truncated]"), "{message}");
+        assert!(
+            message.len() < ERROR_BODY_EXCERPT_BYTES + 512,
+            "the error must carry an excerpt, not the page: {} bytes",
+            message.len()
+        );
+        assert_eq!(handle.join().unwrap().len(), 1);
+    }
+
+    /// An error body is written by the far end, and a proxy that rejects a
+    /// request may echo it back -- URL, query string and auth header included.
+    /// Such a body must reach the log and the error with the secrets removed.
+    #[test]
+    fn error_bodies_that_echo_secrets_are_scrubbed() {
+        const HEADER_SECRET: &str = "hunter2-echoed-apikey";
+        const QUERY_SECRET: &str = "query-key-echoed";
+        let headers = vec![("X-Api-Key".to_string(), HEADER_SECRET.to_string())];
+        let (endpoint, _handle) = {
+            let page = format!(
+                "400 Bad Request: rejected POST /v1/traces?api-key={QUERY_SECRET} \
+                 with X-Api-Key: {HEADER_SECRET}"
+            );
+            let response = Box::leak(
+                format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
+                    page.len()
+                )
+                .into_boxed_str(),
+            );
+            spawn_mock_server(vec![response])
+        };
+        let secret_endpoint = format!("{endpoint}?api-key={QUERY_SECRET}");
+        let client = ExportClient::new(Duration::from_secs(5), &headers, None).unwrap();
+        let config = ExportConfig {
+            client: &client,
+            ..export_config_no_diagnostics(&secret_endpoint, 0)
+        };
+
+        let mut error = String::new();
+        let logged = capture_log(|| {
+            error = format!(
+                "{:#}",
+                export_final_otlp_http(config, &trace_document(1)).unwrap_err()
+            );
+        });
+
+        assert!(error.contains("400"), "{error}");
+        assert!(
+            error.contains("<redacted>"),
+            "the echo is marked, not dropped: {error}"
+        );
+        for secret in [HEADER_SECRET, QUERY_SECRET] {
+            assert!(
+                !error.contains(secret),
+                "{secret:?} leaked into the error: {error}"
+            );
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
+    }
+
+    /// NOTHING SECRET REACHES THE LOG. The operator's header values (API keys,
+    /// tenant ids) and anything they put in the endpoint URL (userinfo, an
+    /// `?api-key=` query) must not appear in any log line or error message on
+    /// any path: the per-attempt debug line, the retry warning, the final error,
+    /// and the connection-failure error whose text comes from reqwest (which
+    /// prints the full URL it was given). Asserts on captured log TEXT at debug
+    /// level, the most verbose an operator can turn on.
+    #[test]
+    fn header_values_and_endpoint_secrets_never_reach_the_log() {
+        const HEADER_SECRET: &str = "hunter2-apikey-secret";
+        const USERINFO_SECRET: &str = "basic-pass-secret";
+        const QUERY_SECRET: &str = "query-key-secret";
+        let headers = vec![
+            ("X-Api-Key".to_string(), HEADER_SECRET.to_string()),
+            ("X-Scope-OrgID".to_string(), "tenant-secret".to_string()),
+        ];
+        let document = trace_document(1);
+
+        // A retry then success: exercises the debug, warn and info lines.
+        let (endpoint, handle) = spawn_mock_server(vec![http_response(503), http_response(200)]);
+        let secret_endpoint = endpoint
+            .replace("http://", &format!("http://alice:{USERINFO_SECRET}@"))
+            + &format!("?api-key={QUERY_SECRET}");
+        let client = ExportClient::new(Duration::from_secs(5), &headers, None).unwrap();
+        let config = ExportConfig {
+            client: &client,
+            ..export_config_no_diagnostics(&secret_endpoint, 3)
+        };
+        let logged = capture_log(|| {
+            export_final_otlp_http(config, &document).unwrap();
+        });
+        assert_eq!(handle.join().unwrap().len(), 2);
+        assert!(
+            logged.contains("exporting OTLP traces") && logged.contains("retrying"),
+            "the capture must have seen the export: {logged}"
+        );
+        assert!(
+            logged.contains("/v1/traces"),
+            "the host and path stay: {logged}"
+        );
+        for secret in [
+            HEADER_SECRET,
+            "tenant-secret",
+            USERINFO_SECRET,
+            QUERY_SECRET,
+            "alice",
+        ] {
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
+
+        // A connection failure: the error text is reqwest's, URL included.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_endpoint = format!(
+            "http://alice:{USERINFO_SECRET}@{}/v1/traces?api-key={QUERY_SECRET}",
+            closed.local_addr().unwrap()
+        );
+        drop(closed);
+        let config = ExportConfig {
+            client: &client,
+            ..export_config_no_diagnostics(&closed_endpoint, 0)
+        };
+        let mut error = String::new();
+        let logged = capture_log(|| {
+            error = format!(
+                "{:#}",
+                export_final_otlp_http(config, &document).unwrap_err()
+            );
+        });
+        assert!(error.contains("failed to send OTLP request"), "{error}");
+        for secret in [HEADER_SECRET, USERINFO_SECRET, QUERY_SECRET, "alice"] {
+            assert!(
+                !error.contains(secret),
+                "{secret:?} leaked into the error: {error}"
+            );
+            assert!(
+                !logged.contains(secret),
+                "{secret:?} leaked into the log:\n{logged}"
+            );
+        }
+    }
+
+    /// Run `body` with the log captured at DEBUG and return what this thread
+    /// logged.
+    ///
+    /// The subscriber is installed GLOBALLY, once per test binary, and writes to a
+    /// thread-local buffer. A scoped (`with_default`) subscriber is not reliable
+    /// under the parallel test runner: a test on another thread that logs with no
+    /// subscriber of its own makes tracing-core recompute the shared callsite
+    /// cache from THAT thread's (absent) default, caching the callsite as "never
+    /// interested" for every thread -- and the capture here comes back empty
+    /// whenever such a test happens to run concurrently. With a global default,
+    /// every thread's recomputation sees a real subscriber. Per-thread buffers
+    /// keep the captures of concurrently running tests apart; the exporter runs
+    /// synchronously on the calling thread, so its log lands in this thread's
+    /// buffer.
+    fn capture_log(body: impl FnOnce()) -> String {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| ThreadLocalSink)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            // Another test module may have installed its own global first; its
+            // subscriber then receives the events, which the assertions below
+            // report as an empty capture rather than silently passing.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        CAPTURED_LOG.with(|log| log.borrow_mut().clear());
+        body();
+        CAPTURED_LOG.with(|log| String::from_utf8(log.borrow().clone()).expect("log must be UTF-8"))
+    }
+
+    thread_local! {
+        static CAPTURED_LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLocalSink;
+
+    impl Write for ThreadLocalSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED_LOG.with(|log| log.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A 3xx is an ERROR, never followed. reqwest's default policy follows up to
+    /// ten redirects and re-sends the request -- the custom auth headers
+    /// (`X-Api-Key`, `X-Scope-OrgID`, ...) AND the trace body -- to wherever
+    /// `Location` points: another host, or https down to plain http. A collector
+    /// that moved is an operator decision (`--otlp-endpoint`), not something the
+    /// exporter resolves on its own with the credentials in hand.
+    #[test]
+    fn refuses_to_follow_otlp_redirects() {
+        // The redirect target. Nothing ever answers it; the test only checks
+        // whether anyone CONNECTED to it.
+        let decoy = TcpListener::bind("127.0.0.1:0").unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let decoy_endpoint = format!("http://{}/v1/traces", decoy.local_addr().unwrap());
+        let redirect = Box::leak(
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {decoy_endpoint}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let (endpoint, handle) = spawn_mock_server(vec![redirect]);
+        let document = trace_document(1);
+
+        let err = export_final_otlp_http(export_config_no_diagnostics(&endpoint, 3), &document)
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.contains("307"),
+            "must surface the status: {message}"
+        );
+        assert!(
+            message.contains("redirect"),
+            "must name the cause: {message}"
+        );
+        assert_eq!(handle.join().unwrap().len(), 1, "a redirect is not retried");
+        assert!(
+            matches!(decoy.accept(), Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "the exporter must never connect to the redirect target"
         );
     }
 
@@ -1478,14 +2171,55 @@ mod tests {
     fn export_config(endpoint: &str, retries: u32) -> ExportConfig<'_> {
         ExportConfig {
             endpoint,
-            headers: &[],
+            client: test_client(),
             compression: OtlpCompression::None,
             max_spans_per_batch: 512,
             max_bytes_per_batch: 0,
-            timeout: Duration::from_secs(5),
             retries,
             diagnostics: true,
         }
+    }
+
+    /// One plain client (no headers, no CA, 5 s timeout) shared by the tests
+    /// that do not care about the client's configuration.
+    fn test_client() -> &'static ExportClient {
+        static CLIENT: std::sync::OnceLock<ExportClient> = std::sync::OnceLock::new();
+        CLIENT.get_or_init(|| ExportClient::new(Duration::from_secs(5), &[], None).unwrap())
+    }
+
+    /// A mock server that accepts ONE connection and serves `requests` requests
+    /// on it, keep-alive, replying 200 to each. Returns the bodies it read off
+    /// that single connection: a client that opened a second connection for its
+    /// second request leaves this server waiting on the first until its read
+    /// timeout, and the count comes back short.
+    fn spawn_keepalive_mock_server(requests: usize) -> (String, thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("http://{addr}/v1/traces");
+        listener.set_nonblocking(true).unwrap();
+        let handle = thread::spawn(move || {
+            let mut served: Vec<Vec<u8>> = Vec::new();
+            let deadline = std::time::Instant::now() + MOCK_SERVER_ACCEPT_TIMEOUT;
+            let Some(mut stream) = accept_before(&listener, deadline) else {
+                return served;
+            };
+            // Short: a second connection is the failure being tested for, and it
+            // must fail fast rather than after the full accept timeout.
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            for _ in 0..requests {
+                let body = read_http_request(&stream);
+                if body.is_empty() {
+                    break;
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .unwrap();
+                stream.flush().ok();
+                served.push(body);
+            }
+            served
+        });
+        (endpoint, handle)
     }
 
     /// The same config with OTLP diagnostics OFF -- the default -- so the flag-off

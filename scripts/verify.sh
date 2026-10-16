@@ -5,19 +5,21 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "${repo_root}"
 
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
 python3 tests/e2e/verify-rgwtrace-json.py --self-test
+python3 -m unittest discover -s tests/e2e -p 'test_*.py'
 python3 -m unittest discover -s tests -p 'test_release.py'
 git diff --check
 git diff --cached --check
+bash tests/scripts/private-dir-test.sh
 
 if [[ "${VERIFY_AUDIT:-0}" == "1" ]]; then
   if ! command -v cargo-audit >/dev/null 2>&1; then
-    cargo install cargo-audit --locked
+    cargo install cargo-audit --version 0.22.2 --locked
   fi
-  cargo audit
+  cargo audit --deny yanked --deny unmaintained
 fi
 
 if [[ "${VERIFY_BPF_LOAD:-0}" == "1" ]]; then

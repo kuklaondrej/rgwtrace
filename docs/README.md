@@ -28,6 +28,8 @@ superseded by later sections in the same document.
 - [RGW A/B benchmark](bench-rgw-ab.md): compare live RGW workloads with and without tracing.
 - [Per-probe microbenchmark](../bench/README.md): isolate probe and ring-buffer costs.
 - [Overhead analysis](overhead-analysis.md): cost model, assumptions, and host-specific measurements.
+- [Collector hot path](perf-collector-hot-path.md): indexed expiry and inference, off-lock span
+  rendering, and the closed-request grace, with before/after numbers.
 - [Stage 0 measurement runbook](stage0-runbook.md): the diagnostic experiment used
   to investigate cross-thread correlation.
 
@@ -38,6 +40,10 @@ superseded by later sections in the same document.
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
+- [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
+  redaction, header sources, client reuse, private CAs, and object-name redaction.
+- [OTLP header pipe handling](bugfix-otlp-header-pipe.md): reject named pipes
+  without blocking during startup.
 - [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
   bounds reference chains, nesting, file reads and decompression, and never
   guesses a container's Ceph version.
@@ -52,3 +58,25 @@ superseded by later sections in the same document.
   addresses are translated to file offsets and checked as function entries, why
   separate debug info must match the binary, and why member offsets are never
   defaulted to 0.
+- [Long-session data integrity](bugfix-long-session-data-integrity.md): bounded
+  collector memory, the rotating no-duplicate tombstone, OTLP loss accounting,
+  and the expiry clock.
+- [Target scoping](bugfix-target-scoping.md): why live tracing requires `--pid`,
+  how targets bind to the files the process maps, and how `/proc/<pid>/root`
+  paths stay inside the container.
+- [PID-root library discovery](bugfix-pid-root-library-discovery.md): why a
+  missing target library must not fall back to a host copy.
+- [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
+  decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
+  and SIGTERM / target-exit handling.
+- [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
+  superseding submit from map capacity or other restore errors.
+
+- [Private privileged-test lab](lab/README.md)
+- [Publication controls](publication-checklist.md)
+- [Dependency audit review](dependency-audit.md)
+- [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
+  why the privileged helper scripts use private directories, generated keys
+  and pinned downloads.
+
+- [Stale sweep cooldown](bugfix-stale-sweep-cooldown.md): bounded scan cycles yield CPU between cycles.

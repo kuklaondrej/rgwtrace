@@ -1,9 +1,98 @@
 const RGWTRACE_BPF: &str = include_str!("../bpf/rgwtrace.bpf.c");
 const RGWTRACE_EVENTS: &str = include_str!("../bpf/rgwtrace_events.h");
 const BPF_UTILS: &str = include_str!("../bpf/bpf_utils.h");
+const CEPH_ABI: &str = include_str!("../bpf/ceph_abi.h");
 const DWARF_NATIVE: &str = include_str!("../src/dwarf_native.rs");
 const LIVE_LINUX: &str = include_str!("../src/live/linux.rs");
 const CLI: &str = include_str!("../src/cli.rs");
+const EVENTS_RS: &str = include_str!("../src/events.rs");
+const DWARF_JSON_RS: &str = include_str!("../src/dwarf_json.rs");
+
+/// Every `RGWTRACE_*` ABI constant the C headers define -- enum members
+/// (`NAME = value,`) and `#define RGWTRACE_* value` layout sizes -- as
+/// `(name, value-text)` pairs.
+fn header_abi_constants(header: &str) -> Vec<(String, String)> {
+    let mut constants = Vec::new();
+    for line in header.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("#define ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(name), Some(value)) = (parts.next(), parts.next()) {
+                if name.starts_with("RGWTRACE_") {
+                    constants.push((name.to_string(), value.to_string()));
+                }
+            }
+        } else if line.starts_with("RGWTRACE_") {
+            if let Some((name, value)) = line.trim_end_matches(',').split_once(" = ") {
+                constants.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    constants
+}
+
+/// The value text of `pub const NAME: <ty> = <value>;` in a Rust source file.
+fn rust_const_value<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("pub const {name}: ");
+    let start = source.find(&needle)? + needle.len();
+    let rest = &source[start..];
+    let value = &rest[rest.find(" = ")? + 3..];
+    Some(&value[..value.find(';')?])
+}
+
+#[test]
+fn every_header_abi_constant_is_mirrored_byte_for_byte_in_rust() {
+    // AGENTS.md: RGWTRACE_* constants are mirrored byte-for-byte between the C
+    // headers and the Rust side. This used to be checked by hand-picked substrings,
+    // which cannot notice a constant that exists on only one side. Every constant
+    // the headers define must now appear, with the same value text, in
+    // src/events.rs (event types, truncation flags, diagnostics counters, record
+    // layout) or src/dwarf_json.rs (the hprobes descriptor layout).
+    let mut checked = 0;
+    for header in [RGWTRACE_EVENTS, CEPH_ABI] {
+        for (name, value) in header_abi_constants(header) {
+            let rust = rust_const_value(EVENTS_RS, &name)
+                .or_else(|| rust_const_value(DWARF_JSON_RS, &name))
+                .unwrap_or_else(|| panic!("{name} is defined in C but not mirrored in Rust"));
+            assert_eq!(rust, value, "{name}: C says {value}, Rust says {rust}");
+            checked += 1;
+        }
+    }
+    // 3 event types + 6 truncation flags + 34 diagnostics entries at least.
+    assert!(checked >= 43, "only {checked} ABI constants found");
+}
+
+#[test]
+fn event_layout_is_asserted_at_compile_time_on_both_sides() {
+    // Substring mirror checks cannot see a struct whose SIZE drifted. Both sides
+    // now refuse to compile when the layout disagrees with the documented sizes.
+    for assertion in [
+        "_Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,",
+        "_Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,",
+        "_Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,",
+        "_Static_assert(__builtin_offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,",
+    ] {
+        assert!(RGWTRACE_EVENTS.contains(assertion), "missing: {assertion}");
+    }
+    assert!(CEPH_ABI.contains("_Static_assert(sizeof(struct VarField) == RGWTRACE_VAR_FIELD_SIZE,"));
+    for assertion in [
+        "assert!(size_of::<RawRequestEvent>() == RGWTRACE_REQUEST_EVENT_SIZE);",
+        "assert!(size_of::<RawRadosEvent>() == RGWTRACE_RADOS_EVENT_SIZE);",
+        "assert!(size_of::<RawEvent>() == RGWTRACE_EVENT_SIZE);",
+        "assert!(offset_of!(RawEvent, data) == RGWTRACE_EVENT_DATA_OFFSET);",
+    ] {
+        assert!(EVENTS_RS.contains(assertion), "missing: {assertion}");
+    }
+    assert!(
+        DWARF_JSON_RS.contains("assert!(size_of::<VarFieldKernel>() == RGWTRACE_VAR_FIELD_SIZE);")
+    );
+    // hprobe values are serialized field by field: viewing the struct as bytes
+    // would read its uninitialized padding, which is undefined behavior.
+    assert!(!LIVE_LINUX.contains("from_raw_parts(ptr, size_of::<VarFieldKernel>())"));
+    assert!(LIVE_LINUX.contains("entry.field.to_bytes()"));
+    // The diagnostics indices now live next to the rest of the mirror, not in the
+    // Linux-only runner.
+    assert!(!LIVE_LINUX.contains("const BPF_DIAG_"));
+}
 
 #[test]
 fn object_name_read_uses_verifier_bounded_length() {
@@ -384,7 +473,7 @@ fn lifecycle_state_maps_use_plain_hash_not_lru() {
         "  __uint(type, BPF_MAP_TYPE_HASH);\n",
         "  __type(key, struct client_op_key);\n",
         "  __type(value, struct rados_op_state);\n",
-        "  __uint(max_entries, 8192);\n",
+        "  __uint(max_entries, RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES);\n",
         "} rados_ops SEC(\".maps\");"
     )));
     assert!(RGWTRACE_BPF.contains(concat!(
@@ -687,7 +776,7 @@ fn an_unresolved_or_null_dpp_fails_closed_exactly_like_a_foreign_one() {
     // and both clear a SEEDED context only, leaving a HOME one alone.
     let seed = phase_b_seed_body();
     assert!(seed.contains(concat!(
-        "  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);\n",
+        "  struct VarField *vf = hprobe_lookup(varid);\n",
         "  if (vf == 0) {\n",
         "    count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);\n",
         "    operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,\n",
@@ -831,8 +920,12 @@ fn revocation_is_total_and_survives_an_lru_eviction_of_the_canonical_entry() {
     // `this` pointer. The record is keyed by that very pointer, so without it there
     // is nothing to look up. Every other path -- crucially the canonical-entry miss
     // -- must fall through to the revocation.
+    // (The process-scope gate's own early return precedes all of this: a foreign
+    // process never inserted a record either.)
+    let gate = "  if (rgwtrace_foreign_process())\n    return 0;\n";
+    let after_gate = dtor.find(gate).expect("process-scope gate") + gate.len();
     assert_eq!(
-        dtor[..record_read].matches("return 0;").count(),
+        dtor[after_gate..record_read].matches("return 0;").count(),
         2,
         "only an absent/unresolvable `this` may return before the revocation"
     );
@@ -948,12 +1041,33 @@ fn get_handler_populates_reqstate_bridge() {
 fn cls_and_method_reads_use_verifier_bounded_lengths() {
     assert!(RGWTRACE_BPF.contains("__u32 cls_read_len = cls_len;"));
     assert!(RGWTRACE_BPF.contains("cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;"));
-    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 7\" : \"+r\"(cls_read_len));"));
+    assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 15\" : \"+r\"(cls_read_len));"));
     assert!(RGWTRACE_BPF.contains("__u32 method_read_len = method_len;"));
     assert!(RGWTRACE_BPF.contains("method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;"));
     assert!(RGWTRACE_BPF.contains("asm volatile(\"%0 &= 31\" : \"+r\"(method_read_len));"));
     assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].cls_name, cls_len"));
     assert!(!RGWTRACE_BPF.contains("event->cls_ops[i].method_name, method_len"));
+}
+
+#[test]
+fn cls_method_is_read_at_the_unclamped_class_length() {
+    // The OSD call indata is `class || method || payload`, so the method name
+    // starts at the class name's FULL wire length. The class length used to be
+    // clamped to the buffer size and then reused as the method offset, so every
+    // class name longer than the buffer (`refcount`, `timeindex`, `2pc_queue`)
+    // produced a garbled method name with no truncation flag on it.
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "      rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_read_len,\n",
+        "                               (void *)(data + cls_len));"
+    )));
+    // Only the COPY lengths are clamped; cls_len / method_len are never rewritten.
+    assert!(!RGWTRACE_BPF.contains("cls_len = sizeof(event->cls_ops[i].cls_name) - 1;"));
+    assert!(!RGWTRACE_BPF.contains("method_len = sizeof(event->cls_ops[i].method_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("cls_read_len = sizeof(event->cls_ops[i].cls_name) - 1;"));
+    assert!(RGWTRACE_BPF.contains("method_read_len = sizeof(event->cls_ops[i].method_name) - 1;"));
+    // Wide enough for every in-tree Ceph object class name (longest: 9 bytes).
+    assert!(CEPH_ABI.contains("#define MAX_CLS_NAME 16"));
+    assert!(CEPH_ABI.contains("char cls_name[MAX_CLS_NAME];"));
 }
 
 #[test]
@@ -967,4 +1081,202 @@ fn dwarf_native_demangling_uses_fallible_api() {
 fn dwarf_native_symbol_lookup_ignores_local_non_text_symbols() {
     assert!(DWARF_NATIVE.contains("!symbol.is_global()"));
     assert!(DWARF_NATIVE.contains("symbol.kind() != SymbolKind::Text"));
+}
+
+/// The text of every `SEC("uprobe...")` program, from its section attribute up to
+/// (not including) the next one.
+fn uprobe_programs() -> Vec<&'static str> {
+    let starts: Vec<usize> = RGWTRACE_BPF
+        .match_indices("SEC(\"uprobe")
+        .map(|(idx, _)| idx)
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, start)| {
+            let end = starts.get(i + 1).copied().unwrap_or(RGWTRACE_BPF.len());
+            &RGWTRACE_BPF[*start..end]
+        })
+        .collect()
+}
+
+#[test]
+fn every_uprobe_program_drops_foreign_processes_before_doing_anything() {
+    // F6: the uprobes used to fire for every process on the node that maps the
+    // probed libraries. The per-process filter is a .rodata constant set by
+    // userspace before load (0 = --all-processes), and every program must test it
+    // FIRST -- before any map lookup, map update, or probe read -- so a foreign
+    // process pays only one helper call and never touches shared state.
+    assert!(RGWTRACE_BPF.contains("const volatile __u32 TARGET_TGID = 0;"));
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "static __always_inline bool rgwtrace_foreign_process(void) {\n",
+        "  return TARGET_TGID != 0 && (bpf_get_current_pid_tgid() >> 32) != TARGET_TGID;\n",
+        "}\n"
+    )));
+
+    let programs = uprobe_programs();
+    assert!(
+        programs.len() >= 7,
+        "expected every uprobe program, found {}",
+        programs.len()
+    );
+    for program in programs {
+        let body_start = program.find("{\n").expect("program body") + 2;
+        let body = &program[body_start..];
+        assert!(
+            body.starts_with("  if (rgwtrace_foreign_process())\n    return 0;\n"),
+            "uprobe program must gate on the target tgid as its first statement:\n{}",
+            &program[..program.len().min(240)]
+        );
+    }
+}
+
+#[test]
+fn userspace_publishes_the_target_tgid_before_load() {
+    // The gate is only as good as the value behind it: it is written into
+    // .rodata on the OPEN skeleton (a const volatile is frozen at load), from
+    // --pid, and is 0 only for --all-processes.
+    assert!(LIVE_LINUX.contains("rodata.TARGET_TGID = target_tgid;"));
+    let configure = LIVE_LINUX
+        .find("open.maps.rodata_data")
+        .expect("configure_rodata call");
+    let load = LIVE_LINUX.find("open.load()").expect("skeleton load");
+    assert!(configure < load, "rodata must be configured before load");
+}
+
+#[test]
+fn rados_op_key_is_scoped_by_process() {
+    // F6: rados_ops was keyed by (cid, tid) only, so two processes -- or two
+    // failed probe reads, which leave the key at {0, 0} -- shared one entry. The
+    // tgid makes the key process-scoped; the pad is explicit so the zeroed key
+    // hashes deterministically.
+    assert!(CEPH_ABI.contains(concat!(
+        "struct client_op_key {\n",
+        "  __u64 cid;\n",
+        "  __u64 tid;\n",
+        "  __u32 tgid;\n",
+        "  __u32 _pad;\n",
+        "};"
+    )));
+    for program in ["int uprobe_send_op(", "int uprobe_finish_op("] {
+        let start = RGWTRACE_BPF.find(program).expect(program);
+        let body = &RGWTRACE_BPF[start..];
+        let key_init = body
+            .find("struct client_op_key key = {};")
+            .expect("zeroed key");
+        let tgid = body.find("key.tgid = get_pid();").expect("tgid stamp");
+        let first_map_op = body.find("&rados_ops, &key").expect("rados_ops use");
+        assert!(key_init < tgid && tgid < first_map_op, "{program}");
+    }
+}
+
+#[test]
+fn request_records_are_reserved_at_their_own_size() {
+    // Every record used to reserve the full union (568 bytes) even though a
+    // request payload is 160, so request markers burned ~3.5x the ring space they
+    // need. They now reserve exactly header + request payload.
+    assert!(RGWTRACE_EVENTS.contains("struct rgwtrace_request_record {"));
+    assert!(RGWTRACE_EVENTS.contains(
+        "_Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,"
+    ));
+    assert!(RGWTRACE_EVENTS.contains(
+        "_Static_assert(__builtin_offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,"
+    ));
+    let emit = &RGWTRACE_BPF[RGWTRACE_BPF
+        .find("static __always_inline void emit_request_event(")
+        .expect("emit_request_event exists")..];
+    let emit = &emit[..emit.find("\n}\n").expect("emit_request_event ends")];
+    assert!(emit.contains(
+        "struct rgwtrace_request_record *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);"
+    ));
+    assert!(!emit.contains("struct rgwtrace_event *e"));
+    // RADOS records still use the full-size layout.
+    assert!(RGWTRACE_BPF
+        .contains("struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);"));
+}
+
+#[test]
+fn ring_buffer_size_is_configured_before_load() {
+    // The 256 KiB ring held ~474 records: any userspace stall over ~25 ms at 20k
+    // ops/s dropped events. The size now comes from --ringbuf-size and is applied
+    // to the OPEN object, since a ring buffer cannot be resized once loaded.
+    assert!(RGWTRACE_BPF.contains(
+        "  __uint(max_entries, RGWTRACE_DEFAULT_RINGBUF_BYTES);\n} events SEC(\".maps\");"
+    ));
+    assert!(LIVE_LINUX.contains(".events\n        .set_max_entries(cli.ringbuf_size)"));
+    assert!(CLI.contains("pub ringbuf_size: u32,"));
+}
+
+#[test]
+fn hprobes_is_a_dense_array_and_every_lookup_checks_presence() {
+    // hprobes holds < 80 small integer keys but was an 8192-entry HASH, and
+    // _send_op does ~12 lookups on it while RGW holds the Objecter lock. An ARRAY
+    // lookup is a bounds check plus an add (the verifier inlines it).
+    assert!(RGWTRACE_BPF.contains(concat!(
+        "  __uint(type, BPF_MAP_TYPE_ARRAY);\n",
+        "  __type(key, __u32);\n",
+        "  __type(value, struct VarField);\n",
+        "  __uint(max_entries, RGWTRACE_HPROBE_SLOTS);\n",
+        "} hprobes SEC(\".maps\");"
+    )));
+    // An ARRAY lookup never misses for an in-range key: an unpopulated slot reads
+    // as all zeroes, i.e. as a "register 0" descriptor. So every lookup goes
+    // through the presence-checking helper and nothing reads the map directly.
+    assert!(RGWTRACE_BPF.contains("if (vf == 0 || vf->present == 0)\n    return 0;"));
+    assert_eq!(
+        RGWTRACE_BPF
+            .matches("bpf_map_lookup_elem(&hprobes,")
+            .count(),
+        1,
+        "only hprobe_lookup may read the hprobes map"
+    );
+    assert!(CEPH_ABI.contains("  __u32 present;\n};"));
+    assert!(CEPH_ABI.contains("#define RGWTRACE_HPROBE_SLOTS 80"));
+}
+
+#[test]
+fn rados_ops_is_sized_at_load_and_swept_from_userspace() {
+    // 8192 entries was below Ceph's default objecter_inflight_ops (24576), and an
+    // op whose client exits before _finish_op is never deleted. The default is now
+    // above the Objecter cap, the size is a flag applied before load, and the poll
+    // loop deletes entries older than --rados-ops-stale-after.
+    assert!(RGWTRACE_BPF.contains("#define RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES 32768"));
+    assert!(LIVE_LINUX.contains(".rados_ops\n        .set_max_entries(cli.bpf_rados_ops_entries)"));
+    assert!(LIVE_LINUX.contains("sweep.run_batch(&skel.maps.rados_ops"));
+    assert!(LIVE_LINUX.contains("const RADOS_OPS_SWEEP_BATCH_KEYS: usize = 256"));
+    assert!(LIVE_LINUX.contains("take_key_batch"));
+    assert!(CLI.contains("pub bpf_rados_ops_entries: u32,"));
+    assert!(CLI.contains("pub rados_ops_stale_after: Duration,"));
+}
+
+#[test]
+fn sigterm_and_sighup_stop_the_trace_like_ctrl_c() {
+    // `systemctl stop` sends SIGTERM. Without ctrlc's `termination` feature only
+    // SIGINT was handled, so SIGTERM killed the process and every collected span
+    // that had not been exported yet was lost.
+    const CARGO_TOML: &str = include_str!("../Cargo.toml");
+    assert!(CARGO_TOML.contains(r#"ctrlc = { version = "3.5", features = ["termination"] }"#));
+    assert!(LIVE_LINUX.contains("failed to install the SIGINT/SIGTERM/SIGHUP handler"));
+}
+
+#[test]
+fn a_pid_session_ends_when_the_target_exits() {
+    // The poll loop never noticed the target exiting, so a --pid session ran on
+    // capturing nothing until a timeout or a signal. It now watches the target
+    // (pidfd, falling back to /proc) and finalizes output when it is gone.
+    assert!(LIVE_LINUX.contains("libc::SYS_pidfd_open"));
+    assert!(LIVE_LINUX.contains("fn proc_stat_says_exited("));
+    assert!(LIVE_LINUX.contains("if watch.exited() {"));
+}
+
+#[test]
+fn target_exit_drains_the_ring_before_finalizing() {
+    // Greptile on #9: records the target wrote between the last poll and its
+    // exit were dropped with the ring buffer. Once the target is gone nothing
+    // new can arrive, so the exit branch drains the ring completely first.
+    let exit = &LIVE_LINUX[LIVE_LINUX
+        .find("if watch.exited() {")
+        .expect("target exit branch")..];
+    let exit = &exit[..exit.find("break;").expect("exit branch breaks")];
+    assert!(exit.contains("ringbuf.consume_raw()"), "{exit}");
 }

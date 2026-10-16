@@ -127,8 +127,10 @@ which is never `T_e`), bounded at the measured ~20–25%.
   Stage 1.)*
 - Maps: `rados_ops` `(cid,op_tid)` LRU (unchanged); `rgw_requests` TID→ctx
   (unchanged shape, carries `req_state_ptr`); `rgw_ctx_by_reqstate` LRU keyed
-  `{ __u64 req_state_ptr; __u32 tgid; __u32 _pad; }` (PID-scoped — `--pid` is
-  optional, `src/cli.rs:60`). *(Landed, Stage 1.)*
+  `{ __u64 req_state_ptr; __u32 tgid; __u32 _pad; }` (PID-scoped — `--pid` was
+  optional when this was written; live tracing now requires it unless
+  `--all-processes` is passed, see `docs/bugfix-target-scoping.md`). *(Landed,
+  Stage 1.)*
 - Raw-pointer param descriptor: `fetch_param_ptr(ctx,vf) = vf->varloc.stack ?
   0 : fetch_register(ctx, vf->varloc.reg)`; native/JSON emit the entry-PC
   **register** location + one sentinel field (`dwarf_native.rs:523` rejects

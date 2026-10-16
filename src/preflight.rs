@@ -156,10 +156,31 @@ pub fn validate_cli(cli: &Cli) -> Result<()> {
         }
     }
 
+    if cli.max_buffered_events.is_some() && cli.output.is_streaming() {
+        bail!(
+            "--max-buffered-events only applies to --output json; --output jsonl and \
+             --output otlp bound memory by draining every --flush-interval instead"
+        );
+    }
+
     validate_explicit_path("--librados-path", cli.librados_path.as_deref())?;
     validate_explicit_path("--librbd-path", cli.librbd_path.as_deref())?;
     validate_explicit_path("--libceph-common-path", cli.libceph_common_path.as_deref())?;
     validate_explicit_path("--radosgw-path", cli.radosgw_path.as_deref())?;
+    Ok(())
+}
+
+/// Refuse a LIVE run that is not scoped to one process, unless the operator
+/// opted in to system-wide probes with `--all-processes`. Dry-run, preflight and
+/// `--export-dwarf-json` attach nothing, so they never call this.
+pub fn validate_live_scope(cli: &Cli) -> Result<()> {
+    if cli.pid.is_none() && !cli.all_processes {
+        bail!(
+            "live tracing requires --pid <radosgw pid>; without it the uprobes would fire in \
+             every process that maps librados/libceph-common on this host. Pass \
+             --all-processes to trace system-wide anyway"
+        );
+    }
     Ok(())
 }
 
@@ -204,6 +225,15 @@ fn validate_dwarf_targets(dwarf: &DwarfInfo, targets: &ProbeTargets) -> Result<(
     }
 
     warn_on_silent_rados_skip(dwarf, targets);
+
+    // The same selection live attach installs: two target modules disagreeing
+    // on a shared hprobe slot fail here, before anything is attached.
+    let target_keys = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect::<Vec<_>>();
+    dwarf.hprobe_entries_for_modules(&target_keys)?;
 
     let radosgw = target_basename(&targets.radosgw, "radosgw target")?;
     require_function(dwarf, &radosgw, GET_HANDLER, GET_HANDLER_FIELDS)?;
@@ -1142,6 +1172,22 @@ mod tests {
 
         assert_eq!(check.status, "warn", "{}", check.detail);
         assert!(check.detail.contains("RGWOp*&"), "{}", check.detail);
+    }
+
+    #[test]
+    fn live_scope_requires_pid_or_an_explicit_all_processes_opt_in() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["rgwtrace", "--import-json", "x.json"].iter().chain(args)).unwrap()
+        };
+
+        let err = validate_live_scope(&parse(&[])).unwrap_err().to_string();
+        assert!(
+            err.contains("--pid") && err.contains("--all-processes"),
+            "{err}"
+        );
+        assert!(validate_live_scope(&parse(&["--pid", "42"])).is_ok());
+        assert!(validate_live_scope(&parse(&["--all-processes"])).is_ok());
     }
 
     #[test]

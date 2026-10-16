@@ -1,11 +1,15 @@
 #![allow(dead_code)]
 
+use std::{borrow::Cow, sync::Arc};
+
 use serde::Serialize;
 
 pub const MAX_ACTING: usize = 16;
 pub const MAX_TRANS_ID: usize = 128;
 pub const MAX_OBJECT_NAME: usize = 128;
 pub const MAX_RADOS_OPS: usize = 3;
+pub const MAX_CLS_NAME: usize = 16;
+pub const MAX_METHOD_NAME: usize = 32;
 
 // Two-marker model (mirrored in bpf/rgwtrace_events.h).
 // START is emitted at `RGWREST::get_handler` entry (the earliest point the
@@ -26,11 +30,61 @@ pub const RGWTRACE_TRUNC_RADOS_OPS: u32 = 1 << 3;
 pub const RGWTRACE_TRUNC_CLS_NAME: u32 = 1 << 4;
 pub const RGWTRACE_TRUNC_METHOD_NAME: u32 = 1 << 5;
 
+// Diagnostics counter indices into the BPF `diagnostics` PERCPU_ARRAY. Mirrored
+// from `enum rgwtrace_diag_counter` in bpf/rgwtrace_events.h, which documents
+// what each counter means. Append only; never renumber.
+pub const RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS: u32 = 0;
+pub const RGWTRACE_DIAG_RINGBUF_RADOS_DROPS: u32 = 1;
+pub const RGWTRACE_DIAG_RADOS_MAP_DROPS: u32 = 2;
+pub const RGWTRACE_DIAG_RADOS_FINISH_MISSES: u32 = 3;
+pub const RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
+pub const RGWTRACE_DIAG_PROBE_READ_FAILURES: u32 = 5;
+pub const RGWTRACE_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
+pub const RGWTRACE_DIAG_RESEED_HITS: u32 = 7;
+pub const RGWTRACE_DIAG_RESEED_MISSES: u32 = 8;
+pub const RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
+pub const RGWTRACE_DIAG_REQUEST_END_HITS: u32 = 10;
+pub const RGWTRACE_DIAG_REQUEST_END_MISSES: u32 = 11;
+pub const RGWTRACE_DIAG_REQUEST_END_BASE_UNRESOLVED: u32 = 12;
+pub const RGWTRACE_DIAG_SENDOP_STALE_CTX_DROPS: u32 = 13;
+pub const RGWTRACE_DIAG_SENDOP_UNVERIFIABLE_CTX: u32 = 14;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS: u32 = 15;
+pub const RGWTRACE_DIAG_OPERATE_SEED_MISSES: u32 = 16;
+pub const RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED: u32 = 17;
+pub const RGWTRACE_DIAG_SENDOP_UNBRIDGED_CTX_DROPS: u32 = 18;
+pub const RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED: u32 = 19;
+pub const RGWTRACE_DIAG_RGWOP_KEY_INSERTS: u32 = 20;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKES: u32 = 21;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKE_SKIPPED: u32 = 22;
+pub const RGWTRACE_DIAG_RGWOP_KEY_UNRESOLVED: u32 = 23;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_REQSTATE: u32 = 24;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_RGWOP: u32 = 25;
+pub const RGWTRACE_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED: u32 = 26;
+pub const RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
+pub const RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
+pub const RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
+pub const RGWTRACE_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
+pub const RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED: u32 = 31;
+pub const RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
+pub const RGWTRACE_DIAG_COUNTERS: u32 = 33;
+
+// Wire layout of `struct rgwtrace_event` and its payloads, asserted below against
+// the #[repr(C)] mirrors. bpf/rgwtrace_events.h defines and _Static_asserts the
+// same numbers, so a drift on either side fails that side's build.
+pub const RGWTRACE_EVENT_DATA_OFFSET: usize = 8;
+pub const RGWTRACE_REQUEST_EVENT_SIZE: usize = 160;
+pub const RGWTRACE_RADOS_EVENT_SIZE: usize = 560;
+pub const RGWTRACE_EVENT_SIZE: usize = 568;
+/// `struct rgwtrace_request_record`: request markers are reserved at this size,
+/// not `RGWTRACE_EVENT_SIZE`, so a decoder must accept a record that ends right
+/// after the request payload.
+pub const RGWTRACE_REQUEST_RECORD_SIZE: usize = 168;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RawClsOp {
-    pub cls_name: [u8; 8],
-    pub method_name: [u8; 32],
+    pub cls_name: [u8; MAX_CLS_NAME],
+    pub method_name: [u8; MAX_METHOD_NAME],
 }
 
 #[repr(C)]
@@ -67,6 +121,47 @@ pub struct RawRadosEvent {
     pub trans_id: [u8; MAX_TRANS_ID],
     pub object_name: [u8; MAX_OBJECT_NAME],
 }
+
+/// `struct rgwtrace_event`: the full-size record. Only used to pin the layout;
+/// records are decoded by `type` from their payload, and a request record is
+/// reserved shorter than this (see `RGWTRACE_REQUEST_RECORD_SIZE`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RawEvent {
+    pub event_type: u32,
+    pub data: RawEventData,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union RawEventData {
+    pub request: RawRequestEvent,
+    pub rados: RawRadosEvent,
+}
+
+const _: () = {
+    use std::mem::{offset_of, size_of};
+
+    assert!(size_of::<RawClsOp>() == MAX_CLS_NAME + MAX_METHOD_NAME);
+    assert!(size_of::<RawRequestEvent>() == RGWTRACE_REQUEST_EVENT_SIZE);
+    assert!(offset_of!(RawRequestEvent, pid) == 16);
+    assert!(offset_of!(RawRequestEvent, flags) == 24);
+    assert!(offset_of!(RawRequestEvent, trans_id) == 28);
+    assert!(size_of::<RawRadosEvent>() == RGWTRACE_RADOS_EVENT_SIZE);
+    assert!(offset_of!(RawRadosEvent, sent_ns) == 16);
+    assert!(offset_of!(RawRadosEvent, rw) == 72);
+    assert!(offset_of!(RawRadosEvent, ops_size) == 76);
+    assert!(offset_of!(RawRadosEvent, acting) == 84);
+    assert!(offset_of!(RawRadosEvent, ops) == 148);
+    assert!(offset_of!(RawRadosEvent, cls_ops) == 154);
+    assert!(offset_of!(RawRadosEvent, trans_id) == 298);
+    assert!(offset_of!(RawRadosEvent, object_name) == 426);
+    assert!(size_of::<RawEvent>() == RGWTRACE_EVENT_SIZE);
+    assert!(offset_of!(RawEvent, data) == RGWTRACE_EVENT_DATA_OFFSET);
+    assert!(
+        RGWTRACE_REQUEST_RECORD_SIZE == RGWTRACE_EVENT_DATA_OFFSET + RGWTRACE_REQUEST_EVENT_SIZE
+    );
+};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -108,7 +203,10 @@ pub struct RequestEvent {
     pub end_ns: u64,
     pub pid: u32,
     pub tid: u32,
-    pub trans_id: String,
+    /// Shared, not owned: the same id becomes the request group's key and every
+    /// index entry that points at the group, and an `Arc` clone is a refcount
+    /// bump where a `String` clone is a heap allocation per event.
+    pub trans_id: Arc<str>,
     pub truncation: CaptureTruncation,
 }
 
@@ -127,7 +225,8 @@ pub struct RadosEvent {
     pub acting: Vec<i32>,
     pub rw: RadosDirection,
     pub object_name: String,
-    pub trans_id: String,
+    /// See [`RequestEvent::trans_id`]: shared with the group key it joins.
+    pub trans_id: Arc<str>,
     pub truncation: CaptureTruncation,
     pub ops: Vec<RadosOp>,
     pub offset: u64,
@@ -144,7 +243,8 @@ pub enum RadosDirection {
 #[derive(Clone, Debug, Serialize)]
 pub struct RadosOp {
     pub code: u16,
-    pub name: String,
+    /// Borrowed for every known opcode; only `unknown(0x..)` allocates.
+    pub name: Cow<'static, str>,
     pub class: Option<String>,
     pub method: Option<String>,
 }
@@ -200,8 +300,15 @@ pub fn nul_terminated_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-pub fn rados_op_name(code: u16) -> String {
-    match code {
+/// Like [`nul_terminated_string`], but straight into the shared form: valid
+/// UTF-8 (the normal case) is copied once, into the `Arc` allocation itself.
+pub fn nul_terminated_arc(bytes: &[u8]) -> Arc<str> {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    Arc::from(String::from_utf8_lossy(&bytes[..end]).as_ref())
+}
+
+pub fn rados_op_name(code: u16) -> Cow<'static, str> {
+    Cow::Borrowed(match code {
         0x1201 => "read",
         0x1202 => "stat",
         0x1203 => "mapext",
@@ -219,9 +326,8 @@ pub fn rados_op_name(code: u16) -> String {
         0x2215 => "omap-set-vals",
         0x1220 => "cmpext",
         0x1401 => "call",
-        _ => return format!("unknown({code:#x})"),
-    }
-    .to_string()
+        _ => return Cow::Owned(format!("unknown({code:#x})")),
+    })
 }
 
 impl From<RawRequestEvent> for RequestEvent {
@@ -231,7 +337,7 @@ impl From<RawRequestEvent> for RequestEvent {
             end_ns: raw.end_ns,
             pid: raw.pid,
             tid: raw.tid,
-            trans_id: nul_terminated_string(&raw.trans_id),
+            trans_id: nul_terminated_arc(&raw.trans_id),
             truncation: CaptureTruncation::from_flags(raw.flags),
         }
     }
@@ -267,14 +373,19 @@ impl From<RawRadosEvent> for RadosEvent {
             pool: raw.pool,
             target_osd: raw.target_osd,
             pg_seed: raw.pg_seed,
-            acting: raw.acting.into_iter().take_while(|osd| *osd >= 0).collect(),
+            // Sized up front: `take_while(..).collect()` cannot know its length
+            // and would grow (reallocate) on the way.
+            acting: {
+                let len = raw.acting.iter().take_while(|osd| **osd >= 0).count();
+                raw.acting[..len].to_vec()
+            },
             rw: if raw.rw & 0x0020 != 0 {
                 RadosDirection::Write
             } else {
                 RadosDirection::Read
             },
             object_name: nul_terminated_string(&raw.object_name),
-            trans_id: nul_terminated_string(&raw.trans_id),
+            trans_id: nul_terminated_arc(&raw.trans_id),
             truncation: CaptureTruncation::from_flags(raw.flags),
             ops,
             offset: raw.offset,
@@ -294,7 +405,7 @@ mod tests {
             end_ns: 0,
             pid: 1,
             tid: 2,
-            trans_id: String::new(),
+            trans_id: "".into(),
             truncation: CaptureTruncation::default(),
         });
 
@@ -323,7 +434,7 @@ mod tests {
             acting: Vec::new(),
             rw: RadosDirection::Read,
             object_name: String::new(),
-            trans_id: String::new(),
+            trans_id: "".into(),
             truncation: CaptureTruncation::default(),
             ops: Vec::new(),
             offset: 0,
@@ -355,7 +466,7 @@ mod tests {
         assert_eq!(request.end_ns, 20);
         assert_eq!(request.pid, 42);
         assert_eq!(request.tid, 7);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
         assert!(request.truncation.trans_id);
         assert!(!request.truncation.object_name);
     }
@@ -367,8 +478,8 @@ mod tests {
         acting[1] = 2;
 
         let empty_cls_op = RawClsOp {
-            cls_name: [0; 8],
-            method_name: [0; 32],
+            cls_name: [0; MAX_CLS_NAME],
+            method_name: [0; MAX_METHOD_NAME],
         };
         let raw = RawRadosEvent {
             cid: 9,
@@ -415,7 +526,7 @@ mod tests {
         assert_eq!(event.acting, vec![1, 2]);
         assert_eq!(event.rw, RadosDirection::Write);
         assert_eq!(event.object_name, "bucket-object");
-        assert_eq!(event.trans_id, "tx0002");
+        assert_eq!(&*event.trans_id, "tx0002");
         assert_eq!(event.offset, 64);
         assert_eq!(event.length, 4096);
         assert_eq!(event.ops.len(), MAX_RADOS_OPS);
@@ -428,6 +539,89 @@ mod tests {
         assert!(event.truncation.rados_ops);
         assert!(event.truncation.cls_name);
         assert!(event.truncation.method_name);
+    }
+
+    #[test]
+    fn decodes_class_names_longer_than_the_old_eight_byte_buffer() {
+        // Real Ceph object classes longer than 7 bytes (`refcount`, `timeindex`,
+        // `2pc_queue`) used to be truncated AND shift the method read; the class
+        // buffer is now 16 bytes, so they arrive whole and untruncated.
+        let mut ops = [RawClsOp {
+            cls_name: [0; MAX_CLS_NAME],
+            method_name: [0; MAX_METHOD_NAME],
+        }; MAX_RADOS_OPS];
+        ops[0] = RawClsOp {
+            cls_name: bytes("timeindex"),
+            method_name: bytes("list"),
+        };
+        ops[1] = RawClsOp {
+            cls_name: bytes("2pc_queue"),
+            method_name: bytes("2pc_queue_list_entries"),
+        };
+        ops[2] = RawClsOp {
+            cls_name: bytes("refcount"),
+            method_name: bytes("put"),
+        };
+        let mut raw = zeroed_rados_event();
+        raw.ops_size = 3;
+        raw.ops = [0x1401; MAX_RADOS_OPS];
+        raw.cls_ops = ops;
+
+        let event = RadosEvent::from(raw);
+        let calls: Vec<_> = event
+            .ops
+            .iter()
+            .map(|op| (op.class.as_deref(), op.method.as_deref()))
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                (Some("timeindex"), Some("list")),
+                (Some("2pc_queue"), Some("2pc_queue_list_entries")),
+                (Some("refcount"), Some("put")),
+            ]
+        );
+        assert!(!event.truncation.cls_name);
+        assert!(!event.truncation.method_name);
+    }
+
+    #[test]
+    fn decodes_a_class_name_that_fills_the_buffer_without_a_nul() {
+        // Defensive: the BPF side copies at most MAX_CLS_NAME - 1 bytes, but a
+        // full, unterminated buffer must still decode rather than overrun.
+        let mut raw = zeroed_rados_event();
+        raw.ops_size = 1;
+        raw.ops[0] = 0x1401;
+        raw.cls_ops[0].cls_name = [b'x'; MAX_CLS_NAME];
+        let event = RadosEvent::from(raw);
+        assert_eq!(event.ops[0].class.as_deref(), Some("xxxxxxxxxxxxxxxx"));
+    }
+
+    fn zeroed_rados_event() -> RawRadosEvent {
+        RawRadosEvent {
+            cid: 0,
+            tid: 0,
+            sent_ns: 0,
+            finish_ns: 0,
+            pool: 0,
+            offset: 0,
+            length: 0,
+            pid: 0,
+            send_tid: 0,
+            target_osd: 0,
+            pg_seed: 0,
+            rw: 0,
+            ops_size: 0,
+            flags: 0,
+            acting: [-1; MAX_ACTING],
+            ops: [0; MAX_RADOS_OPS],
+            cls_ops: [RawClsOp {
+                cls_name: [0; MAX_CLS_NAME],
+                method_name: [0; MAX_METHOD_NAME],
+            }; MAX_RADOS_OPS],
+            trans_id: [0; MAX_TRANS_ID],
+            object_name: [0; MAX_OBJECT_NAME],
+        }
     }
 
     fn bytes<const N: usize>(value: &str) -> [u8; N] {

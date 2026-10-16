@@ -45,9 +45,16 @@ sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 
 
 Preflight refuses any probe address that is not a function entry in the
 target binary, and any separate debug info that does not match it, so a wrong
-artifact fails before a uprobe is placed. Wait for `starting live tracing`
-before generating S3 traffic. JSON is written
-to stdout when the capture finishes; logs go to stderr.
+artifact fails before a uprobe is placed.
+
+Live tracing requires `--pid`: the probes fire only in that process. Pass
+`--all-processes` instead to probe every process that maps the Ceph libraries
+(for lab hosts only).
+
+Wait for `starting live tracing` before generating S3 traffic. JSON is written
+to stdout when the capture finishes; logs go to stderr. For long sessions, use
+`--output jsonl` to stream one document per flush interval instead of holding
+the whole capture in memory (see [long sessions](RUNBOOK.md#long-sessions-jsonl-streaming)).
 
 Continue in the runbook for [preflight and metadata setup](RUNBOOK.md#preflight),
 [OTLP export](RUNBOOK.md#tempo-export), and
@@ -80,3 +87,9 @@ cephtrace's `radostrace` implementation.
 
 Licensed **GPL-2.0-only**. See [NOTICE](NOTICE) for attribution and
 [LICENSE.GPL-2.0](LICENSE.GPL-2.0) for the full license.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the test and review process,
+[SECURITY.md](SECURITY.md) for private vulnerability reporting, and the
+[publication checklist](docs/publication-checklist.md) for administrator controls.

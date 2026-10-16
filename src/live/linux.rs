@@ -1,10 +1,12 @@
 use std::{
     ffi::CString,
+    io::BufWriter,
     mem::{align_of, size_of},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::Path,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -14,24 +16,23 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use libbpf_rs::{
-    skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, OpenObject,
-    RingBufferBuilder,
+    skel::OpenSkel, skel::SkelBuilder, AsRawLibbpf, Link, MapCore, MapFlags, MapKeyIter,
+    OpenObject, RingBufferBuilder,
 };
 use tracing::{debug, info, warn};
 
 use crate::{
     cli::{Cli, OutputMode},
-    collector::{BpfDiagnostics, Collector, TraceDocument},
+    collector::{
+        BpfDiagnostics, Collector, ExpiredBatch, TraceDocument, DEFAULT_MAX_BUFFERED_EVENTS,
+    },
     dwarf_json::{
         module_key_for_path, DwarfInfo, RadosOperateProbe, RequestEndProbe, RequestEndProbeGap,
-        VarFieldKernel, REQ_STATE_DTOR, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
+        REQ_STATE_DTOR, RGWTRACE_HPROBE_SLOTS, RGW_PROCESS_AUTHENTICATED, RGW_RADOS_OPERATE_READ,
         RGW_RADOS_OPERATE_WRITE,
     },
-    events::{
-        RawRadosEvent, RawRequestEvent, TraceEvent, RGWTRACE_EVENT_RADOS_OP,
-        RGWTRACE_EVENT_REQUEST_END, RGWTRACE_EVENT_REQUEST_START,
-    },
-    otel, preflight,
+    events::*,
+    otel, output, preflight,
     probe_sites::ProbeSites,
     targets,
 };
@@ -42,55 +43,65 @@ mod skel {
 
 use skel::*;
 
-const EVENT_DATA_OFFSET: usize = 8;
 const EINTR: i32 = 4;
+// In DRAINS, not spans: each unit is one whole flush-interval drain. Splitting a
+// drain into fixed-size units behind a fixed unit capacity would bound memory,
+// but at production drain sizes (~10^5-10^6 spans) the poll thread's try_send
+// loop outruns any HTTP exporter and would drop most of every drain -- far more
+// than today, where a drop needs the exporter to be two whole intervals behind.
 const OTLP_EXPORT_QUEUE_CAPACITY: usize = 2;
-const BPF_DIAG_RINGBUF_REQUEST_DROPS: u32 = 0;
-const BPF_DIAG_RINGBUF_RADOS_DROPS: u32 = 1;
-const BPF_DIAG_RADOS_MAP_DROPS: u32 = 2;
-const BPF_DIAG_RADOS_FINISH_MISSES: u32 = 3;
-const BPF_DIAG_REQUEST_CONTEXT_DROPS: u32 = 4;
-const BPF_DIAG_PROBE_READ_FAILURES: u32 = 5;
-const BPF_DIAG_REQSTATE_MAP_DROPS: u32 = 6;
-const BPF_DIAG_RESEED_HITS: u32 = 7;
-const BPF_DIAG_RESEED_MISSES: u32 = 8;
-const BPF_DIAG_RESEED_BASE_UNRESOLVED: u32 = 9;
-const BPF_DIAG_REQUEST_END_HITS: u32 = 10;
-const BPF_DIAG_REQUEST_END_MISSES: u32 = 11;
-const BPF_DIAG_REQUEST_END_BASE_UNRESOLVED: u32 = 12;
-const BPF_DIAG_SENDOP_STALE_CTX_DROPS: u32 = 13;
-const BPF_DIAG_SENDOP_UNVERIFIABLE_CTX: u32 = 14;
-const BPF_DIAG_OPERATE_SEED_HITS: u32 = 15;
-const BPF_DIAG_OPERATE_SEED_MISSES: u32 = 16;
-const BPF_DIAG_OPERATE_BASE_UNRESOLVED: u32 = 17;
-const BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS: u32 = 18;
-const BPF_DIAG_OPERATE_MISS_CTX_CLEARED: u32 = 19;
-const BPF_DIAG_RGWOP_KEY_INSERTS: u32 = 20;
-const BPF_DIAG_RGWOP_KEY_REVOKES: u32 = 21;
-const BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED: u32 = 22;
-const BPF_DIAG_RGWOP_KEY_UNRESOLVED: u32 = 23;
-const BPF_DIAG_OPERATE_SEED_HITS_REQSTATE: u32 = 24;
-const BPF_DIAG_OPERATE_SEED_HITS_RGWOP: u32 = 25;
-const BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED: u32 = 26;
-const BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED: u32 = 27;
-const BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT: u32 = 28;
-const BPF_DIAG_RGWOP_KEY_INDEX_DROPS: u32 = 29;
-const BPF_DIAG_RGWOP_KEY_DISABLED: u32 = 30;
-const BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED: u32 = 31;
-const BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED: u32 = 32;
 
 struct OtlpExporter {
-    sender: SyncSender<TraceDocument>,
+    // Detached request groups, not rendered spans: the exporter thread renders
+    // them, so the ring-buffer thread never pays for span construction.
+    sender: SyncSender<ExpiredBatch>,
     handle: JoinHandle<Result<otel::ExportDiagnostics>>,
+    ledger: Arc<ExportLedger>,
+}
+
+/// Documents (and their spans) handed to the OTLP worker vs. ones it finished
+/// with -- exported, or counted as lost. The difference is what a worker panic
+/// destroyed: the document in flight plus everything still queued. Those spans
+/// already left the collector, so `OtlpExporter::finish` counts them as lost.
+#[derive(Debug, Default)]
+struct ExportLedger {
+    queued_documents: AtomicU64,
+    queued_spans: AtomicU64,
+    settled_documents: AtomicU64,
+    settled_spans: AtomicU64,
+}
+
+impl ExportLedger {
+    fn queued(&self, spans: usize) {
+        self.queued_documents.fetch_add(1, Ordering::SeqCst);
+        self.queued_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    fn settled(&self, spans: usize) {
+        self.settled_documents.fetch_add(1, Ordering::SeqCst);
+        self.settled_spans.fetch_add(spans as u64, Ordering::SeqCst);
+    }
+
+    /// (documents, spans) accepted by the worker but never settled.
+    fn unsettled(&self) -> (u64, u64) {
+        let load = |counter: &AtomicU64| counter.load(Ordering::SeqCst);
+        (
+            load(&self.queued_documents).saturating_sub(load(&self.settled_documents)),
+            load(&self.queued_spans).saturating_sub(load(&self.settled_spans)),
+        )
+    }
 }
 
 struct OtlpExporterConfig {
+    service_name: String,
     endpoint: String,
-    headers: Vec<(String, String)>,
+    /// One HTTP client for the exporter's lifetime: its connection pool (and
+    /// TLS session) is reused across every drain, instead of a fresh client --
+    /// and handshake -- per exported document.
+    client: otel::ExportClient,
     compression: crate::cli::OtlpCompression,
     max_spans_per_batch: usize,
     max_bytes_per_batch: usize,
-    timeout: Duration,
     retries: u32,
     diagnostics: bool,
 }
@@ -101,15 +112,24 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // inside an executable PT_LOAD; the artifact's virtual addresses are never
     // handed to the uprobe API directly.
     let probe_sites = preflight::validated_probe_sites(dwarf, &targets, cli.max_debug_file_bytes)?;
-    let pid = cli.pid.unwrap_or(-1);
+    let scope = ProcessScope::from_cli(cli.pid, cli.all_processes)?;
+    if scope.target_tgid != 0 {
+        ensure_init_pid_namespace()?;
+    }
+    let pid = scope.attach_pid;
     info!(pid, "starting live tracing");
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
-    let open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
-    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref())?;
+    let mut open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
+    configure_rodata(
+        open.maps.rodata_data,
+        dwarf.version.as_deref(),
+        scope.target_tgid,
+    )?;
+    configure_map_sizes(&mut open, cli)?;
     let mut skel = open.load()?;
 
-    populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
+    populate_hprobes(&mut skel.maps.hprobes, dwarf, &targets)?;
     // The BPF globals (`REQUEST_END_PROBE_ATTACHED`, `RGW_OP_BRIDGE_KEY_ENABLED`)
     // are published INSIDE attach_probes, between the destructor attach and the
     // first probe that can create or consume a bridge entry. Publishing them here,
@@ -125,7 +145,8 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         !cli.disable_rgw_op_bridge_key,
     )?;
     let _links = attached.links;
-    let timestamp_offset_ns = unix_boottime_offset_ns()?;
+    let clock = TraceClock::new()?;
+    let timestamp_offset_ns = clock.offset_ns;
 
     let mut collector_state = if cli.correlate_inferred {
         Collector::with_inferred_correlation(duration_ns(cli.inference_window))
@@ -137,13 +158,42 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     // under its pending END (which would export it twice). Without it, no END is
     // ever coming and the plain idle TTL is correct.
     collector_state.set_end_probe_attached(attached.request_end_probe);
+    collector_state.set_closed_request_grace(duration_ns(cli.closed_request_grace));
+    collector_state.set_inference_max_pending(cli.inference_max_pending);
+    collector_state.set_redact_object_names(cli.redact_object_names);
+    if cli.output == OutputMode::Json {
+        // `--output json` prints one document at exit and never drains, so the
+        // buffer cap is the only thing bounding its memory.
+        let max = cli
+            .max_buffered_events
+            .unwrap_or(DEFAULT_MAX_BUFFERED_EVENTS);
+        collector_state.set_max_buffered_events(Some(max));
+        if cli.timeout.is_none() {
+            warn!(
+                max_buffered_events = max,
+                "--output json holds the whole session in memory until exit and has no \
+                 --timeout; past --max-buffered-events new requests are dropped. Use \
+                 --output jsonl to stream a long session"
+            );
+        }
+    }
     let collector = Arc::new(Mutex::new(collector_state));
-    let otlp_exporter = matches!(cli.output, OutputMode::Otlp).then(|| OtlpExporter::spawn(cli));
+    let otlp_exporter = matches!(cli.output, OutputMode::Otlp)
+        .then(|| OtlpExporter::spawn(cli, Arc::clone(&collector)))
+        .transpose()?;
+    // `--output jsonl` writes each drain as one line. Buffered so a large drain is
+    // not thousands of small writes; flushed per line.
+    let mut jsonl_out = (cli.output == OutputMode::Jsonl)
+        .then(|| BufWriter::with_capacity(1 << 16, std::io::stdout()));
+    let dwarf_summary = dwarf.summary();
     let collector_cb = Arc::clone(&collector);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_handler = Arc::clone(&stop);
+    // With ctrlc's `termination` feature this also catches SIGTERM and SIGHUP,
+    // so `systemctl stop` ends the run through the same path as Ctrl-C and the
+    // collected spans are still emitted.
     ctrlc::set_handler(move || stop_handler.store(true, Ordering::SeqCst))
-        .context("failed to install Ctrl-C handler")?;
+        .context("failed to install the SIGINT/SIGTERM/SIGHUP handler")?;
 
     let mut ringbuf_builder = RingBufferBuilder::new();
     ringbuf_builder.add(&skel.maps.events, move |data| {
@@ -169,14 +219,15 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
 
     let started = Instant::now();
     let mut last_flush = Instant::now();
-    // Latches once the OTLP exporter thread dies so a single fatal/misconfig
-    // OTLP response cannot tear down the session or spam the log.
-    let mut otlp_export_disabled = false;
-    // Batches drained from the collector for OTLP export but stranded when the
-    // exporter channel was found `Disconnected`. Those spans have already left
-    // the collector, so retain them here and fold them back into the end-of-run
-    // trace rather than losing them.
-    let mut retained_otlp: Vec<TraceDocument> = Vec::new();
+    let target_watch = cli.pid.map(TargetWatch::new);
+    let mut rados_ops_sweep = if cli.rados_ops_stale_after.is_zero() {
+        None
+    } else {
+        Some(StaleRadosOpsSweep::new(&skel.maps.rados_ops)?)
+    };
+    // Set once the OTLP worker thread is found gone (it only exits by panicking),
+    // so the loss is warned about once; drains continue and are counted as lost.
+    let mut otlp_worker_gone = false;
     loop {
         let ret = ringbuf.poll_raw(Duration::from_millis(250));
         if ret < 0 {
@@ -198,17 +249,73 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
                 break;
             }
         }
-        if matches!(cli.output, OutputMode::Otlp) && last_flush.elapsed() >= cli.otlp_flush_interval
-        {
+        if let Some(watch) = &target_watch {
+            if watch.exited() {
+                // The target can no longer write, so whatever it wrote between
+                // the last poll and its exit is all that is left: drain it, or
+                // its final completions and request ENDs are lost with the ring.
+                let drained = ringbuf.consume_raw();
+                if drained < 0 {
+                    warn!(
+                        errno = -drained,
+                        "failed to drain the ring buffer after target exit"
+                    );
+                }
+                warn!(
+                    pid,
+                    "target process exited; stopping the trace and writing what was collected"
+                );
+                break;
+            }
+        }
+        if let Some(sweep) = &mut rados_ops_sweep {
+            match sweep.run_batch(&skel.maps.rados_ops, cli.rados_ops_stale_after) {
+                Ok(swept) if swept > 0 => {
+                    info!(
+                        swept,
+                        stale_after_secs = cli.rados_ops_stale_after.as_secs(),
+                        "deleted stale rados_ops entries"
+                    );
+                    collector
+                        .lock()
+                        .expect("collector lock poisoned")
+                        .record_stale_rados_ops_swept(swept);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    // A later restore failure must not hide earlier successful
+                    // removals in the same batch.
+                    collector
+                        .lock()
+                        .expect("collector lock poisoned")
+                        .record_stale_rados_ops_swept(std::mem::take(&mut sweep.swept_pending));
+                    sweep.pause(Instant::now(), cli.rados_ops_stale_after);
+                    warn!(
+                        error = %format_args!("{err:#}"),
+                        "failed to sweep stale rados_ops entries; retrying after the sweep interval"
+                    );
+                }
+            }
+        }
+        // The streaming modes drain on every flush interval; that drain is what
+        // bounds their memory for any session length.
+        if cli.output.is_streaming() && last_flush.elapsed() >= cli.otlp_flush_interval {
             merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
-            if let Some(exporter) = &otlp_exporter {
-                if let Some(retained) = queue_expired_otlp(
-                    cli,
-                    &collector,
-                    &exporter.sender,
-                    &mut otlp_export_disabled,
-                )? {
-                    retained_otlp.push(retained);
+            if let Some(trace) = drain_expired(cli, &collector, &clock)? {
+                if let Some(exporter) = &otlp_exporter {
+                    dispatch_expired_otlp(
+                        &collector,
+                        &exporter.sender,
+                        &exporter.ledger,
+                        trace,
+                        &mut otlp_worker_gone,
+                    );
+                } else if let Some(out) = jsonl_out.as_mut() {
+                    output::write_jsonl_document(
+                        out,
+                        &dwarf_summary,
+                        &trace.into_trace_document(cli.service_name.clone()),
+                    )?;
                 }
             }
             last_flush = Instant::now();
@@ -218,19 +325,21 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     drop(ringbuf);
     merge_bpf_diagnostics(&skel.maps.diagnostics, &collector)?;
     if let Some(exporter) = otlp_exporter {
-        // The exporter thread returns `Err` after a fatal/exhausted OTLP export.
-        // Surface it for logging, but never let it abort the session: the
-        // collected spans below must still be emitted on the non-OTLP path.
-        match exporter.finish() {
+        // The worker never exits on a failed export, so `Err` here means it
+        // panicked. Never let that abort the session: the end-of-run trace below
+        // still goes through the final export (or the stdout dump).
+        match exporter.finish(&collector) {
             Ok(export) => info!(
                 export_batches = export.batches,
                 export_attempts = export.attempts,
                 export_failures = export.failures,
+                export_failed_batches = export.failed_batches,
+                export_failed_spans = export.failed_spans,
                 "finished live OTLP exporter"
             ),
             Err(err) => warn!(
                 error = %format_args!("{err:#}"),
-                "live OTLP exporter thread ended with an error; continuing without OTLP export"
+                "live OTLP exporter thread ended with an error"
             ),
         }
     }
@@ -238,22 +347,7 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
         .map_err(|_| anyhow::anyhow!("collector still has outstanding references"))?
         .into_inner()
         .expect("collector lock poisoned");
-    let mut trace = collector.into_trace_document(cli.service_name.clone());
-    if !retained_otlp.is_empty() {
-        // Merge only the spans: `drain_expired` already folded these batches'
-        // diagnostics into the collector's cumulative counters (which
-        // `into_trace_document` above emitted), so the retained snapshots are
-        // stale and must be discarded to avoid double counting.
-        let retained_spans: usize = retained_otlp.iter().map(|doc| doc.spans.len()).sum();
-        for doc in retained_otlp {
-            trace.spans.extend(doc.spans);
-        }
-        trace.diagnostics.spans_produced = trace.spans.len() as u64;
-        debug!(
-            retained_spans,
-            "merged OTLP spans stranded by a disconnected exporter into the end-of-run trace"
-        );
-    }
+    let trace = collector.into_trace_document(cli.service_name.clone());
     // The run summary belongs in the log, not only in the JSON body: with
     // `--output otlp` the JSON document is never printed, so without it a live run
     // cannot be evaluated without guessing.
@@ -276,6 +370,13 @@ pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
             otlp_queue_dropped_traces = trace.diagnostics.otlp_queue_dropped_traces,
             otlp_queue_dropped_spans = trace.diagnostics.otlp_queue_dropped_spans,
             "dropped OTLP spans under export backpressure -- the exported trace is incomplete"
+        );
+    }
+    if trace.diagnostics.otlp_export_failed_spans > 0 {
+        warn!(
+            otlp_export_failed_batches = trace.diagnostics.otlp_export_failed_batches,
+            otlp_export_failed_spans = trace.diagnostics.otlp_export_failed_spans,
+            "OTLP export lost spans that could not be delivered -- the exported trace is incomplete"
         );
     }
     // Operator UX: RADOS ops were seen but not a single RGW request marker. The
@@ -319,50 +420,59 @@ fn merge_bpf_diagnostics(map: &impl MapCore, collector: &Arc<Mutex<Collector>>) 
 
 fn read_bpf_diagnostics(map: &impl MapCore) -> Result<BpfDiagnostics> {
     Ok(BpfDiagnostics {
-        ringbuf_request_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_REQUEST_DROPS)?,
-        ringbuf_rados_drops: read_bpf_counter(map, BPF_DIAG_RINGBUF_RADOS_DROPS)?,
-        rados_map_drops: read_bpf_counter(map, BPF_DIAG_RADOS_MAP_DROPS)?,
-        rados_finish_misses: read_bpf_counter(map, BPF_DIAG_RADOS_FINISH_MISSES)?,
-        request_context_drops: read_bpf_counter(map, BPF_DIAG_REQUEST_CONTEXT_DROPS)?,
-        probe_read_failures: read_bpf_counter(map, BPF_DIAG_PROBE_READ_FAILURES)?,
-        reqstate_map_drops: read_bpf_counter(map, BPF_DIAG_REQSTATE_MAP_DROPS)?,
-        reseed_hits: read_bpf_counter(map, BPF_DIAG_RESEED_HITS)?,
-        reseed_misses: read_bpf_counter(map, BPF_DIAG_RESEED_MISSES)?,
-        reseed_base_unresolved: read_bpf_counter(map, BPF_DIAG_RESEED_BASE_UNRESOLVED)?,
-        request_end_hits: read_bpf_counter(map, BPF_DIAG_REQUEST_END_HITS)?,
-        request_end_misses: read_bpf_counter(map, BPF_DIAG_REQUEST_END_MISSES)?,
-        request_end_base_unresolved: read_bpf_counter(map, BPF_DIAG_REQUEST_END_BASE_UNRESOLVED)?,
-        sendop_stale_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_STALE_CTX_DROPS)?,
-        sendop_unverifiable_ctx: read_bpf_counter(map, BPF_DIAG_SENDOP_UNVERIFIABLE_CTX)?,
-        operate_seed_hits: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS)?,
-        operate_seed_misses: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_MISSES)?,
-        operate_base_unresolved: read_bpf_counter(map, BPF_DIAG_OPERATE_BASE_UNRESOLVED)?,
-        sendop_unbridged_ctx_drops: read_bpf_counter(map, BPF_DIAG_SENDOP_UNBRIDGED_CTX_DROPS)?,
-        operate_miss_ctx_cleared: read_bpf_counter(map, BPF_DIAG_OPERATE_MISS_CTX_CLEARED)?,
-        rgw_op_key_inserts: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INSERTS)?,
-        rgw_op_key_revokes: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKES)?,
-        rgw_op_key_revoke_skipped: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_SKIPPED)?,
-        rgw_op_key_unresolved: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_UNRESOLVED)?,
-        operate_seed_hits_reqstate: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_REQSTATE)?,
-        operate_seed_hits_rgwop: read_bpf_counter(map, BPF_DIAG_OPERATE_SEED_HITS_RGWOP)?,
+        ringbuf_request_drops: read_bpf_counter(map, RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS)?,
+        ringbuf_rados_drops: read_bpf_counter(map, RGWTRACE_DIAG_RINGBUF_RADOS_DROPS)?,
+        rados_map_drops: read_bpf_counter(map, RGWTRACE_DIAG_RADOS_MAP_DROPS)?,
+        rados_finish_misses: read_bpf_counter(map, RGWTRACE_DIAG_RADOS_FINISH_MISSES)?,
+        request_context_drops: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_CONTEXT_DROPS)?,
+        probe_read_failures: read_bpf_counter(map, RGWTRACE_DIAG_PROBE_READ_FAILURES)?,
+        reqstate_map_drops: read_bpf_counter(map, RGWTRACE_DIAG_REQSTATE_MAP_DROPS)?,
+        reseed_hits: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_HITS)?,
+        reseed_misses: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_MISSES)?,
+        reseed_base_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_RESEED_BASE_UNRESOLVED)?,
+        request_end_hits: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_END_HITS)?,
+        request_end_misses: read_bpf_counter(map, RGWTRACE_DIAG_REQUEST_END_MISSES)?,
+        request_end_base_unresolved: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_REQUEST_END_BASE_UNRESOLVED,
+        )?,
+        sendop_stale_ctx_drops: read_bpf_counter(map, RGWTRACE_DIAG_SENDOP_STALE_CTX_DROPS)?,
+        sendop_unverifiable_ctx: read_bpf_counter(map, RGWTRACE_DIAG_SENDOP_UNVERIFIABLE_CTX)?,
+        operate_seed_hits: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_HITS)?,
+        operate_seed_misses: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_MISSES)?,
+        operate_base_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED)?,
+        sendop_unbridged_ctx_drops: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_SENDOP_UNBRIDGED_CTX_DROPS,
+        )?,
+        operate_miss_ctx_cleared: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_MISS_CTX_CLEARED)?,
+        rgw_op_key_inserts: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_INSERTS)?,
+        rgw_op_key_revokes: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKES)?,
+        rgw_op_key_revoke_skipped: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKE_SKIPPED)?,
+        rgw_op_key_unresolved: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_UNRESOLVED)?,
+        operate_seed_hits_reqstate: read_bpf_counter(
+            map,
+            RGWTRACE_DIAG_OPERATE_SEED_HITS_REQSTATE,
+        )?,
+        operate_seed_hits_rgwop: read_bpf_counter(map, RGWTRACE_DIAG_OPERATE_SEED_HITS_RGWOP)?,
         operate_seed_hits_unattributed: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED,
+            RGWTRACE_DIAG_OPERATE_SEED_HITS_UNATTRIBUTED,
         )?,
         operate_unresolved_ctx_cleared: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
+            RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
         )?,
-        rgw_op_key_revoke_absent: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
-        rgw_op_key_index_drops: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_INDEX_DROPS)?,
-        rgw_op_key_disabled: read_bpf_counter(map, BPF_DIAG_RGWOP_KEY_DISABLED)?,
+        rgw_op_key_revoke_absent: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_REVOKE_ABSENT)?,
+        rgw_op_key_index_drops: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_INDEX_DROPS)?,
+        rgw_op_key_disabled: read_bpf_counter(map, RGWTRACE_DIAG_RGWOP_KEY_DISABLED)?,
         operate_miss_home_ctx_preserved: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED,
+            RGWTRACE_DIAG_OPERATE_MISS_HOME_CTX_PRESERVED,
         )?,
         operate_unresolved_home_ctx_preserved: read_bpf_counter(
             map,
-            BPF_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED,
+            RGWTRACE_DIAG_OPERATE_UNRESOLVED_HOME_CTX_PRESERVED,
         )?,
     })
 }
@@ -386,153 +496,298 @@ fn read_bpf_counter(map: &impl MapCore, counter: u32) -> Result<u64> {
 }
 
 impl OtlpExporter {
-    fn spawn(cli: &Cli) -> Self {
+    fn spawn(cli: &Cli, collector: Arc<Mutex<Collector>>) -> Result<Self> {
         let (sender, receiver) = mpsc::sync_channel(OTLP_EXPORT_QUEUE_CAPACITY);
         let config = OtlpExporterConfig {
+            service_name: cli.service_name.clone(),
             endpoint: cli.otlp_endpoint.clone(),
-            headers: cli.otlp_header.clone(),
+            client: otel::ExportClient::from_cli(cli)?,
             compression: cli.otlp_compression,
             max_spans_per_batch: cli.otlp_max_spans_per_batch,
             max_bytes_per_batch: cli.otlp_max_bytes_per_batch,
-            timeout: cli.otlp_timeout,
             retries: cli.otlp_retries,
             diagnostics: cli.otlp_diagnostics,
         };
-        let handle = thread::spawn(move || run_otlp_exporter(receiver, config));
-        Self { sender, handle }
+        let ledger = Arc::new(ExportLedger::default());
+        let worker_ledger = Arc::clone(&ledger);
+        let handle = thread::spawn(move || {
+            Ok(run_otlp_exporter(
+                receiver,
+                config,
+                &collector,
+                &worker_ledger,
+            ))
+        });
+        Ok(Self {
+            sender,
+            handle,
+            ledger,
+        })
     }
 
-    fn finish(self) -> Result<otel::ExportDiagnostics> {
+    /// Close the queue and wait for the worker. If it panicked, every document it
+    /// had accepted but not settled is counted as lost before the error is
+    /// returned, so the final counters still measure all missing spans.
+    fn finish(self, collector: &Mutex<Collector>) -> Result<otel::ExportDiagnostics> {
         drop(self.sender);
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("OTLP exporter thread panicked"))?
+        match self.handle.join() {
+            Ok(result) => result,
+            Err(_) => {
+                let (documents, spans) = self.ledger.unsettled();
+                if let Ok(mut collector) = collector.lock() {
+                    collector.record_otlp_export_failure(documents, spans);
+                }
+                anyhow::bail!(
+                    "OTLP exporter thread panicked; {documents} queued document(s) with \
+                     {spans} span(s) were lost and counted in otlp_export_failed_spans"
+                )
+            }
+        }
     }
 }
 
-fn run_otlp_exporter(
-    receiver: Receiver<TraceDocument>,
+/// The OTLP worker: export every drained document until the channel closes.
+///
+/// It NEVER exits on a failed export. It used to return on the first batch that
+/// failed after its retries, which silently disabled OTLP export for the rest of
+/// the run: the batch in flight and the ones queued behind it were lost
+/// uncounted, the live loop then found the channel disconnected and stopped
+/// draining, and the collector grew without bound. Now a lost batch is counted
+/// in the collector's `otlp_export_failed_*` diagnostics and logged, and the
+/// worker moves on to the next drain -- which succeeds as soon as the endpoint
+/// recovers.
+///
+/// No class of error latches export off, including a non-retryable 4xx that
+/// signals misconfiguration (bad auth, wrong path): every drain still gets a
+/// prompt, cheap attempt, each loss is counted and warned about, and a fix on the
+/// collector side (a rotated token, a restarted backend) takes effect without
+/// restarting the tracer.
+fn run_otlp_exporter<T: SpanCount>(
+    receiver: Receiver<T>,
     config: OtlpExporterConfig,
-) -> Result<otel::ExportDiagnostics> {
+    collector: &Mutex<Collector>,
+    ledger: &ExportLedger,
+) -> otel::ExportDiagnostics {
     let mut total = otel::ExportDiagnostics::default();
-    for trace in receiver {
+    for batch in receiver {
+        // Rendered here, off the ring-buffer thread and outside the collector
+        // lock: span construction is the expensive half of a drain.
+        let trace = batch.render(&config.service_name);
         let spans = trace.spans.len();
         let export = otel::export_otlp_http(
             otel::ExportConfig {
                 endpoint: &config.endpoint,
-                headers: &config.headers,
+                client: &config.client,
                 compression: config.compression,
                 max_spans_per_batch: config.max_spans_per_batch,
                 max_bytes_per_batch: config.max_bytes_per_batch,
-                timeout: config.timeout,
                 retries: config.retries,
                 diagnostics: config.diagnostics,
             },
             &trace,
-        )?;
+        )
+        .unwrap_or_else(|err| {
+            // The request could not even be built: the whole document is lost.
+            otel::ExportDiagnostics {
+                failed_batches: 1,
+                failed_spans: spans as u64,
+                last_error: Some(format!("{err:#}")),
+                ..otel::ExportDiagnostics::default()
+            }
+        });
         total.batches += export.batches;
         total.attempts += export.attempts;
         total.failures += export.failures;
-        info!(
-            spans,
-            export_attempts = export.attempts,
-            export_failures = export.failures,
-            "exported expired OTLP spans"
-        );
-    }
-    Ok(total)
-}
-
-fn queue_expired_otlp(
-    cli: &Cli,
-    collector: &Arc<Mutex<Collector>>,
-    sender: &SyncSender<TraceDocument>,
-    disabled: &mut bool,
-) -> Result<Option<TraceDocument>> {
-    // Once the exporter thread has gone away we permanently stop draining spans
-    // into the (dead) channel so the session keeps running and the end-of-run
-    // `into_trace_document` still produces output for the non-OTLP path.
-    if *disabled {
-        return Ok(None);
-    }
-
-    let ttl_ns = duration_ns(cli.correlation_ttl);
-    let now_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
-    let trace = collector
-        .lock()
-        .expect("collector lock poisoned")
-        .drain_expired(cli.service_name.clone(), now_ns, ttl_ns);
-    let Some(trace) = trace else {
-        return Ok(None);
-    };
-
-    // A `Some` return carries a batch the caller must retain: it left the
-    // collector but could not reach a disconnected exporter.
-    Ok(dispatch_expired_otlp(collector, sender, trace, disabled))
-}
-
-/// Hand a drained batch of expired spans to the OTLP exporter thread, degrading
-/// gracefully instead of aborting the session.
-///
-/// A dead exporter thread (channel `Disconnected`) is treated as a permanent,
-/// non-fatal condition: OTLP export is disabled for the rest of the run via
-/// `disabled` and a single warning is logged. The batch has already left the
-/// collector, so it is NOT counted as a drop; instead it is returned as
-/// `Some(trace)` for the caller to retain and re-emit at end of run. Subsequent
-/// calls observe `disabled` and stay silent, so a transient/misconfig OTLP
-/// error can neither tear down live tracing nor spam the log.
-///
-/// Returns `Some(trace)` when the batch must be retained by the caller; `None`
-/// when it was queued for export or dropped as genuine backpressure (`Full`).
-fn dispatch_expired_otlp(
-    collector: &Arc<Mutex<Collector>>,
-    sender: &SyncSender<TraceDocument>,
-    trace: TraceDocument,
-    disabled: &mut bool,
-) -> Option<TraceDocument> {
-    // Export already disabled: the channel is known dead, so retain the batch
-    // for end-of-run emission rather than dropping it. In the live loop
-    // `queue_expired_otlp` short-circuits before draining once disabled, so this
-    // path is defensive.
-    if *disabled {
-        return Some(trace);
-    }
-
-    let spans = trace.spans.len();
-    match sender.try_send(trace) {
-        Ok(()) => {
-            info!(spans, "queued expired OTLP spans");
-            None
-        }
-        Err(TrySendError::Full(trace)) => {
-            // Asymmetry with `Disconnected` below is deliberate. `Full` is
-            // transient backpressure: retaining every full-dropped batch would
-            // grow `retained_otlp` without bound under sustained backpressure,
-            // so we drop the batch (counted via `record_otlp_queue_drop`) to
-            // keep memory bounded. `Disconnected` is a permanent condition that
-            // affects exactly one batch, so retaining that single batch is safe.
+        total.failed_batches += export.failed_batches;
+        total.failed_spans += export.failed_spans;
+        if export.failed_batches > 0 {
             collector
                 .lock()
                 .expect("collector lock poisoned")
-                .record_otlp_queue_drop(trace.spans.len());
+                .record_otlp_export_failure(export.failed_batches, export.failed_spans);
             warn!(
-                spans = trace.spans.len(),
+                spans,
+                failed_batches = export.failed_batches,
+                failed_spans = export.failed_spans,
+                error = export.last_error.as_deref().unwrap_or("unknown"),
+                "OTLP export lost spans; continuing with the next drain"
+            );
+            total.last_error = export.last_error;
+        } else {
+            info!(
+                spans,
+                export_attempts = export.attempts,
+                export_failures = export.failures,
+                "exported expired OTLP spans"
+            );
+        }
+        // Settled only once its outcome is recorded: a panic before this point
+        // leaves the document to `OtlpExporter::finish` to count.
+        ledger.settled(spans);
+    }
+    total
+}
+
+/// Drain the requests and background ops that have expired by the TRACE clock.
+fn drain_expired(
+    cli: &Cli,
+    collector: &Mutex<Collector>,
+    clock: &TraceClock,
+) -> Result<Option<ExpiredBatch>> {
+    let ttl_ns = duration_ns(cli.correlation_ttl);
+    let now_ns = clock.now_ns()?;
+    Ok(collector
+        .lock()
+        .expect("collector lock poisoned")
+        .drain_expired_batch(now_ns, ttl_ns))
+}
+
+/// Hand a drained batch of expired spans to the OTLP exporter thread, never
+/// aborting the session and never letting memory grow.
+///
+/// `Full` is backpressure: the batch is dropped and counted
+/// (`otlp_queue_dropped_*`). `Disconnected` can only mean the worker panicked
+/// (it never exits on a send failure); the batch is counted as lost
+/// (`otlp_export_failed_*`) and the caller keeps draining, so the collector stays
+/// bounded. The old behavior -- retain the batch and stop draining for the rest
+/// of the run -- grew memory without limit. `worker_gone` only keeps the warning
+/// to one line.
+fn dispatch_expired_otlp<T: SpanCount>(
+    collector: &Mutex<Collector>,
+    sender: &SyncSender<T>,
+    ledger: &ExportLedger,
+    trace: T,
+    worker_gone: &mut bool,
+) {
+    let spans = trace.span_count();
+    match sender.try_send(trace) {
+        Ok(()) => {
+            ledger.queued(spans);
+            info!(spans, "queued expired OTLP spans");
+        }
+        Err(TrySendError::Full(trace)) => {
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_queue_drop(trace.span_count());
+            warn!(
+                spans = trace.span_count(),
                 "dropped expired OTLP spans; export queue is full"
             );
-            None
         }
         Err(TrySendError::Disconnected(trace)) => {
-            *disabled = true;
-            warn!(
-                spans = trace.spans.len(),
-                "OTLP exporter worker stopped; retaining these spans for end-of-run emission and disabling OTLP export for the rest of this run"
-            );
-            Some(trace)
+            collector
+                .lock()
+                .expect("collector lock poisoned")
+                .record_otlp_export_failure(1, trace.span_count() as u64);
+            if !*worker_gone {
+                *worker_gone = true;
+                warn!(
+                    spans = trace.span_count(),
+                    "OTLP exporter worker is gone; drained spans are counted as lost \
+                     (otlp_export_failed_spans) and draining continues"
+                );
+            }
         }
     }
 }
 
-fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result<()> {
+/// What crosses the exporter queue, as far as the drop/retain accounting is
+/// concerned. The live queue carries [`ExpiredBatch`]es; a rendered
+/// [`TraceDocument`] counts the same way.
+trait SpanCount {
+    fn render(self, service_name: &str) -> TraceDocument;
+    fn span_count(&self) -> usize;
+}
+
+impl SpanCount for ExpiredBatch {
+    fn render(self, service_name: &str) -> TraceDocument {
+        self.into_trace_document(service_name)
+    }
+    fn span_count(&self) -> usize {
+        ExpiredBatch::span_count(self)
+    }
+}
+
+impl SpanCount for TraceDocument {
+    fn render(self, _service_name: &str) -> TraceDocument {
+        self
+    }
+    fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+}
+
+/// Which processes the uprobes may fire in: the `pid` handed to the uprobe
+/// attach (-1 = every process) and the BPF-side `TARGET_TGID` gate (0 = any).
+/// Both come from the same `--pid`, so they can never disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessScope {
+    attach_pid: i32,
+    target_tgid: u32,
+}
+
+impl ProcessScope {
+    fn from_cli(pid: Option<i32>, all_processes: bool) -> Result<Self> {
+        match (pid, all_processes) {
+            (Some(pid), false) => {
+                let target_tgid = u32::try_from(pid)
+                    .ok()
+                    .filter(|tgid| *tgid != 0)
+                    .context("--pid must be a positive process id")?;
+                Ok(Self {
+                    attach_pid: pid,
+                    target_tgid,
+                })
+            }
+            (None, true) => Ok(Self {
+                attach_pid: -1,
+                target_tgid: 0,
+            }),
+            (Some(_), true) => bail!("--pid and --all-processes are mutually exclusive"),
+            (None, false) => bail!(
+                "live tracing requires --pid <radosgw pid> (or --all-processes to trace \
+                 system-wide)"
+            ),
+        }
+    }
+}
+
+/// `PROC_PID_INIT_INO`: the fixed inode of the initial pid namespace.
+const INIT_PID_NAMESPACE: &str = "pid:[4026531836]";
+
+/// The BPF gate compares `--pid` with `bpf_get_current_pid_tgid() >> 32`, which is
+/// the tgid in the INIT pid namespace. From a nested pid namespace (a container
+/// started without `--pid=host`) `--pid` is a namespace-local number, the gate
+/// would match nothing, and the run would capture zero events with no error. Fail
+/// loudly instead.
+fn ensure_init_pid_namespace() -> Result<()> {
+    let link = std::fs::read_link("/proc/self/ns/pid")
+        .context("failed to read /proc/self/ns/pid to check the pid namespace")?;
+    if !is_init_pid_namespace(&link) {
+        bail!(
+            "rgwtrace is running in a nested pid namespace ({}); --pid would not match the \
+             kernel's tgid and no event would ever be captured. Run rgwtrace in the host pid \
+             namespace (e.g. `docker run --pid=host`)",
+            link.display()
+        );
+    }
+    Ok(())
+}
+
+fn is_init_pid_namespace(link: &Path) -> bool {
+    link.as_os_str() == INIT_PID_NAMESPACE
+}
+
+fn configure_rodata(
+    rodata: &mut types::rodata,
+    version: Option<&str>,
+    target_tgid: u32,
+) -> Result<()> {
+    // The process filter goes first: it is independent of the Ceph version, and a
+    // version error below must not leave it half-configured for a later caller.
+    rodata.TARGET_TGID = target_tgid;
+
     let version = version.context(
         "Ceph version is required to select ceph_osd_op ABI offsets; pass --ceph-version or use DWARF JSON with a version",
     )?;
@@ -557,11 +812,340 @@ fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result
     Ok(())
 }
 
-fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
-    for entry in dwarf.hprobe_entries() {
-        let key = entry.key.to_ne_bytes();
-        let value = bytes_of(&entry.field);
-        map.update(&key, value, MapFlags::ANY).with_context(|| {
+/// Apply the run's map sizes to the OPEN object: max_entries is fixed at load,
+/// and a ring buffer in particular cannot be resized afterwards.
+fn configure_map_sizes(open: &mut OpenRgwtraceSkel<'_>, cli: &Cli) -> Result<()> {
+    let page_size = page_size()?;
+    if u64::from(cli.ringbuf_size) % page_size != 0 {
+        bail!(
+            "--ringbuf-size {} is not a multiple of this host's {page_size}-byte page size",
+            cli.ringbuf_size
+        );
+    }
+    open.maps
+        .events
+        .set_max_entries(cli.ringbuf_size)
+        .with_context(|| {
+            format!(
+                "failed to size the events ring buffer to {} bytes",
+                cli.ringbuf_size
+            )
+        })?;
+    open.maps
+        .rados_ops
+        .set_max_entries(cli.bpf_rados_ops_entries)
+        .with_context(|| {
+            format!(
+                "failed to size the rados_ops map to {} entries",
+                cli.bpf_rados_ops_entries
+            )
+        })?;
+    info!(
+        ringbuf_bytes = cli.ringbuf_size,
+        rados_ops_entries = cli.bpf_rados_ops_entries,
+        "configured BPF map sizes"
+    );
+    Ok(())
+}
+
+/// Notices when the `--pid` target exits, so a session does not keep polling
+/// probes that can no longer fire.
+enum TargetWatch {
+    /// A pidfd: it polls readable once the process has exited (Linux >= 5.3).
+    Pidfd(OwnedFd),
+    /// No pidfd_open (older kernel, seccomp): check `/proc/<pid>/stat` instead.
+    Proc(i32),
+    /// The process was already gone when the watch was created.
+    Exited,
+}
+
+impl TargetWatch {
+    fn new(pid: i32) -> Self {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd >= 0 {
+            // SAFETY: pidfd_open returned a fresh descriptor that nothing else owns.
+            return Self::Pidfd(unsafe { OwnedFd::from_raw_fd(fd as RawFd) });
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Self::Exited;
+        }
+        debug!(pid, error = %err, "pidfd_open unavailable; watching /proc for target exit");
+        Self::Proc(pid)
+    }
+
+    fn exited(&self) -> bool {
+        match self {
+            Self::Pidfd(fd) => {
+                let mut pollfd = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut pollfd, 1, 0) };
+                ready > 0 && pollfd.revents != 0
+            }
+            Self::Proc(pid) => match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(stat) => proc_stat_says_exited(&stat),
+                Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+            },
+            Self::Exited => true,
+        }
+    }
+}
+
+/// Whether a `/proc/<pid>/stat` line describes a process that has exited
+/// (zombie `Z` or dead `X`/`x`). The state is the first field after the
+/// command name, which is parenthesized and may itself contain `)`.
+fn proc_stat_says_exited(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .is_some_and(|state| matches!(state, 'Z' | 'X' | 'x'))
+}
+
+fn rados_ops_sweep_interval(stale_after: Duration) -> Duration {
+    (stale_after / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
+}
+
+/// Limit map work between ring-buffer polls so a busy hash-map iterator cannot
+/// starve event consumption.
+const RADOS_OPS_SWEEP_BATCH_KEYS: usize = 256;
+
+/// Whether a `rados_ops` value (a `struct rados_op_state`, i.e. a
+/// `RawRadosEvent`) was sent more than `stale_after_ns` before `now_ns`.
+///
+/// `sent_ns == 0` is an entry `_send_op` inserted but has not stamped yet; it
+/// is the youngest possible op, never a stale one.
+fn rados_op_is_stale(value: &[u8], now_ns: u64, stale_after_ns: u64) -> bool {
+    let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+    let Some(bytes) = value.get(at..at + size_of::<u64>()) else {
+        return false;
+    };
+    let sent_ns = u64::from_ne_bytes(bytes.try_into().expect("8-byte slice"));
+    sent_ns != 0 && now_ns.saturating_sub(sent_ns) > stale_after_ns
+}
+
+/// What happened to one sweep candidate.
+#[derive(Debug, Eq, PartialEq)]
+enum Reclaim {
+    /// The entry removed was stale: a leaked op, reclaimed.
+    Swept,
+    /// The entry removed had been refreshed (Ceph resent the op, so `_send_op`
+    /// re-stamped the same key) after the scan judged it stale; it was put back.
+    Restored,
+    /// As `Restored`, but a newer `_send_op` re-inserted the key first; that
+    /// newer entry stands.
+    Superseded,
+    /// `_finish_op` deleted the entry first.
+    Gone,
+}
+
+/// Take one candidate out of `rados_ops` and judge what was ACTUALLY removed,
+/// not what the earlier scan saw. `take` must remove and return the entry
+/// atomically; `restore` must insert only if the key is absent.
+fn reclaim_stale_rados_op(
+    take: impl FnOnce() -> Result<Option<Vec<u8>>>,
+    restore: impl FnOnce(&[u8]) -> Result<()>,
+    now_ns: u64,
+    stale_after_ns: u64,
+) -> Result<Reclaim> {
+    let taken = match take() {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => return Ok(Reclaim::Gone),
+    };
+    if rados_op_is_stale(&taken, now_ns, stale_after_ns) {
+        return Ok(Reclaim::Swept);
+    }
+    match restore(&taken) {
+        Ok(()) => Ok(Reclaim::Restored),
+        Err(error)
+            if error
+                .downcast_ref::<libbpf_rs::Error>()
+                .is_some_and(|error| error.kind() == libbpf_rs::ErrorKind::AlreadyExists) =>
+        {
+            Ok(Reclaim::Superseded)
+        }
+        Err(error) => Err(error).context("failed to restore refreshed rados_ops entry"),
+    }
+}
+
+fn take_key_batch<I: Iterator>(
+    keys: &mut I,
+    cycle_budget: &mut usize,
+    batch_limit: usize,
+) -> (Vec<I::Item>, bool) {
+    let mut batch = Vec::with_capacity(batch_limit.min(*cycle_budget));
+    for _ in 0..batch_limit.min(*cycle_budget) {
+        match keys.next() {
+            Some(key) => {
+                batch.push(key);
+                *cycle_budget -= 1;
+            }
+            None => return (batch, true),
+        }
+    }
+    let cycle_complete = *cycle_budget == 0;
+    (batch, cycle_complete)
+}
+
+/// State for a bounded stale-op sweep. A key walk spans multiple poll-loop
+/// turns, and its scan budget caps restarts caused by concurrent `_finish_op`
+/// deletions. Candidates are held until collection ends because deleting a
+/// key during hash iteration can restart that iteration too.
+struct StaleRadosOpsSweep<'a> {
+    keys: Option<MapKeyIter<'a>>,
+    stale_candidates: Vec<Vec<u8>>,
+    scan_limit: usize,
+    scan_remaining: usize,
+    swept_pending: u64,
+    next_scan_at: Option<Instant>,
+}
+
+impl<'a> StaleRadosOpsSweep<'a> {
+    fn new<M: MapCore>(map: &'a M) -> Result<Self> {
+        let scan_limit = (map.info()?.info.max_entries as usize)
+            .saturating_mul(2)
+            .max(1);
+        Ok(Self {
+            keys: Some(map.keys()),
+            stale_candidates: Vec::new(),
+            scan_limit,
+            scan_remaining: scan_limit,
+            swept_pending: 0,
+            next_scan_at: None,
+        })
+    }
+
+    fn restart<M: MapCore>(&mut self, map: &'a M) {
+        self.keys = Some(map.keys());
+        self.stale_candidates.clear();
+        self.scan_remaining = self.scan_limit;
+        self.next_scan_at = None;
+    }
+
+    fn pause(&mut self, now: Instant, stale_after: Duration) {
+        self.keys = None;
+        self.stale_candidates.clear();
+        self.next_scan_at = Some(now + rados_ops_sweep_interval(stale_after));
+    }
+
+    fn waiting(&self, now: Instant) -> bool {
+        self.next_scan_at.is_some_and(|deadline| now < deadline)
+    }
+
+    /// Do at most one bounded scan or delete batch and return this batch's
+    /// reclaim count so diagnostics stay current even if a later batch fails.
+    fn run_batch<M: MapCore>(&mut self, map: &'a M, stale_after: Duration) -> Result<u64> {
+        // Check before map access and the stale-age clock read: idle cycles leave
+        // the ring reader its CPU even when polls return immediately.
+        if self.waiting(Instant::now()) {
+            return Ok(0);
+        }
+        if self.next_scan_at.is_some() {
+            self.restart(map);
+        }
+        let now_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
+        let stale_after_ns = duration_ns(stale_after);
+
+        if let Some(keys) = &mut self.keys {
+            let (batch, cycle_complete) =
+                take_key_batch(keys, &mut self.scan_remaining, RADOS_OPS_SWEEP_BATCH_KEYS);
+            for key in batch {
+                let Some(value) = map
+                    .lookup(&key, MapFlags::ANY)
+                    .context("failed to read a rados_ops entry")?
+                else {
+                    continue;
+                };
+                if rados_op_is_stale(&value, now_ns, stale_after_ns) {
+                    self.stale_candidates.push(key);
+                }
+            }
+            if cycle_complete {
+                self.keys = None;
+            }
+            return Ok(0);
+        }
+
+        for _ in 0..RADOS_OPS_SWEEP_BATCH_KEYS {
+            let Some(key) = self.stale_candidates.pop() else {
+                self.pause(Instant::now(), stale_after);
+                return Ok(std::mem::take(&mut self.swept_pending));
+            };
+            let outcome = match map.lookup_and_delete(&key) {
+                Ok(taken) => reclaim_stale_rados_op(
+                    || Ok(taken),
+                    |value| {
+                        map.update(&key, value, MapFlags::NO_EXIST)
+                            .map_err(Into::into)
+                    },
+                    now_ns,
+                    stale_after_ns,
+                )?,
+                // Pre-5.14 kernels refuse lookup-and-delete on hash maps
+                // (ENOTSUPP); re-read then delete only a still-stale value.
+                Err(_) => match map.lookup(&key, MapFlags::ANY) {
+                    Ok(Some(value)) if rados_op_is_stale(&value, now_ns, stale_after_ns) => {
+                        match map.delete(&key) {
+                            Ok(()) => Reclaim::Swept,
+                            Err(_) => Reclaim::Gone,
+                        }
+                    }
+                    Ok(Some(_)) => Reclaim::Restored,
+                    _ => Reclaim::Gone,
+                },
+            };
+            match outcome {
+                Reclaim::Swept => self.swept_pending += 1,
+                other => {
+                    debug!(outcome = ?other, "rados_ops sweep candidate was not stale any more")
+                }
+            }
+        }
+        if self.stale_candidates.is_empty() {
+            self.pause(Instant::now(), stale_after);
+        }
+        Ok(std::mem::take(&mut self.swept_pending))
+    }
+}
+
+fn page_size() -> Result<u64> {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(size)
+        .ok()
+        .filter(|size| *size > 0)
+        .context("sysconf(_SC_PAGESIZE) failed")
+}
+
+/// Install the hprobe descriptors of the modules this run attaches to -- and only
+/// those (see `DwarfInfo::hprobe_entries_for_modules`): the map is keyed by a
+/// global function id, so a descriptor from any other artifact module would be
+/// read at the target's probe address.
+fn populate_hprobes(
+    map: &mut impl MapCore,
+    dwarf: &DwarfInfo,
+    targets: &targets::ProbeTargets,
+) -> Result<()> {
+    let target_keys: Vec<String> = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect();
+    for entry in dwarf.hprobe_entries_for_modules(&target_keys)? {
+        // hprobes is a dense ARRAY; DwarfInfo::validate already bounds every
+        // key, so an out-of-range one here is a bug, not bad input.
+        let key = u32::try_from(entry.key)
+            .ok()
+            .filter(|key| *key < RGWTRACE_HPROBE_SLOTS as u32)
+            .with_context(|| {
+                format!(
+                    "hprobe key {} for {} is outside the {RGWTRACE_HPROBE_SLOTS}-slot map",
+                    entry.key, entry.function
+                )
+            })?
+            .to_ne_bytes();
+        let value = entry.field.to_bytes();
+        map.update(&key, &value, MapFlags::ANY).with_context(|| {
             format!("failed to populate hprobe {}:{}", entry.function, entry.key)
         })?;
     }
@@ -1238,12 +1822,12 @@ fn attach_uprobe(
 }
 
 fn decode_event(data: &[u8]) -> Result<TraceEvent> {
-    if data.len() < EVENT_DATA_OFFSET {
+    if data.len() < RGWTRACE_EVENT_DATA_OFFSET {
         bail!("event too short: {}", data.len());
     }
 
     let event_type = u32::from_ne_bytes(data[..4].try_into()?);
-    let payload = &data[EVENT_DATA_OFFSET..];
+    let payload = &data[RGWTRACE_EVENT_DATA_OFFSET..];
     match event_type {
         // get_handler START marker: request identity + start_ns (end_ns == 0).
         RGWTRACE_EVENT_REQUEST_START => Ok(TraceEvent::RequestStart(
@@ -1275,6 +1859,30 @@ fn read_payload<T: Copy>(payload: &[u8]) -> Result<T> {
     Ok(unsafe { ptr.read_unaligned() })
 }
 
+/// The clock every span timestamp is on: CLOCK_BOOTTIME (what the BPF side
+/// stamps events with) plus a unix-epoch offset sampled ONCE at startup.
+///
+/// Expiry must read "now" from this same clock. It used to read a fresh
+/// CLOCK_REALTIME, so an NTP step BACK stalled expiry (nothing looked old enough
+/// to drain) and a step FORWARD made open requests look older than they are and
+/// force-expired them early. BOOTTIME never steps, and the fixed offset keeps
+/// `now_ns` comparable with event timestamps however the wall clock moves.
+struct TraceClock {
+    offset_ns: u64,
+}
+
+impl TraceClock {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            offset_ns: unix_boottime_offset_ns()?,
+        })
+    }
+
+    fn now_ns(&self) -> Result<u64> {
+        Ok(clock_time_ns(libc::CLOCK_BOOTTIME)?.saturating_add(self.offset_ns))
+    }
+}
+
 fn unix_boottime_offset_ns() -> Result<u64> {
     let realtime_ns = clock_time_ns(libc::CLOCK_REALTIME)?;
     let boottime_ns = clock_time_ns(libc::CLOCK_BOOTTIME)?;
@@ -1302,11 +1910,6 @@ fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-fn bytes_of(value: &VarFieldKernel) -> &[u8] {
-    let ptr = value as *const VarFieldKernel as *const u8;
-    unsafe { std::slice::from_raw_parts(ptr, size_of::<VarFieldKernel>()) }
-}
-
 fn is_squid_or_newer(version: &str) -> Option<bool> {
     let major = version
         .split(['.', '-'])
@@ -1316,15 +1919,15 @@ fn is_squid_or_newer(version: &str) -> Option<bool> {
 }
 
 const _: () = {
-    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
-    assert!(EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
+    assert!(RGWTRACE_EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRequestEvent>()));
+    assert!(RGWTRACE_EVENT_DATA_OFFSET.is_multiple_of(align_of::<RawRadosEvent>()));
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::collector::{SpanDocument, TraceDiagnostics};
-    use crate::events::{RawClsOp, MAX_ACTING, MAX_RADOS_OPS};
+    use crate::events::{RawClsOp, MAX_ACTING, MAX_CLS_NAME, MAX_METHOD_NAME, MAX_RADOS_OPS};
 
     fn trace_document_with_spans(span_count: usize) -> TraceDocument {
         TraceDocument {
@@ -1450,92 +2053,326 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_disconnected_otlp_does_not_abort_and_retains_batch() {
-        // Receiver dropped up front: every `try_send` sees `Disconnected`, the
-        // exact condition that previously `bail!`-ed and tore down the session.
+    fn dispatch_disconnected_otlp_counts_the_batch_lost_and_keeps_going() {
+        // REGRESSION (F15/F3): a disconnected worker used to latch export off and
+        // RETAIN every later batch in memory for the end of the run -- with
+        // draining stopped, an unbounded leak. The batch is now counted as lost
+        // and the caller keeps draining.
         let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
         drop(receiver);
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
+        let ledger = ExportLedger::default();
 
-        let collector = Arc::new(Mutex::new(Collector::default()));
-        let mut disabled = false;
-
-        // First disconnected dispatch: must not panic/return Err, must latch
-        // OTLP export off, and must RETAIN (return) the batch rather than drop
-        // it — the spans already left the collector.
-        let retained = dispatch_expired_otlp(
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(3),
-            &mut disabled,
+            &mut worker_gone,
         );
-        assert!(disabled, "a disconnected exporter must disable OTLP export");
-        assert_eq!(
-            retained.map(|doc| doc.spans.len()),
-            Some(3),
-            "the disconnect-discovering batch must be retained, not dropped"
-        );
-
-        // Idempotent: repeated calls stay disabled and keep retaining. The
-        // log-once guarantee is structural: only the first, transitioning call
-        // reaches the warning branch; later calls take the disabled path.
-        let retained = dispatch_expired_otlp(
+        assert!(worker_gone);
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(2),
-            &mut disabled,
-        );
-        assert!(
-            disabled,
-            "export must remain disabled after repeated disconnects"
-        );
-        assert_eq!(
-            retained.map(|doc| doc.spans.len()),
-            Some(2),
-            "batches must keep being retained while disabled"
+            &mut worker_gone,
         );
 
-        // The disconnect case must NOT bump the drop counter: retained spans are
-        // preserved, not lost.
-        let diagnostics = Arc::try_unwrap(collector)
-            .expect("collector still referenced")
+        let diagnostics = collector
             .into_inner()
-            .expect("collector lock poisoned")
+            .unwrap()
             .into_trace_document("rgwtrace")
             .diagnostics;
-        assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
-        assert_eq!(diagnostics.otlp_queue_dropped_spans, 0);
+        assert_eq!(diagnostics.otlp_export_failed_batches, 2);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 5);
+        assert_eq!(diagnostics.otlp_queue_dropped_spans, 0, "not backpressure");
+    }
+
+    fn expired_batch_with_spans(count: usize) -> ExpiredBatch {
+        let mut collector = Collector::default();
+        for i in 0..count {
+            collector.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+                start_ns: 10,
+                end_ns: 0,
+                pid: 1,
+                tid: 2,
+                trans_id: format!("tx-{i}").into(),
+                truncation: Default::default(),
+            }));
+        }
+        collector.drain_expired_batch(1_000, 100).unwrap()
     }
 
     #[test]
-    fn dispatch_successful_otlp_send_keeps_export_enabled() {
-        // A live receiver: the batch is accepted, no drop is recorded, and OTLP
-        // export stays enabled.
-        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
-        let collector = Arc::new(Mutex::new(Collector::default()));
-        let mut disabled = false;
+    fn a_panicked_worker_counts_the_documents_it_accepted_but_never_settled() {
+        // A worker panic drops the document it was exporting and every document
+        // still queued behind it. Those spans already left the collector, so they
+        // must be counted as lost at finish -- not only the ones dispatched after
+        // the channel was found disconnected.
+        let (sender, receiver) = mpsc::sync_channel::<ExpiredBatch>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let (go, wait) = mpsc::channel::<()>();
+        let ledger = Arc::new(ExportLedger::default());
+        let handle = thread::spawn(move || -> Result<otel::ExportDiagnostics> {
+            wait.recv().unwrap();
+            let _in_flight = receiver.recv().unwrap();
+            panic!("simulated exporter crash mid-export");
+        });
+        let exporter = OtlpExporter {
+            sender,
+            handle,
+            ledger: Arc::clone(&ledger),
+        };
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
 
-        let retained = dispatch_expired_otlp(
+        dispatch_expired_otlp(
+            &collector,
+            &exporter.sender,
+            &ledger,
+            expired_batch_with_spans(3),
+            &mut worker_gone,
+        );
+        dispatch_expired_otlp(
+            &collector,
+            &exporter.sender,
+            &ledger,
+            expired_batch_with_spans(2),
+            &mut worker_gone,
+        );
+        go.send(()).unwrap();
+
+        assert!(
+            exporter.finish(&collector).is_err(),
+            "the panic is still surfaced"
+        );
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_export_failed_batches, 2);
+        assert_eq!(
+            diagnostics.otlp_export_failed_spans, 5,
+            "the in-flight document AND the queued one are lost"
+        );
+    }
+
+    #[test]
+    fn dispatch_successful_otlp_send_queues_the_batch() {
+        let (sender, receiver) = mpsc::sync_channel::<TraceDocument>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Mutex::new(Collector::default());
+        let mut worker_gone = false;
+        let ledger = ExportLedger::default();
+
+        dispatch_expired_otlp(
             &collector,
             &sender,
+            &ledger,
             trace_document_with_spans(4),
-            &mut disabled,
+            &mut worker_gone,
         );
 
-        assert!(!disabled, "a successful send must not disable export");
+        assert!(!worker_gone);
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("batch should be queued")
+                .spans
+                .len(),
+            4
+        );
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 0);
+    }
+
+    /// A loopback HTTP server answering each connection with the next status.
+    fn spawn_status_server(statuses: Vec<u16>) -> (String, thread::JoinHandle<usize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let mut served = 0;
+            for status in statuses {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).ok();
+                let mut stream = stream;
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                served += 1;
+            }
+            served
+        });
+        (endpoint, handle)
+    }
+
+    #[test]
+    fn the_otlp_worker_survives_a_failed_batch_and_exports_the_next_drain() {
+        // REGRESSION (F15): the worker used to return on the first failed batch.
+        // Everything queued behind it was lost uncounted and OTLP export stayed
+        // off for the rest of the run.
+        let (endpoint, server) = spawn_status_server(vec![400, 200]);
+        let (sender, receiver) = mpsc::sync_channel::<ExpiredBatch>(OTLP_EXPORT_QUEUE_CAPACITY);
+        let collector = Mutex::new(Collector::default());
+        sender.send(expired_batch_with_spans(3)).unwrap();
+        sender.send(expired_batch_with_spans(2)).unwrap();
+        drop(sender);
+
+        let ledger = ExportLedger::default();
+        ledger.queued(3);
+        ledger.queued(2);
+        let total = run_otlp_exporter(
+            receiver,
+            OtlpExporterConfig {
+                endpoint,
+                service_name: "test".to_string(),
+                client: otel::ExportClient::new(Duration::from_secs(5), &[], None).unwrap(),
+                compression: crate::cli::OtlpCompression::None,
+                max_spans_per_batch: 512,
+                max_bytes_per_batch: 0,
+                retries: 0,
+                diagnostics: false,
+            },
+            &collector,
+            &ledger,
+        );
+
+        assert_eq!(ledger.unsettled(), (0, 0), "every document is settled");
+        assert_eq!(
+            server.join().unwrap(),
+            2,
+            "the second drain must still be exported"
+        );
+        assert_eq!(total.batches, 2);
+        assert_eq!(total.failed_batches, 1);
+        assert_eq!(total.failed_spans, 3);
+        let diagnostics = collector
+            .into_inner()
+            .unwrap()
+            .into_trace_document("rgwtrace")
+            .diagnostics;
+        assert_eq!(diagnostics.otlp_export_failed_batches, 1);
+        assert_eq!(diagnostics.otlp_export_failed_spans, 3);
+    }
+
+    #[test]
+    fn expiry_reads_the_boottime_trace_clock_not_the_wall_clock() {
+        // REGRESSION (clock): expiry compared BOOTTIME-based event timestamps
+        // against a fresh CLOCK_REALTIME, so an NTP step stalled or rushed expiry.
+        // With a zero offset the trace clock IS boottime -- nowhere near the wall
+        // clock (decades of nanoseconds away) -- which a realtime read would fail.
+        let clock = TraceClock { offset_ns: 0 };
+        let boottime = clock_time_ns(libc::CLOCK_BOOTTIME).unwrap();
+        let now = clock.now_ns().unwrap();
+        let realtime = clock_time_ns(libc::CLOCK_REALTIME).unwrap();
+        assert!(now >= boottime && now - boottime < 1_000_000_000);
         assert!(
-            retained.is_none(),
-            "a queued batch must not be retained by the caller"
+            now < realtime / 2,
+            "the trace clock must not read CLOCK_REALTIME"
         );
-        let received = receiver.try_recv().expect("batch should be queued");
-        assert_eq!(received.spans.len(), 4);
 
+        // And with the real offset it lands on the same clock events are stamped
+        // with: boottime + offset, monotonic across reads.
+        let clock = TraceClock::new().unwrap();
+        let first = clock.now_ns().unwrap();
+        let second = clock.now_ns().unwrap();
+        assert!(second >= first);
+        let boottime = clock_time_ns(libc::CLOCK_BOOTTIME).unwrap();
+        assert!(second <= boottime.saturating_add(clock.offset_ns));
+    }
+
+    #[test]
+    fn dispatch_full_queue_counts_every_span_of_an_unrendered_batch() {
+        // The live queue carries detached request groups; a Full drop must still
+        // count the spans they WOULD have rendered to (request + children +
+        // background), or the drop counters under-report.
+        let mut source = Collector::default();
+        source.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 1,
+            tid: 2,
+            trans_id: "tx-full".into(),
+            truncation: Default::default(),
+        }));
+        for (trans_id, sent_ns) in [("tx-full", 11), ("tx-full", 12), ("", 13)] {
+            source.push(TraceEvent::RadosOp(crate::events::RadosEvent {
+                pid: 1,
+                send_tid: 2,
+                cid: 1,
+                tid: sent_ns,
+                sent_ns,
+                finish_ns: sent_ns + 1,
+                duration_ns: 1,
+                pool: 1,
+                target_osd: 0,
+                pg_seed: 0,
+                acting: Vec::new(),
+                rw: crate::events::RadosDirection::Read,
+                object_name: "obj".to_string(),
+                trans_id: trans_id.into(),
+                truncation: Default::default(),
+                ops: Vec::new(),
+                offset: 0,
+                length: 0,
+            }));
+        }
+        let batch = source
+            .drain_expired_batch(1_000, 100)
+            .expect("everything is expired");
+        assert_eq!(batch.span_count(), 4);
+
+        let (sender, _receiver) = mpsc::sync_channel::<ExpiredBatch>(1);
+        let mut filler_source = Collector::default();
+        filler_source.push(TraceEvent::RequestStart(crate::events::RequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 1,
+            tid: 2,
+            trans_id: "tx-filler".into(),
+            truncation: Default::default(),
+        }));
+        sender
+            .try_send(filler_source.drain_expired_batch(1_000, 100).unwrap())
+            .expect("first unit fits");
+
+        let collector = Arc::new(Mutex::new(Collector::default()));
+        let mut disabled = false;
+        let ledger = ExportLedger::default();
+        dispatch_expired_otlp(&collector, &sender, &ledger, batch, &mut disabled);
+        assert!(!disabled);
         let diagnostics = Arc::try_unwrap(collector)
             .expect("collector still referenced")
             .into_inner()
             .expect("collector lock poisoned")
             .into_trace_document("rgwtrace")
             .diagnostics;
-        assert_eq!(diagnostics.otlp_queue_dropped_traces, 0);
+        assert_eq!(diagnostics.otlp_queue_dropped_traces, 1);
+        assert_eq!(diagnostics.otlp_queue_dropped_spans, 4);
     }
 
     #[test]
@@ -1557,7 +2394,7 @@ mod tests {
         assert_eq!(request.start_ns, 10);
         assert_eq!(request.end_ns, 30);
         assert_eq!(request.pid, 42);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
     }
 
     #[test]
@@ -1583,7 +2420,7 @@ mod tests {
         assert_eq!(request.start_ns, 10);
         assert_eq!(request.end_ns, 0);
         assert_eq!(request.tid, 7);
-        assert_eq!(request.trans_id, "tx0001");
+        assert_eq!(&*request.trans_id, "tx0001");
     }
 
     #[test]
@@ -1609,8 +2446,8 @@ mod tests {
             acting,
             ops: [0x1201, 0, 0],
             cls_ops: [RawClsOp {
-                cls_name: [0; 8],
-                method_name: [0; 32],
+                cls_name: [0; MAX_CLS_NAME],
+                method_name: [0; MAX_METHOD_NAME],
             }; MAX_RADOS_OPS],
             trans_id: bytes("tx0002"),
             object_name: bytes("bucket-object"),
@@ -1627,7 +2464,7 @@ mod tests {
         assert_eq!(rados.acting, vec![1, 2]);
         assert_eq!(rados.ops[0].name, "read");
         assert_eq!(rados.object_name, "bucket-object");
-        assert_eq!(rados.trans_id, "tx0002");
+        assert_eq!(&*rados.trans_id, "tx0002");
     }
 
     #[test]
@@ -1648,6 +2485,248 @@ mod tests {
     }
 
     #[test]
+    fn decodes_a_request_record_reserved_at_its_own_size() {
+        // The BPF side reserves request markers at RGWTRACE_REQUEST_RECORD_SIZE
+        // (header + request payload), not at the full union size. Exactly that
+        // many bytes must decode; one byte fewer must not.
+        let raw = RawRequestEvent {
+            start_ns: 10,
+            end_ns: 0,
+            pid: 42,
+            tid: 7,
+            flags: 0,
+            trans_id: bytes("tx0003"),
+        };
+        for event_type in [RGWTRACE_EVENT_REQUEST_START, RGWTRACE_EVENT_REQUEST_END] {
+            let data = event_data(event_type, &raw);
+            assert_eq!(data.len(), RGWTRACE_REQUEST_RECORD_SIZE);
+            let event = decode_event(&data).unwrap();
+            let (TraceEvent::RequestStart(request) | TraceEvent::RequestEnd(request)) = event
+            else {
+                panic!("expected a request event");
+            };
+            assert_eq!(request.trans_id.as_ref(), "tx0003");
+
+            let err = decode_event(&data[..RGWTRACE_REQUEST_RECORD_SIZE - 1]).unwrap_err();
+            assert!(err.to_string().contains("payload too short"));
+        }
+    }
+
+    #[test]
+    fn rejects_a_rados_record_cut_to_request_size() {
+        // A RADOS record is still reserved at the full union size; a record cut
+        // at the (smaller) request size must not be decoded as a RADOS op.
+        let mut data = RGWTRACE_EVENT_RADOS_OP.to_ne_bytes().to_vec();
+        data.resize(RGWTRACE_REQUEST_RECORD_SIZE, 0);
+        let err = decode_event(&data).unwrap_err();
+        assert!(err.to_string().contains("payload too short"));
+
+        data.resize(RGWTRACE_EVENT_SIZE, 0);
+        assert!(decode_event(&data).is_ok());
+    }
+
+    #[test]
+    fn a_rados_op_is_stale_only_past_the_threshold() {
+        const MIN: u64 = 60_000_000_000;
+        let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+        let value = |sent_ns: u64| {
+            let mut value = vec![0_u8; RGWTRACE_RADOS_EVENT_SIZE];
+            value[at..at + 8].copy_from_slice(&sent_ns.to_ne_bytes());
+            value
+        };
+        let now = 10 * MIN;
+        assert!(rados_op_is_stale(&value(now - 6 * MIN), now, 5 * MIN));
+        // Exactly at, or younger than, the threshold: a live op is never swept.
+        assert!(!rados_op_is_stale(&value(now - 5 * MIN), now, 5 * MIN));
+        assert!(!rados_op_is_stale(&value(now - 1), now, 5 * MIN));
+        // Clock skew between the BPF stamp and our read cannot underflow.
+        assert!(!rados_op_is_stale(&value(now + 1), now, 5 * MIN));
+        // Inserted but not yet stamped by _send_op: the youngest op, not the oldest.
+        assert!(!rados_op_is_stale(&value(0), now, 5 * MIN));
+        // A truncated value cannot be judged, so it is left alone.
+        assert!(!rados_op_is_stale(&value(1)[..at + 4], now, 5 * MIN));
+    }
+
+    #[test]
+    fn proc_stat_state_parsing_handles_odd_command_names() {
+        assert!(!proc_stat_says_exited("42 (radosgw) S 1 42 42 0"));
+        assert!(!proc_stat_says_exited("42 (rgw) (x) R 1 42"));
+        assert!(proc_stat_says_exited("42 (radosgw) Z 1 42 42 0"));
+        assert!(proc_stat_says_exited("42 (a) b) X 1"));
+        assert!(!proc_stat_says_exited("garbage"));
+    }
+
+    #[test]
+    fn target_watch_sees_a_running_process_as_alive() {
+        let me = std::process::id() as i32;
+        assert!(!TargetWatch::new(me).exited());
+        assert!(!TargetWatch::Proc(me).exited());
+    }
+
+    #[test]
+    fn target_watch_notices_a_child_exiting() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as i32;
+        let pidfd_watch = TargetWatch::new(pid);
+        let proc_watch = TargetWatch::Proc(pid);
+        assert!(!pidfd_watch.exited());
+        assert!(!proc_watch.exited());
+
+        // Unreaped (zombie) is already "exited" for both mechanisms.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(pidfd_watch.exited() && proc_watch.exited()) {
+            assert!(Instant::now() < deadline, "child exit was never observed");
+            thread::sleep(Duration::from_millis(20));
+        }
+        child.wait().expect("reap child");
+        assert!(pidfd_watch.exited());
+        assert!(proc_watch.exited());
+        assert!(TargetWatch::new(pid).exited());
+    }
+
+    #[test]
+    fn a_resent_op_refreshed_after_the_scan_survives_the_sweep() {
+        // Greptile on #9: the scan saw a stale entry, then Ceph resent the op
+        // (same cid/tid key), so _send_op replaced it with a fresh sent_ns. A
+        // blind delete by key removed the refreshed op and its completion became
+        // a finish miss. The entry is now taken atomically and judged on what was
+        // actually removed; a fresh one is put back.
+        const MIN: u64 = 60_000_000_000;
+        let at = std::mem::offset_of!(RawRadosEvent, sent_ns);
+        let value = |sent_ns: u64| {
+            let mut value = vec![0_u8; RGWTRACE_RADOS_EVENT_SIZE];
+            value[at..at + 8].copy_from_slice(&sent_ns.to_ne_bytes());
+            value
+        };
+        let now = 10 * MIN;
+        let stale_after = 5 * MIN;
+
+        let mut restored = None;
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |fresh| {
+                restored = Some(fresh.to_vec());
+                Ok(())
+            },
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome.unwrap(), Reclaim::Restored);
+        assert_eq!(restored, Some(value(now - 1)));
+
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 6 * MIN))),
+            |_| panic!("a stale entry must not be restored"),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome.unwrap(), Reclaim::Swept);
+
+        let outcome = reclaim_stale_rados_op(
+            || Ok(None),
+            |_| panic!("nothing to restore"),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome.unwrap(), Reclaim::Gone);
+
+        // A newer submit re-inserted the key before we could restore: it wins.
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |_| Err(libbpf_rs::Error::from_raw_os_error(libc::EEXIST).into()),
+            now,
+            stale_after,
+        );
+        assert_eq!(outcome.unwrap(), Reclaim::Superseded);
+
+        // A full map is not evidence that another submit installed a newer
+        // value. Surface it so the caller can report the lost stale entry.
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |_| Err(libbpf_rs::Error::from_raw_os_error(libc::ENOSPC).into()),
+            now,
+            stale_after,
+        );
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn stale_sweep_pauses_only_between_cycles_and_preserves_counts() {
+        let now = Instant::now();
+        let mut sweep = StaleRadosOpsSweep {
+            keys: None,
+            stale_candidates: vec![vec![1]],
+            scan_limit: 10,
+            scan_remaining: 5,
+            swept_pending: 3,
+            next_scan_at: None,
+        };
+        assert!(!sweep.waiting(now));
+        sweep.pause(now, Duration::from_secs(60));
+        assert!(sweep.keys.is_none());
+        assert!(sweep.stale_candidates.is_empty());
+        assert_eq!(sweep.swept_pending, 3);
+        assert!(sweep.waiting(now + Duration::from_secs(5)));
+        assert!(!sweep.waiting(now + Duration::from_secs(6)));
+    }
+
+    #[test]
+    fn stale_sweep_cycles_have_a_capped_idle_interval() {
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(60)),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            rados_ops_sweep_interval(Duration::from_secs(86_400)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn stale_sweep_batches_bound_a_restarting_key_iterator() {
+        let mut generated = 0;
+        let mut keys = std::iter::repeat_with(|| {
+            generated += 1;
+            generated
+        });
+        let mut cycle_budget = 5;
+
+        let (first, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(first, vec![1, 2]);
+        assert!(!complete);
+        let (second, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(second, vec![3, 4]);
+        assert!(!complete);
+        let (last, complete) = take_key_batch(&mut keys, &mut cycle_budget, 2);
+        assert_eq!(last, vec![5]);
+        assert!(complete);
+        assert_eq!(generated, 5, "the per-cycle budget must stop restarts");
+    }
+
+    #[test]
+    fn stale_sweep_finishes_short_and_empty_iterators() {
+        let mut keys = [1, 2].into_iter();
+        let mut budget = 8;
+        assert_eq!(
+            take_key_batch(&mut keys, &mut budget, 4),
+            (vec![1, 2], true)
+        );
+        assert_eq!(budget, 6);
+        assert_eq!(take_key_batch(&mut keys, &mut budget, 4), (vec![], true));
+    }
+
+    #[test]
     fn rejects_short_payload() {
         let mut data = RGWTRACE_EVENT_REQUEST_END.to_ne_bytes().to_vec();
         data.extend_from_slice(&0_u32.to_ne_bytes());
@@ -1659,10 +2738,52 @@ mod tests {
     }
 
     #[test]
+    fn process_scope_pins_the_attach_pid_and_the_bpf_gate_to_the_same_process() {
+        assert_eq!(
+            ProcessScope::from_cli(Some(4242), false).unwrap(),
+            ProcessScope {
+                attach_pid: 4242,
+                target_tgid: 4242
+            }
+        );
+        // Only an explicit opt-in may widen the probes to every process.
+        assert_eq!(
+            ProcessScope::from_cli(None, true).unwrap(),
+            ProcessScope {
+                attach_pid: -1,
+                target_tgid: 0
+            }
+        );
+        assert!(ProcessScope::from_cli(None, false).is_err());
+        assert!(ProcessScope::from_cli(Some(0), false).is_err());
+        assert!(ProcessScope::from_cli(Some(-5), false).is_err());
+        assert!(ProcessScope::from_cli(Some(42), true).is_err());
+    }
+
+    #[test]
+    fn publishes_the_target_tgid_into_rodata() {
+        let mut configured = rodata();
+        configure_rodata(&mut configured, Some("19.2.0"), 4242).unwrap();
+        assert_eq!(configured.TARGET_TGID, 4242);
+
+        // Set even when the version is rejected, so the gate is never left at
+        // "any process" by an error path.
+        let mut rejected = rodata();
+        assert!(configure_rodata(&mut rejected, None, 4242).is_err());
+        assert_eq!(rejected.TARGET_TGID, 4242);
+    }
+
+    #[test]
+    fn recognises_only_the_init_pid_namespace() {
+        assert!(is_init_pid_namespace(Path::new("pid:[4026531836]")));
+        assert!(!is_init_pid_namespace(Path::new("pid:[4026532501]")));
+    }
+
+    #[test]
     fn rejects_missing_ceph_version_for_abi_layout() {
         let mut rodata = rodata();
 
-        let err = configure_rodata(&mut rodata, None).unwrap_err();
+        let err = configure_rodata(&mut rodata, None, 42).unwrap_err();
 
         assert!(err.to_string().contains("Ceph version is required"));
     }
@@ -1671,7 +2792,7 @@ mod tests {
     fn configures_pre_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("18.2.8-1jammy")).unwrap();
+        configure_rodata(&mut rodata, Some("18.2.8-1jammy"), 42).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 152);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 96);
@@ -1681,7 +2802,7 @@ mod tests {
     fn configures_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("19.2.0")).unwrap();
+        configure_rodata(&mut rodata, Some("19.2.0"), 0).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 112);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 56);
@@ -1712,6 +2833,7 @@ mod tests {
             CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_RAW_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_DATA_OFFSET: 0,
+            TARGET_TGID: 0,
         }
     }
 }

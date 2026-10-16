@@ -94,12 +94,21 @@ static struct rados_op_state zero_rados_op = {};
  * entries; when genuinely full (e.g. leaked entries) it only rejects NEW inserts
  * with E2BIG, which is counted via the existing drop counters. Rejecting new
  * inserts is strictly less harmful than silently killing op emission.
+ *
+ * SIZING AND LEAKS. max_entries is set at load from --bpf-rados-ops-entries;
+ * the default is above Ceph's objecter_inflight_ops default (24576), the most
+ * ops one Objecter keeps in flight. An op whose client exits before
+ * _finish_op is never deleted here, so userspace sweeps entries whose sent_ns
+ * is older than --rados-ops-stale-after (default 5 min, far above any real op
+ * latency) and counts them as stale_rados_ops_swept.
  */
+#define RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES 32768
+
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, struct client_op_key);
   __type(value, struct rados_op_state);
-  __uint(max_entries, 8192);
+  __uint(max_entries, RGWTRACE_DEFAULT_RADOS_OPS_ENTRIES);
 } rados_ops SEC(".maps");
 
 /* Plain HASH for the same reason as rados_ops (see above): LRU per-CPU
@@ -232,16 +241,38 @@ struct {
   __uint(max_entries, 16384);
 } rgw_op_keys SEC(".maps");
 
+/*
+ * Probe descriptors, keyed by `function base id + var_field index` -- a dense
+ * index space of RGWTRACE_HPROBE_SLOTS keys, written once by userspace before
+ * any probe attaches. An ARRAY, not a HASH: the verifier inlines an ARRAY
+ * lookup into a bounds check plus an add, and _send_op does a dozen of them
+ * per op while RGW holds the Objecter lock.
+ */
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __type(key, int);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __type(key, __u32);
   __type(value, struct VarField);
-  __uint(max_entries, 8192);
+  __uint(max_entries, RGWTRACE_HPROBE_SLOTS);
 } hprobes SEC(".maps");
+
+/* The descriptor in slot `varid`, or 0 when userspace did not populate it. */
+static __always_inline struct VarField *hprobe_lookup(__u32 varid) {
+  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  if (vf == 0 || vf->present == 0)
+    return 0;
+  return vf;
+}
+
+/*
+ * Sized at runtime from --ringbuf-size (bpf_map__set_max_entries on the open
+ * object; a ring buffer cannot be resized after load). The declared value is
+ * only the default that flag mirrors. See the flag's help for the sizing math.
+ */
+#define RGWTRACE_DEFAULT_RINGBUF_BYTES (16 * 1024 * 1024)
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 256 * 1024);
+  __uint(max_entries, RGWTRACE_DEFAULT_RINGBUF_BYTES);
 } events SEC(".maps");
 
 /*
@@ -303,10 +334,33 @@ const volatile __u32 CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET = 0;
 const volatile __u32 CEPH_OSD_OP_BUFFER_RAW_OFFSET = 0;
 const volatile __u32 CEPH_OSD_OP_BUFFER_DATA_OFFSET = 0;
 
+/*
+ * The traced process (tgid, i.e. the userspace PID) from --pid; 0 only for
+ * --all-processes. Written into .rodata by userspace before load, so the
+ * verifier sees a constant.
+ *
+ * The uprobes are attached with that pid already, but the attach scope alone is
+ * not a guarantee worth relying on: every program re-checks it as its FIRST
+ * statement, before any map lookup/update or probe read. A foreign process that
+ * still reaches a program (an --all-processes run, or any future attach that is
+ * not pid-scoped) then costs one helper call and never touches the shared maps
+ * or the ring buffer.
+ *
+ * bpf_get_current_pid_tgid() reports the INIT pid namespace tgid; userspace
+ * refuses to run --pid from a nested pid namespace, where the two would differ.
+ */
+const volatile __u32 TARGET_TGID = 0;
+
+static __always_inline bool rgwtrace_foreign_process(void) {
+  return TARGET_TGID != 0 && (bpf_get_current_pid_tgid() >> 32) != TARGET_TGID;
+}
+
 static __always_inline void emit_request_event(__u32 type,
                                                struct rgw_request_ctx *ctx,
                                                __u64 end_ns) {
-  struct rgwtrace_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+  /* Reserved at request-record size, not the full union (see
+   * struct rgwtrace_request_record). */
+  struct rgwtrace_request_record *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
   if (e == 0) {
     count_diag(RGWTRACE_DIAG_RINGBUF_REQUEST_DROPS);
     return;
@@ -314,13 +368,13 @@ static __always_inline void emit_request_event(__u32 type,
 
   __builtin_memset(e, 0, sizeof(*e));
   e->type = type;
-  e->data.request.start_ns = ctx->start_ns;
-  e->data.request.end_ns = end_ns;
-  e->data.request.pid = ctx->pid;
-  e->data.request.tid = ctx->tid;
-  e->data.request.flags = ctx->flags;
-  __builtin_memcpy(e->data.request.trans_id, ctx->trans_id,
-                   sizeof(e->data.request.trans_id));
+  e->request.start_ns = ctx->start_ns;
+  e->request.end_ns = end_ns;
+  e->request.pid = ctx->pid;
+  e->request.tid = ctx->tid;
+  e->request.flags = ctx->flags;
+  __builtin_memcpy(e->request.trans_id, ctx->trans_id,
+                   sizeof(e->request.trans_id));
   bpf_ringbuf_submit(e, 0);
 }
 
@@ -483,6 +537,8 @@ static __always_inline int request_ctx_is_live(struct rgw_request_ctx *ctx) {
 
 SEC("uprobe")
 int uprobe_rgw_get_handler(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 30;
   __u32 thread_id = get_tid();
   struct rgw_request_ctx fallback = {};
@@ -504,7 +560,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
     }
   }
 
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   int trans_id_len = 0;
   if (vf == 0)
     return 0;
@@ -522,7 +578,7 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
   rgwtrace_probe_read_user(&trans_id_len, sizeof(trans_id_len), (void *)len_addr);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -618,8 +674,10 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 50;
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -765,8 +823,10 @@ int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 40;
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
 
@@ -814,7 +874,7 @@ int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
   __u64 op_ptr = 0;
   if (RGW_OP_BRIDGE_KEY_ENABLED != 0) {
     int varid_op = 41;
-    struct VarField *op_vf = bpf_map_lookup_elem(&hprobes, &varid_op);
+    struct VarField *op_vf = hprobe_lookup(varid_op);
     op_ptr = fetch_param_ptr_ref(ctx, op_vf);
   }
 
@@ -1059,7 +1119,7 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
    * (Userspace additionally refuses to attach these probes at all without a proven
    * descriptor, so the descriptor-shaped causes should be unreachable in practice.)
    */
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0) {
     count_diag(RGWTRACE_DIAG_OPERATE_BASE_UNRESOLVED);
     operate_drop_seeded_ctx(tid, RGWTRACE_DIAG_OPERATE_UNRESOLVED_CTX_CLEARED,
@@ -1118,6 +1178,8 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
  */
 SEC("uprobe")
 int uprobe_rgw_rados_operate_read(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   return rgw_rados_operate_seed(ctx, 60);
 }
 
@@ -1133,14 +1195,19 @@ int uprobe_rgw_rados_operate_read(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_rados_operate_write(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   return rgw_rados_operate_seed(ctx, 70);
 }
 
 SEC("uprobe")
 int uprobe_send_op(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 0;
   struct client_op_key key = {};
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  key.tgid = get_pid();
+  struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1149,7 +1216,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);
@@ -1189,7 +1256,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 osd_addr = fetch_var_member_addr(v, vf);
@@ -1198,7 +1265,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   int name_len = 0;
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1207,7 +1274,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   __u64 name_base = 0;
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1231,7 +1298,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
     rgwtrace_probe_read_user(event->object_name, read_len, (void *)name_base);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 flags_addr = fetch_var_member_addr(v, vf);
@@ -1239,7 +1306,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 pool_addr = fetch_var_member_addr(v, vf);
@@ -1247,7 +1314,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 seed_addr = fetch_var_member_addr(v, vf);
@@ -1260,7 +1327,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 acting_start = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1270,7 +1337,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 acting_finish = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1300,7 +1367,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
   ++varid;
   __u64 ops_start = 0;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1309,7 +1376,7 @@ int uprobe_send_op(struct pt_regs *ctx) {
                            (void *)ops_start_addr);
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf == 0)
     return 0;
   v = fetch_register(ctx, vf->varloc.reg);
@@ -1352,24 +1419,31 @@ int uprobe_send_op(struct pt_regs *ctx) {
       rgwtrace_probe_read_user(&data, sizeof(data),
                                (void *)raw + CEPH_OSD_OP_BUFFER_DATA_OFFSET);
 
+      /*
+       * The call indata is `class || method || payload`, so the method starts
+       * at the class name's FULL wire length. Only the COPY lengths are
+       * clamped; cls_len itself is never rewritten, because clamping it used to
+       * move the method read into the middle of a long class name (`refcount`,
+       * `timeindex`) and garble the method with no truncation flag.
+       */
+      __u32 cls_read_len = cls_len;
       if (cls_len >= sizeof(event->cls_ops[i].cls_name)) {
         event->flags |= RGWTRACE_TRUNC_CLS_NAME;
-        cls_len = sizeof(event->cls_ops[i].cls_name) - 1;
+        cls_read_len = sizeof(event->cls_ops[i].cls_name) - 1;
       }
+      __u32 method_read_len = method_len;
       if (method_len >= sizeof(event->cls_ops[i].method_name)) {
         event->flags |= RGWTRACE_TRUNC_METHOD_NAME;
-        method_len = sizeof(event->cls_ops[i].method_name) - 1;
+        method_read_len = sizeof(event->cls_ops[i].method_name) - 1;
       }
-      __u32 cls_read_len = cls_len;
       cls_read_len &= sizeof(event->cls_ops[i].cls_name) - 1;
-      asm volatile("%0 &= 7" : "+r"(cls_read_len));
-      __u32 method_read_len = method_len;
+      asm volatile("%0 &= 15" : "+r"(cls_read_len));
       method_read_len &= sizeof(event->cls_ops[i].method_name) - 1;
       asm volatile("%0 &= 31" : "+r"(method_read_len));
       rgwtrace_probe_read_user(event->cls_ops[i].cls_name, cls_read_len,
                                (void *)data);
       rgwtrace_probe_read_user(event->cls_ops[i].method_name, method_read_len,
-                               (void *)data + cls_len);
+                               (void *)(data + cls_len));
     }
 
     ops_start += CEPH_OSD_OP_SIZE;
@@ -1380,9 +1454,12 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
 SEC("uprobe")
 int uprobe_finish_op(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 20;
   struct client_op_key key = {};
-  struct VarField *vf = bpf_map_lookup_elem(&hprobes, &varid);
+  key.tgid = get_pid();
+  struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
@@ -1391,7 +1468,7 @@ int uprobe_finish_op(struct pt_regs *ctx) {
   }
 
   ++varid;
-  vf = bpf_map_lookup_elem(&hprobes, &varid);
+  vf = hprobe_lookup(varid);
   if (vf != 0) {
     __u64 v = fetch_register(ctx, vf->varloc.reg);
     __u64 cid_addr = fetch_var_member_addr(v, vf);
