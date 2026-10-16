@@ -1,0 +1,25 @@
+Cargo.toml
+  s_ece52b9a589c27::t_94c7c438f5160c 21
+docs/bugfix-otlp-header-pipe.md
+  s_ece52b9a589c27::t_a14ec0d99c837a 1-11
+src/otlp_headers.rs
+  s_ece52b9a589c27::t_f99eebc3d5e2da 148-159
+tests/cli_otlp_config.rs
+  s_ece52b9a589c27::t_0936d5e379631a 19-30,117-142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5379aebc58bfe106497c59a101699a8bdae26061",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
