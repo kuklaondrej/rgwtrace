@@ -1,0 +1,25 @@
+docs/README.md
+  s_c8ad461a19ff4d::t_11d0ea4fcb9a00 36-37
+docs/bugfix-dependency-audit.md
+  s_c8ad461a19ff4d::t_11d0ea4fcb9a00 1-27
+Cargo.lock
+  s_c8ad461a19ff4d::t_039d1b415b1c2d 171,173,920,922,1087,1089,1336,1338,1360,1362,1377,1379
+Cargo.toml
+  s_c8ad461a19ff4d::t_753cf9a54a4316 22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "85a9a7e63ff46729fcd24a679355e301cf220172",
+  "prompts": {},
+  "sessions": {
+    "s_c8ad461a19ff4d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1440e-3436-7850-80c8-4cf1981292e5",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
