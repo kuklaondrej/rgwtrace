@@ -1,0 +1,23 @@
+docs/bugfix-pending-inference-drain-index.md
+  s_ece52b9a589c27::t_b42803a0be5a77 10,15-16
+src/collector.rs
+  s_ece52b9a589c27::t_1b93806df45c90 395,414,425,436,467,508,510,712,953-954,2616,2627,2638,2651-2663,2666,2675,2683
+src/collector_bench.rs
+  s_ece52b9a589c27::t_c7643029971e4f 331
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c767539bcf58d905351d7a56727866958b378be1",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
