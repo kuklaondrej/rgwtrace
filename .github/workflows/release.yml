@@ -1,0 +1,120 @@
+name: Binary release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: binary-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: rustfmt, clippy
+      - name: Check release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "rgwtrace") | .version')
+          test "$RELEASE_TAG" = "v$version"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev
+      - name: Verify and build
+        run: |
+          scripts/verify.sh
+          cargo build --release --locked
+      - name: Package and smoke test
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          scripts/package-binary.sh target/release/rgwtrace "$RELEASE_TAG" "$TARGET"
+          scripts/smoke-release-binary.sh "dist/rgwtrace-${RELEASE_TAG}-${TARGET}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  centos9:
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CentOS 9 toolchain image
+        run: docker build -f docker/Dockerfile.centos9-builder -t rgwtrace-centos9-builder .
+      - name: Verify, build and package on CentOS 9
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          docker run --rm \
+            -e RELEASE_TAG -e TARGET -e CARGO_TARGET_DIR=/tmp/target \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$GITHUB_WORKSPACE/dist:/workspace/dist" \
+            rgwtrace-centos9-builder scripts/build-centos9-release.sh
+      - name: Smoke test in clean CentOS 9 runtime
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          docker run --rm -e RELEASE_TAG -e TARGET \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" -w /workspace \
+            quay.io/centos/centos:stream9 bash -c '
+              set -euo pipefail
+              dnf install -y elfutils-libelf zlib python3 tar gzip
+              scripts/smoke-release-binary.sh "dist/rgwtrace-${RELEASE_TAG}-${TARGET}-centos9.tar.gz"
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-centos9-${{ matrix.target }}
+          path: dist/*-centos9.tar.gz
+          if-no-files-found: error
+  publish:
+    needs: [build, centos9]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          scripts/publish-release.sh "$RELEASE_TAG" dist release/BINARY-README.txt binary

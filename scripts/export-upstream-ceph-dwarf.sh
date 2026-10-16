@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-dwarf-artifacts}"
 CEPH_VERSION="${CEPH_VERSION:-}"
+CEPH_PACKAGE_VERSION="${CEPH_PACKAGE_VERSION:-}"
 DEBIAN_FRONTEND=noninteractive
 export DEBIAN_FRONTEND
 
@@ -77,6 +78,15 @@ configure_ceph_repo() {
 }
 
 install_export_dependencies() {
+    local package
+    local packages=()
+    for package in "${CEPH_PACKAGES[@]}"; do
+        if [[ -n "${CEPH_PACKAGE_VERSION}" ]]; then
+            packages+=("${package}=${CEPH_PACKAGE_VERSION}")
+        else
+            packages+=("${package}")
+        fi
+    done
     info "installing rgwtrace build dependencies and Ceph packages"
     apt-get update -q
     apt-get install -y -q --no-install-recommends \
@@ -90,30 +100,22 @@ install_export_dependencies() {
         pkg-config \
         xz-utils \
         zlib1g-dev \
-        ceph-common \
-        ceph-common-dbg \
-        librados2 \
-        librados2-dbg \
-        librbd1 \
-        librbd1-dbg \
-        radosgw \
-        radosgw-dbg
+        "${packages[@]}"
 }
 
 assert_package_versions() {
     local package
     local version
-    for package in \
-        ceph-common \
-        ceph-common-dbg \
-        librados2 \
-        librados2-dbg \
-        librbd1 \
-        librbd1-dbg \
-        radosgw \
-        radosgw-dbg
-    do
-        version="$(dpkg-query -W -f='${Version}' "${package}")"
+    for package in "${CEPH_PACKAGES[@]}"; do
+        if [[ "${EXPORT_OS}" == centos-stream ]]; then
+            version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "${package}")"
+        else
+            version="$(dpkg-query -W -f='${Version}' "${package}")"
+        fi
+        if [[ -n "${CEPH_PACKAGE_VERSION}" && "${version}" != "${CEPH_PACKAGE_VERSION}" ]]; then
+            err "installed ${package} version ${version} differs from pinned ${CEPH_PACKAGE_VERSION}"
+            exit 1
+        fi
         if [[ "${version}" != "${CEPH_VERSION}-"* ]]; then
             err "installed ${package} version ${version} does not match requested Ceph ${CEPH_VERSION}"
             exit 1
@@ -122,16 +124,72 @@ assert_package_versions() {
 }
 
 capture_packages() {
-    dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' \
-        ceph-common \
-        ceph-common-dbg \
-        librados2 \
-        librados2-dbg \
-        librbd1 \
-        librbd1-dbg \
-        radosgw \
-        radosgw-dbg \
-        >"${PACKAGES_TXT}"
+    if [[ "${EXPORT_OS}" == centos-stream ]]; then
+        rpm -q --qf '%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n' \
+            "${CEPH_PACKAGES[@]}" >"${PACKAGES_TXT}"
+    else
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\n' \
+            "${CEPH_PACKAGES[@]}" >"${PACKAGES_TXT}"
+    fi
+}
+
+select_platform() {
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case "${ID}:${VERSION_ID}" in
+        ubuntu:*)
+            EXPORT_OS=ubuntu
+            CEPH_PACKAGES=(ceph-common ceph-common-dbg librados2 librados2-dbg
+                           librbd1 librbd1-dbg radosgw radosgw-dbg)
+            ;;
+        centos:9)
+            EXPORT_OS=centos-stream
+            CEPH_PACKAGES=(ceph-common ceph-common-debuginfo ceph-debuginfo
+                           librados2 librados2-debuginfo librbd1 librbd1-debuginfo
+                           ceph-radosgw ceph-radosgw-debuginfo)
+            ;;
+        *) err "unsupported export OS ${ID}:${VERSION_ID}"; exit 1 ;;
+    esac
+    EXPORT_OS_VERSION="${VERSION_ID}"
+    if [[ "$(uname -m)" != x86_64 ]]; then
+        err "DWARF exporter currently requires linux/amd64"
+        exit 1
+    fi
+}
+
+install_centos_dependencies() {
+    local repo_url="https://download.ceph.com/rpm-${CEPH_VERSION}/el9"
+    local package
+    local packages=()
+    if [[ -z "${CEPH_PACKAGE_VERSION}" ]]; then
+        err "CentOS exports require an exact CEPH_PACKAGE_VERSION"
+        exit 1
+    fi
+    dnf install -y ca-certificates curl-minimal dnf-plugins-core
+    dnf config-manager --set-enabled crb
+    dnf install -y epel-release
+    curl -fsSL "${repo_url}/x86_64/repodata/repomd.xml" -o "${REPO_RELEASE_TXT}"
+    curl -fsSL https://download.ceph.com/keys/release.asc -o /etc/pki/rpm-gpg/RPM-GPG-KEY-ceph
+    rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-ceph
+    cat >/etc/yum.repos.d/rgwtrace-ceph.repo <<EOF
+[rgwtrace-ceph]
+name=Ceph ${CEPH_VERSION} EL9 x86_64
+baseurl=${repo_url}/x86_64
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ceph
+[rgwtrace-ceph-noarch]
+name=Ceph ${CEPH_VERSION} EL9 noarch
+baseurl=${repo_url}/noarch
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-ceph
+EOF
+    for package in "${CEPH_PACKAGES[@]}"; do
+        packages+=("${package}-${CEPH_PACKAGE_VERSION}.x86_64")
+    done
+    dnf install -y gcc gcc-c++ clang elfutils-libelf-devel kernel-headers llvm \
+        make pkgconf-pkg-config xz zlib-devel "${packages[@]}"
 }
 
 install_rust_toolchain() {
@@ -171,6 +229,8 @@ resolve_library() {
     local path
 
     for path in \
+        "/usr/lib64/ceph/${soname}" \
+        "/usr/lib64/${soname}" \
         "/usr/lib/ceph/${soname}" \
         "/usr/lib/x86_64-linux-gnu/${soname}" \
         "/usr/lib/${soname}" \
@@ -259,7 +319,7 @@ write_readme() {
     cat >"${README_TXT}" <<EOF
 rgwtrace upstream Ceph DWARF artifact
 
-Ubuntu codename: ${UBUNTU_CODENAME}
+Distribution: ${EXPORT_OS} ${EXPORT_OS_VERSION}
 Ceph version: ${CEPH_VERSION}
 Architecture: linux/amd64
 
@@ -288,12 +348,14 @@ main() {
     mkdir -p "${ARTIFACT_DIR}"
     cp /etc/os-release "${OS_RELEASE_TXT}"
 
-    UBUNTU_CODENAME="$(ubuntu_codename)"
-    export UBUNTU_CODENAME
-
-    install_base_tools
-    configure_ceph_repo "${UBUNTU_CODENAME}"
-    install_export_dependencies
+    select_platform
+    if [[ "${EXPORT_OS}" == centos-stream ]]; then
+        install_centos_dependencies
+    else
+        install_base_tools
+        configure_ceph_repo "$(ubuntu_codename)"
+        install_export_dependencies
+    fi
     assert_package_versions
     capture_packages
     install_rust_toolchain
@@ -306,4 +368,6 @@ main() {
     info "DWARF artifact written to ${ARTIFACT_DIR}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
