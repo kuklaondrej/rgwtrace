@@ -332,3 +332,45 @@ to `0`, and the zero-mis-correlation check still holds. Raise those thresholds
 the functional test) so the object→request mapping stays unambiguous.
 
 Without `--workload-manifest`, the verifier behaves exactly as before.
+
+
+## Release downloads
+
+Download the binary archive matching `uname -m` (`x86_64` or `aarch64`) and
+`SHA256SUMS` from a versioned [GitHub Release](https://github.com/kuklaondrej/rgwtrace/releases).
+On Ubuntu/Debian, install runtime dependencies with
+`sudo apt-get install libelf1 zlib1g`; the standard archives require glibc
+2.35 or newer. On CentOS 9, choose the archive ending in `-centos9.tar.gz`
+(glibc 2.34) and install dependencies with
+`sudo dnf install elfutils-libelf zlib`. Both variants are available for x86_64
+and aarch64. No Rust toolchain or BPF compilation is needed on the target.
+
+```sh
+# Run in the directory containing the downloaded archive and SHA256SUMS.
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf rgwtrace-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd rgwtrace-v0.1.0-x86_64-unknown-linux-gnu
+./rgwtrace --version
+./rgwtrace --import-json minimal_dwarf.json --dry-run --output json
+```
+
+Replace the example version and architecture with the asset you downloaded.
+The fixture tests the executable offline; it cannot be used against a live RGW.
+
+For pre-generated metadata, choose a separate `dwarf-<hash>` release. Inspect
+`index.json` for the package source, exact package revisions, architecture,
+module build IDs, and optional probe capability checks. Download and verify
+the matching bundle using that catalog's `SHA256SUMS`, then extract it.
+
+```sh
+sudo ./rgwtrace --pid 12345 --import-json /path/to/native-dwarf.json --preflight
+sudo ./rgwtrace --pid 12345 --import-json /path/to/native-dwarf.json --timeout 30 --output json
+```
+
+Match the binaries used by the RGW process, including libraries inside its
+container. An OS/Ceph version label alone does not establish compatibility.
+Never use `--allow-build-id-mismatch` to force a catalog match. If no exact
+bundle exists, use native extraction with matching debug symbols as described
+above. Catalog preflight validates metadata offline; it does not attest to a
+successful live attach. Optional probe warnings in the catalog describe
+reduced duration or correlation capabilities.

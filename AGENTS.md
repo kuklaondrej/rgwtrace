@@ -29,7 +29,7 @@ Licensed GPL-2.0-only (the `bpf/` code is derived from Ceph `cephtrace`/`radostr
 - JSON self-test, no cluster: `python3 tests/e2e/verify-rgwtrace-json.py --self-test`
 - BPF verifier load check (Linux + root): `sudo scripts/verify-bpf-load.sh`
 
-**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test`, clippy (deny warnings), the Python self-test, and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) mirrors this gate and adds `cargo audit` + a release build.
+**Canonical pre-commit gate:** `scripts/verify.sh` — runs fmt check, `cargo test`, clippy (deny warnings), the Python self-test, release packaging tests (`tests/test_release.py`), and `git diff --check`. Opt-in env flags: `VERIFY_AUDIT=1` (cargo audit), `VERIFY_BPF_LOAD=1`, `VERIFY_CONTAINER_BUILD=1`. CI (`.github/workflows/ci.yml`) mirrors this gate and adds `cargo audit` + a release build.
 
 ## Running locally
 
@@ -121,4 +121,5 @@ For a bug fix, add a short `docs/bugfix-<descriptive-name>.md` (create `docs/` i
 - Prefer smaller, focused commits over one bulky commit.
 - Work on feature branches and PR into `main`; **never force-push `main`**.
 - Do not commit generated or ignored paths: `target/`, `dist/`, `*.o`, `*.skel.rs`, `trace-data/`, local env files.
+- Release automation: `.github/workflows/release.yml` publishes stable `vX.Y.Z` binary releases; `dwarf-release.yml` publishes validated, immutable DWARF catalogs from `release/dwarf-matrix.json`. See `docs/development.md#publishing-releases`.
 - PRs include a concise summary, relevant design notes, linked issues if any, and the results of `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` (i.e. a clean `scripts/verify.sh`).

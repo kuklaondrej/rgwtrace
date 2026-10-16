@@ -6,6 +6,7 @@
 
 | Guide | What it covers |
 | --- | --- |
+| [Release automation](development.md#publishing-releases) | Binary builds, DWARF catalogs, validation, and publishing |
 | [Building and testing](development.md) | Native and container builds, local checks, and live end-to-end test setup |
 | [Production runbook](../RUNBOOK.md) | Requirements, preflight, capture, export, diagnostics, and troubleshooting |
 | [Reading a trace](trace-examples.md) | Annotated GET and DELETE captures |
