@@ -1,0 +1,28 @@
+tests/bpf_source.rs
+  s_ece52b9a589c27::t_065c3d0cd85259 1105-1107
+src/live/linux.rs
+  s_ece52b9a589c27::t_81063c53e04f04 18-19,134-138,187-188
+  s_ece52b9a589c27::t_2c1e8530861c8f 189,200-207,209,778-779,784,808,814,840,847
+  s_ece52b9a589c27::t_b7f4db14f4b088 208,737-749,752-777,780-783,785-807,809-813,815-836,838-839,841-845,849-850,2106
+  s_ece52b9a589c27::t_e9918e2f1468e8 210-213,675-677,848,852,2092-2105,2107-2115,2117-2118,2120-2121
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_4b8ca06dcefe21 23
+docs/bugfix-bpf-live-path-hardening.md
+  s_ece52b9a589c27::t_255ae4ec6cdf92 38-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "18e38fee03559ed33d2320c52a1cc1f9ef98e234",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
