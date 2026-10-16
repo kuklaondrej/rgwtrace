@@ -361,6 +361,14 @@ pub struct TraceDiagnostics {
     pub bpf_ringbuf_rados_drops: u64,
     pub bpf_rados_map_drops: u64,
     pub bpf_rados_finish_misses: u64,
+    /// `rados_ops` entries the userspace sweep deleted because their `sent_ns`
+    /// was older than `--rados-ops-stale-after`: ops whose client exited (or
+    /// whose `_finish_op` was never probed) before completing, which would
+    /// otherwise hold a map slot for the rest of the run. An op that was merely
+    /// SLOW past the threshold and completes later shows up as a
+    /// `bpf_rados_finish_misses` and emits no event, so a nonzero count on a
+    /// healthy cluster means the threshold is too low.
+    pub stale_rados_ops_swept: u64,
     pub bpf_request_context_drops: u64,
     pub bpf_probe_read_failures: u64,
     pub bpf_reqstate_map_drops: u64,
@@ -870,6 +878,11 @@ impl Collector {
 
     pub fn record_decode_error(&mut self) {
         self.diagnostics.decode_errors += 1;
+    }
+
+    pub fn record_stale_rados_ops_swept(&mut self, swept: u64) {
+        self.diagnostics.stale_rados_ops_swept =
+            self.diagnostics.stale_rados_ops_swept.saturating_add(swept);
     }
 
     pub fn record_otlp_queue_drop(&mut self, spans: usize) {
@@ -2634,6 +2647,24 @@ mod tests {
         let document = collector.into_trace_document("rgwtrace");
         assert_eq!(document.diagnostics.otlp_queue_dropped_traces, 2);
         assert_eq!(document.diagnostics.otlp_queue_dropped_spans, 5);
+    }
+
+    #[test]
+    fn records_swept_stale_rados_ops_cumulatively() {
+        // The sweep runs every few seconds; the counter is a run total, and a BPF
+        // diagnostics merge (which overwrites the bpf_* snapshot) must not reset it.
+        let mut collector = Collector::default();
+
+        collector.record_stale_rados_ops_swept(3);
+        collector.merge_bpf_diagnostics(BpfDiagnostics::default());
+        collector.record_stale_rados_ops_swept(4);
+
+        let document = collector.into_trace_document("rgwtrace");
+        assert_eq!(document.diagnostics.stale_rados_ops_swept, 7);
+        assert!(document
+            .diagnostics
+            .counters()
+            .contains(&("stale_rados_ops_swept".to_string(), 7)));
     }
 
     #[test]

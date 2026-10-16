@@ -281,4 +281,48 @@ struct rgwtrace_event {
   } data;
 };
 
+/*
+ * WIRE LAYOUT. These sizes are the ABI contract with src/events.rs, which
+ * asserts the same numbers against its #[repr(C)] mirrors at compile time; both
+ * builds fail if either side drifts.
+ *
+ *   struct rgwtrace_request_event   160 bytes
+ *   struct rgwtrace_rados_event     560 bytes (cls_ops: 3 x (16 + 32))
+ *   struct rgwtrace_event           568 bytes; `data` starts at offset 8
+ */
+#define RGWTRACE_EVENT_DATA_OFFSET 8
+#define RGWTRACE_REQUEST_EVENT_SIZE 160
+#define RGWTRACE_RADOS_EVENT_SIZE 560
+#define RGWTRACE_EVENT_SIZE 568
+
+/* __builtin_offsetof, not offsetof: libbpf's bpf_helpers.h defines offsetof as
+ * a pointer cast, which is not an integer constant expression. */
+_Static_assert(sizeof(struct rgwtrace_request_event) == RGWTRACE_REQUEST_EVENT_SIZE,
+               "rgwtrace_request_event layout drifted from src/events.rs");
+_Static_assert(sizeof(struct rgwtrace_rados_event) == RGWTRACE_RADOS_EVENT_SIZE,
+               "rgwtrace_rados_event layout drifted from src/events.rs");
+_Static_assert(sizeof(struct rgwtrace_event) == RGWTRACE_EVENT_SIZE,
+               "rgwtrace_event layout drifted from src/events.rs");
+_Static_assert(__builtin_offsetof(struct rgwtrace_event, data) == RGWTRACE_EVENT_DATA_OFFSET,
+               "rgwtrace_event data offset drifted from src/events.rs");
+
+/*
+ * A request marker as it is RESERVED on the ring: the same header and payload
+ * offset as struct rgwtrace_event, but without the RADOS arm of the union. It
+ * is 168 bytes instead of 568, so request markers take ~3.4x less ring space.
+ * Userspace decodes by `type` and needs only header + payload bytes.
+ */
+struct rgwtrace_request_record {
+  __u32 type;
+  __u32 _pad;
+  struct rgwtrace_request_event request;
+};
+
+#define RGWTRACE_REQUEST_RECORD_SIZE 168
+
+_Static_assert(sizeof(struct rgwtrace_request_record) == RGWTRACE_REQUEST_RECORD_SIZE,
+               "rgwtrace_request_record layout drifted from src/events.rs");
+_Static_assert(__builtin_offsetof(struct rgwtrace_request_record, request) == RGWTRACE_EVENT_DATA_OFFSET,
+               "rgwtrace_request_record payload offset drifted from struct rgwtrace_event");
+
 #endif

@@ -337,9 +337,25 @@ To check end-probe coverage on a run, compare `measured_duration_requests` again
 
 RADOS child spans carry `ceph.rados.send_tid` and request spans carry `rgw.request.tid`. If they differ, the op was submitted on a different thread than the one that handled the request -- an asio coroutine migration.
 
-RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names.
+RADOS spans may include `rgwtrace.truncated` when fixed BPF capture limits clipped object names, `trans_id`, acting sets, op lists, class names, or method names. Class names hold 15 bytes, enough for every in-tree Ceph object class; before this was 7, and `refcount`, `timeindex` and `2pc_queue` calls came out with garbled method names.
 
 ---
+
+## BPF Sizing and Run Lifecycle
+
+| Flag | Default | What it sizes |
+|---|---|---|
+| `--ringbuf-size` | `16M` | Events ring buffer, bytes (K/M/G suffixes). Power of two, page multiple, at most 1 GiB. Locked kernel memory. |
+| `--bpf-rados-ops-entries` | `32768` | In-flight RADOS op map. ~600 bytes/entry preallocated (~20 MiB at the default). Minimum 1024. |
+| `--rados-ops-stale-after` | `300` | Seconds after which a `rados_ops` entry is swept. `0` disables; otherwise at least 60. |
+
+**`bpf_ringbuf_rados_drops` / `bpf_ringbuf_request_drops` are nonzero.** The reader fell behind the ring buffer. 16 MiB absorbs ~1.4 s of reader stall at 20k RADOS ops/s. Raise `--ringbuf-size` (for example `64M`) on very busy gateways or loaded hosts.
+
+**`bpf_rados_map_drops` is nonzero.** `rados_ops` was full when `_send_op` fired, so those ops were not traced. Check `stale_rados_ops_swept`: if it is also climbing, clients are exiting with ops in flight faster than the sweep reclaims them; otherwise in-flight load exceeds the map. Raise `--bpf-rados-ops-entries`.
+
+**`stale_rados_ops_swept` is nonzero.** The sweep deleted ops older than `--rados-ops-stale-after`. After a client restart this is expected and harmless. On a healthy cluster with no restarts it means ops are blocking longer than the threshold (inactive PGs, stuck OSDs); those ops emit no event when they complete and appear as `bpf_rados_finish_misses`. Raise the threshold rather than lower it.
+
+**Stopping a run.** SIGINT, SIGTERM (`systemctl stop`, `docker stop`), SIGHUP, `--timeout`, and, with `--pid`, the target process exiting all end the run the same way: diagnostics are read, pending spans are emitted (JSON on stdout, or the final OTLP export), and the process exits 0. A target exit is logged as `target process exited; stopping the trace and writing what was collected`. Before this change SIGTERM killed the process without output, and a `--pid` run outlived its target.
 
 ## Verification
 

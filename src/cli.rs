@@ -182,6 +182,39 @@ pub struct Cli {
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
 
+    /// Size of the BPF ring buffer that carries events to userspace, in bytes
+    /// (suffixes K/M/G, binary). Must be a power of two and a multiple of the
+    /// page size; it is locked kernel memory for the whole run.
+    ///
+    /// The buffer only has to absorb userspace stalls: a RADOS record is 576
+    /// bytes on the ring, so the 16 MiB default holds ~29k records, i.e. ~1.4 s
+    /// of a gateway doing 20k RADOS ops/s with the reader stopped. The old fixed
+    /// 256 KiB held ~470 records (~25 ms). A full buffer drops new events and
+    /// counts them in `bpf_ringbuf_*_drops`.
+    #[arg(long, default_value = "16M", value_parser = parse_ringbuf_size)]
+    pub ringbuf_size: u32,
+
+    /// Capacity of the BPF `rados_ops` map, which holds every RADOS op between
+    /// `_send_op` and `_finish_op` (minimum 1024).
+    ///
+    /// The default is above Ceph's `objecter_inflight_ops` default (24576), the
+    /// most ops one Objecter keeps in flight. The map is a preallocated HASH of
+    /// ~600-byte entries, so the default costs ~20 MiB of kernel memory. When
+    /// it is full, new ops are not traced and `bpf_rados_map_drops` counts them.
+    #[arg(long, default_value_t = 32768, value_parser = parse_rados_ops_entries)]
+    pub bpf_rados_ops_entries: u32,
+
+    /// Delete `rados_ops` entries older than this many seconds (0 disables;
+    /// otherwise at least 60).
+    ///
+    /// An op whose client exits before `_finish_op` stays in the map forever,
+    /// and a long session would eventually fill it. The poll loop sweeps such
+    /// entries and counts them in `stale_rados_ops_swept`. The threshold must be
+    /// far above any real op latency: an op still blocked when swept (for
+    /// example on an inactive PG) emits no event when it completes.
+    #[arg(long, default_value = "300", value_parser = parse_stale_after)]
+    pub rados_ops_stale_after: Duration,
+
     #[arg(long)]
     pub dry_run: bool,
 
@@ -279,6 +312,74 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
     Ok(number)
 }
 
+/// The largest ring buffer accepted, as a sanity bound on locked kernel memory.
+const MAX_RINGBUF_BYTES: u64 = 1024 * 1024 * 1024;
+/// The smallest page size Linux runs with; the kernel re-checks the real one.
+const MIN_PAGE_BYTES: u64 = 4096;
+
+fn parse_ringbuf_size(value: &str) -> Result<u32, String> {
+    let trimmed = value.trim();
+    let digits_end = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(digits_end);
+    let number = digits
+        .parse::<u64>()
+        .map_err(|err| format!("invalid size {value:?}: {err}"))?;
+    let multiplier: u64 = match suffix.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1024,
+        "m" | "mib" => 1024 * 1024,
+        "g" | "gib" => 1024 * 1024 * 1024,
+        _ => return Err(format!("invalid size suffix {suffix:?} in {value:?}")),
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size {value:?} overflows"))?;
+    if !bytes.is_power_of_two() || bytes < MIN_PAGE_BYTES {
+        return Err(format!(
+            "ring buffer size {bytes} must be a power of two of at least {MIN_PAGE_BYTES} bytes"
+        ));
+    }
+    if bytes > MAX_RINGBUF_BYTES {
+        return Err(format!(
+            "ring buffer size {bytes} exceeds the {MAX_RINGBUF_BYTES}-byte limit"
+        ));
+    }
+    u32::try_from(bytes).map_err(|_| format!("ring buffer size {bytes} does not fit in u32"))
+}
+
+/// The smallest `rados_ops` capacity accepted.
+const MIN_RADOS_OPS_ENTRIES: u32 = 1024;
+/// The shortest stale-op threshold accepted. Ceph flags an op as slow after 30
+/// seconds (`osd_op_complaint_time`), so anything younger than twice that may
+/// still be a live op.
+const MIN_RADOS_OPS_STALE_AFTER_SECS: u64 = 60;
+
+fn parse_rados_ops_entries(value: &str) -> Result<u32, String> {
+    let entries = value
+        .parse::<u32>()
+        .map_err(|err| format!("invalid entry count {value:?}: {err}"))?;
+    if entries < MIN_RADOS_OPS_ENTRIES {
+        return Err(format!(
+            "rados_ops needs at least {MIN_RADOS_OPS_ENTRIES} entries"
+        ));
+    }
+    Ok(entries)
+}
+
+fn parse_stale_after(value: &str) -> Result<Duration, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|err| format!("invalid duration {value:?}: {err}"))?;
+    if seconds != 0 && seconds < MIN_RADOS_OPS_STALE_AFTER_SECS {
+        return Err(format!(
+            "stale threshold must be 0 (disabled) or at least {MIN_RADOS_OPS_STALE_AFTER_SECS} seconds"
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn parse_http_header(value: &str) -> Result<(String, String), String> {
     let Some((name, header_value)) = value.split_once(':') else {
         return Err("header must use NAME:VALUE syntax".to_string());
@@ -294,6 +395,51 @@ fn parse_http_header(value: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ringbuf_size_accepts_bytes_and_binary_suffixes() {
+        assert_eq!(parse_ringbuf_size("16777216"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("16M"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("16MiB"), Ok(16 * 1024 * 1024));
+        assert_eq!(parse_ringbuf_size("256k"), Ok(256 * 1024));
+        assert_eq!(parse_ringbuf_size("1G"), Ok(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn ringbuf_size_rejects_what_the_kernel_would_reject() {
+        // BPF ring buffers must be a power-of-two multiple of the page size.
+        assert!(parse_ringbuf_size("0").is_err());
+        assert!(parse_ringbuf_size("3M").is_err());
+        assert!(parse_ringbuf_size("2048").is_err());
+        assert!(parse_ringbuf_size("2G").is_err());
+        assert!(parse_ringbuf_size("lots").is_err());
+    }
+
+    #[test]
+    fn rados_ops_sizing_defaults_cover_the_objecter_inflight_cap() {
+        let cli = Cli::parse_from(["rgwtrace"]);
+        // Above Ceph's objecter_inflight_ops default (24576).
+        assert_eq!(cli.bpf_rados_ops_entries, 32768);
+        assert_eq!(cli.rados_ops_stale_after, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn rados_ops_stale_after_refuses_thresholds_near_real_op_latency() {
+        // 0 disables the sweep; anything else must be far above a real op's
+        // latency, because a swept op that later completes loses its event.
+        assert_eq!(parse_stale_after("0"), Ok(Duration::ZERO));
+        assert_eq!(parse_stale_after("600"), Ok(Duration::from_secs(600)));
+        assert!(parse_stale_after("59").is_err());
+        assert!(parse_stale_after("soon").is_err());
+        assert!(parse_rados_ops_entries("1023").is_err());
+        assert_eq!(parse_rados_ops_entries("65536"), Ok(65536));
+    }
+
+    #[test]
+    fn default_ringbuf_size_is_16_mib() {
+        let cli = Cli::parse_from(["rgwtrace"]);
+        assert_eq!(cli.ringbuf_size, 16 * 1024 * 1024);
+    }
 
     #[test]
     fn max_debug_file_bytes_default_matches_the_extractor_default() {

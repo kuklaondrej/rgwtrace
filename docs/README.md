@@ -47,6 +47,11 @@ superseded by later sections in the same document.
   guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
+  decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
+  and SIGTERM / target-exit handling.
+- [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
+  superseding submit from map capacity or other restore errors.
 
 - [Private privileged-test lab](lab/README.md)
 - [Publication controls](publication-checklist.md)
@@ -54,3 +59,5 @@ superseded by later sections in the same document.
 - [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
   why the privileged helper scripts use private directories, generated keys
   and pinned downloads.
+
+- [Stale sweep cooldown](bugfix-stale-sweep-cooldown.md): bounded scan cycles yield CPU between cycles.

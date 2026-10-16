@@ -49,22 +49,36 @@ pub struct FieldK {
     pub pointer: bool,
 }
 
-/// Mirror of `struct VarField`: `{ VarLocation varloc; Field fields[10]; int size; }`.
+/// Mirror of `struct VarField`:
+/// `{ VarLocation varloc; Field fields[10]; int size; __u32 present; }`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VarFieldK {
     pub varloc: VarLocationK,
     pub fields: [FieldK; 10],
     pub size: i32,
+    /// `hprobes` is an ARRAY; the BPF side ignores a slot whose `present` is 0.
+    pub present: u32,
 }
 
 impl VarFieldK {
-    /// Raw bytes for `bpf_map_update_elem` into `hprobes` (value = `struct VarField`).
-    pub fn as_bytes(&self) -> &[u8] {
-        let ptr = self as *const VarFieldK as *const u8;
-        // SAFETY: `VarFieldK` is `#[repr(C)]`, `Copy`, and contains no padding
-        // that matters (the kernel side reads the same struct layout).
-        unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<VarFieldK>()) }
+    /// Bytes for `bpf_map_update_elem` into `hprobes` (value = `struct VarField`),
+    /// written field by field into a zeroed buffer: the struct has implicit
+    /// padding after each `bool`, and viewing it as `&[u8]` would read those
+    /// uninitialized bytes (undefined behavior).
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut out = vec![0_u8; std::mem::size_of::<VarFieldK>()];
+        out[0..4].copy_from_slice(&self.varloc.reg.to_ne_bytes());
+        out[4..8].copy_from_slice(&self.varloc.offset.to_ne_bytes());
+        out[8] = u8::from(self.varloc.stack);
+        for (idx, field) in self.fields.iter().enumerate() {
+            let base = 12 + idx * 8;
+            out[base..base + 4].copy_from_slice(&field.offset.to_ne_bytes());
+            out[base + 4] = u8::from(field.pointer);
+        }
+        out[92..96].copy_from_slice(&self.size.to_ne_bytes());
+        out[96..100].copy_from_slice(&self.present.to_ne_bytes());
+        out
     }
 }
 
@@ -83,6 +97,7 @@ pub fn reg_member(reg: i32, member_offset: i32) -> VarFieldK {
         },
         fields: [FieldK::default(); 10],
         size: 2,
+        present: 1,
     };
     vf.fields[1].offset = member_offset;
     vf
@@ -100,6 +115,7 @@ pub fn raw_pointer(reg: i32) -> VarFieldK {
         },
         fields: [FieldK::default(); 10],
         size: 1,
+        present: 1,
     }
 }
 
@@ -109,12 +125,12 @@ mod tests {
 
     #[test]
     fn varfield_matches_kernel_struct_size() {
-        // struct VarField = VarLocation(12) + Field[10](8*10) + int(4) = 96.
+        // struct VarField = VarLocation(12) + Field[10](8*10) + int(4) + u32(4) = 100.
         // A mismatch here means the hprobes value size disagrees with the BPF
         // map and every descriptor write would be rejected or misread.
         assert_eq!(std::mem::size_of::<VarLocationK>(), 12);
         assert_eq!(std::mem::size_of::<FieldK>(), 8);
-        assert_eq!(std::mem::size_of::<VarFieldK>(), 96);
+        assert_eq!(std::mem::size_of::<VarFieldK>(), 100);
     }
 
     #[test]
@@ -124,7 +140,8 @@ mod tests {
         assert!(!vf.varloc.stack);
         assert_eq!(vf.fields[1].offset, 40);
         assert_eq!(vf.size, 2);
-        assert_eq!(vf.as_bytes().len(), 96);
+        assert_eq!(vf.as_bytes().len(), 100);
+        assert_eq!(vf.as_bytes()[96..100], 1_u32.to_ne_bytes());
     }
 
     #[test]

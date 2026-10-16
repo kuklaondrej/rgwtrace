@@ -282,6 +282,7 @@
     "bpf_ringbuf_rados_drops": 0,
     "bpf_rados_map_drops": 0,
     "bpf_rados_finish_misses": 0,
+    "stale_rados_ops_swept": 0,
     "bpf_request_context_drops": 0,
     "bpf_probe_read_failures": 0,
     "bpf_reqstate_map_drops": 0,
