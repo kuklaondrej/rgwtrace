@@ -125,18 +125,35 @@ fn rejects_a_named_pipe_header_file_without_waiting_for_a_writer() {
     let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
 
-    let start = Instant::now();
-    let output = rgwtrace()
+    let mut child = rgwtrace()
         .args(["--otlp-header-file", path.to_str().unwrap()])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("failed to run rgwtrace");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().expect("failed to poll rgwtrace").is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("failed to kill hung rgwtrace");
+            let output = child
+                .wait_with_output()
+                .expect("failed to reap hung rgwtrace");
+            panic!(
+                "rgwtrace blocked opening a FIFO and was killed; stderr: {}",
+                stderr_of(&output)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child
+        .wait_with_output()
+        .expect("failed to collect rgwtrace output");
 
     assert!(!output.status.success());
     assert!(stderr_of(&output).contains("not a regular file"));
-    assert!(
-        start.elapsed() < Duration::from_secs(2),
-        "FIFO open blocked"
-    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
