@@ -33,6 +33,8 @@ superseded by later sections in the same document.
 
 ## Maintenance references
 
+- [Dependency audit fixes](bugfix-dependency-audit.md): patched TLS/QUIC and compressed-DWARF dependencies.
+
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
