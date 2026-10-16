@@ -1,0 +1,17 @@
+FROM quay.io/centos/centos:stream9
+
+RUN dnf install -y dnf-plugins-core \
+    && dnf config-manager --set-enabled crb \
+    && dnf install -y ca-certificates curl-minimal gcc gcc-c++ clang \
+        elfutils-libelf-devel kernel-headers llvm make pkgconf-pkg-config \
+        zlib-devel git python3 tar gzip diffutils \
+    && dnf clean all
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo
+ENV PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
+    && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.90.0 \
+    && rustup component add rustfmt clippy \
+    && rm /tmp/rustup.sh
+
+WORKDIR /workspace

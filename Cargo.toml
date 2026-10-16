@@ -19,7 +19,7 @@ cpp_demangle = "0.4"
 flate2 = "1.0"
 gimli = "0.31"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
-object = { version = "0.39", default-features = false, features = ["read", "elf", "compression"] }
+object = { version = "0.40", default-features = false, features = ["read", "elf", "compression"] }
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -1,0 +1,276 @@
+{
+  "include": [
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.0",
+      "arch": "amd64",
+      "package_version": "18.2.0-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.0",
+      "arch": "amd64",
+      "package_version": "18.2.0-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.1",
+      "arch": "amd64",
+      "package_version": "18.2.1-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.1",
+      "arch": "amd64",
+      "package_version": "18.2.1-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.2",
+      "arch": "amd64",
+      "package_version": "18.2.2-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.2",
+      "arch": "amd64",
+      "package_version": "18.2.2-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.4",
+      "arch": "amd64",
+      "package_version": "18.2.4-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.4",
+      "arch": "amd64",
+      "package_version": "18.2.4-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.5",
+      "arch": "amd64",
+      "package_version": "18.2.5-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.5",
+      "arch": "amd64",
+      "package_version": "18.2.5-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.6",
+      "arch": "amd64",
+      "package_version": "18.2.6-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.6",
+      "arch": "amd64",
+      "package_version": "18.2.6-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.7",
+      "arch": "amd64",
+      "package_version": "18.2.7-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.7",
+      "arch": "amd64",
+      "package_version": "18.2.7-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "18.2.8",
+      "arch": "amd64",
+      "package_version": "18.2.8-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "18.2.8",
+      "arch": "amd64",
+      "package_version": "18.2.8-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.0",
+      "arch": "amd64",
+      "package_version": "19.2.0-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.0",
+      "arch": "amd64",
+      "package_version": "19.2.0-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.1",
+      "arch": "amd64",
+      "package_version": "19.2.1-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.1",
+      "arch": "amd64",
+      "package_version": "19.2.1-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.2",
+      "arch": "amd64",
+      "package_version": "19.2.2-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.2",
+      "arch": "amd64",
+      "package_version": "19.2.2-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.3",
+      "arch": "amd64",
+      "package_version": "19.2.3-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.3",
+      "arch": "amd64",
+      "package_version": "19.2.3-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.4",
+      "arch": "amd64",
+      "package_version": "19.2.4-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.4",
+      "arch": "amd64",
+      "package_version": "19.2.4-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.5",
+      "arch": "amd64",
+      "package_version": "19.2.5-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.5",
+      "arch": "amd64",
+      "package_version": "19.2.5-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.6",
+      "arch": "amd64",
+      "package_version": "19.2.6-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.6",
+      "arch": "amd64",
+      "package_version": "19.2.6-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "19.2.7",
+      "arch": "amd64",
+      "package_version": "19.2.7-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "19.2.7",
+      "arch": "amd64",
+      "package_version": "19.2.7-0.el9"
+    },
+    {
+      "os": "ubuntu",
+      "os_version": "22.04",
+      "image": "ubuntu:22.04",
+      "ceph": "20.2.4",
+      "arch": "amd64",
+      "package_version": "20.2.4-1jammy"
+    },
+    {
+      "os": "centos-stream",
+      "os_version": "9",
+      "image": "quay.io/centos/centos:stream9",
+      "ceph": "20.2.4",
+      "arch": "amd64",
+      "package_version": "20.2.4-0.el9"
+    }
+  ]
+}

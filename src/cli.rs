@@ -14,6 +14,18 @@ pub struct Cli {
     #[arg(long)]
     pub ceph_version: Option<String>,
 
+    /// Largest file native DWARF extraction will read, and the most it will
+    /// decompress out of any one file's compressed DWARF sections (bytes; K, M,
+    /// G, T suffixes are binary multiples).
+    ///
+    /// Extraction reads each target, its separate debug file and its DWZ
+    /// supplementary file whole. Without a bound, a sparse multi-GB file or a
+    /// compressed section whose header declares an absurd size drives the tracer
+    /// to tens of GB of memory, and on a storage node the OOM killer may pick an
+    /// OSD instead. Raise it only for a debug file genuinely larger than this.
+    #[arg(long, default_value = "4G", value_parser = parse_byte_size)]
+    pub max_debug_file_bytes: u64,
+
     #[arg(long, default_value = "json")]
     pub output: OutputMode,
 
@@ -226,6 +238,37 @@ fn parse_duration_secs(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    let (digits, shift) = match trimmed.char_indices().last() {
+        Some((index, suffix)) if suffix.is_ascii_alphabetic() => {
+            let shift = match suffix.to_ascii_uppercase() {
+                'K' => 10,
+                'M' => 20,
+                'G' => 30,
+                'T' => 40,
+                _ => {
+                    return Err(format!(
+                        "unknown size suffix in {value:?}; use K, M, G or T"
+                    ))
+                }
+            };
+            (&trimmed[..index], shift)
+        }
+        _ => (trimmed, 0),
+    };
+    let number = digits
+        .parse::<u64>()
+        .map_err(|err| format!("invalid byte size {value:?}: {err}"))?;
+    let bytes = number
+        .checked_mul(1u64 << shift)
+        .ok_or_else(|| format!("byte size {value:?} overflows u64"))?;
+    if bytes == 0 {
+        return Err("byte size must be at least 1".to_string());
+    }
+    Ok(bytes)
+}
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let number = value
         .parse::<usize>()
@@ -246,4 +289,32 @@ fn parse_http_header(value: &str) -> Result<(String, String), String> {
         return Err("header name and value must be non-empty".to_string());
     }
     Ok((name.to_string(), header_value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_debug_file_bytes_default_matches_the_extractor_default() {
+        let cli = Cli::parse_from(["rgwtrace"]);
+
+        assert_eq!(
+            cli.max_debug_file_bytes,
+            crate::dwarf_native::DEFAULT_MAX_DEBUG_FILE_BYTES
+        );
+    }
+
+    #[test]
+    fn parses_byte_sizes_with_binary_suffixes() {
+        assert_eq!(parse_byte_size("4096"), Ok(4096));
+        assert_eq!(parse_byte_size("64K"), Ok(64 << 10));
+        assert_eq!(parse_byte_size("512m"), Ok(512 << 20));
+        assert_eq!(parse_byte_size("4G"), Ok(4 << 30));
+        assert_eq!(parse_byte_size("1T"), Ok(1 << 40));
+        assert!(parse_byte_size("0").is_err());
+        assert!(parse_byte_size("4X").is_err());
+        assert!(parse_byte_size("G").is_err());
+        assert!(parse_byte_size("99999999999T").is_err());
+    }
 }

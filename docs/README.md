@@ -6,6 +6,7 @@
 
 | Guide | What it covers |
 | --- | --- |
+| [Release automation](development.md#publishing-releases) | Binary builds, DWARF catalogs, validation, and publishing |
 | [Building and testing](development.md) | Native and container builds, local checks, and live end-to-end test setup |
 | [Production runbook](../RUNBOOK.md) | Requirements, preflight, capture, export, diagnostics, and troubleshooting |
 | [Reading a trace](trace-examples.md) | Annotated GET and DELETE captures |
@@ -32,10 +33,17 @@ superseded by later sections in the same document.
 
 ## Maintenance references
 
+- [Dependency audit fixes](bugfix-dependency-audit.md): patched TLS/QUIC and compressed-DWARF dependencies.
+
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why
   imported metadata must resolve symlinked libraries correctly.
 - [OTLP export hardening](bugfix-otlp-export-hardening.md): redirects, log
   redaction, header sources, client reuse, private CAs, and object-name redaction.
+- [OTLP header pipe handling](bugfix-otlp-header-pipe.md): reject named pipes
+  without blocking during startup.
+- [DWARF parser limits](bugfix-dwarf-parser-limits.md): why native extraction
+  bounds reference chains, nesting, file reads and decompression, and never
+  guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
