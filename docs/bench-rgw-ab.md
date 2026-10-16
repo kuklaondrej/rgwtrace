@@ -20,9 +20,16 @@ It is a **macro** benchmark: it measures what an operator actually pays
 - A built tracer at `target/release/rgwtrace` (`cargo build --release`), or pass
   `--rgwtrace-bin`.
 - `python3` with `boto3` (same dependency the e2e workload uses).
-- An S3 user/keys on the target RGW. The defaults match the MicroCeph e2e test
-  (`RGWTRACEACCESSKEY001` / the e2e secret, endpoint `http://127.0.0.1:8080`);
-  override with `--access-key` / `--secret-key` / `--endpoint`.
+- An S3 user/keys on the target RGW, exported as `RGW_ACCESS_KEY` /
+  `RGW_SECRET_KEY` (or the standard `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY`). There is no default key pair. The MicroCeph e2e test
+  generates one per run and deletes the user on exit; run it with
+  `KEEP_E2E_RESOURCES=1` and read the keys back with
+  `microceph.radosgw-admin user info --uid=rgwtrace-e2e`. The endpoint defaults
+  to `http://127.0.0.1:8080` (`--endpoint`). `--access-key` / `--secret-key`
+  still work but put the secret on this process's argv, where every local user
+  can read it; the script warns when you do that. The workload always receives
+  the keys through the environment, and `--dry-run` never prints them.
 
 Native DWARF extraction is the default. If native debug info is unavailable,
 pass `--dwarf-json /path/to/rgwtrace_dwarf.json` (and optionally
@@ -88,7 +95,8 @@ Common flags (`--help` lists all):
 - `--repeats R` interleaved blocks (default 3)
 - `--warmup-requests N` unmeasured warm-up run before the phases (default 50)
 - `--with-inferred` adds arm D
-- `--endpoint / --access-key / --secret-key` S3 target and credentials
+- `--endpoint` S3 target; credentials come from `RGW_ACCESS_KEY` /
+  `RGW_SECRET_KEY` (or `AWS_*`) in the environment, see above
 - `--pid` radosgw PID to trace; `--rgwtrace-bin`, `--dwarf-json`, `--ceph-version`
 
 ---

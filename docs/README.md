@@ -47,3 +47,6 @@ superseded by later sections in the same document.
 - [Private privileged-test lab](lab/README.md)
 - [Publication controls](publication-checklist.md)
 - [Dependency audit review](dependency-audit.md)
+- [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
+  why the privileged helper scripts use private directories, generated keys
+  and pinned downloads.

@@ -13,6 +13,7 @@ python3 -m unittest discover -s tests/e2e -p 'test_*.py'
 python3 -m unittest discover -s tests -p 'test_release.py'
 git diff --check
 git diff --cached --check
+bash tests/scripts/private-dir-test.sh
 
 if [[ "${VERIFY_AUDIT:-0}" == "1" ]]; then
   if ! command -v cargo-audit >/dev/null 2>&1; then

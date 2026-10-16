@@ -47,7 +47,10 @@ jobs:
           CEPH_VERSION: ${{ inputs.ceph_version }}
         run: |
           set -euo pipefail
-          mkdir -p "${ARTIFACTS_DIR}"
+          # The export script runs as root in the container and refuses an
+          # artifact directory it does not own; create it root-owned 0700 and
+          # hand it back to the runner user afterwards for the upload step.
+          sudo install -d -m 0700 -o root -g root "${ARTIFACTS_DIR}"
           docker pull --platform linux/amd64 "ubuntu:${UBUNTU_VERSION}"
           docker run --rm \
             --platform linux/amd64 \
@@ -58,6 +61,10 @@ jobs:
             -w /workspace \
             "ubuntu:${UBUNTU_VERSION}" \
             bash /workspace/scripts/export-upstream-ceph-dwarf.sh
+
+      - name: Make artifacts readable by the runner user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" "${ARTIFACTS_DIR}" 2>/dev/null || true
 
       - name: Upload DWARF artifact
         if: always()
