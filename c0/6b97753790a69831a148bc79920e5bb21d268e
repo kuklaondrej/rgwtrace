@@ -1,0 +1,49 @@
+.dockerignore
+  s_ece52b9a589c27::t_65dc57fcad01bf 1-22
+.github/workflows/dwarf-artifact.yml
+  s_ece52b9a589c27::t_86a927bd0bc8d6 50-53,65-68
+docker/Dockerfile
+  s_ece52b9a589c27::t_c8be1bc916bef6 1-4
+docs/README.md
+  s_ece52b9a589c27::t_77a69e42358b47 50-52
+docs/bench-rgw-ab.md
+  s_ece52b9a589c27::t_332e14fda3cc2d 23-32,98-99
+docs/bugfix-script-temp-dirs-and-credentials.md
+  s_ece52b9a589c27::t_4bfb7f2e28fbf3 1-142
+docs/development.md
+  s_ece52b9a589c27::t_cc55a2f08dc994 39-44,119,121
+docs/stage0-runbook.md
+  s_ece52b9a589c27::t_72e3b5e5ea841f 71-80,86-87,92-104,113-114,124,126-127,141,143,294
+scripts/bench-rgw-ab.sh
+  s_ece52b9a589c27::t_27ada9536fae6c 51,54-58,99-101,128,240-241,256-257,261-273,830-837
+scripts/export-upstream-ceph-dwarf.sh
+  s_ece52b9a589c27::t_d7a60faf73b6fb 6-18,24-46,65-77,105-125,138-150,152-153,277-303,305-314,316,318-319,334-335,461,463-464
+scripts/lib/private-dir.sh
+  s_ece52b9a589c27::t_228047eadfa029 1-144
+scripts/stage0-crossthread-probe.sh
+  s_ece52b9a589c27::t_37475c836a1661 44-47,73-75,78-81,85,454-457
+scripts/verify.sh
+  s_ece52b9a589c27::t_349674d927d4c6 16
+tests/e2e/functional-test-microceph-rgw.sh
+  s_ece52b9a589c27::t_06127dcaa03cd6 7-9,12-19,32-36,96-98,100-101,104,384-397,400-426,516-518,566
+tests/e2e/s3-workload.py
+  s_ece52b9a589c27::t_2e66b31aec887f 7,9,21-27,101-124
+tests/scripts/private-dir-test.sh
+  s_ece52b9a589c27::t_96d3efe7519b49 1-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c06b97753790a69831a148bc79920e5bb21d268e",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
