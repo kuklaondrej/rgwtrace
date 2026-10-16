@@ -4,9 +4,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# shellcheck source=scripts/lib/private-dir.sh
+. "${PROJECT_ROOT}/scripts/lib/private-dir.sh"
+
 PATH="/snap/bin:${PATH}"
 
-ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-e2e}"
+# Everything below runs as root and the artifacts include the exported
+# DWARF, the trace and the RGW user record: keep them private.
+umask 077
+
+# Default to a fresh private directory. A caller-supplied ARTIFACT_DIR is
+# created with mode 0700 if missing, otherwise it must already be ours and
+# not group/other writable (checked in main before anything is written).
+ARTIFACT_DIR="${ARTIFACT_DIR:-$(rgwtrace_private_tmpdir rgwtrace-e2e)}"
 TRACE_SECONDS="${TRACE_SECONDS:-60}"
 TRACE_ATTACH_DELAY="${TRACE_ATTACH_DELAY:-6}"
 TRACE_TIMEOUT_GRACE="${TRACE_TIMEOUT_GRACE:-180}"
@@ -19,8 +29,11 @@ MICROCEPH_ALLOW_CHANNEL_SWITCH="${MICROCEPH_ALLOW_CHANNEL_SWITCH:-0}"
 RGW_PORT="${RGW_PORT:-8080}"
 RGW_ENDPOINT="${RGW_ENDPOINT:-}"
 RGW_USER="${RGW_USER:-rgwtrace-e2e}"
-RGW_ACCESS_KEY="${RGW_ACCESS_KEY:-RGWTRACEACCESSKEY001}"
-RGW_SECRET_KEY="${RGW_SECRET_KEY:-rgwtrace-secret-key-rgwtrace-secret-key}"
+# Credentials are generated per run by radosgw-admin unless BOTH are supplied.
+# No well-known default: the user is reachable on the RGW port for the whole
+# run, and a fixed key pair would let anyone on the network use it.
+RGW_ACCESS_KEY="${RGW_ACCESS_KEY:-}"
+RGW_SECRET_KEY="${RGW_SECRET_KEY:-}"
 RGWTRACE_BIN="${RGWTRACE_BIN:-${PROJECT_ROOT}/target/release/rgwtrace}"
 RGWTRACE_DWARF_JSON="${RGWTRACE_DWARF_JSON:-}"
 KEEP_E2E_RESOURCES="${KEEP_E2E_RESOURCES:-0}"
@@ -68,11 +81,15 @@ cleanup() {
     fi
     pkill -f "${RGWTRACE_BIN}" 2>/dev/null || true
 
-    if [[ ${rc} -eq 0 && "${KEEP_E2E_RESOURCES}" != "1" && -n "${RGW_ADMIN}" ]]; then
+    # Purge the user on every exit path, not only on success: a failed run
+    # must not leave a credentialed S3 user behind on the host.
+    if [[ "${KEEP_E2E_RESOURCES}" != "1" && -n "${RGW_ADMIN}" ]]; then
         "${RGW_ADMIN}" user rm --uid="${RGW_USER}" --purge-data --purge-keys >/dev/null 2>&1 || true
+    elif [[ "${KEEP_E2E_RESOURCES}" == "1" && -n "${RGW_ADMIN}" ]]; then
+        info "KEEP_E2E_RESOURCES=1: RGW user ${RGW_USER} kept; read its keys with '${RGW_ADMIN} user info --uid=${RGW_USER}'"
     fi
 
-    info "artifacts preserved in ${ARTIFACT_DIR}"
+    info "artifacts preserved in ${ARTIFACT_DIR} (rc=${rc})"
 }
 trap cleanup EXIT
 
@@ -352,12 +369,49 @@ find_rgw_admin() {
 create_rgw_user() {
     find_rgw_admin
     "${RGW_ADMIN}" user rm --uid="${RGW_USER}" --purge-data --purge-keys >/dev/null 2>&1 || true
-    "${RGW_ADMIN}" user create \
+
+    local key_args=()
+    if [[ -n "${RGW_ACCESS_KEY}" && -n "${RGW_SECRET_KEY}" ]]; then
+        key_args=(--access-key="${RGW_ACCESS_KEY}" --secret-key="${RGW_SECRET_KEY}")
+    elif [[ -n "${RGW_ACCESS_KEY}" || -n "${RGW_SECRET_KEY}" ]]; then
+        err "set both RGW_ACCESS_KEY and RGW_SECRET_KEY, or neither (keys are then generated per run)"
+        return 1
+    fi
+
+    # With no key flags radosgw-admin generates a random S3 key pair itself,
+    # so the secret never appears on a command line. The JSON is kept in
+    # memory; the persisted copy has the secrets redacted.
+    local user_json
+    user_json="$("${RGW_ADMIN}" user create \
         --uid="${RGW_USER}" \
         --display-name="${RGW_USER}" \
-        --access-key="${RGW_ACCESS_KEY}" \
-        --secret-key="${RGW_SECRET_KEY}" \
-        --format=json >"${RGW_USER_JSON}"
+        "${key_args[@]}" \
+        --format=json)"
+
+    local creds
+    creds="$(printf '%s' "${user_json}" | python3 -c '
+import json, sys
+user = json.load(sys.stdin)
+keys = [k for k in user.get("keys", []) if k.get("access_key") and k.get("secret_key")]
+if not keys:
+    sys.exit("radosgw-admin user create returned no S3 key pair")
+print(keys[0]["access_key"])
+print(keys[0]["secret_key"])
+')" || return 1
+    RGW_ACCESS_KEY="$(printf '%s\n' "${creds}" | sed -n 1p)"
+    RGW_SECRET_KEY="$(printf '%s\n' "${creds}" | sed -n 2p)"
+
+    printf '%s' "${user_json}" | python3 -c '
+import json, sys
+user = json.load(sys.stdin)
+for field in ("keys", "swift_keys"):
+    for entry in user.get(field, []):
+        if "secret_key" in entry:
+            entry["secret_key"] = "<redacted>"
+json.dump(user, sys.stdout, indent=2)
+sys.stdout.write("\n")
+' >"${RGW_USER_JSON}"
+    info "created RGW user ${RGW_USER} (access key ${RGW_ACCESS_KEY}; secret redacted in ${RGW_USER_JSON})"
 }
 
 find_rgw_pid() {
@@ -442,10 +496,10 @@ start_trace() {
 
 run_workload() {
     info "running S3 workload against ${RGW_ENDPOINT}"
-    if ! python3 "${SCRIPT_DIR}/s3-workload.py" \
+    # Credentials go through the environment, never argv (visible in ps).
+    if ! AWS_ACCESS_KEY_ID="${RGW_ACCESS_KEY}" AWS_SECRET_ACCESS_KEY="${RGW_SECRET_KEY}" \
+        python3 "${SCRIPT_DIR}/s3-workload.py" \
         --endpoint "${RGW_ENDPOINT}" \
-        --access-key "${RGW_ACCESS_KEY}" \
-        --secret-key "${RGW_SECRET_KEY}" \
         --output "${WORKLOAD_JSONL}" \
         --manifest "${WORKLOAD_MANIFEST}" \
         --unique-keys \
@@ -477,7 +531,7 @@ verify_trace() {
 
 main() {
     require_root
-    mkdir -p "${ARTIFACT_DIR}"
+    rgwtrace_require_private_dir "${ARTIFACT_DIR}" "ARTIFACT_DIR" || exit 1
     rm -f \
         "${PREFLIGHT_JSON}" \
         "${PREFLIGHT_LOG}" \

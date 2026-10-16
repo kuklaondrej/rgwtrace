@@ -3,11 +3,46 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
-ARTIFACT_DIR="${ARTIFACT_DIR:-/tmp/rgwtrace-dwarf-artifacts}"
+
+# shellcheck source=scripts/lib/private-dir.sh
+. "${SCRIPT_DIR}/lib/private-dir.sh"
+
+# This script installs packages, a Rust toolchain and builds as root. Nothing
+# it writes may live in a directory another local user can pre-create.
+umask 077
+
+ARTIFACT_DIR="${ARTIFACT_DIR:-$(rgwtrace_private_tmpdir rgwtrace-dwarf-artifacts)}"
+# Scratch space for the rustup installer, CARGO_HOME and the cargo target dir.
+# A predictable CARGO_HOME is root code execution: cargo honours
+# $CARGO_HOME/config.toml (build.rustc-wrapper, [target].runner, ...).
+WORK_DIR="${WORK_DIR:-$(rgwtrace_private_tmpdir rgwtrace-dwarf-work)}"
 CEPH_VERSION="${CEPH_VERSION:-}"
 CEPH_PACKAGE_VERSION="${CEPH_PACKAGE_VERSION:-}"
 DEBIAN_FRONTEND=noninteractive
 export DEBIAN_FRONTEND
+
+# The script reconfigures APT and installs a toolchain system-wide, so it is
+# only meant for a throwaway container (the dwarf-artifact workflow runs it in
+# a fresh ubuntu image). Set RGWTRACE_ALLOW_HOST_EXPORT=1 to run it elsewhere
+# on purpose.
+RGWTRACE_ALLOW_HOST_EXPORT="${RGWTRACE_ALLOW_HOST_EXPORT:-0}"
+
+# Ceph release signing key, "Ceph.com (release key) <security@ceph.com>".
+# The long key ID E84AC2C0460F3994 is the one published in Ceph's 2015
+# signing-key security notice (ceph.io blog, "Important security notice
+# regarding signing key and binary downloads of Ceph"); the full fingerprint
+# was taken from https://download.ceph.com/keys/release.asc on 2026-10-09 and
+# its last 16 hex digits are that published key ID. Refresh only if Ceph
+# rotates the key: gpg --show-keys --with-fingerprint release.asc
+CEPH_RELEASE_KEY_FINGERPRINT="${CEPH_RELEASE_KEY_FINGERPRINT:-08B73419AC32B4E966C1A330E84AC2C0460F3994}"
+
+# rustup-init is fetched as a pinned release binary and checked against the
+# SHA-256 rustup publishes next to it, instead of piping sh.rustup.rs into sh.
+# To refresh: VERSION=$(curl -fsSL https://static.rust-lang.org/rustup/release-stable.toml)
+# then, per triple, curl -fsSL https://static.rust-lang.org/rustup/archive/<version>/<triple>/rustup-init.sha256
+RUSTUP_INIT_VERSION="${RUSTUP_INIT_VERSION:-1.29.1}"
+RUSTUP_INIT_SHA256_x86_64="dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71"
+RUSTUP_INIT_SHA256_aarch64="15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433"
 
 NATIVE_DWARF_JSON="${ARTIFACT_DIR}/native-dwarf.json"
 NATIVE_DWARF_LOG="${ARTIFACT_DIR}/native-dwarf.log"
@@ -25,6 +60,19 @@ info() {
 
 err() {
     printf '[ERROR] %s\n' "$*" >&2
+}
+
+require_container() {
+    if [[ "${RGWTRACE_ALLOW_HOST_EXPORT}" == "1" ]]; then
+        info "RGWTRACE_ALLOW_HOST_EXPORT=1: running outside a container as requested"
+        return 0
+    fi
+    if [[ -f /.dockerenv || -f /run/.containerenv || -n "${container:-}" ]]; then
+        return 0
+    fi
+    err "refusing to run outside a container: this script rewrites APT sources and installs packages and a Rust toolchain system-wide"
+    err "run it in a throwaway container (see .github/workflows/dwarf-artifact.yml) or set RGWTRACE_ALLOW_HOST_EXPORT=1"
+    exit 1
 }
 
 require_ceph_version() {
@@ -54,6 +102,27 @@ install_base_tools() {
         gnupg
 }
 
+# Print the primary-key fingerprint of an armored key file, refusing a file
+# that carries more than one primary key: gpg --dearmor installs the whole
+# file into the APT keyring, so a second key appended by a compromised server
+# would be trusted too even though only the first one was checked.
+ceph_key_single_fingerprint() {
+    local key_file="$1"
+    local listing pub_count
+    listing="$(gpg --batch --with-colons --show-keys --with-fingerprint "${key_file}" 2>/dev/null)" || {
+        err "gpg could not parse ${key_file}"
+        return 1
+    }
+    pub_count="$(printf '%s\n' "${listing}" | awk -F: '$1 == "pub"' | wc -l | tr -d ' ')"
+    if [[ "${pub_count}" != "1" ]]; then
+        err "expected exactly one primary key in ${key_file}, found ${pub_count}"
+        return 1
+    fi
+    # The first fpr record follows the (only) pub record; later ones belong to
+    # its subkeys.
+    printf '%s\n' "${listing}" | awk -F: '$1 == "fpr" { print $10; exit }'
+}
+
 configure_ceph_repo() {
     local codename="$1"
     local repo_url="https://download.ceph.com/debian-${CEPH_VERSION}"
@@ -66,9 +135,22 @@ configure_ceph_repo() {
         exit 1
     fi
 
+    # Fetch the key to a private file and compare its fingerprint with the
+    # pinned one before trusting it for package verification: TLS alone only
+    # proves we talked to download.ceph.com, not that the key is Ceph's.
+    local key_asc="${WORK_DIR}/ceph-release.asc"
+    local fingerprint
+    curl --proto '=https' --tlsv1.2 -fsSL https://download.ceph.com/keys/release.asc -o "${key_asc}"
+    fingerprint="$(ceph_key_single_fingerprint "${key_asc}")" || exit 1
+    if [[ "${fingerprint}" != "${CEPH_RELEASE_KEY_FINGERPRINT}" ]]; then
+        err "Ceph release key fingerprint mismatch: got '${fingerprint:-<none>}', expected ${CEPH_RELEASE_KEY_FINGERPRINT}"
+        exit 1
+    fi
+    info "Ceph release key fingerprint verified (${fingerprint})"
+
     install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://download.ceph.com/keys/release.asc \
-        | gpg --batch --yes --dearmor -o /etc/apt/keyrings/ceph.gpg
+    gpg --batch --yes --dearmor -o /etc/apt/keyrings/ceph.gpg "${key_asc}"
+    chmod 0644 /etc/apt/keyrings/ceph.gpg
     printf 'deb [signed-by=/etc/apt/keyrings/ceph.gpg] %s %s main\n' \
         "${repo_url}" \
         "${codename}" \
@@ -192,17 +274,49 @@ EOF
         make pkgconf-pkg-config xz zlib-devel "${packages[@]}"
 }
 
-install_rust_toolchain() {
-    if ! command -v rustup >/dev/null 2>&1; then
-        info "installing rustup"
-        curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain none
-        # shellcheck disable=SC1091
-        . "${HOME}/.cargo/env"
-    else
-        # shellcheck disable=SC1091
-        . "${HOME}/.cargo/env" 2>/dev/null || true
+install_rustup_pinned() {
+    local arch triple expected actual installer
+    arch="$(uname -m)"
+    case "${arch}" in
+        x86_64)  triple="x86_64-unknown-linux-gnu";  expected="${RUSTUP_INIT_SHA256_x86_64}" ;;
+        aarch64) triple="aarch64-unknown-linux-gnu"; expected="${RUSTUP_INIT_SHA256_aarch64}" ;;
+        *)
+            err "no pinned rustup-init checksum for architecture ${arch}"
+            exit 1
+            ;;
+    esac
+
+    installer="${WORK_DIR}/rustup-init"
+    info "downloading rustup-init ${RUSTUP_INIT_VERSION} for ${triple}"
+    curl --proto '=https' --tlsv1.2 -fsSL \
+        "https://static.rust-lang.org/rustup/archive/${RUSTUP_INIT_VERSION}/${triple}/rustup-init" \
+        -o "${installer}"
+    actual="$(sha256sum "${installer}" | awk '{ print $1 }')"
+    if [[ "${actual}" != "${expected}" ]]; then
+        err "rustup-init checksum mismatch: got ${actual}, expected ${expected}"
+        exit 1
     fi
+    chmod 0700 "${installer}"
+    "${installer}" -y --profile minimal --default-toolchain none --no-modify-path
+    rm -f "${installer}"
+}
+
+install_rust_toolchain() {
+    # CARGO_HOME is fixed before rustup runs so the proxies, the registry cache
+    # and any config.toml all live in our private scratch directory.
+    export CARGO_HOME="${CARGO_HOME:-${WORK_DIR}/cargo-home}"
+    export RUSTUP_HOME="${RUSTUP_HOME:-${WORK_DIR}/rustup-home}"
+    rgwtrace_require_private_dir "${CARGO_HOME}" "CARGO_HOME" || exit 1
+    # The toolchain binaries cargo runs as root live under RUSTUP_HOME, so it
+    # needs the same guarantee as CARGO_HOME.
+    rgwtrace_require_private_dir "${RUSTUP_HOME}" "RUSTUP_HOME" || exit 1
+
+    if ! command -v rustup >/dev/null 2>&1 && [[ ! -x "${CARGO_HOME}/bin/rustup" ]]; then
+        info "installing rustup"
+        install_rustup_pinned
+    fi
+    PATH="${CARGO_HOME}/bin:${PATH}"
+    export PATH
 
     local toolchain
     toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' "${REPO_ROOT}/rust-toolchain.toml")"
@@ -217,8 +331,8 @@ install_rust_toolchain() {
 
 build_rgwtrace() {
     info "building rgwtrace"
-    export CARGO_HOME="${CARGO_HOME:-/tmp/rgwtrace-cargo-home}"
-    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/rgwtrace-target}"
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${WORK_DIR}/target}"
+    rgwtrace_require_private_dir "${CARGO_TARGET_DIR}" "CARGO_TARGET_DIR" || exit 1
 
     cd "${REPO_ROOT}"
     cargo build --release --locked
@@ -344,8 +458,10 @@ EOF
 }
 
 main() {
+    require_container
     require_ceph_version
-    mkdir -p "${ARTIFACT_DIR}"
+    rgwtrace_require_private_dir "${ARTIFACT_DIR}" "ARTIFACT_DIR" || exit 1
+    rgwtrace_require_private_dir "${WORK_DIR}" "WORK_DIR" || exit 1
     cp /etc/os-release "${OS_RELEASE_TXT}"
 
     select_platform
