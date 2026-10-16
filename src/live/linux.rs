@@ -707,17 +707,24 @@ fn reclaim_stale_rados_op(
     restore: impl FnOnce(&[u8]) -> Result<()>,
     now_ns: u64,
     stale_after_ns: u64,
-) -> Reclaim {
+) -> Result<Reclaim> {
     let taken = match take() {
         Ok(Some(value)) => value,
-        Ok(None) | Err(_) => return Reclaim::Gone,
+        Ok(None) | Err(_) => return Ok(Reclaim::Gone),
     };
     if rados_op_is_stale(&taken, now_ns, stale_after_ns) {
-        return Reclaim::Swept;
+        return Ok(Reclaim::Swept);
     }
     match restore(&taken) {
-        Ok(()) => Reclaim::Restored,
-        Err(_) => Reclaim::Superseded,
+        Ok(()) => Ok(Reclaim::Restored),
+        Err(error)
+            if error
+                .downcast_ref::<libbpf_rs::Error>()
+                .is_some_and(|error| error.kind() == libbpf_rs::ErrorKind::AlreadyExists) =>
+        {
+            Ok(Reclaim::Superseded)
+        }
+        Err(error) => Err(error).context("failed to restore refreshed rados_ops entry"),
     }
 }
 
@@ -764,7 +771,7 @@ fn sweep_stale_rados_ops(map: &impl MapCore, stale_after: Duration) -> Result<u6
                 },
                 now_ns,
                 stale_after_ns,
-            ),
+            )?,
             // Pre-5.14 kernels refuse lookup-and-delete on hash maps (ENOTSUPP,
             // which has no portable errno kind); fall back to re-read + delete.
             Err(_) => match map.lookup(&key, MapFlags::ANY) {
@@ -1982,7 +1989,7 @@ mod tests {
             now,
             stale_after,
         );
-        assert_eq!(outcome, Reclaim::Restored);
+        assert_eq!(outcome.unwrap(), Reclaim::Restored);
         assert_eq!(restored, Some(value(now - 1)));
 
         let outcome = reclaim_stale_rados_op(
@@ -1991,7 +1998,7 @@ mod tests {
             now,
             stale_after,
         );
-        assert_eq!(outcome, Reclaim::Swept);
+        assert_eq!(outcome.unwrap(), Reclaim::Swept);
 
         let outcome = reclaim_stale_rados_op(
             || Ok(None),
@@ -1999,16 +2006,26 @@ mod tests {
             now,
             stale_after,
         );
-        assert_eq!(outcome, Reclaim::Gone);
+        assert_eq!(outcome.unwrap(), Reclaim::Gone);
 
         // A newer submit re-inserted the key before we could restore: it wins.
         let outcome = reclaim_stale_rados_op(
             || Ok(Some(value(now - 1))),
-            |_| Err(anyhow::anyhow!("EEXIST")),
+            |_| Err(libbpf_rs::Error::from_raw_os_error(libc::EEXIST).into()),
             now,
             stale_after,
         );
-        assert_eq!(outcome, Reclaim::Superseded);
+        assert_eq!(outcome.unwrap(), Reclaim::Superseded);
+
+        // A full map is not evidence that another submit installed a newer
+        // value. Surface it so the caller can report the lost stale entry.
+        let outcome = reclaim_stale_rados_op(
+            || Ok(Some(value(now - 1))),
+            |_| Err(libbpf_rs::Error::from_raw_os_error(libc::ENOSPC).into()),
+            now,
+            stale_after,
+        );
+        assert!(outcome.is_err());
     }
 
     #[test]

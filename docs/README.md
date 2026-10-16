@@ -40,3 +40,5 @@ superseded by later sections in the same document.
 - [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
   decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
   and SIGTERM / target-exit handling.
+- [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
+  superseding submit from map capacity or other restore errors.
