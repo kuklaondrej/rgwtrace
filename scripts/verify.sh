@@ -9,6 +9,7 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 python3 tests/e2e/verify-rgwtrace-json.py --self-test
+python3 -m unittest discover -s tests -p 'test_release.py'
 git diff --check
 git diff --cached --check
 

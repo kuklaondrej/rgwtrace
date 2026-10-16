@@ -49,7 +49,13 @@ Validate an imported artifact without attaching probes:
 rgwtrace --import-json /path/to/dwarf.json --dry-run --output json
 ```
 
-If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout.
+If native mode cannot discover the Ceph version, add `--ceph-version <version>`. The major version selects the pre-Squid or Squid+ `ceph_osd_op` ABI layout. For a containerized RGW (targets under `/proc/<pid>/root`), rgwtrace never falls back to the host's `dpkg-query`/`rpm`, because the host package says nothing about the image. Without an embedded version string, extraction fails and asks for `--ceph-version`.
+
+Native extraction refuses any file larger than `--max-debug-file-bytes` (default `4G`; accepts `K`/`M`/`G`/`T`), and refuses to decompress more than that from one file's compressed DWARF sections. This protects the node from a sparse or crafted debug file. Raise the limit only for a debug file that is genuinely larger:
+
+```sh
+sudo rgwtrace --dwarf-source native --pid <pid> --max-debug-file-bytes 8G --preflight
+```
 
 Build ID mismatches fail preflight and live attach by default. Use `--allow-build-id-mismatch` only when the mismatch is understood.
 
@@ -159,6 +165,9 @@ different loss: drains dropped because the exporter fell two drains behind.
 - `missing function address`: native debug data or imported JSON lacks a required probe PC.
 - `missing variable fields`: native debug data or imported JSON lacks required variable locations or member field paths.
 - `build ID mismatch`: verify native module/debug files, regenerate JSON for the exact binaries, or rerun with `--allow-build-id-mismatch` only if the mismatch is understood.
+- `... is N bytes, over the M-byte limit` or `compressed DWARF section ... exceeds the M-byte limit`: the named file or section is larger than `--max-debug-file-bytes`. Check that the file is the expected debug file. Then raise the limit, or export JSON on a host with more memory.
+- `the host package database cannot describe ... pass --ceph-version`: the target is in a container and has no embedded version string. Pass the version the RGW process runs, for example `--ceph-version 18.2.8`.
+- `type qualifier chain ...`, `... pointer/reference indirections ...`, `DWARF scope nesting deeper than ...`: the debug info is malformed (a reference cycle or absurd nesting). Use a debug file from the distribution's debuginfo package, or `--import-json`.
 
 ---
 
@@ -370,3 +379,45 @@ to `0`, and the zero-mis-correlation check still holds. Raise those thresholds
 the functional test) so the object→request mapping stays unambiguous.
 
 Without `--workload-manifest`, the verifier behaves exactly as before.
+
+
+## Release downloads
+
+Download the binary archive matching `uname -m` (`x86_64` or `aarch64`) and
+`SHA256SUMS` from a versioned [GitHub Release](https://github.com/kuklaondrej/rgwtrace/releases).
+On Ubuntu/Debian, install runtime dependencies with
+`sudo apt-get install libelf1 zlib1g`; the standard archives require glibc
+2.35 or newer. On CentOS 9, choose the archive ending in `-centos9.tar.gz`
+(glibc 2.34) and install dependencies with
+`sudo dnf install elfutils-libelf zlib`. Both variants are available for x86_64
+and aarch64. No Rust toolchain or BPF compilation is needed on the target.
+
+```sh
+# Run in the directory containing the downloaded archive and SHA256SUMS.
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf rgwtrace-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+cd rgwtrace-v0.1.0-x86_64-unknown-linux-gnu
+./rgwtrace --version
+./rgwtrace --import-json minimal_dwarf.json --dry-run --output json
+```
+
+Replace the example version and architecture with the asset you downloaded.
+The fixture tests the executable offline; it cannot be used against a live RGW.
+
+For pre-generated metadata, choose a separate `dwarf-<hash>` release. Inspect
+`index.json` for the package source, exact package revisions, architecture,
+module build IDs, and optional probe capability checks. Download and verify
+the matching bundle using that catalog's `SHA256SUMS`, then extract it.
+
+```sh
+sudo ./rgwtrace --pid 12345 --import-json /path/to/native-dwarf.json --preflight
+sudo ./rgwtrace --pid 12345 --import-json /path/to/native-dwarf.json --timeout 30 --output json
+```
+
+Match the binaries used by the RGW process, including libraries inside its
+container. An OS/Ceph version label alone does not establish compatibility.
+Never use `--allow-build-id-mismatch` to force a catalog match. If no exact
+bundle exists, use native extraction with matching debug symbols as described
+above. Catalog preflight validates metadata offline; it does not attest to a
+successful live attach. Optional probe warnings in the catalog describe
+reduced duration or correlation capabilities.

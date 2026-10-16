@@ -1,0 +1,88 @@
+name: DWARF release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dwarf-release
+  cancel-in-progress: false
+
+jobs:
+  matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      builds: ${{ steps.matrix.outputs.builds }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: matrix
+        run: echo "builds=$(jq -c . release/dwarf-matrix.json)" >> "$GITHUB_OUTPUT"
+  export:
+    needs: matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.matrix.outputs.builds) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Export metadata
+        env:
+          EXPORT_IMAGE: ${{ matrix.image }}
+          CEPH_VERSION: ${{ matrix.ceph }}
+          CEPH_PACKAGE_VERSION: ${{ matrix.package_version }}
+        run: |
+          mkdir -p dwarf-artifacts
+          docker run --rm --platform linux/amd64 \
+            -e CEPH_VERSION -e CEPH_PACKAGE_VERSION -e ARTIFACT_DIR=/artifacts \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$GITHUB_WORKSPACE/dwarf-artifacts:/artifacts" \
+            -w /workspace "${EXPORT_IMAGE}" \
+            bash scripts/export-upstream-ceph-dwarf.sh
+      - name: Validate and package
+        env:
+          DISTRO: ${{ matrix.os }}
+          DISTRO_VERSION: ${{ matrix.os_version }}
+          CEPH_VERSION: ${{ matrix.ceph }}
+          CEPH_PACKAGE_VERSION: ${{ matrix.package_version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python3 scripts/package-dwarf.py bundle dwarf-artifacts dist \
+            --os "$DISTRO" --os-version "$DISTRO_VERSION" --ceph "$CEPH_VERSION" \
+            --arch "$ARCH" --commit "$GITHUB_SHA" --package-version "$CEPH_PACKAGE_VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dwarf-bundle-${{ matrix.os }}-${{ matrix.os_version }}-${{ matrix.ceph }}-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dwarf-diagnostics-${{ matrix.os }}-${{ matrix.os_version }}-${{ matrix.ceph }}-${{ matrix.arch }}
+          path: dwarf-artifacts/
+          retention-days: 14
+  publish:
+    needs: export
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dwarf-bundle-*
+          merge-multiple: true
+          path: dist
+      - name: Publish catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(python3 scripts/package-dwarf.py index dist)
+          scripts/publish-release.sh "$tag" dist release/DWARF-README.txt dwarf
