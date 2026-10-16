@@ -1,0 +1,195 @@
+.dockerignore
+  s_ece52b9a589c27::t_7cce1a7638db03 1-22
+.github/CODEOWNERS
+  s_ece52b9a589c27::t_9cb0854aaf4184 1-9
+.github/actionlint.yaml
+  s_ece52b9a589c27::t_0c29b6087ed55f 1-3
+.github/dependabot.yml
+  s_ece52b9a589c27::t_3eec9a523b2564 1-10
+.github/workflows/ci.yml
+  s_ece52b9a589c27::t_2bcf04774af372 6-16,19-26,28-31,33,35-36,39-46,48-99
+.github/workflows/dwarf-artifact.yml
+  s_ece52b9a589c27::t_34ff894e074e4b 25-27,50-53,65-68,71
+.github/workflows/dwarf-release.yml
+  s_ece52b9a589c27::t_7b869535205722 1-88
+.github/workflows/release.yml
+  s_ece52b9a589c27::t_28747d8fa35e6e 1-120
+.gitignore
+  s_ece52b9a589c27::t_675f48116d21f4 10-19
+AGENTS.md
+  s_ece52b9a589c27::t_a50dea6b88f73a 26-28,32,57-58,74-77,90-93,95,133-134
+ARCHITECTURE.md
+  s_ece52b9a589c27::t_095e857ba58f27 13-26,38-68,116-131,298-305,328-340
+CONTRIBUTING.md
+  s_ece52b9a589c27::t_f2e7f510b1b58c 1-29
+Cargo.lock
+  s_ece52b9a589c27::t_d543a924a9b9ef 171,173,920,922,1087,1089,1283,1337,1339,1361,1363,1378,1380
+Cargo.toml
+  s_ece52b9a589c27::t_8e49be517afa87 17,21,23,31-36
+README.md
+  s_ece52b9a589c27::t_8cfc37b1993861 28-35,46-49,84-89
+RUNBOOK.md
+  s_ece52b9a589c27::t_0b6e974d0a36c4 13-14,32-34,56-62,115-175,192-199,204-206,216-220,358,362-377,431-453,456-497
+SECURITY.md
+  s_ece52b9a589c27::t_be4b1e078d9713 1-18
+bench/README.md
+  s_ece52b9a589c27::t_1625085af48d6e 59-61,69-70,139-141,146-147
+bench/src/descriptors.rs
+  s_ece52b9a589c27::t_205e3ca1de7e49 52-53,60-61,65-81,100,118,128,133,143-144
+bench/src/main.rs
+  s_ece52b9a589c27::t_6e5838c026df77 14,16,18,77-80,109-110,689,1261-1263,1267,1288-1289,1319,1465-1466,1491,1711
+bench/src/target.rs
+  s_ece52b9a589c27::t_b55c067a0808be 94,324,327
+bpf/ceph_abi.h
+  s_ece52b9a589c27::t_6d62c90daf4da7 11-17,44-45,48-54,58-59,77-82,85-95
+bpf/rgwtrace.bpf.c
+  s_ece52b9a589c27::t_eb0682cb0c39a4 97-103,105-106,111,244-250,252-253,255,258-272,275,337-357,361-363,371-377,540-541,563,581,677-678,680,826-827,829,877,1122,1181-1182,1198-1199,1205-1206,1209-1210,1219,1259,1268,1277,1301,1309,1317,1330,1340,1370,1379,1422-1429,1432,1434,1437,1440,1446,1457-1458,1461-1462,1471
+bpf/rgwtrace_events.h
+  s_ece52b9a589c27::t_2821f1f7db551e 284-327
+docker/Dockerfile
+  s_ece52b9a589c27::t_dac3a8e8c3efe4 1-4
+docker/Dockerfile.centos9-builder
+  s_ece52b9a589c27::t_10d88d012fdba8 1-17
+docs/README.md
+  s_ece52b9a589c27::t_c4bcec4b4663c8 9,38-39,43-49,52-70
+docs/bench-rgw-ab.md
+  s_ece52b9a589c27::t_5ad52c0644f326 23-32,98-99
+docs/bugfix-bpf-live-path-hardening.md
+  s_ece52b9a589c27::t_b2b1e027273728 1-137
+docs/bugfix-ci-coverage.md
+  s_ece52b9a589c27::t_ab3b2387bef9c4 1-37
+docs/bugfix-dependency-audit.md
+  s_ece52b9a589c27::t_49893c291d9327 1-27
+docs/bugfix-dwarf-parser-limits.md
+  s_ece52b9a589c27::t_37f9edb305baba 1-144
+docs/bugfix-otlp-export-hardening.md
+  s_ece52b9a589c27::t_3f692aa1bb402d 1-114
+docs/bugfix-otlp-header-pipe.md
+  s_ece52b9a589c27::t_d85670c3d69fc8 1-11
+docs/bugfix-pid-root-library-discovery.md
+  s_ece52b9a589c27::t_9899723e4c2d2c 1-12
+docs/bugfix-script-temp-dirs-and-credentials.md
+  s_ece52b9a589c27::t_c8c87ed71b1afe 1-142
+docs/bugfix-stale-op-restore-errors.md
+  s_ece52b9a589c27::t_0ebdd5138997c1 1-12
+docs/bugfix-stale-sweep-cooldown.md
+  s_ece52b9a589c27::t_12898f82c8f4b5 1-14
+docs/bugfix-target-scoping.md
+  s_ece52b9a589c27::t_c849bcadebeb29 1-154
+docs/dependency-audit.md
+  s_ece52b9a589c27::t_8121503b8661de 1-22
+docs/design-cross-thread-correlation.md
+  s_ece52b9a589c27::t_d6bb3616226a0c 130-133
+docs/development.md
+  s_ece52b9a589c27::t_e368a72b814d1d 16,39-44,61,75-80,82-85,88-91,94,96,98-102,104-105,108-112,115-119,121,126-128,138-141,147-273
+docs/lab/README.md
+  s_ece52b9a589c27::t_51df62e8a77599 1-50
+docs/lab/workflows/bpf-verify-5-8.yml
+  s_ece52b9a589c27::t_25920034d6f4dc 5-11,15-17,21-31
+docs/lab/workflows/e2e.yml
+  s_ece52b9a589c27::t_31da223ac9682c 6-20,34-36,39-45,47,51,53-57,59-61,94,103-113,122-124,129-131,155,157
+docs/overhead-analysis.md
+  s_ece52b9a589c27::t_e559d5e26058d3 10-19,167-170,288-290
+docs/publication-checklist.md
+  s_ece52b9a589c27::t_b2685b845d0237 1-31
+docs/stage0-runbook.md
+  s_ece52b9a589c27::t_99068187e5d096 71-80,86-87,92-104,113-114,124,126-127,141,143,294
+release/BINARY-README.txt
+  s_ece52b9a589c27::t_c12a302fd8aa64 1-34
+release/DWARF-README.txt
+  s_ece52b9a589c27::t_fa338232085b48 1-23
+release/dwarf-matrix.json
+  s_ece52b9a589c27::t_2a67a03f27f666 1-276
+scripts/bench-rgw-ab.sh
+  s_ece52b9a589c27::t_cffc1eed934661 51,54-58,99-101,128,240-241,256-257,261-273,830-837
+scripts/build-centos9-release.sh
+  s_ece52b9a589c27::t_15d41e2702b1c6 1-13
+scripts/export-upstream-ceph-dwarf.sh
+  s_ece52b9a589c27::t_7bf5be6604b05e 6-18,20,24-46,65-77,105-125,138-150,152-153,163-171,185,191-200,209-301,305-314,316,318-319,334-335,346-347,436,461,463-464,467-474,487-489
+scripts/lib/private-dir.sh
+  s_ece52b9a589c27::t_5ba768b548ebba 1-144
+scripts/package-binary.sh
+  s_ece52b9a589c27::t_ce6139c30e8aea 1-25
+scripts/package-dwarf.py
+  s_ece52b9a589c27::t_d8985c28c57c7b 1-137
+scripts/publish-release.sh
+  s_ece52b9a589c27::t_82355175207f21 1-26
+scripts/smoke-release-binary.sh
+  s_ece52b9a589c27::t_b7d7edddeaeecd 1-12
+scripts/stage0-crossthread-probe.sh
+  s_ece52b9a589c27::t_ab894793645a62 44-47,73-75,78-81,85,454-457
+scripts/verify.sh
+  s_ece52b9a589c27::t_bb2840ebb1a02d 8-10,12-13,16,20,22
+src/cli.rs
+  s_ece52b9a589c27::t_5c4aabaeac2f74 17-28,35-39,43-55,93-104,195-197,201-209,213-245,302-332,343-410,422-494
+src/collector.rs
+  s_ece52b9a589c27::t_107aa750c70be0 170-175,1136-1143,1546-1551,1776-1780,1977,1990-1995,1999,2021,2042-2046,2048-2052,2177,2180,2185-2189,2250,2275,2289-2294,2325,2342-2347,2356,2358-2360,2362-2366,2394,2405-2409,2417-2428,3807-3824,3906-4054
+src/collector_bench.rs
+  s_ece52b9a589c27::t_452b56b75348f0 74
+src/dwarf_input.rs
+  s_ece52b9a589c27::t_6baa90e6d4dad3 5-8,13,21-22,39,57
+src/dwarf_json.rs
+  s_ece52b9a589c27::t_6ba1bfe32e7ead 85,93,100,105-109,112-186,733,880-939,1135,1331,1361,1380-1462,1564-1566,2310-2468
+src/dwarf_native.rs
+  s_ece52b9a589c27::t_bc29c20aa2b623 5,9,12,14,87-121,257-283,286,289,291,295,302,304-309,312-314,316-320,329-357,360-420,425,496-499,504-507,514-518,526-614,624,642,653-661,663-665,668,705-712,822-861,1135,1174,1194,1204-1216,1267-1276,1728,1735-1786,1795-1819,1823-1824,1988-1990,2016,2022,2030-2042,2077-2086,2236-2241,2254-2262,2292-2294,2304-2313,2404,2419-2421,2430-2440,2559,2561-2562,2573-2580,2592-2594,2596,2598-2608,3010,3018-3040,3052,3059,3065,3078-3082,3103,3106,3183,3194-3216,3220,3238-3256,3319-3349,3353,3368,3382,3386,3399,3411-3483,3487,3623,3628,3644,3649,3662-3672,3677,3687,3694,3709,3720,3732,3745,3989,4006,4035,4045,4081,4091,4206,4216,4243,4253,4336,4350,4384,4394,4415,4438,4449,4618-4621,4629-4630,4641-4645,4709-4716,4749,4756,4775,4872,4876,4884,4928,4937,5114-5120,5124-5128,5141,5206,5347,5354,5370,5377,5456,5458-5459,5887-5894,5901,5905-5908,5911-5913,5944,5952,5964,5976,5988,5998,6157-6161,6189,6195-6199,6230,6241,6253,6304,6347,6441-6444
+src/dwarf_native_robustness_tests.rs
+  s_ece52b9a589c27::t_093a600a796668 1-678
+src/events.rs
+  s_ece52b9a589c27::t_3006d88f650296 11-12,33-82,86-87,125-165,481-482,544-626
+src/host_tools.rs
+  s_ece52b9a589c27::t_1bcee8a15d803c 1-57
+src/live/linux.rs
+  s_ece52b9a589c27::t_432b06e3928df5 4,18-19,28,31,59-62,72-76,80-86,89,118,120-122,126-128,130,156-161,191-238,362-396,399,403,405-407,410,414,438,443,451,475,607-676,701-1034,1673,1678,1746-1747,1754,2109-2110,2147-2388,2400-2441,2446,2455,2465,2496
+src/main.rs
+  s_ece52b9a589c27::t_93b755a891c0dd 11,14,17-18,36-42,57-63,84-86,88-96,114-116
+src/otel.rs
+  s_ece52b9a589c27::t_ae85cf7dac7ce8 1,20,36-118,122,142,190,200-202,237,245-246,254-255,439-440,444-448,450-451,457-459,468-481,490-582,647-649,658-664,672,814-817,821,1190-1192,1199-1259,1737-2035,2042,2051-2092
+src/otlp_headers.rs
+  s_ece52b9a589c27::t_acfae5e4817d8a 1-340
+src/preflight.rs
+  s_ece52b9a589c27::t_7ba4cfd79ef344 93-106,149-157,527-533,535,937-952,1009-1041
+src/targets.rs
+  s_ece52b9a589c27::t_37711d182c8876 4-7,10,12,79,85-86,90,112,118-119,123-124,143-144,148,167-213,224,227,230-239,242,245-248,256-269,275-465,469-508,526-529,565,569-570,578,589,591-593,632-633,639,647-650,654-775,781-936,938-942,944-945
+src/test_elf.rs
+  s_ece52b9a589c27::t_5db05b28d537d3 1-69
+tests/bpf_source.rs
+  s_ece52b9a589c27::t_f9f361ca09b37a 4,8-95,424,728,872-875,877,995,1003-1023,1036-1233
+tests/cli_dry_run.rs
+  s_ece52b9a589c27::t_1c20544cdc1892 69-117
+tests/cli_otlp_config.rs
+  s_ece52b9a589c27::t_e448dd7cccd26e 1-365
+tests/e2e/functional-test-microceph-rgw.sh
+  s_ece52b9a589c27::t_3df2fac9d91f14 7-9,12-19,32-36,41-58,96-98,100-101,104,384-397,400-426,495-498,505,516-518,523-524,534-545,548,566,579-587,607-621
+tests/e2e/s3-workload.py
+  s_ece52b9a589c27::t_cb847b256f7d29 7-9,21-27,29-31,101-124,549-559
+tests/e2e/test_verifier.py
+  s_ece52b9a589c27::t_a8af4e70d01974 1-110
+tests/e2e/verify-rgwtrace-json.py
+  s_ece52b9a589c27::t_da51c734e31776 5,168-174,198,206,212-217,219-222,949-977
+tests/fixtures/collector_trace_golden.json
+  s_ece52b9a589c27::t_5a479fa0ce8c1a 286
+tests/fixtures/otlp_test_ca.pem
+  s_ece52b9a589c27::t_5266a88b3890b1 1-12
+tests/fixtures/otlp_test_other_ca.pem
+  s_ece52b9a589c27::t_b4234b96327f62 1-12
+tests/scripts/private-dir-test.sh
+  s_ece52b9a589c27::t_dc277b60a37ecd 1-77
+tests/test_release.py
+  s_ece52b9a589c27::t_28a0ab6d74f221 1-252
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f4c982cb6bfec908343ea9744017cc2f303ca798",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
