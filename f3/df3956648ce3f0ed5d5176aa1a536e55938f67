@@ -1,0 +1,35 @@
+docs/bugfix-pending-inference-drain-index.md
+  s_ece52b9a589c27::t_07d9f8e738c66e 10-15
+src/collector.rs
+  s_ece52b9a589c27::t_e935b1a25db334 558-560,563-567,572-576,590,2619-2623,2630-2634,2642-2646
+  s_ece52b9a589c27::t_ca33bb202ab3e6 431-432,436-438,458-459,463-468,512,609-610
+  s_ece52b9a589c27::t_1445e9dba048e9 397-398,402-413,418-419,439-453,509-510,513-532,536-557,561-562,568-571,577-589,591-607,611-627,629-630,2647
+  s_ece52b9a589c27::t_18f89826650fbb 2617,2649-2659,2667,2673-2694,2697-2700
+  s_ece52b9a589c27::t_0670322e4fbf1d 2660-2666
+  s_ece52b9a589c27::t_422efcf3d42ebc 2668-2672
+  s_ece52b9a589c27::t_26832ccf72a45d 2614,2616,2625-2628,2635-2640
+  s_ece52b9a589c27::t_989cef7d8f7f92 2701-2702
+  s_ece52b9a589c27::t_ee8138942d3915 608,628
+  s_ece52b9a589c27::t_2ddad20951d2a8 511,631-634,821,2618,2629,2641
+  s_ece52b9a589c27::t_a087a03494e756 2624
+  s_ece52b9a589c27::t_61cfefb5880721 2648
+src/collector_bench.rs
+  s_ece52b9a589c27::t_f06c21efebe17d 337
+  s_ece52b9a589c27::t_a508891d09bb6b 345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f3df3956648ce3f0ed5d5176aa1a536e55938f67",
+  "prompts": {},
+  "sessions": {
+    "s_ece52b9a589c27": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a145e1-439e-76a3-bdb8-7d016a7d8a99",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
