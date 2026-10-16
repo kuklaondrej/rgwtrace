@@ -193,7 +193,11 @@ compatibility with every kernel or Ceph build.
 ### DWARF catalog
 
 The [DWARF release workflow](../.github/workflows/dwarf-release.yml) runs weekly,
-on version tags, or manually. Its curated matrix is
+on version tags, or manually. It generates and publishes validated DWARF
+catalogs as separate `dwarf-<hash>` releases on the same
+[GitHub Releases page](https://github.com/kuklaondrej/rgwtrace/releases) as the
+binary releases. Catalog releases do not replace the latest binary release.
+Its curated matrix is
 [`release/dwarf-matrix.json`](../release/dwarf-matrix.json). As checked on
 2026-10-16, it contains 34 amd64 builds: each version below on both Ubuntu
 22.04 (Jammy) and CentOS Stream 9 (upstream EL9 RPMs).
