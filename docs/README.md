@@ -48,3 +48,10 @@ superseded by later sections in the same document.
   and SIGTERM / target-exit handling.
 - [Stale-op restore failures](bugfix-stale-op-restore-errors.md): distinguish a
   superseding submit from map capacity or other restore errors.
+
+- [Private privileged-test lab](lab/README.md)
+- [Publication controls](publication-checklist.md)
+- [Dependency audit review](dependency-audit.md)
+- [Script temp directories and credentials](bugfix-script-temp-dirs-and-credentials.md):
+  why the privileged helper scripts use private directories, generated keys
+  and pinned downloads.

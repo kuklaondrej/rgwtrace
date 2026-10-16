@@ -1,0 +1,37 @@
+name: BPF Verify Linux 5.8
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed full commit SHA in kuklaondrej/rgwtrace
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  load:
+    if: github.event.repository.private
+    environment: privileged-tests
+    # Register this runner INSIDE a disposable VM, never on the lab host.
+    runs-on: [self-hosted, linux, x64, kernel-5.8]
+    timeout-minutes: 20
+    steps:
+      - name: Validate revision and minimum kernel
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(uname -r)" == 5.8.* ]]
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          repository: kuklaondrej/rgwtrace
+          ref: ${{ inputs.source_sha }}
+      - name: Install BPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bpftool clang libbpf-dev libelf-dev linux-libc-dev llvm
+      - name: Verify BPF load on Linux 5.8
+        run: sudo scripts/verify-bpf-load.sh

@@ -11,8 +11,11 @@
 //! unit-tested via `cargo test` while the harness below is exercised by the
 //! orchestrator.
 
+#[cfg(any(target_os = "linux", test))]
 mod descriptors;
+#[cfg(any(target_os = "linux", test))]
 mod stats;
+#[cfg(any(target_os = "linux", test))]
 mod target;
 
 #[cfg(not(target_os = "linux"))]
@@ -1705,7 +1708,7 @@ mod linux {
                 return "unknown".to_string();
             }
             let bytes: &[u8] =
-                std::slice::from_raw_parts(uts.release.as_ptr() as *const u8, uts.release.len());
+                std::slice::from_raw_parts(uts.release.as_ptr().cast::<u8>(), uts.release.len());
             let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
             String::from_utf8_lossy(&bytes[..end]).into_owned()
         }

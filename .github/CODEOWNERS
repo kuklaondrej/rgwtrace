@@ -1,0 +1,9 @@
+# Review ownership; enforcement requires a GitHub ruleset.
+/.github/ @kuklaondrej
+/scripts/ @kuklaondrej
+/tests/ @kuklaondrej
+/bpf/ @kuklaondrej
+/src/dwarf_*.rs @kuklaondrej
+/src/collector.rs @kuklaondrej
+/src/live/ @kuklaondrej
+/SECURITY.md @kuklaondrej

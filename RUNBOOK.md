@@ -348,13 +348,29 @@ op's time window. This drives two checks:
   `RATE`. A workload object landing as `background`/`inferred` is a coverage
   miss, not a mis-correlation.
 
-On the current baseline (no cross-thread bridge), cross-thread data ops are not
-correlated, so the coverage gates run at `0` — the functional test's
-`REQUIRE_GET_READ_CORRELATION` / `REQUIRE_PUT_WRITE_CORRELATION` env vars default
-to `0`, and the zero-mis-correlation check still holds. Raise those thresholds
-(0.90, and 0.80 with `WORKLOAD_CONCURRENT_REQUESTS`) once Stage 3's
-`--correlate-cross-thread` bridge is enabled. Use `--unique-keys` (already set by
-the functional test) so the object→request mapping stays unambiguous.
+The functional harness requires explicit `REQUIRE_GET_READ_CORRELATION` and
+`REQUIRE_PUT_WRITE_CORRELATION` values in `(0, 1]`. Calibrate and record these for
+each Ceph build and profile; there is no zero-coverage default. A regression is
+not a reason to lower an established threshold. The standalone verifier keeps
+rate checks optional when their flags are omitted.
+
+`E2E_PROFILE=baseline` requires measured request-END activity;
+`E2E_PROFILE=cross-thread` also enables `--correlate-cross-thread` and requires
+actual cross-thread children and per-submit bridge hits. `E2E_PROFILE=no-end`
+removes the destructor metadata from a copy of the exported artifact, requests
+cross-thread correlation, and verifies the warning and fail-soft fallback:
+no END markers, measured durations, or per-submit seeds. This does not test
+kernel-induced attach failure; that remains a separate failure-injection case.
+
+Every profile provisions a sharded test bucket (`REQUIRE_LIST_SHARDS=3` by
+default) and checks its configured shard count. The verifier's
+`--require-list-shards N` requires **every** manifest LIST to correlate at least
+N distinct bucket-index objects. No LIST, fewer observed shards, or lost shard
+coverage fails instead of skipping. `--unique-keys` keeps the object/request
+mapping unambiguous. The harness records the source revision, kernel, profile,
+thresholds, Ceph metadata, workload manifest, trace, and validation output.
+
+See [private lab setup](docs/lab/README.md) before running privileged tests.
 
 Without `--workload-manifest`, the verifier behaves exactly as before.
 

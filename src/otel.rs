@@ -57,6 +57,7 @@ pub struct ExportConfig<'a> {
 /// One periodic drain of expired spans, mid-run. Sends nothing when the drain is
 /// empty; the run summary rides along on the resource of whatever batches it does
 /// send, and is superseded by the final export.
+#[cfg(any(target_os = "linux", test))]
 pub fn export_otlp_http(
     config: ExportConfig<'_>,
     document: &TraceDocument,
@@ -104,6 +105,7 @@ pub fn export_final_otlp_http(
 /// Which export a call is: a mid-run drain, or the run's last word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Export {
+    #[cfg(any(target_os = "linux", test))]
     Periodic,
     Final,
 }
