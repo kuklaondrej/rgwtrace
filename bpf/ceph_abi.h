@@ -45,9 +45,18 @@ struct cls_op {
   char method_name[MAX_METHOD_NAME];
 };
 
+/*
+ * rados_ops key. The tgid scopes it to one process: (cid, tid) are only unique
+ * within one Objecter, and a failed probe read leaves both at 0, so without it
+ * two processes (or two failed reads) would share one in-flight entry. The pad
+ * is explicit so a `= {}` key hashes deterministically. BPF-internal: userspace
+ * never reads this map, so there is no Rust mirror.
+ */
 struct client_op_key {
   __u64 cid;
   __u64 tid;
+  __u32 tgid;
+  __u32 _pad;
 };
 
 struct VarLocation {

@@ -334,6 +334,27 @@ const volatile __u32 CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET = 0;
 const volatile __u32 CEPH_OSD_OP_BUFFER_RAW_OFFSET = 0;
 const volatile __u32 CEPH_OSD_OP_BUFFER_DATA_OFFSET = 0;
 
+/*
+ * The traced process (tgid, i.e. the userspace PID) from --pid; 0 only for
+ * --all-processes. Written into .rodata by userspace before load, so the
+ * verifier sees a constant.
+ *
+ * The uprobes are attached with that pid already, but the attach scope alone is
+ * not a guarantee worth relying on: every program re-checks it as its FIRST
+ * statement, before any map lookup/update or probe read. A foreign process that
+ * still reaches a program (an --all-processes run, or any future attach that is
+ * not pid-scoped) then costs one helper call and never touches the shared maps
+ * or the ring buffer.
+ *
+ * bpf_get_current_pid_tgid() reports the INIT pid namespace tgid; userspace
+ * refuses to run --pid from a nested pid namespace, where the two would differ.
+ */
+const volatile __u32 TARGET_TGID = 0;
+
+static __always_inline bool rgwtrace_foreign_process(void) {
+  return TARGET_TGID != 0 && (bpf_get_current_pid_tgid() >> 32) != TARGET_TGID;
+}
+
 static __always_inline void emit_request_event(__u32 type,
                                                struct rgw_request_ctx *ctx,
                                                __u64 end_ns) {
@@ -516,6 +537,8 @@ static __always_inline int request_ctx_is_live(struct rgw_request_ctx *ctx) {
 
 SEC("uprobe")
 int uprobe_rgw_get_handler(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 30;
   __u32 thread_id = get_tid();
   struct rgw_request_ctx fallback = {};
@@ -651,6 +674,8 @@ int uprobe_rgw_get_handler(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 50;
   struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
@@ -798,6 +823,8 @@ int uprobe_rgw_req_state_dtor(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_process_authenticated(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 40;
   struct VarField *vf = hprobe_lookup(varid);
   if (vf == 0)
@@ -1151,6 +1178,8 @@ static __always_inline int rgw_rados_operate_seed(struct pt_regs *ctx, int varid
  */
 SEC("uprobe")
 int uprobe_rgw_rados_operate_read(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   return rgw_rados_operate_seed(ctx, 60);
 }
 
@@ -1166,13 +1195,18 @@ int uprobe_rgw_rados_operate_read(struct pt_regs *ctx) {
  */
 SEC("uprobe")
 int uprobe_rgw_rados_operate_write(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   return rgw_rados_operate_seed(ctx, 70);
 }
 
 SEC("uprobe")
 int uprobe_send_op(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 0;
   struct client_op_key key = {};
+  key.tgid = get_pid();
   struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {
@@ -1420,8 +1454,11 @@ int uprobe_send_op(struct pt_regs *ctx) {
 
 SEC("uprobe")
 int uprobe_finish_op(struct pt_regs *ctx) {
+  if (rgwtrace_foreign_process())
+    return 0;
   int varid = 20;
   struct client_op_key key = {};
+  key.tgid = get_pid();
   struct VarField *vf = hprobe_lookup(varid);
 
   if (vf != 0) {

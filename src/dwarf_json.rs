@@ -82,7 +82,7 @@ pub struct HprobeEntry {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct VarLocationKernel {
     pub reg: i32,
     pub offset: i32,
@@ -90,14 +90,14 @@ pub struct VarLocationKernel {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct FieldKernel {
     pub offset: i32,
     pub pointer: bool,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct VarFieldKernel {
     pub varloc: VarLocationKernel,
     pub fields: [FieldKernel; 10],
@@ -875,6 +875,66 @@ impl DwarfInfo {
             }
         }
         entries
+    }
+
+    /// The hprobe descriptors to install for a run that attaches to the modules
+    /// named by `target_keys` (path-derived keys, resolved exactly like attach
+    /// resolves them -- see [`Self::match_module`]).
+    ///
+    /// The hprobes map is keyed by a GLOBAL function id, not by module, so one
+    /// slot serves every address the function is probed at. Two rules follow:
+    ///
+    /// * only modules that are actually attach targets may contribute. Any other
+    ///   module in the artifact (a stale `radosgw.old`, an unrelated library) is
+    ///   ignored -- otherwise it could overwrite the target's descriptors and the
+    ///   probe would read another build's field offsets at this build's address;
+    /// * two target modules that both describe the same slot must describe it
+    ///   IDENTICALLY. If they differ there is no correct value for the shared
+    ///   slot, so this refuses rather than letting the last writer win. A module
+    ///   with NO descriptors for a function never conflicts, which keeps the
+    ///   librados-addresses / libceph-common-descriptors split working.
+    pub fn hprobe_entries_for_modules(&self, target_keys: &[String]) -> Result<Vec<HprobeEntry>> {
+        let mut selected: Vec<&str> = Vec::new();
+        for key in target_keys {
+            let ModuleMatch::Unique(module) = self.match_module(key) else {
+                continue;
+            };
+            let Some(name) = self
+                .modules
+                .iter()
+                .find_map(|(name, candidate)| std::ptr::eq(candidate, module).then_some(name))
+            else {
+                continue;
+            };
+            if !selected.contains(&name.as_str()) {
+                selected.push(name);
+            }
+        }
+
+        let mut by_key: BTreeMap<i32, HprobeEntry> = BTreeMap::new();
+        for entry in self.hprobe_entries() {
+            if !selected.contains(&entry.module.as_str()) {
+                continue;
+            }
+            match by_key.get(&entry.key) {
+                Some(existing) if existing.field != entry.field => bail!(
+                    "modules {} and {} both provide hprobe slot {} ({}) with DIFFERENT variable \
+                     descriptors; the slot is shared by every probe address of that function, so \
+                     one of them would read the other's field offsets. Re-export the DWARF \
+                     artifact from the binaries the target process actually maps, or remove the \
+                     extra module from it",
+                    existing.module,
+                    entry.module,
+                    entry.key,
+                    entry.function
+                ),
+                Some(_) => {}
+                None => {
+                    by_key.insert(entry.key, entry);
+                }
+            }
+        }
+        Ok(by_key.into_values().collect())
     }
 
     /// Classify a module-key lookup: exact match first, then a soname-aware
@@ -2244,6 +2304,165 @@ mod tests {
                 })
                 .collect(),
             func2linkage: BTreeMap::new(),
+        }
+    }
+
+    fn info_with(modules: Vec<(&str, DwarfModule)>) -> DwarfInfo {
+        DwarfInfo {
+            version: Some("19.2.0".to_string()),
+            arch: Some("amd64".to_string()),
+            modules: modules
+                .into_iter()
+                .map(|(name, module)| (name.to_string(), module))
+                .collect(),
+        }
+    }
+
+    fn keys(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// F7: hprobe descriptors are keyed by a GLOBAL function id, so a module
+    /// that is not an attach target (a stale `radosgw.old` left in the artifact)
+    /// used to overwrite the live module's descriptors -- last writer wins -- and
+    /// the probe fired at one module's address while reading another's offsets.
+    #[test]
+    fn hprobes_come_only_from_the_attach_target_modules() {
+        let mut stale = module_with(&[("RGWREST::get_handler", 0x2000)], &[]);
+        stale.func2vf.insert(
+            "RGWREST::get_handler".to_string(),
+            FunctionVarFields {
+                var_fields: vec![var_field_at(9, 640)],
+            },
+        );
+        let info = info_with(vec![
+            (
+                "radosgw",
+                module_with(
+                    &[("RGWREST::get_handler", 0x1000)],
+                    &[("RGWREST::get_handler", 1)],
+                ),
+            ),
+            // Sorts AFTER "radosgw", so it used to be the last writer.
+            ("radosgw.old", stale),
+        ]);
+
+        let entries = info
+            .hprobe_entries_for_modules(&keys(&["radosgw"]))
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].module, "radosgw");
+        assert_eq!(entries[0].field.varloc.reg, sample_var_field().location.reg);
+    }
+
+    /// A target key reaches its module through the same soname-aware match the
+    /// attach path uses, so `librados.so.2` selects `librados.so.2.0.0`.
+    #[test]
+    fn hprobe_target_keys_resolve_through_the_soname_fallback() {
+        let info = info_with(vec![(
+            "libceph-common.so.2.0.0",
+            module_with(
+                &[("Objecter::_send_op", 0x10)],
+                &[("Objecter::_send_op", 2)],
+            ),
+        )]);
+
+        let entries = info
+            .hprobe_entries_for_modules(&keys(&["libceph-common.so.2"]))
+            .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .all(|e| e.module == "libceph-common.so.2.0.0"));
+    }
+
+    /// The Ubuntu split (librados carries the addresses, libceph-common the
+    /// var_fields) must keep working: an EMPTY descriptor set never conflicts.
+    #[test]
+    fn hprobes_keep_the_cross_module_split_working() {
+        let info = info_with(vec![
+            (
+                "librados.so.2",
+                module_with(&[("Objecter::_send_op", 1)], &[]),
+            ),
+            (
+                "libceph-common.so.2",
+                module_with(&[], &[("Objecter::_send_op", 12)]),
+            ),
+        ]);
+
+        let entries = info
+            .hprobe_entries_for_modules(&keys(&["librados.so.2", "libceph-common.so.2"]))
+            .unwrap();
+
+        assert_eq!(entries.len(), 12);
+    }
+
+    /// Identical descriptors from two selected modules are the same fact twice,
+    /// not a conflict, and are installed once.
+    #[test]
+    fn identical_hprobes_from_two_target_modules_are_deduplicated() {
+        let info = info_with(vec![
+            (
+                "librados.so.2",
+                module_with(&[("Objecter::_send_op", 1)], &[("Objecter::_send_op", 3)]),
+            ),
+            (
+                "libceph-common.so.2",
+                module_with(&[("Objecter::_send_op", 2)], &[("Objecter::_send_op", 3)]),
+            ),
+        ]);
+
+        let entries = info
+            .hprobe_entries_for_modules(&keys(&["librados.so.2", "libceph-common.so.2"]))
+            .unwrap();
+
+        assert_eq!(entries.len(), 3);
+    }
+
+    /// F7: `_send_op` present in BOTH librados and libceph-common with DIFFERENT
+    /// descriptors cannot share one global hprobe slot: whichever is written
+    /// last is read at both addresses. Refuse, naming both modules.
+    #[test]
+    fn conflicting_hprobes_from_two_target_modules_are_refused() {
+        let mut librados = module_with(&[("Objecter::_send_op", 1)], &[]);
+        librados.func2vf.insert(
+            "Objecter::_send_op".to_string(),
+            FunctionVarFields {
+                var_fields: vec![var_field_at(5, 16)],
+            },
+        );
+        let info = info_with(vec![
+            ("librados.so.2", librados),
+            (
+                "libceph-common.so.2",
+                module_with(&[("Objecter::_send_op", 2)], &[("Objecter::_send_op", 1)]),
+            ),
+        ]);
+
+        let err = info
+            .hprobe_entries_for_modules(&keys(&["librados.so.2", "libceph-common.so.2"]))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("librados.so.2"), "{err}");
+        assert!(err.contains("libceph-common.so.2"), "{err}");
+        assert!(err.contains("Objecter::_send_op"), "{err}");
+    }
+
+    fn var_field_at(reg: i32, offset: i32) -> VarFieldJson {
+        VarFieldJson {
+            location: VarLocationJson {
+                reg,
+                offset: 0,
+                stack: false,
+            },
+            fields: vec![FieldJson {
+                offset,
+                pointer: false,
+            }],
         }
     }
 

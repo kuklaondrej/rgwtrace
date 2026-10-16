@@ -47,6 +47,11 @@ superseded by later sections in the same document.
   guesses a container's Ceph version.
 - [Removal of the dead request-lifecycle path](bugfix-remove-dead-request-lifecycle-path.md):
   historical context for the entry-probe request model.
+- [Target scoping](bugfix-target-scoping.md): why live tracing requires `--pid`,
+  how targets bind to the files the process maps, and how `/proc/<pid>/root`
+  paths stay inside the container.
+- [PID-root library discovery](bugfix-pid-root-library-discovery.md): why a
+  missing target library must not fall back to a host copy.
 - [BPF live-path hardening](bugfix-bpf-live-path-hardening.md): cls method
   decoding, map and ring-buffer sizing, the stale-op sweep, ABI layout asserts,
   and SIGTERM / target-exit handling.

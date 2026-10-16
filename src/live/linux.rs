@@ -61,16 +61,24 @@ struct OtlpExporterConfig {
 
 pub fn run(cli: &Cli, dwarf: &DwarfInfo) -> Result<TraceDocument> {
     let targets = preflight::validated_targets(cli, dwarf)?;
-    let pid = cli.pid.unwrap_or(-1);
+    let scope = ProcessScope::from_cli(cli.pid, cli.all_processes)?;
+    if scope.target_tgid != 0 {
+        ensure_init_pid_namespace()?;
+    }
+    let pid = scope.attach_pid;
     info!(pid, "starting live tracing");
 
     let mut open_object = std::mem::MaybeUninit::<OpenObject>::uninit();
     let mut open = RgwtraceSkelBuilder::default().open(&mut open_object)?;
-    configure_rodata(open.maps.rodata_data, dwarf.version.as_deref())?;
+    configure_rodata(
+        open.maps.rodata_data,
+        dwarf.version.as_deref(),
+        scope.target_tgid,
+    )?;
     configure_map_sizes(&mut open, cli)?;
     let mut skel = open.load()?;
 
-    populate_hprobes(&mut skel.maps.hprobes, dwarf)?;
+    populate_hprobes(&mut skel.maps.hprobes, dwarf, &targets)?;
     // The BPF globals (`REQUEST_END_PROBE_ATTACHED`, `RGW_OP_BRIDGE_KEY_ENABLED`)
     // are published INSIDE attach_probes, between the destructor attach and the
     // first probe that can create or consume a bridge entry. Publishing them here,
@@ -559,7 +567,76 @@ fn dispatch_expired_otlp(
     }
 }
 
-fn configure_rodata(rodata: &mut types::rodata, version: Option<&str>) -> Result<()> {
+/// Which processes the uprobes may fire in: the `pid` handed to the uprobe
+/// attach (-1 = every process) and the BPF-side `TARGET_TGID` gate (0 = any).
+/// Both come from the same `--pid`, so they can never disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessScope {
+    attach_pid: i32,
+    target_tgid: u32,
+}
+
+impl ProcessScope {
+    fn from_cli(pid: Option<i32>, all_processes: bool) -> Result<Self> {
+        match (pid, all_processes) {
+            (Some(pid), false) => {
+                let target_tgid = u32::try_from(pid)
+                    .ok()
+                    .filter(|tgid| *tgid != 0)
+                    .context("--pid must be a positive process id")?;
+                Ok(Self {
+                    attach_pid: pid,
+                    target_tgid,
+                })
+            }
+            (None, true) => Ok(Self {
+                attach_pid: -1,
+                target_tgid: 0,
+            }),
+            (Some(_), true) => bail!("--pid and --all-processes are mutually exclusive"),
+            (None, false) => bail!(
+                "live tracing requires --pid <radosgw pid> (or --all-processes to trace \
+                 system-wide)"
+            ),
+        }
+    }
+}
+
+/// `PROC_PID_INIT_INO`: the fixed inode of the initial pid namespace.
+const INIT_PID_NAMESPACE: &str = "pid:[4026531836]";
+
+/// The BPF gate compares `--pid` with `bpf_get_current_pid_tgid() >> 32`, which is
+/// the tgid in the INIT pid namespace. From a nested pid namespace (a container
+/// started without `--pid=host`) `--pid` is a namespace-local number, the gate
+/// would match nothing, and the run would capture zero events with no error. Fail
+/// loudly instead.
+fn ensure_init_pid_namespace() -> Result<()> {
+    let link = std::fs::read_link("/proc/self/ns/pid")
+        .context("failed to read /proc/self/ns/pid to check the pid namespace")?;
+    if !is_init_pid_namespace(&link) {
+        bail!(
+            "rgwtrace is running in a nested pid namespace ({}); --pid would not match the \
+             kernel's tgid and no event would ever be captured. Run rgwtrace in the host pid \
+             namespace (e.g. `docker run --pid=host`)",
+            link.display()
+        );
+    }
+    Ok(())
+}
+
+fn is_init_pid_namespace(link: &Path) -> bool {
+    link.as_os_str() == INIT_PID_NAMESPACE
+}
+
+fn configure_rodata(
+    rodata: &mut types::rodata,
+    version: Option<&str>,
+    target_tgid: u32,
+) -> Result<()> {
+    // The process filter goes first: it is independent of the Ceph version, and a
+    // version error below must not leave it half-configured for a later caller.
+    rodata.TARGET_TGID = target_tgid;
+
     let version = version.context(
         "Ceph version is required to select ceph_osd_op ABI offsets; pass --ceph-version or use DWARF JSON with a version",
     )?;
@@ -889,8 +966,21 @@ fn page_size() -> Result<u64> {
         .context("sysconf(_SC_PAGESIZE) failed")
 }
 
-fn populate_hprobes(map: &mut impl MapCore, dwarf: &DwarfInfo) -> Result<()> {
-    for entry in dwarf.hprobe_entries() {
+/// Install the hprobe descriptors of the modules this run attaches to -- and only
+/// those (see `DwarfInfo::hprobe_entries_for_modules`): the map is keyed by a
+/// global function id, so a descriptor from any other artifact module would be
+/// read at the target's probe address.
+fn populate_hprobes(
+    map: &mut impl MapCore,
+    dwarf: &DwarfInfo,
+    targets: &targets::ProbeTargets,
+) -> Result<()> {
+    let target_keys: Vec<String> = targets
+        .all_paths()
+        .into_iter()
+        .filter_map(module_key_for_path)
+        .collect();
+    for entry in dwarf.hprobe_entries_for_modules(&target_keys)? {
         // hprobes is a dense ARRAY; DwarfInfo::validate already bounds every
         // key, so an out-of-range one here is a bug, not bad input.
         let key = u32::try_from(entry.key)
@@ -2201,10 +2291,52 @@ mod tests {
     }
 
     #[test]
+    fn process_scope_pins_the_attach_pid_and_the_bpf_gate_to_the_same_process() {
+        assert_eq!(
+            ProcessScope::from_cli(Some(4242), false).unwrap(),
+            ProcessScope {
+                attach_pid: 4242,
+                target_tgid: 4242
+            }
+        );
+        // Only an explicit opt-in may widen the probes to every process.
+        assert_eq!(
+            ProcessScope::from_cli(None, true).unwrap(),
+            ProcessScope {
+                attach_pid: -1,
+                target_tgid: 0
+            }
+        );
+        assert!(ProcessScope::from_cli(None, false).is_err());
+        assert!(ProcessScope::from_cli(Some(0), false).is_err());
+        assert!(ProcessScope::from_cli(Some(-5), false).is_err());
+        assert!(ProcessScope::from_cli(Some(42), true).is_err());
+    }
+
+    #[test]
+    fn publishes_the_target_tgid_into_rodata() {
+        let mut configured = rodata();
+        configure_rodata(&mut configured, Some("19.2.0"), 4242).unwrap();
+        assert_eq!(configured.TARGET_TGID, 4242);
+
+        // Set even when the version is rejected, so the gate is never left at
+        // "any process" by an error path.
+        let mut rejected = rodata();
+        assert!(configure_rodata(&mut rejected, None, 4242).is_err());
+        assert_eq!(rejected.TARGET_TGID, 4242);
+    }
+
+    #[test]
+    fn recognises_only_the_init_pid_namespace() {
+        assert!(is_init_pid_namespace(Path::new("pid:[4026531836]")));
+        assert!(!is_init_pid_namespace(Path::new("pid:[4026532501]")));
+    }
+
+    #[test]
     fn rejects_missing_ceph_version_for_abi_layout() {
         let mut rodata = rodata();
 
-        let err = configure_rodata(&mut rodata, None).unwrap_err();
+        let err = configure_rodata(&mut rodata, None, 42).unwrap_err();
 
         assert!(err.to_string().contains("Ceph version is required"));
     }
@@ -2213,7 +2345,7 @@ mod tests {
     fn configures_pre_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("18.2.8-1jammy")).unwrap();
+        configure_rodata(&mut rodata, Some("18.2.8-1jammy"), 42).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 152);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 96);
@@ -2223,7 +2355,7 @@ mod tests {
     fn configures_squid_abi_layout() {
         let mut rodata = rodata();
 
-        configure_rodata(&mut rodata, Some("19.2.0")).unwrap();
+        configure_rodata(&mut rodata, Some("19.2.0"), 0).unwrap();
 
         assert_eq!(rodata.CEPH_OSD_OP_SIZE, 112);
         assert_eq!(rodata.CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET, 56);
@@ -2254,6 +2386,7 @@ mod tests {
             CEPH_OSD_OP_BUFFER_CARRIAGE_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_RAW_OFFSET: 0,
             CEPH_OSD_OP_BUFFER_DATA_OFFSET: 0,
+            TARGET_TGID: 0,
         }
     }
 }

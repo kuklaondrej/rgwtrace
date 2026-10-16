@@ -10,7 +10,8 @@ Live tracing pipeline for RGW and RADOS.
 
 `rgwtrace` starts by loading probe metadata from native DWARF or `cephtrace` JSON.
 
-The Linux runner opens the BPF skeleton, configures Ceph ABI offsets and map sizes, populates the `hprobes` map, attaches uprobes, and polls the ring buffer.
+The Linux runner opens the BPF skeleton, configures Ceph ABI offsets, map sizes, and the target process, populates the `hprobes` map from the attach-target modules, attaches uprobes to that process, and polls the ring buffer.
+
 
 ### BPF maps that are sized or maintained from userspace
 
@@ -33,6 +34,37 @@ Pipeline:
 ```text
 native DWARF or cephtrace JSON -> hprobes -> eBPF uprobes -> ring buffer -> Rust events -> spans -> JSON or OTLP protobuf
 ```
+
+### Process scoping
+
+Live tracing is scoped to one radosgw process. `--pid` is required unless the operator passes `--all-processes`, which logs a warning. The scope is enforced in two places from the same value:
+
+```text
+--pid N  ->  uprobe attach pid = N            (kernel only fires the probes in N)
+         ->  .rodata TARGET_TGID = N          (set on the OPEN skeleton, before load)
+
+every SEC("uprobe") program:
+    if (rgwtrace_foreign_process()) return 0;   // FIRST statement: before any map
+                                                // op, probe read or ring-buffer use
+--all-processes  ->  attach pid = -1, TARGET_TGID = 0 (gate disabled)
+```
+
+The BPF gate compares against `bpf_get_current_pid_tgid() >> 32`, which is the tgid in the **init** pid namespace. A `--pid` run from a nested pid namespace is therefore refused at startup (`/proc/self/ns/pid` must be `pid:[4026531836]`); run the tracer with the host pid namespace (`docker run --pid=host`). `tests/bpf_source.rs` asserts that every uprobe program opens with the gate. The `rados_ops` in-flight key is `(cid, tid, tgid)`, so two processes, or two failed probe reads that both leave `(0, 0)`, cannot share one entry.
+
+### Target discovery
+
+`src/targets.rs` resolves `librados`, `librbd` (optional), `libceph-common` and `radosgw`. An explicit `--*-path` always wins. With `--pid`, discovery reads what the process actually runs:
+
+- Libraries come from `/proc/<pid>/maps`. A mapping whose path ends in ` (deleted)` (the file was replaced on disk after the process started, typically by a package upgrade) is a **hard error** naming the file and telling the operator to restart the daemon. Before this, the line was skipped and discovery fell back to the new on-disk file, which the process does not map: attach succeeded and no event arrived.
+- The executable comes from `/proc/<pid>/exe`. A deleted executable is the same hard error, and an executable that is not `radosgw`/`ceph-radosgw` is an error asking for the right pid or `--radosgw-path`. There is no fallback to a host path such as `/usr/bin/radosgw` when `--pid` is given.
+
+Every path derived for a `--pid` target is opened through `/proc/<pid>/root`. Only the first hop through that magic link is special: the kernel resolves any symlink further down against the **caller's** root, so a container's absolute symlink (or `..`) would reach a host file. `resolve_in_root` therefore walks the path by hand, expanding each symlink inside `/proc/<pid>/root` (absolute targets restart at that root, `..` stops at it, the semantics of `openat2(RESOLVE_IN_ROOT)`), and re-checks that the result is still under the prefix. Debug-file lookups for a target under `/proc/<pid>/root` go through the same confinement, and a `.gnu_debuglink` name that is not a plain filename (`/`, `.`, `..`, absolute) is an error.
+
+A residual race remains: a path component can be swapped for a symlink between this walk and the later open or uprobe attach. The stronger follow-up is to open each target with `openat2(RESOLVE_IN_ROOT)` (or through `/proc/<pid>/map_files/<range>`, which pins the exact mapped inode) and parse and attach through `/proc/self/fd/N`.
+
+### hprobes come only from the attach targets
+
+The `hprobes` map is keyed by a **global** function id, not by module, so one slot serves every address where that function is probed. `DwarfInfo::hprobe_entries_for_modules` installs only the descriptors of the modules resolved for the discovered attach targets (exact key, then the soname fallback). Any other module in the artifact, such as a stale `radosgw.old`, is ignored. If two target modules both describe the same slot, they must describe it identically; otherwise preflight and attach fail with an error naming both modules. A module with no descriptors for a function never conflicts, so an artifact that carries addresses in `librados` and descriptors in `libceph-common` still works. In the Ubuntu jammy 18.2.7/18.2.8 cephtrace artifacts, `librados`, `libceph-common` and `librbd` carry identical `Objecter` descriptors, which are deduplicated.
 
 ---
 

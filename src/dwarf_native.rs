@@ -3180,7 +3180,7 @@ fn debuglink_file(path: &Path, file: &object::File<'_>) -> Result<Option<PathBuf
         return Ok(None);
     };
     let filename = std::str::from_utf8(filename).context(".gnu_debuglink filename is not UTF-8")?;
-    Ok(first_existing(debuglink_candidates(path, filename)))
+    Ok(first_existing(debuglink_candidates(path, filename)?))
 }
 
 fn build_id_debug_file(path: &Path, build_id: &str) -> Option<PathBuf> {
@@ -3191,11 +3191,33 @@ fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
-fn debuglink_candidates(path: &Path, filename: &str) -> Vec<PathBuf> {
+/// Where `.gnu_debuglink`'s `filename` may live for the binary at `path`.
+///
+/// The name comes from the binary, which may come from an untrusted container
+/// image, and the debuglink format defines it as a bare filename looked up in
+/// fixed directories. Anything else (a `/`, `.`/`..`, an absolute path) would
+/// join onto those directories and reach an arbitrary file, so it is an error,
+/// not a skipped candidate. Candidates under `/proc/<pid>/root` are resolved
+/// inside that root (`targets::confine_to_proc_root`), so a symlink in the
+/// container's debug tree cannot redirect the read onto the host; a candidate
+/// that cannot be resolved there is skipped.
+fn debuglink_candidates(path: &Path, filename: &str) -> Result<Vec<PathBuf>> {
+    if filename.is_empty()
+        || filename == "."
+        || filename == ".."
+        || filename.contains('/')
+        || filename.contains('\0')
+    {
+        anyhow::bail!(
+            "{}: .gnu_debuglink names {filename:?}, which is not a plain filename; refusing to \
+             look it up",
+            path.display()
+        );
+    }
     let mut candidates = Vec::new();
     let filename = Path::new(filename);
     let Some(parent) = path.parent() else {
-        return candidates;
+        return Ok(candidates);
     };
 
     push_unique(&mut candidates, parent.join(filename));
@@ -3213,7 +3235,25 @@ fn debuglink_candidates(path: &Path, filename: &str) -> Vec<PathBuf> {
         }
     }
 
-    candidates
+    // A location that cannot be resolved inside the root (a symlink loop, an
+    // unreadable directory) cannot hold the debug file; skip it rather than
+    // fail when another location may.
+    Ok(candidates
+        .iter()
+        .filter_map(
+            |candidate| match crate::targets::confine_to_proc_root(candidate) {
+                Ok(confined) => Some(confined),
+                Err(err) => {
+                    debug!(
+                        candidate = %candidate.display(),
+                        error = %format_args!("{err:#}"),
+                        "skipping an unresolvable .gnu_debuglink location"
+                    );
+                    None
+                }
+            },
+        )
+        .collect())
 }
 
 fn build_id_debug_candidates(path: &Path, build_id: &str) -> Vec<PathBuf> {
@@ -3368,10 +3408,83 @@ mod tests {
         assert!(module.function_addr("RGWREST::get_handler").is_some());
     }
 
+    /// F20: `.gnu_debuglink` is a bare FILENAME (the spec looks it up in a fixed
+    /// set of directories). A name with a `/`, `..`, or an absolute path, joined
+    /// onto those directories, reaches any file on the host -- and the binary
+    /// carrying it may come from an untrusted container image. Refused, loudly.
+    #[test]
+    fn debuglink_names_that_are_not_a_plain_filename_are_refused() {
+        let binary = Path::new("/tmp/root/usr/bin/radosgw");
+        for name in [
+            "/etc/shadow",
+            "../../../etc/shadow",
+            "sub/radosgw.debug",
+            "..",
+            ".",
+            "",
+        ] {
+            let err = debuglink_candidates(binary, name).unwrap_err().to_string();
+            assert!(err.contains(".gnu_debuglink"), "{name:?}: {err}");
+        }
+    }
+
+    /// F20: a debug-file candidate under `/proc/<pid>/root` is resolved INSIDE
+    /// that root, never through a symlink that the kernel would follow against
+    /// the host root.
+    #[test]
+    fn debuglink_candidates_under_a_proc_root_stay_inside_it() {
+        let candidates = debuglink_candidates(
+            Path::new("/proc/2147483647/root/usr/bin/radosgw"),
+            "radosgw.debug",
+        )
+        .unwrap();
+
+        assert!(candidates.contains(&PathBuf::from(
+            "/proc/2147483647/root/usr/lib/debug/usr/bin/radosgw.debug"
+        )));
+        for candidate in &candidates {
+            if candidate.starts_with("/proc/2147483647/root") {
+                assert!(
+                    !candidate
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                    "{}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    /// Greptile #1 on PR #10: a debug-file location that cannot be resolved
+    /// (a symlink loop in `.debug`) is skipped, so a usable debug file next to
+    /// the binary is still found. Linux-only: it needs a real `/proc/<pid>/root`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unresolvable_debuglink_location_is_skipped() {
+        let dir = std::env::temp_dir().join(format!("rgwtrace-dbgloop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("usr/bin")).unwrap();
+        fs::write(dir.join("usr/bin/radosgw.debug"), b"x").unwrap();
+        std::os::unix::fs::symlink(".debug", dir.join("usr/bin/.debug")).unwrap();
+        let binary = Path::new("/proc")
+            .join(std::process::id().to_string())
+            .join("root")
+            .join(dir.strip_prefix("/").unwrap())
+            .join("usr/bin/radosgw");
+
+        let candidates = debuglink_candidates(&binary, "radosgw.debug").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            candidates.first(),
+            Some(&binary.with_file_name("radosgw.debug"))
+        );
+    }
+
     #[test]
     fn debuglink_candidates_include_local_and_debug_trees() {
         let candidates =
-            debuglink_candidates(Path::new("/tmp/root/usr/bin/radosgw"), "radosgw.debug");
+            debuglink_candidates(Path::new("/tmp/root/usr/bin/radosgw"), "radosgw.debug").unwrap();
 
         assert!(candidates.contains(&PathBuf::from("/tmp/root/usr/bin/radosgw.debug")));
         assert!(candidates.contains(&PathBuf::from("/tmp/root/usr/bin/.debug/radosgw.debug")));

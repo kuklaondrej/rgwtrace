@@ -43,6 +43,10 @@ sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --prefligh
 sudo ./target/release/rgwtrace --dwarf-source native --pid "$RGW_PID" --timeout 30 --output json
 ```
 
+Live tracing requires `--pid`: the probes fire only in that process. Pass
+`--all-processes` instead to probe every process that maps the Ceph libraries
+(for lab hosts only).
+
 Wait for `starting live tracing` before generating S3 traffic. JSON is written
 to stdout when the capture finishes; logs go to stderr.
 

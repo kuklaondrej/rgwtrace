@@ -83,6 +83,15 @@ fn main() -> Result<()> {
         collector.set_redact_object_names(cli.redact_object_names);
         collector.into_trace_document(cli.service_name.clone())
     } else {
+        preflight::validate_live_scope(&cli)?;
+        if cli.all_processes {
+            warn!(
+                "--all-processes: uprobes are attached SYSTEM-WIDE. Every process mapping the \
+                 target libraries (OSDs, qemu/librbd, other gateways, CLI tools) pays the probe \
+                 cost, shares the ring buffer and BPF maps, and is inside the tracer's crash \
+                 radius. Use --pid on production hosts"
+            );
+        }
         warn_if_import_unusable(&dwarf);
         live::run(&cli, &dwarf)?
     };

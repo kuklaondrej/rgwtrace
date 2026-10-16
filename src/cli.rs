@@ -176,8 +176,20 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
+    /// The radosgw process to trace. Required for live tracing: the uprobes are
+    /// attached to this process only, and the BPF programs drop every hit from
+    /// any other process before touching a map.
     #[arg(short = 'p', long)]
     pub pid: Option<i32>,
+
+    /// Trace every process that maps the target binaries instead of one `--pid`.
+    ///
+    /// The uprobes then fire in EVERY librados client on the node (OSDs via
+    /// libceph-common, qemu/librbd, other gateways, CLI tools): all of them pay
+    /// the probe cost, share one ring buffer and one set of BPF maps, and sit
+    /// inside the tracer's crash radius. Only for lab hosts.
+    #[arg(long, conflicts_with = "pid")]
+    pub all_processes: bool,
 
     #[arg(short = 't', long)]
     pub timeout: Option<u64>,
