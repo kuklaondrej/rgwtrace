@@ -192,8 +192,8 @@ compatibility with every kernel or Ceph build.
 
 ### DWARF catalog
 
-The [DWARF release workflow](../.github/workflows/dwarf-release.yml) runs weekly,
-on version tags, or manually. It generates and publishes validated DWARF
+The [DWARF release workflow](../.github/workflows/dwarf-release.yml) runs on
+version tags or manually (`workflow_dispatch`); it has no schedule. It generates and publishes validated DWARF
 catalogs as separate `dwarf-<hash>` releases on the same
 [GitHub Releases page](https://github.com/kuklaondrej/rgwtrace/releases) as the
 binary releases. Catalog releases do not replace the latest binary release.
@@ -239,8 +239,8 @@ To extend coverage, check that the versioned upstream repository publishes all
 runtime/debug packages listed in `scripts/export-upstream-ceph-dwarf.sh` at
 the selected revision, then add an explicit matrix entry. The current exporter
 is amd64-only; ARM64 binary availability does not imply ARM64 DWARF coverage.
-New Ceph versions require a matrix change; the schedule rechecks listed
-versions, it does not discover and approve new versions automatically. Jobs
+New Ceph versions require a matrix change; a run rechecks listed versions,
+it does not discover and approve new versions automatically. Jobs
 run with `max-parallel: 4` to limit concurrent debug-package downloads.
 
 The exporter installs upstream binaries and debug packages, records the exact
@@ -264,8 +264,8 @@ changed metadata, exporter commit, or provenance creates a new snapshot. Old
 releases remain available for old deployments. Each snapshot indexes its own
 matrix results, not the union of all previous releases.
 
-Currently scheduled runs rebuild the matrix before checking the catalog's
-identity; unchanged published catalogs are skipped at publication. A failed
+Each run rebuilds the matrix before checking the catalog's identity;
+unchanged published catalogs are skipped at publication. A failed
 matrix entry prevents publication of the entire snapshot. Raw exports and
 logs are retained as 14-day Actions diagnostic artifacts, including failed
 preflight output. The older manual `DWARF Artifact` workflow remains useful
