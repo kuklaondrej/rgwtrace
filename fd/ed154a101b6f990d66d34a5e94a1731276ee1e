@@ -1,0 +1,19 @@
+docs/development.md
+  s_1413be33460479::t_721145034813c8 195-196,242-243,267-268
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fded154a101b6f990d66d34a5e94a1731276ee1e",
+  "prompts": {},
+  "sessions": {
+    "s_1413be33460479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "100dce4d-36f5-4088-927d-4e2463f875ae",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
