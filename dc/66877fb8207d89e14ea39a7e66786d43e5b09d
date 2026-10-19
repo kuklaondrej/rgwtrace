@@ -1,0 +1,25 @@
+bpf/bpf_utils.h
+  s_1413be33460479::t_3128577ac33973 61-125,127
+docs/bugfix-ci-bpftool-noble.md
+  s_1413be33460479::t_88a3b6c6aa7480 32-49
+tests/bpf_source.rs
+  s_1413be33460479::t_1ba6b6955e8923 571-574,578-582,585-588
+  s_1413be33460479::t_88a3b6c6aa7480 561-570,575-577,583-584,589-590
+  s_1413be33460479::t_007217c41e0292 560
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dc66877fb8207d89e14ea39a7e66786d43e5b09d",
+  "prompts": {},
+  "sessions": {
+    "s_1413be33460479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "100dce4d-36f5-4088-927d-4e2463f875ae",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
