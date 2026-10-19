@@ -1,0 +1,27 @@
+docs/lab/workflows/e2e.yml
+  s_1413be33460479::t_a8b05e51d905b9 107
+docs/README.md
+  s_1413be33460479::t_681dc88abeb8a0 39-40
+docs/bugfix-ci-bpftool-noble.md
+  s_1413be33460479::t_17d5e2c8ea3b35 1-29
+.github/workflows/ci.yml
+  s_1413be33460479::t_f704f950bf3336 54
+  s_1413be33460479::t_e9b7750914cd79 51-52,56-57
+  s_1413be33460479::t_721145034813c8 5,40-50,53,55,58-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "488718d4ba82a9441483048d78e3814e748410e4",
+  "prompts": {},
+  "sessions": {
+    "s_1413be33460479": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "100dce4d-36f5-4088-927d-4e2463f875ae",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Ondřej Kukla <ondrej.kukla@cdn77.com>"
+    }
+  }
+}
