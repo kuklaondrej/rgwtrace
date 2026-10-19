@@ -16,13 +16,15 @@ red, and every Dependabot PR inherited the failures. Two unrelated causes:
 
 ## Fix
 
-- A dedicated "Install bpftool" step installs `linux-tools-common` plus the
-  kernel-flavour package `linux-tools-$(uname -r)`, falling back to
-  `linux-tools-generic`. The wrapper from `linux-tools-common` execs
-  `/usr/lib/linux-tools/$(uname -r)/bpftool`, so when only the generic flavour
-  is present the step points that path at the installed binary instead of
-  relying on PATH order. Verified in an `ubuntu:24.04` container where the
-  fallback path is exercised.
+- A dedicated "Install bpftool" step installs `linux-tools-common` and
+  `linux-tools-generic`. The kernel-flavour package for the runner's Azure
+  kernel (`linux-azure-6.17-tools-*`) ships perf and cpupower but no bpftool,
+  so the exact-flavour route is a dead end. The wrapper from
+  `linux-tools-common` execs `/usr/lib/linux-tools/$(uname -r)/bpftool`; the
+  step points that path at the generic package's binary when the wrapper
+  cannot find one. bpftool is a userspace tool, so the generic build loads
+  programs on the running kernel. Verified in an `ubuntu:24.04` container
+  where the same fallback path is exercised.
 - `# shellcheck disable=SC2016` on the lab build step, with a comment saying
   why.
 - `ci.yml` now triggers `push` only on `main`, so a PR branch gets one run
