@@ -18,7 +18,7 @@ jobs:
     outputs:
       builds: ${{ steps.matrix.outputs.builds }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: matrix
         run: echo "builds=$(jq -c . release/dwarf-matrix.json)" >> "$GITHUB_OUTPUT"
   export:
@@ -30,7 +30,7 @@ jobs:
       max-parallel: 4
       matrix: ${{ fromJSON(needs.matrix.outputs.builds) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Export metadata
         env:
           EXPORT_IMAGE: ${{ matrix.image }}
@@ -72,7 +72,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
           pattern: dwarf-bundle-*
