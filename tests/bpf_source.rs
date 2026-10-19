@@ -558,6 +558,37 @@ fn fetch_param_ptr_is_register_only_and_fails_closed_on_stack() {
 }
 
 #[test]
+fn fetch_register_arm64_uses_constant_ctx_offsets() {
+    // The verifier rejects `variable ctx access` on pt_regs: every register
+    // read must be at a compile-time constant offset. The arm64 branch once
+    // indexed `regs->regs[reg]`, which loaded on no aarch64 kernel at all
+    // (CI never reached the load step, so it went unnoticed).
+    let arm64 = BPF_UTILS
+        .split("#elif defined(__TARGET_ARCH_arm64)")
+        .nth(1)
+        .and_then(|s| s.split("#else").next())
+        .expect("arm64 branch present");
+    assert!(
+        !arm64.contains("regs->regs[reg]"),
+        "variable ctx index: {arm64}"
+    );
+    assert!(!arm64.contains("regs->sp"));
+    // DWARF aarch64 register numbers: 0..=30 -> x0..x30 at reg*8, 31 -> sp at 248.
+    for reg in 0..=30u32 {
+        let want = format!(
+            "if (reg == {reg})
+    return READ_CTX_U64(ctx, {});",
+            reg * 8
+        );
+        assert!(arm64.contains(&want), "missing constant read for x{reg}");
+    }
+    assert!(arm64.contains(
+        "if (reg == 31)
+    return READ_CTX_U64(ctx, 248);"
+    ));
+}
+
+#[test]
 fn reseed_probe_reads_raw_pointer_and_bridges_context() {
     // Stage 3 consumer: the rgw_process_authenticated uprobe fetches the
     // req_state* raw-pointer descriptor (varid 40, register-only via

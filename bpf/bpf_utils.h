@@ -58,11 +58,73 @@ static __noinline __u64 fetch_register(const struct pt_regs *const ctx, int reg)
   else if (reg == 15)
     return READ_CTX_U64(ctx, 0);
 #elif defined(__TARGET_ARCH_arm64)
-  const struct user_pt_regs *regs = (const struct user_pt_regs *)ctx;
-  if (reg >= 0 && reg <= 30)
-    return regs->regs[reg];
+  /* DWARF aarch64 register numbers: 0..30 are x0..x30 (user_pt_regs.regs[]),
+   * 31 is sp. The verifier forbids variable-offset ctx access, so each read
+   * is spelled out at a constant offset like the x86 branch. */
+  if (reg == 0)
+    return READ_CTX_U64(ctx, 0);
+  else if (reg == 1)
+    return READ_CTX_U64(ctx, 8);
+  else if (reg == 2)
+    return READ_CTX_U64(ctx, 16);
+  else if (reg == 3)
+    return READ_CTX_U64(ctx, 24);
+  else if (reg == 4)
+    return READ_CTX_U64(ctx, 32);
+  else if (reg == 5)
+    return READ_CTX_U64(ctx, 40);
+  else if (reg == 6)
+    return READ_CTX_U64(ctx, 48);
+  else if (reg == 7)
+    return READ_CTX_U64(ctx, 56);
+  else if (reg == 8)
+    return READ_CTX_U64(ctx, 64);
+  else if (reg == 9)
+    return READ_CTX_U64(ctx, 72);
+  else if (reg == 10)
+    return READ_CTX_U64(ctx, 80);
+  else if (reg == 11)
+    return READ_CTX_U64(ctx, 88);
+  else if (reg == 12)
+    return READ_CTX_U64(ctx, 96);
+  else if (reg == 13)
+    return READ_CTX_U64(ctx, 104);
+  else if (reg == 14)
+    return READ_CTX_U64(ctx, 112);
+  else if (reg == 15)
+    return READ_CTX_U64(ctx, 120);
+  else if (reg == 16)
+    return READ_CTX_U64(ctx, 128);
+  else if (reg == 17)
+    return READ_CTX_U64(ctx, 136);
+  else if (reg == 18)
+    return READ_CTX_U64(ctx, 144);
+  else if (reg == 19)
+    return READ_CTX_U64(ctx, 152);
+  else if (reg == 20)
+    return READ_CTX_U64(ctx, 160);
+  else if (reg == 21)
+    return READ_CTX_U64(ctx, 168);
+  else if (reg == 22)
+    return READ_CTX_U64(ctx, 176);
+  else if (reg == 23)
+    return READ_CTX_U64(ctx, 184);
+  else if (reg == 24)
+    return READ_CTX_U64(ctx, 192);
+  else if (reg == 25)
+    return READ_CTX_U64(ctx, 200);
+  else if (reg == 26)
+    return READ_CTX_U64(ctx, 208);
+  else if (reg == 27)
+    return READ_CTX_U64(ctx, 216);
+  else if (reg == 28)
+    return READ_CTX_U64(ctx, 224);
+  else if (reg == 29)
+    return READ_CTX_U64(ctx, 232);
+  else if (reg == 30)
+    return READ_CTX_U64(ctx, 240);
   else if (reg == 31)
-    return regs->sp;
+    return READ_CTX_U64(ctx, 248);
 #else
 #error "Unsupported architecture: only x86 and arm64 are supported"
 #endif

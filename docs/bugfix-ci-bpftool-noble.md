@@ -29,3 +29,21 @@ red, and every Dependabot PR inherited the failures. Two unrelated causes:
   why.
 - `ci.yml` now triggers `push` only on `main`, so a PR branch gets one run
   instead of a `push` run plus a `pull_request` run.
+
+## Found once Linux CI ran: arm64 BPF load
+
+With apt fixed, the ARM64 job reached the BPF load step for the first time and
+the verifier rejected `uprobe_rgw_get_handler`:
+
+```
+508: (79) r0 = *(u64 *)(r1 +0)
+variable ctx access var_off=(0x0; 0xf8) disallowed
+libbpf: prog 'uprobe_rgw_get_handler': failed to load: -13
+```
+
+The aarch64 branch of `fetch_register` in `bpf/bpf_utils.h` indexed
+`regs->regs[reg]` with a runtime register number. The verifier only allows
+`pt_regs` reads at constant offsets, so the program could not load on any
+aarch64 kernel. The branch now spells out one constant-offset read per DWARF
+register number (0..30 at `reg * 8`, 31 is `sp` at 248), like the x86 branch.
+`tests/bpf_source.rs` pins that shape.
