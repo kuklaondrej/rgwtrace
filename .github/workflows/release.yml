@@ -51,7 +51,7 @@ jobs:
         run: |
           scripts/package-binary.sh target/release/rgwtrace "$RELEASE_TAG" "$TARGET"
           scripts/smoke-release-binary.sh "dist/rgwtrace-${RELEASE_TAG}-${TARGET}.tar.gz"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -94,7 +94,7 @@ jobs:
               dnf install -y elfutils-libelf zlib python3 tar gzip
               scripts/smoke-release-binary.sh "dist/rgwtrace-${RELEASE_TAG}-${TARGET}-centos9.tar.gz"
             '
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binary-centos9-${{ matrix.target }}
           path: dist/*-centos9.tar.gz
