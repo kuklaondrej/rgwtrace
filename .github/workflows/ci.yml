@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -36,7 +37,26 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev g++ dwz binutils bpftool libbpf-dev
+          sudo apt-get install -y --no-install-recommends clang libelf-dev linux-libc-dev llvm pkg-config zlib1g-dev g++ dwz binutils libbpf-dev
+      - name: Install bpftool
+        if: runner.os == 'Linux'
+        # On Ubuntu 24.04 `bpftool` is a virtual package: the binary ships in a
+        # linux-tools flavour package and is reached through the
+        # linux-tools-common wrapper, which execs
+        # /usr/lib/linux-tools/$(uname -r)/bpftool. Hosted runners boot an
+        # Azure kernel whose tools package does not ship bpftool at all, so
+        # install the generic flavour and point the wrapper's per-kernel
+        # directory at its binary. bpftool is a userspace tool; the generic
+        # build works against the running kernel.
+        run: |
+          sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-generic
+          if ! bpftool version >/dev/null 2>&1; then
+            real=$(find /usr/lib -maxdepth 2 -path '/usr/lib/linux-*tools-*/bpftool' -type f | sort -V | tail -n 1)
+            test -n "$real" || { echo 'no bpftool binary found' >&2; exit 1; }
+            sudo mkdir -p "/usr/lib/linux-tools/$(uname -r)"
+            sudo ln -sf "$real" "/usr/lib/linux-tools/$(uname -r)/bpftool"
+          fi
+          bpftool version
       - name: Require Linux DWARF fixture coverage
         if: matrix.os == 'ubuntu-24.04'
         run: echo 'RGWTRACE_REQUIRE_DWARF_FIXTURES=1' >> "$GITHUB_ENV"

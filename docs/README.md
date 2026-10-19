@@ -36,6 +36,8 @@ superseded by later sections in the same document.
 ## Maintenance references
 
 - [Dependency audit fixes](bugfix-dependency-audit.md): patched TLS/QUIC and compressed-DWARF dependencies.
+- [CI bpftool install on Ubuntu 24.04](bugfix-ci-bpftool-noble.md): why hosted
+  Linux CI failed at apt and how `bpftool` is installed now.
 
 - [Repository guidance](../AGENTS.md): development conventions and correctness constraints.
 - [Versioned-soname module matching](bugfix-soname-symlink-module-match.md): why

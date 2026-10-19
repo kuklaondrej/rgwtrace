@@ -104,6 +104,7 @@ jobs:
           lxc file push /tmp/rgwtrace-revision.txt "${E2E_VM_NAME}/root/rgwtrace/revision.txt"
       - name: Build inside the disposable VM
         run: |
+          # shellcheck disable=SC2016 # the single-quoted script expands inside the VM, not here
           lxc exec "${E2E_VM_NAME}" -- bash -euo pipefail -c '
             curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
             sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.90.0

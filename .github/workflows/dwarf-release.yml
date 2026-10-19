@@ -2,8 +2,6 @@ name: DWARF release
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '23 4 * * 1'
   push:
     tags: ['v[0-9]*']
 
